@@ -30,6 +30,8 @@ import (
 
 type GatewayState struct {
 	*gatewayv1.Gateway
+	ClientCert []byte
+	ClientKey  []byte
 }
 
 func (s *GatewayState) GetHTTPRoutes(allRoutes []*HTTPRouteState, controllerName string) []*HTTPRouteState {
@@ -119,8 +121,10 @@ type InternalBackend struct {
 }
 
 type InternalTLSConfig struct {
-	Hostname string
-	CACerts  [][]byte
+	Hostname   string
+	CACerts    [][]byte
+	ClientCert []byte
+	ClientKey  []byte
 }
 
 type InternalRedirect struct {
@@ -487,8 +491,10 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 									}
 
 									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
+										Hostname:   string(policy.Spec.Validation.Hostname),
+										CACerts:    caCerts,
+										ClientCert: s.ClientCert,
+										ClientKey:  s.ClientKey,
 									}
 									break
 								}

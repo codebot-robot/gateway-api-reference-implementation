@@ -91,12 +91,14 @@ func (s *State) GetService(name types.NamespacedName) *corev1.Service {
 	return s.services[name]
 }
 
-func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
+func (s *State) UpsertGateway(gw *gatewayv1.Gateway, clientCert, clientKey []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.gateways[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = &GatewayState{
-		Gateway: gw,
+		Gateway:    gw,
+		ClientCert: clientCert,
+		ClientKey:  clientKey,
 	}
 }
 

@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -152,6 +153,44 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Update status to Programmed and add address
+	resolvedRefsCondition := metav1.Condition{
+		Type:               string(gatewayv1.GatewayConditionResolvedRefs),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(gatewayv1.GatewayReasonResolvedRefs),
+		Message:            "All references resolved",
+	}
+
+	var clientCert, clientKey []byte
+	if gw.Spec.TLS != nil && gw.Spec.TLS.Backend != nil && gw.Spec.TLS.Backend.ClientCertificateRef != nil {
+		ref := gw.Spec.TLS.Backend.ClientCertificateRef
+		if string(state.ValueOf(ref.Group)) == "" && string(state.ValueOf(ref.Kind)) == "Secret" {
+			secret := &corev1.Secret{}
+			ns := gw.Namespace
+			if ref.Namespace != nil {
+				ns = string(*ref.Namespace)
+			}
+			if ns != gw.Namespace {
+				resolvedRefsCondition.Status = metav1.ConditionFalse
+				resolvedRefsCondition.Reason = string(gatewayv1.GatewayReasonRefNotPermitted)
+				resolvedRefsCondition.Message = fmt.Sprintf("Referenced Secret %s/%s is in a different namespace and ReferenceGrant is not supported", ns, string(ref.Name))
+			} else if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: string(ref.Name)}, secret); err != nil {
+				resolvedRefsCondition.Status = metav1.ConditionFalse
+				resolvedRefsCondition.Reason = string(gatewayv1.GatewayReasonInvalidClientCertificateRef)
+				resolvedRefsCondition.Message = fmt.Sprintf("Referenced Secret %s/%s not found", ns, string(ref.Name))
+				l.Error(err, "unable to fetch client certificate secret")
+			} else {
+				clientCert = secret.Data["tls.crt"]
+				clientKey = secret.Data["tls.key"]
+				if len(clientCert) == 0 || len(clientKey) == 0 {
+					resolvedRefsCondition.Status = metav1.ConditionFalse
+					resolvedRefsCondition.Reason = string(gatewayv1.GatewayReasonInvalidClientCertificateRef)
+					resolvedRefsCondition.Message = fmt.Sprintf("Referenced Secret %s/%s is missing tls.crt or tls.key", ns, string(ref.Name))
+				}
+			}
+		}
+	}
+
 	newConditions := []metav1.Condition{
 		{
 			Type:               string(gatewayv1.GatewayConditionProgrammed),
@@ -167,6 +206,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			Reason:             string(gatewayv1.GatewayReasonAccepted),
 			Message:            "Gateway accepted by reference implementation",
 		},
+		resolvedRefsCondition,
 	}
 	newAddresses := []gatewayv1.GatewayStatusAddress{
 		{
@@ -304,7 +344,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	r.State.UpsertGateway(gw)
+	r.State.UpsertGateway(gw, clientCert, clientKey)
 	_ = gs // keep for now
 	r.updateProxy()
 
@@ -331,6 +371,32 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 							NamespacedName: types.NamespacedName{
 								Namespace: route.Namespace, // Assuming same namespace for now
 								Name:      string(parentRef.Name),
+							},
+						})
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			secret := obj.(*corev1.Secret)
+			var list gatewayv1.GatewayList
+			if err := mgr.GetClient().List(ctx, &list); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, gw := range list.Items {
+				if gw.Spec.TLS != nil && gw.Spec.TLS.Backend != nil && gw.Spec.TLS.Backend.ClientCertificateRef != nil {
+					ref := gw.Spec.TLS.Backend.ClientCertificateRef
+					ns := gw.Namespace
+					if ref.Namespace != nil {
+						ns = string(*ref.Namespace)
+					}
+					if ns == secret.Namespace && string(ref.Name) == secret.Name {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: gw.Namespace,
+								Name:      gw.Name,
 							},
 						})
 					}

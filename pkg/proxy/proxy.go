@@ -166,6 +166,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			} else {
 				tlsConfig.InsecureSkipVerify = true
 			}
+			if len(backend.TLSConfig.ClientCert) > 0 && len(backend.TLSConfig.ClientKey) > 0 {
+				cert, err := tls.X509KeyPair(backend.TLSConfig.ClientCert, backend.TLSConfig.ClientKey)
+				if err == nil {
+					tlsConfig.Certificates = []tls.Certificate{cert}
+				} else {
+					log.Log.Error(err, "Failed to load client certificate")
+				}
+			}
 		} else {
 			tlsConfig.InsecureSkipVerify = true
 		}
