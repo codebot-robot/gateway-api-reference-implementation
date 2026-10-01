@@ -488,20 +488,25 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					// retain filterErr
 				} else if redirect == nil {
 					for _, backendRef := range rule.BackendRefs {
+						group := ValueOf(backendRef.Group)
 						kind := ValueOf(backendRef.Kind)
 						if kind == "" {
 							kind = "Service"
 						}
-						if kind != "Service" {
+						if (group != "" && group != "core") || kind != "Service" {
+							msg := fmt.Sprintf("Unsupported backend kind: %s", kind)
+							if group != "" && group != "core" {
+								msg = fmt.Sprintf("Unsupported backend: %s/%s", group, kind)
+							}
 							iRule.Error = &ErrorState{
 								Condition: metav1.Condition{
 									Type:    string(gatewayv1.RouteConditionResolvedRefs),
 									Status:  metav1.ConditionFalse,
 									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+									Message: msg,
 								},
 								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+								HTTPMessage:    msg,
 							}
 							continue
 						}

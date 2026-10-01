@@ -109,10 +109,22 @@ func (s *HTTPRouteState) ComputeResolvedRefsCondition() metav1.Condition {
 
 	for _, rule := range s.Spec.Rules {
 		for _, backendRef := range rule.BackendRefs {
-			if backendRef.Kind != nil && *backendRef.Kind != "Service" {
+			group := ""
+			if backendRef.Group != nil {
+				group = string(*backendRef.Group)
+			}
+			kind := "Service"
+			if backendRef.Kind != nil {
+				kind = string(*backendRef.Kind)
+			}
+			if (group != "" && group != "core") || kind != "Service" {
 				resolvedRefsStatus = metav1.ConditionFalse
 				resolvedRefsReason = gatewayv1.RouteReasonInvalidKind
-				resolvedRefsMessage = fmt.Sprintf("Unsupported backend kind: %s", *backendRef.Kind)
+				if group != "" && group != "core" {
+					resolvedRefsMessage = fmt.Sprintf("Unsupported backend: %s/%s", group, kind)
+				} else {
+					resolvedRefsMessage = fmt.Sprintf("Unsupported backend kind: %s", kind)
+				}
 				goto done
 			}
 		}

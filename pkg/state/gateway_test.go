@@ -576,6 +576,97 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 		},
 		{
+			name: "invalid backend group and kind",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route-unknown-group",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Group: Ptr(gatewayv1.Group("unknownkind.example.com")),
+													Kind:  Ptr(gatewayv1.Kind("NonExistent")),
+													Name:  "backend-svc",
+													Port:  Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Error: &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.RouteConditionResolvedRefs),
+									Status:  metav1.ConditionFalse,
+									Reason:  string(gatewayv1.RouteReasonInvalidKind),
+									Message: "Unsupported backend: unknownkind.example.com/NonExistent",
+								},
+								HTTPStatusCode: 500,
+								HTTPMessage:    "Unsupported backend: unknownkind.example.com/NonExistent",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "BackendTLSPolicy conflict resolution - oldest wins",
 			gateway: &GatewayState{
 				Gateway: &gatewayv1.Gateway{
