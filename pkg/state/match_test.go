@@ -288,3 +288,136 @@ func TestMatchRoute_HeaderMatching(t *testing.T) {
 		t.Errorf("Expected two headers match (more headers win), got %v", rule2)
 	}
 }
+
+func TestMatchRoute_HostnamePrecedence(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Hostnames: []string{"*.bar.com"},
+			Rules: []InternalRule{
+				{
+					Backend: &InternalBackend{Host: "wildcard-bar-backend"},
+				},
+			},
+		},
+		{
+			Hostnames: []string{"foo.bar.com"},
+			Rules: []InternalRule{
+				{
+					Backend: &InternalBackend{Host: "exact-foo-bar-backend"},
+				},
+			},
+		},
+		{
+			Hostnames: []string{"*.foo.bar.com"},
+			Rules: []InternalRule{
+				{
+					Backend: &InternalBackend{Host: "longer-wildcard-backend"},
+				},
+			},
+		},
+		{
+			Hostnames: []string{"*"},
+			Rules: []InternalRule{
+				{
+					Backend: &InternalBackend{Host: "catch-all-backend"},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name            string
+		host            string
+		expectedBackend string
+	}{
+		{
+			name:            "Exact hostname wins over wildcard",
+			host:            "foo.bar.com",
+			expectedBackend: "exact-foo-bar-backend",
+		},
+		{
+			name:            "Exact hostname wins with port and case insensitivity",
+			host:            "FOO.BAR.COM:8080",
+			expectedBackend: "exact-foo-bar-backend",
+		},
+		{
+			name:            "Longer wildcard hostname wins over shorter wildcard",
+			host:            "test.foo.bar.com",
+			expectedBackend: "longer-wildcard-backend",
+		},
+		{
+			name:            "Wildcard hostname matches single prefix",
+			host:            "baz.bar.com",
+			expectedBackend: "wildcard-bar-backend",
+		},
+		{
+			name:            "Wildcard hostname matches multiple prefix levels",
+			host:            "multiple.prefixes.bar.com",
+			expectedBackend: "wildcard-bar-backend",
+		},
+		{
+			name:            "Catch-all matches host not matching any wildcard suffix",
+			host:            "other.domain.com",
+			expectedBackend: "catch-all-backend",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "http://"+tt.host+"/", nil)
+			rule, _ := MatchRoute(routes, req)
+			if rule == nil {
+				t.Fatalf("Expected match, got nil")
+			}
+			if rule.Backend.Host != tt.expectedBackend {
+				t.Errorf("Expected backend %s, got %s", tt.expectedBackend, rule.Backend.Host)
+			}
+		})
+	}
+}
+
+func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Hostnames: []string{"*.bar.com"},
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/exact-path",
+							},
+						},
+					},
+					Backend: &InternalBackend{Host: "wildcard-host-exact-path-backend"},
+				},
+			},
+		},
+		{
+			Hostnames: []string{"foo.bar.com"},
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+						},
+					},
+					Backend: &InternalBackend{Host: "exact-host-prefix-path-backend"},
+				},
+			},
+		},
+	}
+
+	req, _ := http.NewRequest("GET", "http://foo.bar.com/exact-path", nil)
+	rule, _ := MatchRoute(routes, req)
+	if rule == nil {
+		t.Fatalf("Expected match, got nil")
+	}
+	if rule.Backend.Host != "exact-host-prefix-path-backend" {
+		t.Errorf("Expected exact hostname match (exact-host-prefix-path-backend) to take precedence over wildcard host match with exact path, got %s", rule.Backend.Host)
+	}
+}

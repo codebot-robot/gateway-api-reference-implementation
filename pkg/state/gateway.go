@@ -61,29 +61,55 @@ type InternalRoute struct {
 }
 
 func (ir *InternalRoute) MatchHostname(host string) bool {
+	matched, _, _ := ir.MatchHostnameScore(host)
+	return matched
+}
+
+// MatchHostnameScore computes whether the host matches any of the route's hostnames,
+// and returns the number of characters in the matching non-wildcard hostname and total matching hostname.
+func (ir *InternalRoute) MatchHostnameScore(host string) (bool, int, int) {
 	// Strip port if present
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+	cleanHost := strings.ToLower(host)
 
 	if len(ir.Hostnames) == 0 {
-		return true
+		return true, 0, 0
 	}
+
+	matched := false
+	maxNonWildcardLen := 0
+	maxHostnameLen := 0
+
 	for _, h := range ir.Hostnames {
-		if h == "*" {
-			return true
+		cleanH := strings.ToLower(h)
+		if cleanH == "*" {
+			matched = true
+			continue
 		}
-		if h == host {
-			return true
+		if cleanH == cleanHost {
+			matched = true
+			if len(cleanH) > maxNonWildcardLen {
+				maxNonWildcardLen = len(cleanH)
+			}
+			if len(cleanH) > maxHostnameLen {
+				maxHostnameLen = len(cleanH)
+			}
+			continue
 		}
-		if strings.HasPrefix(h, "*.") {
-			suffix := h[1:] // .example.com
-			if strings.HasSuffix(host, suffix) {
-				return true
+		if strings.HasPrefix(cleanH, "*.") {
+			suffix := cleanH[1:] // .example.com
+			if len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix) {
+				matched = true
+				if len(cleanH) > maxHostnameLen {
+					maxHostnameLen = len(cleanH)
+				}
 			}
 		}
 	}
-	return false
+
+	return matched, maxNonWildcardLen, maxHostnameLen
 }
 
 // ErrorState represents an error that should be surfaced to the user.
@@ -235,68 +261,105 @@ type InternalHeaderMatch struct {
 	MatchRegularExpressionValue *regexp.Regexp
 }
 
+type routeMatchCandidate struct {
+	rule                   *InternalRule
+	match                  *InternalMatch
+	nonWildcardHostnameLen int
+	hostnameLen            int
+}
+
 func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *InternalMatch) {
-	var bestRule *InternalRule
-	var bestMatch *InternalMatch
+	var bestCandidate *routeMatchCandidate
 
 	for i := range routes {
 		route := &routes[i]
-		if !route.MatchHostname(r.Host) {
+		matched, nonWildcardLen, hostnameLen := route.MatchHostnameScore(r.Host)
+		if !matched {
 			continue
 		}
 
 		for j := range route.Rules {
 			rule := &route.Rules[j]
+			if len(rule.Matches) == 0 {
+				defaultMatch := InternalMatch{
+					Path: &InternalPathMatch{
+						Type:  gatewayv1.PathMatchPathPrefix,
+						Value: "/",
+					},
+				}
+				candidate := &routeMatchCandidate{
+					rule:                   rule,
+					match:                  &defaultMatch,
+					nonWildcardHostnameLen: nonWildcardLen,
+					hostnameLen:            hostnameLen,
+				}
+				if isBetterCandidate(candidate, bestCandidate) {
+					bestCandidate = candidate
+				}
+				continue
+			}
+
 			for k := range rule.Matches {
 				match := &rule.Matches[k]
 				if match.Matches(r.Method, r.URL.Path, r.Header) {
-					if isBetterMatch(match, bestMatch) {
-						bestMatch = match
-						bestRule = rule
+					candidate := &routeMatchCandidate{
+						rule:                   rule,
+						match:                  match,
+						nonWildcardHostnameLen: nonWildcardLen,
+						hostnameLen:            hostnameLen,
 					}
-				}
-			}
-			if len(rule.Matches) == 0 {
-				// Rule with no matches always matches, but is the least specific
-				if bestRule == nil {
-					bestRule = rule
-					bestMatch = &InternalMatch{}
+					if isBetterCandidate(candidate, bestCandidate) {
+						bestCandidate = candidate
+					}
 				}
 			}
 		}
 	}
 
-	return bestRule, bestMatch
+	if bestCandidate == nil {
+		return nil, nil
+	}
+	return bestCandidate.rule, bestCandidate.match
 }
 
-func isBetterMatch(current, best *InternalMatch) bool {
+func isBetterCandidate(current, best *routeMatchCandidate) bool {
 	if best == nil {
 		return true
 	}
 
-	// 1. Path match type priority: Exact > PathPrefix > None
-	currentType := getPathMatchType(current)
-	bestType := getPathMatchType(best)
+	// 1. Characters in a matching non-wildcard hostname
+	if current.nonWildcardHostnameLen != best.nonWildcardHostnameLen {
+		return current.nonWildcardHostnameLen > best.nonWildcardHostnameLen
+	}
+
+	// 2. Characters in a matching hostname
+	if current.hostnameLen != best.hostnameLen {
+		return current.hostnameLen > best.hostnameLen
+	}
+
+	// 3. Path match type priority: Exact > PathPrefix > None
+	currentType := getPathMatchType(current.match)
+	bestType := getPathMatchType(best.match)
 
 	if currentType != bestType {
 		return getPathMatchTypeWeight(currentType) > getPathMatchTypeWeight(bestType)
 	}
 
-	// 2. Longest path match wins
-	currentPathLen := getPathLen(current)
-	bestPathLen := getPathLen(best)
+	// 4. Longest path match wins
+	currentPathLen := getPathLen(current.match)
+	bestPathLen := getPathLen(best.match)
 	if currentPathLen != bestPathLen {
 		return currentPathLen > bestPathLen
 	}
 
-	// 3. Method match wins over no method match
-	if (current.Method != nil) != (best.Method != nil) {
-		return current.Method != nil
+	// 5. Method match wins over no method match
+	if (current.match.Method != nil) != (best.match.Method != nil) {
+		return current.match.Method != nil
 	}
 
-	// 4. Most header matches win
-	if len(current.Headers) != len(best.Headers) {
-		return len(current.Headers) > len(best.Headers)
+	// 6. Most header matches win
+	if len(current.match.Headers) != len(best.match.Headers) {
+		return len(current.match.Headers) > len(best.match.Headers)
 	}
 
 	return false
