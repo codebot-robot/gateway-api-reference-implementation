@@ -106,6 +106,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteListenerHostnameMatching,
 		tests.HTTPRouteRewriteHost,
+		tests.HTTPRoute307Redirect,
 		// tests.HTTPRouteRewritePath, // Fails on rewrite-path-and-modify-headers under v1.5.0
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,

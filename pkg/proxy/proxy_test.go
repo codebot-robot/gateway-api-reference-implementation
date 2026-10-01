@@ -219,3 +219,73 @@ func TestProxyModifyHeaders(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyRedirect(t *testing.T) {
+	tests := []struct {
+		name             string
+		redirect         state.InternalRedirect
+		match            *state.InternalMatch
+		initialURL       string
+		initialHost      string
+		expectedStatus   int
+		expectedLocation string
+	}{
+		{
+			name: "307 redirect status code default path and host",
+			redirect: state.InternalRedirect{
+				StatusCode: state.Ptr(307),
+			},
+			initialURL:       "http://example.com/temporary",
+			initialHost:      "example.com",
+			expectedStatus:   307,
+			expectedLocation: "http://example.com/temporary",
+		},
+		{
+			name: "307 redirect with full path",
+			redirect: state.InternalRedirect{
+				StatusCode: state.Ptr(307),
+				Path: &state.InternalPathRedirect{
+					Type:  gatewayv1.FullPathHTTPPathModifier,
+					Value: "/new-path",
+				},
+			},
+			initialURL:       "http://example.com/old-path",
+			initialHost:      "example.com",
+			expectedStatus:   307,
+			expectedLocation: "http://example.com/new-path",
+		},
+		{
+			name: "307 redirect with scheme, hostname and port",
+			redirect: state.InternalRedirect{
+				Scheme:     state.Ptr("https"),
+				Hostname:   state.Ptr(gatewayv1.PreciseHostname("foo.example.com")),
+				Port:       state.Ptr(gatewayv1.PortNumber(8443)),
+				StatusCode: state.Ptr(307),
+			},
+			initialURL:       "http://example.com/temporary",
+			initialHost:      "example.com",
+			expectedStatus:   307,
+			expectedLocation: "https://foo.example.com:8443/temporary",
+		},
+	}
+
+	p := NewProxy()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tt.initialURL, nil)
+			req.Host = tt.initialHost
+			w := httptest.NewRecorder()
+
+			p.redirect(w, req, tt.redirect, tt.match)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("expected status %d, got %d", tt.expectedStatus, resp.StatusCode)
+			}
+			location := resp.Header.Get("Location")
+			if location != tt.expectedLocation {
+				t.Errorf("expected Location %q, got %q", tt.expectedLocation, location)
+			}
+		})
+	}
+}
