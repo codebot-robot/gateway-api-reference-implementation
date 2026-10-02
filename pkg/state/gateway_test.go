@@ -125,10 +125,13 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{
-								Host:        "backend-svc.default.svc.cluster.local",
-								Port:        80,
-								AppProtocol: Ptr("kubernetes.io/h2c"),
+							Backends: []InternalBackend{
+								{
+									Host:        "backend-svc.default.svc.cluster.local",
+									Port:        80,
+									AppProtocol: Ptr("kubernetes.io/h2c"),
+									Weight:      1,
+								},
 							},
 						},
 					},
@@ -211,7 +214,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
 						},
 					},
 				},
@@ -293,7 +296,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"foo.example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080},
+							Backends: []InternalBackend{{Host: "backend-svc.test-ns.svc.cluster.local", Port: 8080, Weight: 1}},
 						},
 					},
 				},
@@ -389,7 +392,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
 						},
 					},
 				},
@@ -479,7 +482,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 									Method: Ptr(gatewayv1.HTTPMethod("POST")),
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
 						},
 					},
 				},
@@ -1003,13 +1006,16 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"example.com"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{
-								Host:        "backend-svc.default.svc.cluster.local",
-								Port:        80,
-								AppProtocol: Ptr("https"),
-								TLSConfig: &InternalTLSConfig{
-									Hostname: "old.example.com",
-									CACerts:  nil,
+							Backends: []InternalBackend{
+								{
+									Host:        "backend-svc.default.svc.cluster.local",
+									Port:        80,
+									AppProtocol: Ptr("https"),
+									TLSConfig: &InternalTLSConfig{
+										Hostname: "old.example.com",
+										CACerts:  nil,
+									},
+									Weight: 1,
 								},
 							},
 						},
@@ -1110,7 +1116,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 									Value: "/new-prefix",
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
 						},
 					},
 				},
@@ -1220,7 +1226,7 @@ func TestBuildInternalRoutes(t *testing.T) {
 									{Name: "X-Header-Set", Value: "set-val"},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
 						},
 					},
 				},
@@ -1332,7 +1338,175 @@ func TestBuildInternalRoutes(t *testing.T) {
 								},
 								Remove: []string{"X-Header-Remove"},
 							},
-							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+							Backends: []InternalBackend{{Host: "backend-svc.default.svc.cluster.local", Port: 80, Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "route with multiple weighted backends and backend filters",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Port:     80,
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					}},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "backend-v1"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{
+							{Port: 8080},
+						},
+					},
+				},
+				{Namespace: "default", Name: "backend-v2"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{
+							{Port: 8080},
+						},
+					},
+				},
+				{Namespace: "default", Name: "backend-v3"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{
+							{Port: 8080},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "weighted-route",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-v1",
+													Port: Ptr(gatewayv1.PortNumber(8080)),
+												},
+												Weight: Ptr(int32(70)),
+											},
+											Filters: []gatewayv1.HTTPRouteFilter{
+												{
+													Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+													RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+														Set: []gatewayv1.HTTPHeader{
+															{Name: "Backend", Value: "backend-v1"},
+														},
+													},
+												},
+											},
+										},
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-v2",
+													Port: Ptr(gatewayv1.PortNumber(8080)),
+												},
+												Weight: Ptr(int32(30)),
+											},
+											Filters: []gatewayv1.HTTPRouteFilter{
+												{
+													Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+													RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+														Set: []gatewayv1.HTTPHeader{
+															{Name: "Backend", Value: "backend-v2"},
+														},
+													},
+												},
+											},
+										},
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-v3",
+													Port: Ptr(gatewayv1.PortNumber(8080)),
+												},
+												Weight: Ptr(int32(0)),
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Backends: []InternalBackend{
+								{
+									Host:   "backend-v1.default.svc.cluster.local",
+									Port:   8080,
+									Weight: 70,
+									RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+										Set: []gatewayv1.HTTPHeader{
+											{Name: "Backend", Value: "backend-v1"},
+										},
+									},
+								},
+								{
+									Host:   "backend-v2.default.svc.cluster.local",
+									Port:   8080,
+									Weight: 30,
+									RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+										Set: []gatewayv1.HTTPHeader{
+											{Name: "Backend", Value: "backend-v2"},
+										},
+									},
+								},
+								{
+									Host:   "backend-v3.default.svc.cluster.local",
+									Port:   8080,
+									Weight: 0,
+								},
+							},
 						},
 					},
 				},
@@ -1439,17 +1613,20 @@ func TestBuildInternalRoutes(t *testing.T) {
 					Hostnames: []string{"*"},
 					Rules: []InternalRule{
 						{
-							Backend: &InternalBackend{
-								Host: "backend-svc.default.svc.cluster.local",
-								Port: 80,
-								RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
-									Set: []gatewayv1.HTTPHeader{
-										{Name: "X-Backend-Req-Set", Value: "b-set"},
+							Backends: []InternalBackend{
+								{
+									Host:   "backend-svc.default.svc.cluster.local",
+									Port:   80,
+									Weight: 1,
+									RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+										Set: []gatewayv1.HTTPHeader{
+											{Name: "X-Backend-Req-Set", Value: "b-set"},
+										},
 									},
-								},
-								ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
-									Set: []gatewayv1.HTTPHeader{
-										{Name: "X-Backend-Resp-Set", Value: "b-resp-set"},
+									ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+										Set: []gatewayv1.HTTPHeader{
+											{Name: "X-Backend-Resp-Set", Value: "b-resp-set"},
+										},
 									},
 								},
 							},
@@ -1572,7 +1749,7 @@ func TestMatchRoute_Method(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "post-backend", Port: 80},
+					Backends: []InternalBackend{{Host: "post-backend", Port: 80, Weight: 1}},
 				},
 				{
 					Matches: []InternalMatch{
@@ -1584,7 +1761,7 @@ func TestMatchRoute_Method(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "get-backend", Port: 80},
+					Backends: []InternalBackend{{Host: "get-backend", Port: 80, Weight: 1}},
 				},
 			},
 		},
@@ -1622,13 +1799,13 @@ func TestMatchRoute_Method(t *testing.T) {
 			rule, _ := MatchRoute(routes, req)
 			if tt.wantBackend == "" {
 				if rule != nil {
-					t.Errorf("MatchRoute() matched rule %v, want no match", rule.Backend.Host)
+					t.Errorf("MatchRoute() matched rule %v, want no match", rule.Backends[0].Host)
 				}
 			} else {
 				if rule == nil {
 					t.Errorf("MatchRoute() matched no rule, want %s", tt.wantBackend)
-				} else if rule.Backend.Host != tt.wantBackend {
-					t.Errorf("MatchRoute() matched backend %s, want %s", rule.Backend.Host, tt.wantBackend)
+				} else if len(rule.Backends) == 0 || rule.Backends[0].Host != tt.wantBackend {
+					t.Errorf("MatchRoute() matched backend %v, want %s", rule.Backends, tt.wantBackend)
 				}
 			}
 		})

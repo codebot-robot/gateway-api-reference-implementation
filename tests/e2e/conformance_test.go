@@ -124,10 +124,12 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteRedirectPortAndScheme,
 		tests.HTTPRouteRedirectScheme,
 		tests.HTTPRouteRequestHeaderModifier,
+		tests.HTTPRouteRequestHeaderModifierBackendWeights,
 		tests.HTTPRouteResponseHeaderModifier,
 		tests.HTTPRouteRewriteHost,
 		tests.HTTPRouteRewritePath,
 		tests.HTTPRouteSimpleSameNamespace,
+		tests.HTTPRouteWeight,
 	}
 
 	cSuite.Setup(t, selectedTests)

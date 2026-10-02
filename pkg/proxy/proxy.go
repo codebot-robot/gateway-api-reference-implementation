@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -127,11 +128,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if bestRule.RequestHeaderModifier != nil {
 			p.modifyHeaders(r, *bestRule.RequestHeaderModifier)
 		}
-		if bestRule.Backend != nil {
-			if bestRule.Backend.RequestHeaderModifier != nil {
-				p.modifyHeaders(r, *bestRule.Backend.RequestHeaderModifier)
+		if len(bestRule.Backends) > 0 {
+			backend, err := pickBackend(bestRule.Backends)
+			if err != nil {
+				if bestRule.ResponseHeaderModifier != nil {
+					modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
-			p.forward(w, r, *bestRule.Backend, bestRule.ResponseHeaderModifier)
+			if backend.Error != nil {
+				if bestRule.ResponseHeaderModifier != nil {
+					modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
+				}
+				if backend.ResponseHeaderModifier != nil {
+					modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+				}
+				http.Error(w, backend.Error.HTTPMessage, backend.Error.HTTPStatusCode)
+				return
+			}
+			if backend.RequestHeaderModifier != nil {
+				p.modifyHeaders(r, *backend.RequestHeaderModifier)
+			}
+			p.forward(w, r, backend, bestRule.ResponseHeaderModifier)
 			return
 		}
 	}
@@ -365,4 +384,43 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 
 	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
 	proxy.ServeHTTP(w, r)
+}
+
+// pickBackend selects a backend from the list based on their weights.
+// If all backends have weight 0 or the list is empty, an error is returned.
+func pickBackend(backends []state.InternalBackend) (state.InternalBackend, error) {
+	if len(backends) == 0 {
+		return state.InternalBackend{}, fmt.Errorf("no backends configured")
+	}
+
+	if len(backends) == 1 {
+		if backends[0].Weight <= 0 {
+			return state.InternalBackend{}, fmt.Errorf("all backends have zero weight")
+		}
+		return backends[0], nil
+	}
+
+	var totalWeight int64
+	for _, b := range backends {
+		if b.Weight > 0 {
+			totalWeight += int64(b.Weight)
+		}
+	}
+
+	if totalWeight <= 0 {
+		return state.InternalBackend{}, fmt.Errorf("all backends have zero weight")
+	}
+
+	n := rand.Int64N(totalWeight)
+	for _, b := range backends {
+		if b.Weight <= 0 {
+			continue
+		}
+		if n < int64(b.Weight) {
+			return b, nil
+		}
+		n -= int64(b.Weight)
+	}
+
+	return backends[len(backends)-1], nil
 }
