@@ -97,31 +97,31 @@ func TestConformance(t *testing.T) {
 	}
 
 	selectedTests := []suite.ConformanceTest{
-		tests.HTTPRouteSimpleSameNamespace,
-		tests.HTTPRouteMatching,
-		tests.HTTPRoutePathMatchOrder,
-		tests.HTTPRouteExactPathMatching,
-		tests.HTTPRouteMethodMatching, // Fails on HTTPRouteMethodMatching/11 with headers under v1.5.0
-		tests.HTTPRouteHeaderMatching,
-		tests.HTTPRouteHostnameIntersection,
-		tests.HTTPRouteListenerHostnameMatching,
-		tests.HTTPRouteRewriteHost,
+		// tests.BackendTLSPolicy, // Fails on re-encrypt under v1.5.0
+		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
+		tests.GatewayInvalidTLSConfiguration,
+		tests.GatewayObservedGenerationBump,
 		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
 		tests.HTTPRoute308Redirect,
+		tests.HTTPRouteBackendProtocolH2C,
+		tests.HTTPRouteExactPathMatching,
+		tests.HTTPRouteHeaderMatching,
+		tests.HTTPRouteHostnameIntersection,
+		tests.HTTPRouteInvalidBackendRefUnknownKind,
+		tests.HTTPRouteListenerHostnameMatching,
+		tests.HTTPRouteMatching,
+		tests.HTTPRouteMethodMatching, // Fails on HTTPRouteMethodMatching/11 with headers under v1.5.0
+		tests.HTTPRoutePathMatchOrder,
 		tests.HTTPRouteRedirectHostAndStatus,
 		tests.HTTPRouteRedirectPath,
 		tests.HTTPRouteRedirectPort,
-		tests.HTTPRouteRedirectScheme,
 		tests.HTTPRouteRedirectPortAndScheme,
+		tests.HTTPRouteRedirectScheme,
 		tests.HTTPRouteResponseHeaderModifier,
+		tests.HTTPRouteRewriteHost,
 		// tests.HTTPRouteRewritePath, // Fails on rewrite-path-and-modify-headers under v1.5.0
-		tests.HTTPRouteInvalidBackendRefUnknownKind,
-		tests.HTTPRouteBackendProtocolH2C,
-		// tests.BackendTLSPolicy, // Fails on re-encrypt under v1.5.0
-		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
-		tests.GatewayObservedGenerationBump,
-		tests.GatewayInvalidTLSConfiguration,
+		tests.HTTPRouteSimpleSameNamespace,
 	}
 
 	cSuite.Setup(t, selectedTests)
