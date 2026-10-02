@@ -42,7 +42,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-prefix"},
+							Backends: []InternalBackend{{Host: "backend-prefix"}},
 						},
 						{
 							Matches: []InternalMatch{
@@ -53,14 +53,14 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-exact"},
+							Backends: []InternalBackend{{Host: "backend-exact"}},
 						},
 					},
 				},
 			},
 			path: "/match/exact",
 			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-exact"},
+				Backends: []InternalBackend{{Host: "backend-exact"}},
 			},
 		},
 		{
@@ -77,7 +77,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-short"},
+							Backends: []InternalBackend{{Host: "backend-short"}},
 						},
 						{
 							Matches: []InternalMatch{
@@ -88,14 +88,14 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-long"},
+							Backends: []InternalBackend{{Host: "backend-long"}},
 						},
 					},
 				},
 			},
 			path: "/match/prefix/one/any",
 			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-long"},
+				Backends: []InternalBackend{{Host: "backend-long"}},
 			},
 		},
 		{
@@ -112,7 +112,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-1"},
+							Backends: []InternalBackend{{Host: "backend-1"}},
 						},
 						{
 							Matches: []InternalMatch{
@@ -123,14 +123,14 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-2"},
+							Backends: []InternalBackend{{Host: "backend-2"}},
 						},
 					},
 				},
 			},
 			path: "/match",
 			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-1"},
+				Backends: []InternalBackend{{Host: "backend-1"}},
 			},
 		},
 		{
@@ -147,7 +147,7 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-A"},
+							Backends: []InternalBackend{{Host: "backend-A"}},
 						},
 					},
 				},
@@ -162,14 +162,14 @@ func TestMatchRouteOrder(t *testing.T) {
 									},
 								},
 							},
-							Backend: &InternalBackend{Host: "backend-B"},
+							Backends: []InternalBackend{{Host: "backend-B"}},
 						},
 					},
 				},
 			},
 			path: "/match",
 			expectedRule: &InternalRule{
-				Backend: &InternalBackend{Host: "backend-A"},
+				Backends: []InternalBackend{{Host: "backend-A"}},
 			},
 		},
 	}
@@ -183,8 +183,8 @@ func TestMatchRouteOrder(t *testing.T) {
 				t.Fatalf("Expected a match, but got nil")
 			}
 
-			if bestRule.Backend.Host != tt.expectedRule.Backend.Host {
-				t.Errorf("Expected backend %s, but got %s", tt.expectedRule.Backend.Host, bestRule.Backend.Host)
+			if len(bestRule.Backends) == 0 || len(tt.expectedRule.Backends) == 0 || bestRule.Backends[0].Host != tt.expectedRule.Backends[0].Host {
+				t.Errorf("Expected backend %v, but got %v", tt.expectedRule.Backends, bestRule.Backends)
 			}
 		})
 	}
@@ -201,7 +201,7 @@ func TestMatchRoute_MethodVsHeaderPrecedence(t *testing.T) {
 							Method: Ptr(gatewayv1.HTTPMethod("PATCH")),
 						},
 					},
-					Backend: &InternalBackend{Host: "method-backend"},
+					Backends: []InternalBackend{{Host: "method-backend"}},
 				},
 				{
 					Matches: []InternalMatch{
@@ -214,7 +214,7 @@ func TestMatchRoute_MethodVsHeaderPrecedence(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "header-backend"},
+					Backends: []InternalBackend{{Host: "header-backend"}},
 				},
 			},
 		},
@@ -227,8 +227,8 @@ func TestMatchRoute_MethodVsHeaderPrecedence(t *testing.T) {
 	if rule == nil {
 		t.Fatalf("Expected match, got nil")
 	}
-	if rule.Backend.Host != "method-backend" {
-		t.Errorf("Expected method match (method-backend) to take precedence over header match (header-backend), got %s", rule.Backend.Host)
+	if len(rule.Backends) == 0 || rule.Backends[0].Host != "method-backend" {
+		t.Errorf("Expected method match (method-backend) to take precedence over header match (header-backend), got %v", rule.Backends)
 	}
 }
 
@@ -252,7 +252,7 @@ func TestMatchRoute_HeaderMatching(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "two-headers-backend"},
+					Backends: []InternalBackend{{Host: "two-headers-backend"}},
 				},
 				{
 					Matches: []InternalMatch{
@@ -265,7 +265,7 @@ func TestMatchRoute_HeaderMatching(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "one-header-backend"},
+					Backends: []InternalBackend{{Host: "one-header-backend"}},
 				},
 			},
 		},
@@ -275,7 +275,7 @@ func TestMatchRoute_HeaderMatching(t *testing.T) {
 	req1, _ := http.NewRequest("GET", "http://example.com/", nil)
 	req1.Header.Set("X-Header-One", "val1")
 	rule1, _ := MatchRoute(routes, req1)
-	if rule1 == nil || rule1.Backend.Host != "one-header-backend" {
+	if rule1 == nil || len(rule1.Backends) == 0 || rule1.Backends[0].Host != "one-header-backend" {
 		t.Errorf("Expected single header match, got %v", rule1)
 	}
 
@@ -284,7 +284,7 @@ func TestMatchRoute_HeaderMatching(t *testing.T) {
 	req2.Header.Set("x-header-one", "val1") // test case insensitivity
 	req2.Header.Set("X-Header-Two", "val2")
 	rule2, _ := MatchRoute(routes, req2)
-	if rule2 == nil || rule2.Backend.Host != "two-headers-backend" {
+	if rule2 == nil || len(rule2.Backends) == 0 || rule2.Backends[0].Host != "two-headers-backend" {
 		t.Errorf("Expected two headers match (more headers win), got %v", rule2)
 	}
 }
@@ -295,7 +295,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			Hostnames: []string{"*.bar.com"},
 			Rules: []InternalRule{
 				{
-					Backend: &InternalBackend{Host: "wildcard-bar-backend"},
+					Backends: []InternalBackend{{Host: "wildcard-bar-backend"}},
 				},
 			},
 		},
@@ -303,7 +303,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			Hostnames: []string{"foo.bar.com"},
 			Rules: []InternalRule{
 				{
-					Backend: &InternalBackend{Host: "exact-foo-bar-backend"},
+					Backends: []InternalBackend{{Host: "exact-foo-bar-backend"}},
 				},
 			},
 		},
@@ -311,7 +311,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			Hostnames: []string{"*.foo.bar.com"},
 			Rules: []InternalRule{
 				{
-					Backend: &InternalBackend{Host: "longer-wildcard-backend"},
+					Backends: []InternalBackend{{Host: "longer-wildcard-backend"}},
 				},
 			},
 		},
@@ -319,7 +319,7 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			Hostnames: []string{"*"},
 			Rules: []InternalRule{
 				{
-					Backend: &InternalBackend{Host: "catch-all-backend"},
+					Backends: []InternalBackend{{Host: "catch-all-backend"}},
 				},
 			},
 		},
@@ -369,8 +369,8 @@ func TestMatchRoute_HostnamePrecedence(t *testing.T) {
 			if rule == nil {
 				t.Fatalf("Expected match, got nil")
 			}
-			if rule.Backend.Host != tt.expectedBackend {
-				t.Errorf("Expected backend %s, got %s", tt.expectedBackend, rule.Backend.Host)
+			if len(rule.Backends) == 0 || rule.Backends[0].Host != tt.expectedBackend {
+				t.Errorf("Expected backend %s, got %v", tt.expectedBackend, rule.Backends)
 			}
 		})
 	}
@@ -390,7 +390,7 @@ func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "wildcard-host-exact-path-backend"},
+					Backends: []InternalBackend{{Host: "wildcard-host-exact-path-backend"}},
 				},
 			},
 		},
@@ -406,7 +406,7 @@ func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 							},
 						},
 					},
-					Backend: &InternalBackend{Host: "exact-host-prefix-path-backend"},
+					Backends: []InternalBackend{{Host: "exact-host-prefix-path-backend"}},
 				},
 			},
 		},
@@ -417,7 +417,7 @@ func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 	if rule == nil {
 		t.Fatalf("Expected match, got nil")
 	}
-	if rule.Backend.Host != "exact-host-prefix-path-backend" {
-		t.Errorf("Expected exact hostname match (exact-host-prefix-path-backend) to take precedence over wildcard host match with exact path, got %s", rule.Backend.Host)
+	if len(rule.Backends) == 0 || rule.Backends[0].Host != "exact-host-prefix-path-backend" {
+		t.Errorf("Expected exact hostname match (exact-host-prefix-path-backend) to take precedence over wildcard host match with exact path, got %v", rule.Backends)
 	}
 }

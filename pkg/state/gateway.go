@@ -131,7 +131,7 @@ type ErrorState struct {
 // InternalRule is the internal representation of an HTTPRouteRule.
 type InternalRule struct {
 	Matches  []InternalMatch
-	Backend  *InternalBackend
+	Backends []InternalBackend
 	Redirect *InternalRedirect
 	Rewrite  *InternalRewrite
 	// RequestHeaderModifier defines the request header modifications to apply.
@@ -163,8 +163,10 @@ type InternalBackend struct {
 	Port                   int32
 	AppProtocol            *string
 	TLSConfig              *InternalTLSConfig
+	Weight                 int32
 	RequestHeaderModifier  *gatewayv1.HTTPHeaderFilter
 	ResponseHeaderModifier *gatewayv1.HTTPHeaderFilter
+	Error                  *ErrorState
 }
 
 type InternalTLSConfig struct {
@@ -677,18 +679,20 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							break
 						}
 
-						iRule.Backend = &InternalBackend{
+						weight := int32(1)
+						if backendRef.Weight != nil {
+							weight = *backendRef.Weight
+						}
+
+						iRule.Backends = append(iRule.Backends, InternalBackend{
 							Host:                   fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
 							Port:                   int32(*backendRef.Port),
 							AppProtocol:            appProtocol,
 							TLSConfig:              tlsConfig,
+							Weight:                 weight,
 							RequestHeaderModifier:  backendReqHeaderModifier,
 							ResponseHeaderModifier: backendRespHeaderModifier,
-						}
-						iRule.Error = nil
-
-						// For minimal implementation, we just take the first Service backendRef for each rule
-						break
+						})
 					}
 				}
 

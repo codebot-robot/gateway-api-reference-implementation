@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -512,9 +513,12 @@ func TestProxyResponseHeaderModifier(t *testing.T) {
 		{
 			Rules: []state.InternalRule{
 				{
-					Backend: &state.InternalBackend{
-						Host: host,
-						Port: int32(port),
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
 					},
 					ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
 						Set: []gatewayv1.HTTPHeader{
@@ -590,17 +594,20 @@ func TestProxyBackendHeaderModifiers(t *testing.T) {
 							{Name: "X-Rule-Resp", Value: "rule-resp-val"},
 						},
 					},
-					Backend: &state.InternalBackend{
-						Host: host,
-						Port: int32(port),
-						RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
-							Set: []gatewayv1.HTTPHeader{
-								{Name: "X-Backend-Req", Value: "backend-val"},
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+							RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "X-Backend-Req", Value: "backend-val"},
+								},
 							},
-						},
-						ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
-							Set: []gatewayv1.HTTPHeader{
-								{Name: "X-Backend-Resp", Value: "backend-resp-val"},
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "X-Backend-Resp", Value: "backend-resp-val"},
+								},
 							},
 						},
 					},
@@ -636,5 +643,229 @@ func TestProxyBackendHeaderModifiers(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Resp-Original"); got != "resp-orig" {
 		t.Errorf("expected X-Resp-Original to be 'resp-orig', got %q", got)
+	}
+}
+
+func TestPickBackend(t *testing.T) {
+	t.Run("empty backends", func(t *testing.T) {
+		_, err := pickBackend(nil)
+		if err == nil {
+			t.Errorf("expected error for empty backends, got nil")
+		}
+	})
+
+	t.Run("all zero weight", func(t *testing.T) {
+		backends := []state.InternalBackend{
+			{Host: "b1", Weight: 0},
+			{Host: "b2", Weight: 0},
+		}
+		_, err := pickBackend(backends)
+		if err == nil {
+			t.Errorf("expected error for all zero weight, got nil")
+		}
+	})
+
+	t.Run("single backend zero weight", func(t *testing.T) {
+		backends := []state.InternalBackend{
+			{Host: "b1", Weight: 0},
+		}
+		_, err := pickBackend(backends)
+		if err == nil {
+			t.Errorf("expected error for single backend with zero weight, got nil")
+		}
+	})
+
+	t.Run("single backend", func(t *testing.T) {
+		backends := []state.InternalBackend{
+			{Host: "b1", Weight: 1},
+		}
+		b, err := pickBackend(backends)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if b.Host != "b1" {
+			t.Errorf("expected host b1, got %s", b.Host)
+		}
+	})
+}
+
+func TestProxy_WeightedBackends(t *testing.T) {
+	var counts sync.Map
+	counts.Store("v1", 0)
+	counts.Store("v2", 0)
+	counts.Store("v3", 0)
+
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, _ := counts.Load("v1")
+		counts.Store("v1", v.(int)+1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, _ := counts.Load("v2")
+		counts.Store("v2", v.(int)+1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s2.Close()
+
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, _ := counts.Load("v3")
+		counts.Store("v3", v.(int)+1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	port1, _ := strconv.Atoi(u1.Port())
+	u2, _ := url.Parse(s2.URL)
+	port2, _ := strconv.Atoi(u2.Port())
+	u3, _ := url.Parse(s3.URL)
+	port3, _ := strconv.Atoi(u3.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{Host: u1.Hostname(), Port: int32(port1), Weight: 70},
+						{Host: u2.Hostname(), Port: int32(port2), Weight: 30},
+						{Host: u3.Hostname(), Port: int32(port3), Weight: 0},
+					},
+				},
+			},
+		},
+	})
+
+	totalRequests := 1000
+	for range totalRequests {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		if w.Result().StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: %d", w.Result().StatusCode)
+		}
+	}
+
+	v1Count, _ := counts.Load("v1")
+	v2Count, _ := counts.Load("v2")
+	v3Count, _ := counts.Load("v3")
+
+	if v3Count.(int) != 0 {
+		t.Errorf("expected 0 requests to backend with weight 0, got %d", v3Count.(int))
+	}
+
+	v1Pct := float64(v1Count.(int)) / float64(totalRequests)
+	v2Pct := float64(v2Count.(int)) / float64(totalRequests)
+
+	// Tolerance of 5% around 0.70 and 0.30
+	if v1Pct < 0.60 || v1Pct > 0.80 {
+		t.Errorf("expected v1 percentage ~0.70 (+/- 0.10), got %f", v1Pct)
+	}
+	if v2Pct < 0.20 || v2Pct > 0.40 {
+		t.Errorf("expected v2 percentage ~0.30 (+/- 0.10), got %f", v2Pct)
+	}
+}
+
+func TestProxy_BackendRequestHeaderModifier(t *testing.T) {
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Backend"); got != "infra-backend-v1" {
+			t.Errorf("expected Backend header 'infra-backend-v1', got %q", got)
+		}
+		if got := r.Header.Get("X-Rule-Header"); got != "rule-val" {
+			t.Errorf("expected X-Rule-Header 'rule-val', got %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	port1, _ := strconv.Atoi(u1.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Rule-Header", Value: "rule-val"},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   u1.Hostname(),
+							Port:   int32(port1),
+							Weight: 10,
+							RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "Backend", Value: "infra-backend-v1"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status code: %d", w.Result().StatusCode)
+	}
+}
+
+func TestProxy_BackendResponseHeaderModifier(t *testing.T) {
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	port1, _ := strconv.Atoi(u1.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Rule-Resp", Value: "rule-resp"},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   u1.Hostname(),
+							Port:   int32(port1),
+							Weight: 1,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "X-Backend-Resp", Value: "backend-resp"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status code: %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Rule-Resp"); got != "rule-resp" {
+		t.Errorf("expected X-Rule-Resp 'rule-resp', got %q", got)
+	}
+	if got := resp.Header.Get("X-Backend-Resp"); got != "backend-resp" {
+		t.Errorf("expected X-Backend-Resp 'backend-resp', got %q", got)
 	}
 }
