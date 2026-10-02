@@ -159,10 +159,12 @@ type InternalPathRewrite struct {
 }
 
 type InternalBackend struct {
-	Host        string
-	Port        int32
-	AppProtocol *string
-	TLSConfig   *InternalTLSConfig
+	Host                   string
+	Port                   int32
+	AppProtocol            *string
+	TLSConfig              *InternalTLSConfig
+	RequestHeaderModifier  *gatewayv1.HTTPHeaderFilter
+	ResponseHeaderModifier *gatewayv1.HTTPHeaderFilter
 }
 
 type InternalTLSConfig struct {
@@ -636,11 +638,23 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							}
 						}
 
+						var backendReqHeaderModifier *gatewayv1.HTTPHeaderFilter
+						var backendRespHeaderModifier *gatewayv1.HTTPHeaderFilter
+						for _, filter := range backendRef.Filters {
+							if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier {
+								backendReqHeaderModifier = filter.RequestHeaderModifier
+							} else if filter.Type == gatewayv1.HTTPRouteFilterResponseHeaderModifier {
+								backendRespHeaderModifier = filter.ResponseHeaderModifier
+							}
+						}
+
 						iRule.Backend = &InternalBackend{
-							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
-							AppProtocol: appProtocol,
-							TLSConfig:   tlsConfig,
+							Host:                   fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+							Port:                   int32(*backendRef.Port),
+							AppProtocol:            appProtocol,
+							TLSConfig:              tlsConfig,
+							RequestHeaderModifier:  backendReqHeaderModifier,
+							ResponseHeaderModifier: backendRespHeaderModifier,
 						}
 						iRule.Error = nil
 

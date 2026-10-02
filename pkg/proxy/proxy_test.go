@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -549,5 +550,91 @@ func TestProxyResponseHeaderModifier(t *testing.T) {
 	}
 	if got := resp.Header.Values("X-Header-Remove"); len(got) > 0 {
 		t.Errorf("expected X-Header-Remove to be absent, got %v", got)
+	}
+}
+
+func TestProxyBackendHeaderModifiers(t *testing.T) {
+	var receivedHeaders http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.Header().Set("X-Resp-Original", "resp-orig")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	u, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("failed to split host and port: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("failed to parse port: %v", err)
+	}
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Rule-Req", Value: "rule-val"},
+						},
+					},
+					ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Rule-Resp", Value: "rule-resp-val"},
+						},
+					},
+					Backend: &state.InternalBackend{
+						Host: host,
+						Port: int32(port),
+						RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+							Set: []gatewayv1.HTTPHeader{
+								{Name: "X-Backend-Req", Value: "backend-val"},
+							},
+						},
+						ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+							Set: []gatewayv1.HTTPHeader{
+								{Name: "X-Backend-Resp", Value: "backend-resp-val"},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/test", nil)
+	w := httptest.NewRecorder()
+
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Verify request headers received by backend
+	if got := receivedHeaders.Get("X-Rule-Req"); got != "rule-val" {
+		t.Errorf("expected X-Rule-Req to be 'rule-val', got %q", got)
+	}
+	if got := receivedHeaders.Get("X-Backend-Req"); got != "backend-val" {
+		t.Errorf("expected X-Backend-Req to be 'backend-val', got %q", got)
+	}
+
+	// Verify response headers returned to client
+	if got := resp.Header.Get("X-Rule-Resp"); got != "rule-resp-val" {
+		t.Errorf("expected X-Rule-Resp to be 'rule-resp-val', got %q", got)
+	}
+	if got := resp.Header.Get("X-Backend-Resp"); got != "backend-resp-val" {
+		t.Errorf("expected X-Backend-Resp to be 'backend-resp-val', got %q", got)
+	}
+	if got := resp.Header.Get("X-Resp-Original"); got != "resp-orig" {
+		t.Errorf("expected X-Resp-Original to be 'resp-orig', got %q", got)
 	}
 }
