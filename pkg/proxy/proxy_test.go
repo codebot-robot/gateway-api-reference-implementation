@@ -15,7 +15,11 @@
 package proxy
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -402,5 +406,110 @@ func TestProxyRedirect(t *testing.T) {
 				t.Errorf("expected Location %q, got %q", tt.expectedLocation, location)
 			}
 		})
+	}
+}
+
+func TestProxyModifyHeadersCaseInsensitive(t *testing.T) {
+	modifier := gatewayv1.HTTPHeaderFilter{
+		Set: []gatewayv1.HTTPHeader{
+			{Name: "X-Header-Set", Value: "header-set"},
+		},
+		Add: []gatewayv1.HTTPHeader{
+			{Name: "X-Header-Add", Value: "header-add"},
+			{Name: "X-New-Add", Value: "new-add"},
+		},
+		Remove: []string{"x-header-remove"},
+	}
+
+	header := http.Header{
+		"x-header-set":    []string{"original-val-set"},
+		"x-header-add":    []string{"original-val-add"},
+		"x-header-remove": []string{"original-val-remove"},
+		"Another-Header":  []string{"another-header-val"},
+	}
+
+	modifyHeaders(header, modifier)
+
+	if got := header.Get("X-Header-Set"); got != "header-set" {
+		t.Errorf("expected X-Header-Set to be 'header-set', got %q", got)
+	}
+	if got := strings.Join(header.Values("X-Header-Add"), ","); got != "original-val-add,header-add" {
+		t.Errorf("expected X-Header-Add to be 'original-val-add,header-add', got %q", got)
+	}
+	if got := header.Get("X-New-Add"); got != "new-add" {
+		t.Errorf("expected X-New-Add to be 'new-add', got %q", got)
+	}
+	if got := header.Get("Another-Header"); got != "another-header-val" {
+		t.Errorf("expected Another-Header to be 'another-header-val', got %q", got)
+	}
+	if got := header.Values("X-Header-Remove"); len(got) > 0 {
+		t.Errorf("expected X-Header-Remove to be absent, got %v", got)
+	}
+	if got := header.Values("x-header-remove"); len(got) > 0 {
+		t.Errorf("expected x-header-remove to be absent, got %v", got)
+	}
+}
+
+func TestProxyResponseHeaderModifier(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend-Original", "orig")
+		w.Header().Set("X-Header-Remove", "remove-me")
+		w.Header().Set("X-Header-Set", "old-set")
+		w.Header().Add("X-Header-Add", "existing-add")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server url: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backend: &state.InternalBackend{
+						Host: host,
+						Port: int32(port),
+					},
+					ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Header-Set", Value: "new-set"},
+						},
+						Add: []gatewayv1.HTTPHeader{
+							{Name: "X-Header-Add", Value: "new-add"},
+						},
+						Remove: []string{"X-Header-Remove"},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/test", nil)
+	w := httptest.NewRecorder()
+
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Header-Set"); got != "new-set" {
+		t.Errorf("expected X-Header-Set to be 'new-set', got %q", got)
+	}
+	if got := strings.Join(resp.Header.Values("X-Header-Add"), ","); got != "existing-add,new-add" {
+		t.Errorf("expected X-Header-Add to be 'existing-add,new-add', got %q", got)
+	}
+	if got := resp.Header.Get("X-Backend-Original"); got != "orig" {
+		t.Errorf("expected X-Backend-Original to be 'orig', got %q", got)
+	}
+	if got := resp.Header.Values("X-Header-Remove"); len(got) > 0 {
+		t.Errorf("expected X-Header-Remove to be absent, got %v", got)
 	}
 }

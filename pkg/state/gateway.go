@@ -136,6 +136,8 @@ type InternalRule struct {
 	Rewrite  *InternalRewrite
 	// RequestHeaderModifier defines the request header modifications to apply.
 	RequestHeaderModifier *gatewayv1.HTTPHeaderFilter
+	// ResponseHeaderModifier defines the response header modifications to apply.
+	ResponseHeaderModifier *gatewayv1.HTTPHeaderFilter
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
@@ -467,7 +469,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			for _, rule := range route.Spec.Rules {
 				var redirect *InternalRedirect
 				var rewrite *InternalRewrite
-				var headerModifier *gatewayv1.HTTPHeaderFilter
+				var reqHeaderModifier *gatewayv1.HTTPHeaderFilter
+				var respHeaderModifier *gatewayv1.HTTPHeaderFilter
 				var filterErr *ErrorState
 				for _, filter := range rule.Filters {
 					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
@@ -530,15 +533,18 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 							}
 						}
 					} else if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier {
-						headerModifier = filter.RequestHeaderModifier
+						reqHeaderModifier = filter.RequestHeaderModifier
+					} else if filter.Type == gatewayv1.HTTPRouteFilterResponseHeaderModifier {
+						respHeaderModifier = filter.ResponseHeaderModifier
 					}
 				}
 
 				iRule := InternalRule{
-					Redirect:              redirect,
-					Rewrite:               rewrite,
-					RequestHeaderModifier: headerModifier,
-					Error:                 filterErr,
+					Redirect:               redirect,
+					Rewrite:                rewrite,
+					RequestHeaderModifier:  reqHeaderModifier,
+					ResponseHeaderModifier: respHeaderModifier,
+					Error:                  filterErr,
 				}
 
 				if resolvedRefsCond.Status == metav1.ConditionFalse {
