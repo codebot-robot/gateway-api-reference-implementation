@@ -466,3 +466,142 @@ func TestIsAcceptedForParentRef(t *testing.T) {
 		t.Errorf("expected route NOT to be accepted for gw-nonexistent")
 	}
 }
+
+func TestHTTPRouteValidate_Filters(t *testing.T) {
+	tests := []struct {
+		name        string
+		route       *HTTPRouteState
+		expectError bool
+	}{
+		{
+			name: "supported rule filters and backend filters",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier},
+									{Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier},
+									{Type: gatewayv1.HTTPRouteFilterRequestRedirect},
+									{Type: gatewayv1.HTTPRouteFilterURLRewrite},
+								},
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										Filters: []gatewayv1.HTTPRouteFilter{
+											{Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier},
+											{Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "unsupported rule filter type",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{Type: gatewayv1.HTTPRouteFilterType("UnknownFilter")},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "unsupported backend filter type",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										Filters: []gatewayv1.HTTPRouteFilter{
+											{Type: gatewayv1.HTTPRouteFilterRequestMirror},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.route.Validate()
+			if (err != nil) != tt.expectError {
+				t.Errorf("Validate() err = %v, expectError = %v", err, tt.expectError)
+			}
+		})
+	}
+}
+
+func TestComputeAcceptedCondition_UnknownFilter(t *testing.T) {
+	gw := &GatewayState{
+		Gateway: &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-gateway",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.GatewaySpec{
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "http",
+						Protocol: gatewayv1.HTTPProtocolType,
+						Port:     80,
+					},
+				},
+			},
+		},
+	}
+
+	route := &HTTPRouteState{
+		HTTPRoute: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "invalid-filter-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{Name: "test-gateway"},
+					},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{Type: gatewayv1.HTTPRouteFilterType("CustomFilter")},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cond := route.ComputeAcceptedCondition(gatewayv1.ParentReference{Name: "test-gateway"}, []*GatewayState{gw})
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("expected Accepted status False, got %v", cond.Status)
+	}
+	if cond.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Errorf("expected Accepted reason UnsupportedValue, got %v", cond.Reason)
+	}
+}

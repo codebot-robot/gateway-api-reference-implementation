@@ -18,8 +18,9 @@
   1. Updated `InternalBackend` struct in `pkg/state/gateway.go` to include `RequestHeaderModifier` and `ResponseHeaderModifier` fields (`*gatewayv1.HTTPHeaderFilter`).
   2. Updated `BuildInternalRoutes` in `pkg/state/gateway.go` to iterate over `backendRef.Filters` and populate `RequestHeaderModifier` and `ResponseHeaderModifier` on `InternalBackend`.
   3. Updated `ServeHTTP` in `pkg/proxy/proxy.go` to apply `bestRule.Backend.RequestHeaderModifier` before forwarding. Also updated `forward` to apply `backend.ResponseHeaderModifier` when modifying responses.
-  4. Added unit tests in `pkg/state/gateway_test.go` and `pkg/proxy/proxy_test.go` to verify backend-level request and response header modifiers.
-  5. Added `tests.HTTPRouteBackendRequestHeaderModifier` and `tests.HTTPRouteRequestHeaderModifier` in alphabetical order to `selectedTests` in `tests/e2e/conformance_test.go`.
+  4. Added validation in `HTTPRouteState.Validate()` and error state in `BuildInternalRoutes` for unknown/unsupported filter types on rules and backendRefs, setting `Accepted` condition to `Status: False` with `Reason: UnsupportedValue` per Gateway API spec.
+  5. Added unit tests in `pkg/state/gateway_test.go`, `pkg/state/httproute_test.go`, and `pkg/proxy/proxy_test.go` to verify backend-level request and response header modifiers, filter validation, and unknown filter handling.
+  6. Added `tests.HTTPRouteBackendRequestHeaderModifier` and `tests.HTTPRouteRequestHeaderModifier` in alphabetical order to `selectedTests` in `tests/e2e/conformance_test.go`.
 - **Key Files Modified**:
   - `pkg/state/gateway.go`
   - `pkg/state/gateway_test.go`

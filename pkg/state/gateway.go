@@ -542,6 +542,17 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						iRule.RequestHeaderModifier = filter.RequestHeaderModifier
 					} else if filter.Type == gatewayv1.HTTPRouteFilterResponseHeaderModifier {
 						iRule.ResponseHeaderModifier = filter.ResponseHeaderModifier
+					} else {
+						iRule.Error = &ErrorState{
+							Condition: metav1.Condition{
+								Type:    string(gatewayv1.RouteConditionAccepted),
+								Status:  metav1.ConditionFalse,
+								Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+								Message: fmt.Sprintf("Unsupported filter type: %s", filter.Type),
+							},
+							HTTPStatusCode: http.StatusInternalServerError,
+							HTTPMessage:    fmt.Sprintf("Unsupported filter type: %s", filter.Type),
+						}
 					}
 				}
 
@@ -640,12 +651,30 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 
 						var backendReqHeaderModifier *gatewayv1.HTTPHeaderFilter
 						var backendRespHeaderModifier *gatewayv1.HTTPHeaderFilter
+						var backendFilterError *ErrorState
 						for _, filter := range backendRef.Filters {
 							if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier {
 								backendReqHeaderModifier = filter.RequestHeaderModifier
 							} else if filter.Type == gatewayv1.HTTPRouteFilterResponseHeaderModifier {
 								backendRespHeaderModifier = filter.ResponseHeaderModifier
+							} else {
+								backendFilterError = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionAccepted),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: fmt.Sprintf("Unsupported backend filter type: %s", filter.Type),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Unsupported backend filter type: %s", filter.Type),
+								}
+								break
 							}
+						}
+
+						if backendFilterError != nil {
+							iRule.Error = backendFilterError
+							break
 						}
 
 						iRule.Backend = &InternalBackend{

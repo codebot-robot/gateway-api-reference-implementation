@@ -31,6 +31,26 @@ func (s *HTTPRouteState) Validate() error {
 		return nil
 	}
 	for _, rule := range s.Spec.Rules {
+		for _, filter := range rule.Filters {
+			switch filter.Type {
+			case gatewayv1.HTTPRouteFilterRequestRedirect,
+				gatewayv1.HTTPRouteFilterURLRewrite,
+				gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+				gatewayv1.HTTPRouteFilterResponseHeaderModifier:
+			default:
+				return fmt.Errorf("unsupported filter type: %s", filter.Type)
+			}
+		}
+		for _, backendRef := range rule.BackendRefs {
+			for _, filter := range backendRef.Filters {
+				switch filter.Type {
+				case gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+					gatewayv1.HTTPRouteFilterResponseHeaderModifier:
+				default:
+					return fmt.Errorf("unsupported backend filter type: %s", filter.Type)
+				}
+			}
+		}
 		for _, match := range rule.Matches {
 			for _, header := range match.Headers {
 				if ValueOf(header.Type) == gatewayv1.HeaderMatchRegularExpression {
