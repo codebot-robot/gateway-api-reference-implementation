@@ -141,17 +141,18 @@ func run(ctx context.Context) error {
 	g.Go(func() error {
 		setupLog.Info("starting proxy HTTPS server", "addr", proxyHTTPSAddr)
 
-		// Generate a self-signed cert for the reference implementation
+		// Generate a self-signed cert for the reference implementation as default fallback
 		cert, err := generateSelfSignedCert()
 		if err != nil {
 			return fmt.Errorf("failed to generate self-signed cert: %w", err)
 		}
+		p.SetDefaultCertificate(&cert)
 
 		srv := &http.Server{
 			Addr:    proxyHTTPSAddr,
 			Handler: p,
 			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
+				GetCertificate: p.GetCertificate,
 			},
 		}
 		go func() {
@@ -215,6 +216,15 @@ func run(ctx context.Context) error {
 		Proxy:  p,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating ConfigMap controller: %w", err)
+	}
+
+	if err = (&controller.SecretReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		State:  st,
+		Proxy:  p,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Secret controller: %w", err)
 	}
 
 	g.Go(func() error {

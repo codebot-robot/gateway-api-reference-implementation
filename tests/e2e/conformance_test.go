@@ -106,13 +106,21 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteListenerHostnameMatching,
 		tests.HTTPRouteRewriteHost,
+		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
+		tests.HTTPRoute308Redirect,
+		tests.HTTPRouteRedirectHostAndStatus,
+		tests.HTTPRouteRedirectPath,
+		tests.HTTPRouteRedirectPort,
+		tests.HTTPRouteRedirectScheme,
+		tests.HTTPRouteRedirectPortAndScheme,
 		// tests.HTTPRouteRewritePath, // Fails on rewrite-path-and-modify-headers under v1.5.0
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
 		// tests.BackendTLSPolicy, // Fails on re-encrypt under v1.5.0
 		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
 		tests.GatewayObservedGenerationBump,
+		tests.GatewayInvalidTLSConfiguration,
 	}
 
 	cSuite.Setup(t, selectedTests)
