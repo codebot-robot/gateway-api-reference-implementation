@@ -20,11 +20,14 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -132,5 +135,55 @@ func (r *HTTPRouteReconciler) updateProxy() {
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.HTTPRoute{}).
+		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			gw := obj.(*gatewayv1.Gateway)
+			var routeList gatewayv1.HTTPRouteList
+			if err := r.List(ctx, &routeList); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, route := range routeList.Items {
+				for _, parentRef := range route.Spec.ParentRefs {
+					targetNamespace := route.Namespace
+					if parentNamespace := state.ValueOf(parentRef.Namespace); parentNamespace != "" {
+						targetNamespace = string(parentNamespace)
+					}
+					if string(parentRef.Name) == gw.Name && (targetNamespace == "" || targetNamespace == gw.Namespace) {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: route.Namespace,
+								Name:      route.Name,
+							},
+						})
+						break
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			svc := obj.(*corev1.Service)
+			var routeList gatewayv1.HTTPRouteList
+			if err := r.List(ctx, &routeList, client.InNamespace(svc.Namespace)); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, route := range routeList.Items {
+				for _, rule := range route.Spec.Rules {
+					for _, bRef := range rule.BackendRefs {
+						if string(bRef.Name) == svc.Name {
+							requests = append(requests, ctrl.Request{
+								NamespacedName: types.NamespacedName{
+									Namespace: route.Namespace,
+									Name:      route.Name,
+								},
+							})
+							break
+						}
+					}
+				}
+			}
+			return requests
+		})).
 		Complete(r)
 }

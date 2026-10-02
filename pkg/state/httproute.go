@@ -56,9 +56,12 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	} else {
 		// Check if Gateway exists and has matching listeners
 		var gw *GatewayState
+		targetNamespace := s.Namespace
+		if parentNamespace := ValueOf(parentRef.Namespace); parentNamespace != "" {
+			targetNamespace = string(parentNamespace)
+		}
 		for _, g := range gateways {
-			if g.Name == string(parentRef.Name) {
-				// Note: for now we only check name, but should check namespace too if specified
+			if g.Name == string(parentRef.Name) && (targetNamespace == "" || g.Namespace == "" || g.Namespace == targetNamespace) {
 				gw = g
 				break
 			}
