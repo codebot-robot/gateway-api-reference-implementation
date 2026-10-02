@@ -105,10 +105,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if bestRule != nil {
 		if bestRule.Redirect != nil {
+			if bestRule.ResponseHeaderModifier != nil {
+				modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
+			}
 			p.redirect(w, r, *bestRule.Redirect, bestMatch)
 			return
 		}
 		if bestRule.Error != nil {
+			if bestRule.ResponseHeaderModifier != nil {
+				modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
+			}
 			// Per Gateway API specification, if a rule matches but its backend is invalid
 			// or unresolved, the implementation SHOULD return an HTTP 500 Internal Server Error.
 			// This is also verified by conformance tests like HTTPRouteInvalidBackendRefUnknownKind.
@@ -122,7 +128,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.modifyHeaders(r, *bestRule.RequestHeaderModifier)
 		}
 		if bestRule.Backend != nil {
-			p.forward(w, r, *bestRule.Backend)
+			p.forward(w, r, *bestRule.Backend, bestRule.ResponseHeaderModifier)
 			return
 		}
 	}
@@ -132,14 +138,39 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // modifyHeaders modifies the request headers in place before forwarding.
 func (p *Proxy) modifyHeaders(r *http.Request, modifier gatewayv1.HTTPHeaderFilter) {
+	modifyHeaders(r.Header, modifier)
+}
+
+// modifyHeaders modifies the HTTP headers in place according to the modifier.
+func modifyHeaders(header http.Header, modifier gatewayv1.HTTPHeaderFilter) {
 	for _, h := range modifier.Remove {
-		r.Header.Del(h)
+		header.Del(h)
+		for k := range header {
+			if strings.EqualFold(k, h) {
+				delete(header, k)
+			}
+		}
 	}
 	for _, h := range modifier.Set {
-		r.Header.Set(string(h.Name), h.Value)
+		for k := range header {
+			if strings.EqualFold(k, string(h.Name)) {
+				delete(header, k)
+			}
+		}
+		header.Set(string(h.Name), h.Value)
 	}
 	for _, h := range modifier.Add {
-		r.Header.Add(string(h.Name), h.Value)
+		var existing []string
+		for k, v := range header {
+			if strings.EqualFold(k, string(h.Name)) {
+				existing = append(existing, v...)
+				delete(header, k)
+			}
+		}
+		for _, v := range existing {
+			header.Add(string(h.Name), v)
+		}
+		header.Add(string(h.Name), h.Value)
 	}
 }
 
@@ -274,7 +305,7 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 	http.Redirect(w, r, newURL.String(), statusCode)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter) {
 	scheme := "http"
 	if state.ValueOf(backend.AppProtocol) == "https" {
 		scheme = "https"
@@ -286,6 +317,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	if respHeaderModifier != nil {
+		proxy.ModifyResponse = func(res *http.Response) error {
+			modifyHeaders(res.Header, *respHeaderModifier)
+			return nil
+		}
+	}
 
 	if scheme == "https" {
 		tlsConfig := &tls.Config{InsecureSkipVerify: false}

@@ -472,9 +472,13 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
+						targetNamespace := route.Namespace
+						if parentNamespace := state.ValueOf(parentRef.Namespace); parentNamespace != "" {
+							targetNamespace = string(parentNamespace)
+						}
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
-								Namespace: route.Namespace, // Assuming same namespace for now
+								Namespace: targetNamespace,
 								Name:      string(parentRef.Name),
 							},
 						})

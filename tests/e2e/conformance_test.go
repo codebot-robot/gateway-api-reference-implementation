@@ -114,6 +114,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteRedirectPort,
 		tests.HTTPRouteRedirectScheme,
 		tests.HTTPRouteRedirectPortAndScheme,
+		tests.HTTPRouteResponseHeaderModifier,
 		// tests.HTTPRouteRewritePath, // Fails on rewrite-path-and-modify-headers under v1.5.0
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
