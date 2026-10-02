@@ -22,9 +22,27 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+// ResolveNamespacedName resolves an optional namespace pointer and a name against a source object.
+// If namespace is nil or empty, src.GetNamespace() is used.
+func ResolveNamespacedName[N ~string, M ~string](namespace *N, name M, src client.Object) types.NamespacedName {
+	ns := ""
+	if src != nil {
+		ns = src.GetNamespace()
+	}
+	if namespace != nil && string(*namespace) != "" {
+		ns = string(*namespace)
+	}
+	return types.NamespacedName{
+		Namespace: ns,
+		Name:      string(name),
+	}
+}
 
 func updateProxy(st *state.State, p *proxy.Proxy) {
 	gateways := st.GetGateways()
@@ -36,7 +54,7 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 
 	var proxyRoutes []state.InternalRoute
 	for _, gw := range gateways {
-		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, st, ControllerName)...)
 	}
 	p.UpdateRoutes(proxyRoutes)
 
@@ -50,11 +68,20 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 					group := state.ValueOf(ref.Group)
 					kind := state.ValueOf(ref.Kind)
 					if (group == "" || group == "core") && (kind == "" || kind == "Secret") {
-						ns := gw.Namespace
-						if ref.Namespace != nil && string(*ref.Namespace) != "" {
-							ns = string(*ref.Namespace)
+						secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
+						from := state.Reference{
+							GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+							Namespace: gw.Namespace,
 						}
-						secret, ok := secrets[types.NamespacedName{Namespace: ns, Name: string(ref.Name)}]
+						to := state.Reference{
+							GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+							Namespace: secretKey.Namespace,
+							Name:      secretKey.Name,
+						}
+						if secretKey.Namespace != gw.Namespace && !st.IsReferencePermitted(from, to) {
+							continue
+						}
+						secret, ok := secrets[secretKey]
 						if ok && secret != nil {
 							certBytes := secret.Data[corev1.TLSCertKey]
 							keyBytes := secret.Data[corev1.TLSPrivateKeyKey]

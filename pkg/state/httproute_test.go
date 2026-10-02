@@ -17,21 +17,29 @@ package state
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 func TestComputeResolvedRefsCondition(t *testing.T) {
 	tests := []struct {
-		name           string
-		route          *HTTPRouteState
-		expectedStatus metav1.ConditionStatus
-		expectedReason string
+		name            string
+		route           *HTTPRouteState
+		services        map[types.NamespacedName]*corev1.Service
+		referenceGrants []*gatewayv1beta1.ReferenceGrant
+		expectedStatus  metav1.ConditionStatus
+		expectedReason  string
 	}{
 		{
 			name: "valid backend ref with default kind and group",
 			route: &HTTPRouteState{
 				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
 					Spec: gatewayv1.HTTPRouteSpec{
 						Rules: []gatewayv1.HTTPRouteRule{
 							{
@@ -50,6 +58,9 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 					},
 				},
 			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "valid-service"}: {},
+			},
 			expectedStatus: metav1.ConditionTrue,
 			expectedReason: string(gatewayv1.RouteReasonResolvedRefs),
 		},
@@ -57,6 +68,9 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 			name: "valid backend ref with explicit Service kind and empty group",
 			route: &HTTPRouteState{
 				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
 					Spec: gatewayv1.HTTPRouteSpec{
 						Rules: []gatewayv1.HTTPRouteRule{
 							{
@@ -77,6 +91,9 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 					},
 				},
 			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "valid-service"}: {},
+			},
 			expectedStatus: metav1.ConditionTrue,
 			expectedReason: string(gatewayv1.RouteReasonResolvedRefs),
 		},
@@ -84,6 +101,9 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 			name: "invalid backend ref with unknown kind",
 			route: &HTTPRouteState{
 				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
 					Spec: gatewayv1.HTTPRouteSpec{
 						Rules: []gatewayv1.HTTPRouteRule{
 							{
@@ -110,6 +130,9 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 			name: "invalid backend ref with custom group and kind",
 			route: &HTTPRouteState{
 				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
 					Spec: gatewayv1.HTTPRouteSpec{
 						Rules: []gatewayv1.HTTPRouteRule{
 							{
@@ -133,11 +156,133 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 			expectedStatus: metav1.ConditionFalse,
 			expectedReason: string(gatewayv1.RouteReasonInvalidKind),
 		},
+		{
+			name: "invalid backend ref with nonexistent service",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										BackendRef: gatewayv1.BackendRef{
+											BackendObjectReference: gatewayv1.BackendObjectReference{
+												Name: "nonexistent-svc",
+												Port: Ptr(gatewayv1.PortNumber(80)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "default", Name: "other-svc"}: {},
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonBackendNotFound),
+		},
+		{
+			name: "invalid cross-namespace backend ref without ReferenceGrant",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										BackendRef: gatewayv1.BackendRef{
+											BackendObjectReference: gatewayv1.BackendObjectReference{
+												Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+												Name:      "web-backend",
+												Port:      Ptr(gatewayv1.PortNumber(80)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "other-ns", Name: "web-backend"}: {},
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonRefNotPermitted),
+		},
+		{
+			name: "valid cross-namespace backend ref with ReferenceGrant",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "default",
+					},
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										BackendRef: gatewayv1.BackendRef{
+											BackendObjectReference: gatewayv1.BackendObjectReference{
+												Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+												Name:      "web-backend",
+												Port:      Ptr(gatewayv1.PortNumber(80)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "other-ns", Name: "web-backend"}: {},
+			},
+			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "other-ns",
+						Name:      "grant-all-services",
+					},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "HTTPRoute",
+								Namespace: "default",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "Service",
+							},
+						},
+					},
+				},
+			},
+			expectedStatus: metav1.ConditionTrue,
+			expectedReason: string(gatewayv1.RouteReasonResolvedRefs),
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cond := tt.route.ComputeResolvedRefsCondition()
+			st := NewState()
+			for _, rg := range tt.referenceGrants {
+				st.UpsertReferenceGrant(rg)
+			}
+			cond := tt.route.ComputeResolvedRefsCondition(tt.services, st)
 			if cond.Status != tt.expectedStatus {
 				t.Errorf("ComputeResolvedRefsCondition() Status = %v, want %v", cond.Status, tt.expectedStatus)
 			}

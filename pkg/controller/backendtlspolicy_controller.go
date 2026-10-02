@@ -173,13 +173,10 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				for _, rule := range route.Spec.Rules {
 					for _, backendRef := range rule.BackendRefs {
 						if string(state.ValueOf(backendRef.Kind)) == "Service" || state.ValueOf(backendRef.Kind) == "" {
-							ns := route.Namespace
-							if backendRef.Namespace != nil {
-								ns = string(*backendRef.Namespace)
-							}
+							backendSvcKey := ResolveNamespacedName(backendRef.Namespace, backendRef.Name, route)
 
 							for _, targetRef := range policy.Spec.TargetRefs {
-								if ns == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
+								if backendSvcKey.Namespace == policy.Namespace && backendSvcKey.Name == string(targetRef.Name) {
 									usesPolicy = true
 									break
 								}

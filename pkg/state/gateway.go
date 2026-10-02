@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -398,7 +399,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -474,7 +475,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
+			resolvedRefsCond := route.ComputeResolvedRefsCondition(services, refValidator)
 
 			for _, rule := range route.Spec.Rules {
 				var iRule InternalRule
@@ -596,21 +597,62 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 
 						backendSvcNamespace := route.Namespace
-						if backendRef.Namespace != nil {
+						if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
 							backendSvcNamespace = string(*backendRef.Namespace)
+						}
+
+						if backendSvcNamespace != route.Namespace {
+							from := Reference{
+								GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+								Namespace: route.Namespace,
+							}
+							to := Reference{
+								GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+								Namespace: backendSvcNamespace,
+								Name:      string(backendRef.Name),
+							}
+							if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
+								msg := fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", backendSvcNamespace, string(backendRef.Name))
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
+										Message: msg,
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    msg,
+								}
+								continue
+							}
 						}
 
 						backendSvcName := types.NamespacedName{
 							Namespace: backendSvcNamespace,
 							Name:      string(backendRef.Name),
 						}
+
+						svc, ok := services[backendSvcName]
+						if !ok || svc == nil {
+							msg := fmt.Sprintf("Backend service %s/%s not found", backendSvcNamespace, string(backendRef.Name))
+							iRule.Error = &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.RouteConditionResolvedRefs),
+									Status:  metav1.ConditionFalse,
+									Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+									Message: msg,
+								},
+								HTTPStatusCode: http.StatusInternalServerError,
+								HTTPMessage:    msg,
+							}
+							continue
+						}
+
 						var appProtocol *string
-						if svc, ok := services[backendSvcName]; ok {
-							for _, port := range svc.Spec.Ports {
-								if port.Port == int32(*backendRef.Port) {
-									appProtocol = port.AppProtocol
-									break
-								}
+						for _, port := range svc.Spec.Ports {
+							if port.Port == int32(*backendRef.Port) {
+								appProtocol = port.AppProtocol
+								break
 							}
 						}
 

@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type GatewayClassReconciler struct {
@@ -266,30 +268,38 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					break
 				}
 
-				ns := gw.Namespace
-				if ref.Namespace != nil && string(*ref.Namespace) != "" {
-					ns = string(*ref.Namespace)
-				}
-				if ns != gw.Namespace {
-					resolvedRefsStatus = metav1.ConditionFalse
-					resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
-					resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted", ns, string(ref.Name))
+				secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
+				if secretKey.Namespace != gw.Namespace {
+					from := state.Reference{
+						GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+						Namespace: gw.Namespace,
+					}
+					to := state.Reference{
+						GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+						Namespace: secretKey.Namespace,
+						Name:      secretKey.Name,
+					}
+					if !r.State.IsReferencePermitted(from, to) {
+						resolvedRefsStatus = metav1.ConditionFalse
+						resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
+						resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
 
-					programmedStatus = metav1.ConditionFalse
-					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted", ns, string(ref.Name))
-					break
+						programmedStatus = metav1.ConditionFalse
+						programmedReason = gatewayv1.ListenerReasonInvalid
+						programmedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
+						break
+					}
 				}
 
-				secret, ok := secrets[types.NamespacedName{Namespace: ns, Name: string(ref.Name)}]
+				secret, ok := secrets[secretKey]
 				if !ok || secret == nil {
 					resolvedRefsStatus = metav1.ConditionFalse
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s not found", ns, string(ref.Name))
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
 
 					programmedStatus = metav1.ConditionFalse
 					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Secret %s/%s not found", ns, string(ref.Name))
+					programmedMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
 					break
 				}
 
@@ -298,22 +308,22 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				if len(certBytes) == 0 || len(keyBytes) == 0 {
 					resolvedRefsStatus = metav1.ConditionFalse
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", ns, string(ref.Name))
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
 
 					programmedStatus = metav1.ConditionFalse
 					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", ns, string(ref.Name))
+					programmedMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
 					break
 				}
 
 				if _, err := tls.X509KeyPair(certBytes, keyBytes); err != nil {
 					resolvedRefsStatus = metav1.ConditionFalse
 					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", ns, string(ref.Name), err)
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
 
 					programmedStatus = metav1.ConditionFalse
 					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", ns, string(ref.Name), err)
+					programmedMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
 					break
 				}
 			}
@@ -474,15 +484,9 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
-						targetNamespace := route.Namespace
-						if parentNamespace := state.ValueOf(parentRef.Namespace); parentNamespace != "" {
-							targetNamespace = string(parentNamespace)
-						}
+						gwKey := ResolveNamespacedName(parentRef.Namespace, parentRef.Name, route)
 						requests = append(requests, ctrl.Request{
-							NamespacedName: types.NamespacedName{
-								Namespace: targetNamespace,
-								Name:      string(parentRef.Name),
-							},
+							NamespacedName: gwKey,
 						})
 					}
 				}
@@ -505,6 +509,29 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					}
 					return requests
 				}
+			}
+			return nil
+		})).
+		// A ReferenceGrant update invalidates all gateways that might use it
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			rg := obj.(*gatewayv1beta1.ReferenceGrant)
+			var gwList gatewayv1.GatewayList
+			if err := r.List(ctx, &gwList); err == nil {
+				var requests []ctrl.Request
+				for _, gw := range gwList.Items {
+					for _, from := range rg.Spec.From {
+						if (string(from.Group) == gatewayv1.GroupName || string(from.Group) == "") && string(from.Kind) == "Gateway" && string(from.Namespace) == gw.Namespace {
+							requests = append(requests, ctrl.Request{
+								NamespacedName: types.NamespacedName{
+									Namespace: gw.Namespace,
+									Name:      gw.Name,
+								},
+							})
+							break
+						}
+					}
+				}
+				return requests
 			}
 			return nil
 		})).

@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type State struct {
@@ -34,6 +35,7 @@ type State struct {
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
 	secrets            map[types.NamespacedName]*corev1.Secret
+	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 }
 
 func NewState() *State {
@@ -44,7 +46,22 @@ func NewState() *State {
 		services:           make(map[types.NamespacedName]*corev1.Service),
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
 		secrets:            make(map[types.NamespacedName]*corev1.Secret),
+		referenceGrants:    make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant),
 	}
+}
+
+func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.referenceGrants[types.NamespacedName{Namespace: rg.Namespace, Name: rg.Name}] = rg
+}
+
+func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.referenceGrants, name)
 }
 
 func (s *State) UpsertSecret(secret *corev1.Secret) {
