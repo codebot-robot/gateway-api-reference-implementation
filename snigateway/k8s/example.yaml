@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: example-tls-cert
+  namespace: default
+type: kubernetes.io/tls
+data:
+  # Base64-encoded server certificate and private key for app.example.com
+  tls.crt: ""
+  tls.key: ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: example-svc
+  namespace: default
+spec:
+  selector:
+    app: example-app
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: example-gateway
+  namespace: default
+spec:
+  gatewayClassName: snigateway
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    hostname: "app.example.com"
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind: Secret
+        name: example-tls-cert
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: example-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: example-gateway
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: example-svc
+      port: 8080
