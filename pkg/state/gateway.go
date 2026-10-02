@@ -15,16 +15,13 @@
 package state
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"regexp"
-	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -400,22 +397,12 @@ func getPathLen(m *InternalMatch) int {
 }
 
 func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) []InternalRoute {
-	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
-	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
-		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
-			return true
+	for _, route := range routes {
+		if route.HTTPRoute == nil {
+			continue
 		}
-		if backendTLSPolicies[i].CreationTimestamp.Time.After(backendTLSPolicies[j].CreationTimestamp.Time) {
-			return false
-		}
-		if backendTLSPolicies[i].Namespace < backendTLSPolicies[j].Namespace {
-			return true
-		}
-		if backendTLSPolicies[i].Namespace > backendTLSPolicies[j].Namespace {
-			return false
-		}
-		return backendTLSPolicies[i].Name < backendTLSPolicies[j].Name
-	})
+		route.Compile(services, backendTLSPolicies, configMaps, refValidator)
+	}
 
 	var internalRoutes []InternalRoute
 
@@ -425,7 +412,13 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			continue
 		}
 
+		listenerHostname := ValueOf(listener.Hostname)
+
 		for _, route := range routes {
+			if route.HTTPRoute == nil || route.Internal == nil {
+				continue
+			}
+
 			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 			bound := false
 			var matchingParentRef *gatewayv1.ParentReference
@@ -463,311 +456,16 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 
 			// Calculate intersected hostnames
 			routeHostnames := route.GetHostnames()
-			listenerHostname := ValueOf(listener.Hostname)
-
 			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
 			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
 				// No intersection, skip this listener
 				continue
 			}
 
-			ir := InternalRoute{
+			internalRoutes = append(internalRoutes, InternalRoute{
 				Hostnames: effectiveHostnames,
-			}
-
-			for _, rule := range route.Spec.Rules {
-				var iRule InternalRule
-				for _, filter := range rule.Filters {
-					if filter.Type == gatewayv1.HTTPRouteFilterRequestRedirect {
-						r := filter.RequestRedirect
-						redirect := &InternalRedirect{
-							Scheme:     r.Scheme,
-							Hostname:   r.Hostname,
-							Port:       r.Port,
-							StatusCode: r.StatusCode,
-						}
-						if r.Path != nil {
-							var pathValue string
-							if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
-								pathValue = ValueOf(r.Path.ReplaceFullPath)
-							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
-								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
-							} else {
-								iRule.Error = &ErrorState{
-									Condition: metav1.Condition{
-										Type:    string(gatewayv1.RouteConditionResolvedRefs),
-										Status:  metav1.ConditionFalse,
-										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
-										Message: fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
-									},
-									HTTPStatusCode: http.StatusInternalServerError,
-									HTTPMessage:    fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
-								}
-							}
-							redirect.Path = &InternalPathRedirect{
-								Type:  r.Path.Type,
-								Value: pathValue,
-							}
-						}
-						iRule.Redirect = redirect
-					} else if filter.Type == gatewayv1.HTTPRouteFilterURLRewrite {
-						r := filter.URLRewrite
-						rewrite := &InternalRewrite{
-							Hostname: r.Hostname,
-						}
-						if r.Path != nil {
-							var pathValue string
-							if r.Path.Type == gatewayv1.FullPathHTTPPathModifier {
-								pathValue = ValueOf(r.Path.ReplaceFullPath)
-							} else if r.Path.Type == gatewayv1.PrefixMatchHTTPPathModifier {
-								pathValue = ValueOf(r.Path.ReplacePrefixMatch)
-							} else {
-								iRule.Error = &ErrorState{
-									Condition: metav1.Condition{
-										Type:    string(gatewayv1.RouteConditionResolvedRefs),
-										Status:  metav1.ConditionFalse,
-										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
-										Message: fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
-									},
-									HTTPStatusCode: http.StatusInternalServerError,
-									HTTPMessage:    fmt.Sprintf("Unsupported path modifier type: %s", r.Path.Type),
-								}
-							}
-							rewrite.Path = &InternalPathRewrite{
-								Type:  r.Path.Type,
-								Value: pathValue,
-							}
-						}
-						iRule.Rewrite = rewrite
-					} else if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier {
-						iRule.RequestHeaderModifier = filter.RequestHeaderModifier
-					} else if filter.Type == gatewayv1.HTTPRouteFilterResponseHeaderModifier {
-						iRule.ResponseHeaderModifier = filter.ResponseHeaderModifier
-					} else {
-						iRule.Error = &ErrorState{
-							Condition: metav1.Condition{
-								Type:    string(gatewayv1.RouteConditionAccepted),
-								Status:  metav1.ConditionFalse,
-								Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
-								Message: fmt.Sprintf("Unsupported filter type: %s", filter.Type),
-							},
-							HTTPStatusCode: http.StatusInternalServerError,
-							HTTPMessage:    fmt.Sprintf("Unsupported filter type: %s", filter.Type),
-						}
-					}
-				}
-
-				if iRule.Error != nil {
-					// retain filter error
-				} else if iRule.Redirect == nil {
-					for _, backendRef := range rule.BackendRefs {
-						group := ValueOf(backendRef.Group)
-						kind := ValueOf(backendRef.Kind)
-						if kind == "" {
-							kind = "Service"
-						}
-						if (group != "" && group != "core") || kind != "Service" {
-							msg := fmt.Sprintf("Unsupported backend kind: %s", kind)
-							if group != "" && group != "core" {
-								msg = fmt.Sprintf("Unsupported backend: %s/%s", group, kind)
-							}
-							iRule.Error = &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: msg,
-								},
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    msg,
-							}
-							continue
-						}
-
-						if backendRef.Port == nil {
-							continue
-						}
-
-						backendSvcNamespace := route.Namespace
-						if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
-							backendSvcNamespace = string(*backendRef.Namespace)
-						}
-
-						if backendSvcNamespace != route.Namespace {
-							from := Reference{
-								GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
-								Namespace: route.Namespace,
-							}
-							to := Reference{
-								GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-								Namespace: backendSvcNamespace,
-								Name:      string(backendRef.Name),
-							}
-							if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
-								msg := fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", backendSvcNamespace, string(backendRef.Name))
-								iRule.Error = &ErrorState{
-									Condition: metav1.Condition{
-										Type:    string(gatewayv1.RouteConditionResolvedRefs),
-										Status:  metav1.ConditionFalse,
-										Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
-										Message: msg,
-									},
-									HTTPStatusCode: http.StatusInternalServerError,
-									HTTPMessage:    msg,
-								}
-								continue
-							}
-						}
-
-						backendSvcName := types.NamespacedName{
-							Namespace: backendSvcNamespace,
-							Name:      string(backendRef.Name),
-						}
-
-						svc, ok := services[backendSvcName]
-						if !ok || svc == nil {
-							msg := fmt.Sprintf("Backend service %s/%s not found", backendSvcNamespace, string(backendRef.Name))
-							iRule.Error = &ErrorState{
-								Condition: metav1.Condition{
-									Type:    string(gatewayv1.RouteConditionResolvedRefs),
-									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonBackendNotFound),
-									Message: msg,
-								},
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    msg,
-							}
-							continue
-						}
-
-						var appProtocol *string
-						for _, port := range svc.Spec.Ports {
-							if port.Port == int32(*backendRef.Port) {
-								appProtocol = port.AppProtocol
-								break
-							}
-						}
-
-						// Check for BackendTLSPolicy
-						var tlsConfig *InternalTLSConfig
-						for _, policy := range backendTLSPolicies {
-							if tlsConfig != nil {
-								break
-							}
-							for _, targetRef := range policy.Spec.TargetRefs {
-								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-									string(targetRef.Name) == string(backendRef.Name) &&
-									policy.Namespace == backendSvcNamespace {
-									// Found a policy targeting this service
-									https := "https"
-									appProtocol = &https
-
-									var caCerts [][]byte
-									for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-										if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-											cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-											if cm, ok := configMaps[cmName]; ok {
-												if data, ok := cm.Data["ca.crt"]; ok {
-													caCerts = append(caCerts, []byte(data))
-												} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-													caCerts = append(caCerts, data)
-												}
-											}
-										}
-									}
-
-									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
-									}
-									break
-								}
-							}
-						}
-
-						var backendReqHeaderModifier *gatewayv1.HTTPHeaderFilter
-						var backendRespHeaderModifier *gatewayv1.HTTPHeaderFilter
-						var backendFilterError *ErrorState
-						for _, filter := range backendRef.Filters {
-							if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier {
-								backendReqHeaderModifier = filter.RequestHeaderModifier
-							} else if filter.Type == gatewayv1.HTTPRouteFilterResponseHeaderModifier {
-								backendRespHeaderModifier = filter.ResponseHeaderModifier
-							} else {
-								backendFilterError = &ErrorState{
-									Condition: metav1.Condition{
-										Type:    string(gatewayv1.RouteConditionAccepted),
-										Status:  metav1.ConditionFalse,
-										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
-										Message: fmt.Sprintf("Unsupported backend filter type: %s", filter.Type),
-									},
-									HTTPStatusCode: http.StatusInternalServerError,
-									HTTPMessage:    fmt.Sprintf("Unsupported backend filter type: %s", filter.Type),
-								}
-								break
-							}
-						}
-
-						if backendFilterError != nil {
-							iRule.Error = backendFilterError
-							break
-						}
-
-						weight := int32(1)
-						if backendRef.Weight != nil {
-							weight = *backendRef.Weight
-						}
-
-						iRule.Backends = append(iRule.Backends, InternalBackend{
-							Host:                   fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:                   int32(*backendRef.Port),
-							AppProtocol:            appProtocol,
-							TLSConfig:              tlsConfig,
-							Weight:                 weight,
-							RequestHeaderModifier:  backendReqHeaderModifier,
-							ResponseHeaderModifier: backendRespHeaderModifier,
-						})
-					}
-				}
-
-				for _, match := range rule.Matches {
-					iMatch := InternalMatch{}
-					if match.Method != nil {
-						iMatch.Method = match.Method
-					}
-					if match.Path != nil {
-						iMatch.Path = &InternalPathMatch{
-							Type:  ValueOf(match.Path.Type),
-							Value: ValueOf(match.Path.Value),
-						}
-						if iMatch.Path.Type == "" {
-							iMatch.Path.Type = gatewayv1.PathMatchPathPrefix
-						}
-					}
-					for _, header := range match.Headers {
-						headerType := ValueOf(header.Type)
-						if headerType == "" {
-							headerType = gatewayv1.HeaderMatchExact
-						}
-						hm := InternalHeaderMatch{
-							Type:            headerType,
-							Name:            string(header.Name),
-							MatchExactValue: header.Value,
-						}
-						if headerType == gatewayv1.HeaderMatchRegularExpression {
-							re, err := regexp.Compile(header.Value)
-							if err == nil {
-								hm.MatchRegularExpressionValue = re
-							}
-						}
-						iMatch.Headers = append(iMatch.Headers, hm)
-					}
-					iRule.Matches = append(iRule.Matches, iMatch)
-				}
-
-				ir.Rules = append(ir.Rules, iRule)
-			}
-			internalRoutes = append(internalRoutes, ir)
+				Rules:     route.Internal.Rules,
+			})
 			_ = matchingParentRef // keep for now
 		}
 	}

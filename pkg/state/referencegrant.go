@@ -46,6 +46,10 @@ func (s *State) IsReferencePermitted(from, to Reference) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	return s.isReferencePermittedLocked(from, to)
+}
+
+func (s *State) isReferencePermittedLocked(from, to Reference) bool {
 	return isReferencePermitted(from, to, s.referenceGrants)
 }
 

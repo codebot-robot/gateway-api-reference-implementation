@@ -17,7 +17,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"reflect"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -58,67 +57,35 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// If the route is not accepted, we still update the state but it won't be used for proxying
+	// Compile and store in state
 	validationCondition := r.State.UpsertHTTPRoute(route)
 
-	// Update status
-	// For each parentRef, we should add a ParentStatus
-	gateways := r.State.GetGateways()
-	services := r.State.GetServices()
-	rs := state.HTTPRouteState{HTTPRoute: route}
+	// Fetch route state with compiled internal route
+	rs := r.State.GetHTTPRoute(req.NamespacedName)
+	if rs == nil {
+		rs = &state.HTTPRouteState{HTTPRoute: route}
+		rs.Compile(r.State.GetServices(), r.State.GetBackendTLSPolicies(), r.State.GetConfigMaps(), r.State)
+	}
 
-	var newParents []gatewayv1.RouteParentStatus
+	gateways := r.State.GetGateways()
+	var desiredParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {
 		acceptedCondition := validationCondition
 		if acceptedCondition.Status == metav1.ConditionTrue {
 			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways)
 		}
 
-		newParents = append(newParents, gatewayv1.RouteParentStatus{
+		desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
 			ParentRef:      parentRef,
 			ControllerName: gatewayv1.GatewayController(controllerName),
 			Conditions: []metav1.Condition{
 				acceptedCondition,
-				rs.ComputeResolvedRefsCondition(services, r.State),
+				rs.Internal.ResolvedRefsCondition,
 			},
 		})
 	}
 
-	updated := false
-	if len(route.Status.Parents) != len(newParents) {
-		updated = true
-	} else {
-		for i := range newParents {
-			if !reflect.DeepEqual(route.Status.Parents[i].ParentRef, newParents[i].ParentRef) ||
-				string(route.Status.Parents[i].ControllerName) != string(newParents[i].ControllerName) ||
-				len(route.Status.Parents[i].Conditions) != len(newParents[i].Conditions) {
-				updated = true
-				break
-			}
-			for j := range newParents[i].Conditions {
-				matched := false
-				for k := range route.Status.Parents[i].Conditions {
-					if route.Status.Parents[i].Conditions[k].Type == newParents[i].Conditions[j].Type {
-						if route.Status.Parents[i].Conditions[k].Status == newParents[i].Conditions[j].Status &&
-							route.Status.Parents[i].Conditions[k].ObservedGeneration == newParents[i].Conditions[j].ObservedGeneration &&
-							route.Status.Parents[i].Conditions[k].Reason == newParents[i].Conditions[j].Reason &&
-							route.Status.Parents[i].Conditions[k].Message == newParents[i].Conditions[j].Message {
-							matched = true
-						}
-						break
-					}
-				}
-				if !matched {
-					updated = true
-					break
-				}
-			}
-			if updated {
-				break
-			}
-		}
-	}
-
+	newParents, updated := state.UpdateRouteParentStatuses(route.Status.Parents, desiredParents)
 	if updated {
 		route.Status.Parents = newParents
 		if err := r.Status().Update(ctx, route); err != nil {

@@ -15,7 +15,6 @@
 package state
 
 import (
-	"fmt"
 	"sort"
 	"sync"
 
@@ -151,34 +150,41 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 	delete(s.gateways, name)
 }
 
+func (s *State) getBackendTLSPoliciesLocked() []*gatewayv1.BackendTLSPolicy {
+	var policies []*gatewayv1.BackendTLSPolicy
+	for _, p := range s.backendTLSPolicies {
+		policies = append(policies, p)
+	}
+	return policies
+}
+
+type lockedReferenceValidator struct {
+	referenceGrants map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+}
+
+func (v lockedReferenceValidator) IsReferencePermitted(from, to Reference) bool {
+	return isReferencePermitted(from, to, v.referenceGrants)
+}
+
 func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) metav1.Condition {
-	rs := &HTTPRouteState{
-		HTTPRoute: route,
-	}
-
-	status := metav1.ConditionTrue
-	reason := gatewayv1.RouteReasonAccepted
-	message := "Route accepted by reference implementation"
-
-	if err := rs.Validate(); err != nil {
-		status = metav1.ConditionFalse
-		reason = gatewayv1.RouteReasonUnsupportedValue
-		message = fmt.Sprintf("Invalid route: %v", err)
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	rs := &HTTPRouteState{
+		HTTPRoute: route,
+	}
+	rs.Compile(s.services, s.getBackendTLSPoliciesLocked(), s.configMaps, lockedReferenceValidator{referenceGrants: s.referenceGrants})
+
 	s.httpRoutes[types.NamespacedName{Namespace: route.Namespace, Name: route.Name}] = rs
 
-	return metav1.Condition{
-		Type:               string(gatewayv1.RouteConditionAccepted),
-		Status:             status,
-		ObservedGeneration: route.Generation,
-		LastTransitionTime: metav1.Now(),
-		Reason:             string(reason),
-		Message:            message,
-	}
+	return rs.Internal.ValidationCondition
+}
+
+func (s *State) GetHTTPRoute(name types.NamespacedName) *HTTPRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.httpRoutes[name]
 }
 
 func (s *State) DeleteHTTPRoute(name types.NamespacedName) {

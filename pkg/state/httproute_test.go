@@ -819,3 +819,187 @@ func TestComputeAcceptedCondition_UnknownFilter(t *testing.T) {
 		t.Errorf("expected Accepted reason UnsupportedValue, got %v", cond.Reason)
 	}
 }
+
+func TestCompileHTTPRoute(t *testing.T) {
+	t.Run("compiles valid route with matches, filters, backends, and TLS", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{Name: "my-gw"},
+					},
+				},
+				Hostnames: []gatewayv1.Hostname{"example.com"},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Path: &gatewayv1.HTTPPathMatch{
+									Type:  Ptr(gatewayv1.PathMatchPathPrefix),
+									Value: Ptr("/api"),
+								},
+								Headers: []gatewayv1.HTTPHeaderMatch{
+									{
+										Type:  Ptr(gatewayv1.HeaderMatchRegularExpression),
+										Name:  "X-Version",
+										Value: "v[0-9]+",
+									},
+								},
+								Method: Ptr(gatewayv1.HTTPMethodGet),
+							},
+						},
+						Filters: []gatewayv1.HTTPRouteFilter{
+							{
+								Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+								RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+									Set: []gatewayv1.HTTPHeader{
+										{Name: "X-Forwarded-Proto", Value: "https"},
+									},
+								},
+							},
+						},
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "api-svc",
+										Port: Ptr(gatewayv1.PortNumber(8443)),
+									},
+									Weight: Ptr(int32(10)),
+								},
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{
+										Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier,
+										ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+											Add: []gatewayv1.HTTPHeader{
+												{Name: "X-Server", Value: "api"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		services := map[types.NamespacedName]*corev1.Service{
+			{Namespace: "default", Name: "api-svc"}: {
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{
+						{Port: 8443, AppProtocol: Ptr("https")},
+					},
+				},
+			},
+		}
+
+		policies := []*gatewayv1.BackendTLSPolicy{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "api-tls",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+						{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Group: "",
+								Kind:  "Service",
+								Name:  "api-svc",
+							},
+						},
+					},
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						Hostname: "api.example.internal",
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, services, policies, nil, nil)
+		if internal == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+
+		if internal.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ValidationCondition True, got %+v", internal.ValidationCondition)
+		}
+		if internal.ResolvedRefsCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ResolvedRefsCondition True, got %+v", internal.ResolvedRefsCondition)
+		}
+
+		if len(internal.Rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(internal.Rules))
+		}
+
+		rule := internal.Rules[0]
+		if rule.Error != nil {
+			t.Fatalf("expected nil rule.Error, got %+v", rule.Error)
+		}
+		if len(rule.Matches) != 1 {
+			t.Fatalf("expected 1 match, got %d", len(rule.Matches))
+		}
+		if rule.Matches[0].Path == nil || rule.Matches[0].Path.Value != "/api" {
+			t.Errorf("expected path /api, got %+v", rule.Matches[0].Path)
+		}
+		if len(rule.Matches[0].Headers) != 1 || rule.Matches[0].Headers[0].MatchRegularExpressionValue == nil {
+			t.Errorf("expected compiled regex header match, got %+v", rule.Matches[0].Headers)
+		}
+		if rule.RequestHeaderModifier == nil {
+			t.Errorf("expected rule RequestHeaderModifier, got nil")
+		}
+		if len(rule.Backends) != 1 {
+			t.Fatalf("expected 1 backend, got %d", len(rule.Backends))
+		}
+
+		backend := rule.Backends[0]
+		if backend.Host != "api-svc.default.svc.cluster.local" || backend.Port != 8443 || backend.Weight != 10 {
+			t.Errorf("unexpected backend values: %+v", backend)
+		}
+		if backend.TLSConfig == nil || backend.TLSConfig.Hostname != "api.example.internal" {
+			t.Errorf("expected backend TLS config, got %+v", backend.TLSConfig)
+		}
+		if backend.ResponseHeaderModifier == nil {
+			t.Errorf("expected backend ResponseHeaderModifier, got nil")
+		}
+	})
+
+	t.Run("compiles invalid regex with error condition", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-regex", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Headers: []gatewayv1.HTTPHeaderMatch{
+									{
+										Type:  Ptr(gatewayv1.HeaderMatchRegularExpression),
+										Name:  "X-Version",
+										Value: "[invalid",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", internal.ValidationCondition.Status)
+		}
+		if internal.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %s", internal.ValidationCondition.Reason)
+		}
+		if len(internal.Rules) != 1 || internal.Rules[0].Error == nil {
+			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
+		}
+	})
+}
