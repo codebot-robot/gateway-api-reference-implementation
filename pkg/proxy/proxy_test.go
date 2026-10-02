@@ -96,6 +96,44 @@ func TestProxyRewrite(t *testing.T) {
 			expectedPath: "/new-prefix/suffix",
 		},
 		{
+			name: "prefix path rewrite strip prefix with subpath",
+			rewrite: state.InternalRewrite{
+				Path: &state.InternalPathRewrite{
+					Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+					Value: "/",
+				},
+			},
+			match: &state.InternalMatch{
+				Path: &state.InternalPathMatch{
+					Type:  gatewayv1.PathMatchPathPrefix,
+					Value: "/strip-prefix",
+				},
+			},
+			initialHost:  "example.com",
+			expectedHost: "example.com",
+			initialPath:  "/strip-prefix/three",
+			expectedPath: "/three",
+		},
+		{
+			name: "prefix path rewrite strip prefix exact match",
+			rewrite: state.InternalRewrite{
+				Path: &state.InternalPathRewrite{
+					Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+					Value: "/",
+				},
+			},
+			match: &state.InternalMatch{
+				Path: &state.InternalPathMatch{
+					Type:  gatewayv1.PathMatchPathPrefix,
+					Value: "/strip-prefix",
+				},
+			},
+			initialHost:  "example.com",
+			expectedHost: "example.com",
+			initialPath:  "/strip-prefix",
+			expectedPath: "/",
+		},
+		{
 			name: "prefix path rewrite with missing match (default /)",
 			rewrite: state.InternalRewrite{
 				Path: &state.InternalPathRewrite{

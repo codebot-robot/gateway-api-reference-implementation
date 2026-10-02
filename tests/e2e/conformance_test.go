@@ -120,7 +120,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteRedirectScheme,
 		tests.HTTPRouteResponseHeaderModifier,
 		tests.HTTPRouteRewriteHost,
-		// tests.HTTPRouteRewritePath, // Fails on rewrite-path-and-modify-headers under v1.5.0
+		tests.HTTPRouteRewritePath,
 		tests.HTTPRouteSimpleSameNamespace,
 	}
 
