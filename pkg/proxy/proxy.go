@@ -37,6 +37,7 @@ import (
 type Proxy struct {
 	mu           sync.RWMutex
 	routes       []state.InternalRoute
+	listeners    []state.InternalListener
 	certificates map[string]*tls.Certificate
 	defaultCert  *tls.Certificate
 }
@@ -44,6 +45,7 @@ type Proxy struct {
 func NewProxy() *Proxy {
 	return &Proxy{
 		routes:       []state.InternalRoute{},
+		listeners:    []state.InternalListener{},
 		certificates: make(map[string]*tls.Certificate),
 	}
 }
@@ -57,6 +59,19 @@ func (p *Proxy) SetDefaultCertificate(cert *tls.Certificate) {
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.routes = routes
+}
+
+func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.listeners = listeners
+}
+
+func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.InternalRoute) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.listeners = listeners
 	p.routes = routes
 }
 
@@ -100,7 +115,111 @@ func (p *Proxy) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, er
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RLock()
 	routes := p.routes
+	listeners := p.listeners
 	p.mu.RUnlock()
+
+	if len(listeners) > 0 {
+		if r.TLS != nil {
+			var httpsListeners []state.InternalListener
+			for _, l := range listeners {
+				if l.Protocol == gatewayv1.HTTPSProtocolType {
+					httpsListeners = append(httpsListeners, l)
+				}
+			}
+
+			if len(httpsListeners) > 0 {
+				sni := strings.ToLower(r.TLS.ServerName)
+				connListeners, connMatchType := state.MatchListeners(httpsListeners, sni)
+				if len(connListeners) == 0 {
+					http.Error(w, fmt.Sprintf("No listener for server name %s", sni), http.StatusNotFound)
+					return
+				}
+
+				reqHost := r.Host
+				if h, _, err := net.SplitHostPort(reqHost); err == nil {
+					reqHost = h
+				}
+				reqHost = strings.ToLower(reqHost)
+
+				reqHostListeners, reqMatchType := state.MatchListeners(httpsListeners, reqHost)
+
+				if connMatchType == state.CatchAllMatch {
+					if reqMatchType == state.ExactMatch || reqMatchType == state.WildcardMatch {
+						http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+						return
+					}
+				} else if connMatchType == state.WildcardMatch {
+					hasMatchingConnListener := false
+					for _, l := range connListeners {
+						if state.MatchesWildcard(l.Hostname, reqHost) {
+							hasMatchingConnListener = true
+							break
+						}
+					}
+					if !hasMatchingConnListener {
+						if len(reqHostListeners) > 0 {
+							http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+						} else {
+							http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+						}
+						return
+					}
+					if reqMatchType == state.ExactMatch {
+						http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+						return
+					}
+				} else if connMatchType == state.ExactMatch {
+					hasMatchingConnListener := false
+					for _, l := range connListeners {
+						if strings.EqualFold(l.Hostname, reqHost) {
+							hasMatchingConnListener = true
+							break
+						}
+					}
+					if !hasMatchingConnListener {
+						if len(reqHostListeners) > 0 {
+							http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
+						} else {
+							http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+						}
+						return
+					}
+				}
+
+				var connRoutes []state.InternalRoute
+				for _, l := range connListeners {
+					connRoutes = append(connRoutes, l.Routes...)
+				}
+				routes = connRoutes
+			}
+		} else {
+			var httpListeners []state.InternalListener
+			for _, l := range listeners {
+				if l.Protocol == gatewayv1.HTTPProtocolType {
+					httpListeners = append(httpListeners, l)
+				}
+			}
+
+			if len(httpListeners) > 0 {
+				reqHost := r.Host
+				if h, _, err := net.SplitHostPort(reqHost); err == nil {
+					reqHost = h
+				}
+				reqHost = strings.ToLower(reqHost)
+
+				reqHostListeners, _ := state.MatchListeners(httpListeners, reqHost)
+				if len(reqHostListeners) == 0 {
+					http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+					return
+				}
+				var matchedRoutes []state.InternalRoute
+				for _, l := range reqHostListeners {
+					matchedRoutes = append(matchedRoutes, l.Routes...)
+				}
+				routes = matchedRoutes
+			}
+		}
+	}
 
 	bestRule, bestMatch := state.MatchRoute(routes, r)
 

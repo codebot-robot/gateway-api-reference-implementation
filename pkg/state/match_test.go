@@ -421,3 +421,61 @@ func TestMatchRoute_HostnamePrecedenceOverPath(t *testing.T) {
 		t.Errorf("Expected exact hostname match (exact-host-prefix-path-backend) to take precedence over wildcard host match with exact path, got %v", rule.Backends)
 	}
 }
+
+func TestMatchesWildcard(t *testing.T) {
+	tests := []struct {
+		pattern string
+		host    string
+		want    bool
+	}{
+		{"*.wildcard.org", "third-example.wildcard.org", true},
+		{"*.wildcard.org", "fourth-example.wildcard.org", true},
+		{"*.wildcard.org", "sub.third.wildcard.org", true},
+		{"*.wildcard.org", "wildcard.org", false},
+		{"*.wildcard.org", "other.org", false},
+		{"*.wildcard.org", "second-example.org", false},
+		{"example.org", "example.org", false}, // not a wildcard pattern
+	}
+
+	for _, tt := range tests {
+		if got := MatchesWildcard(tt.pattern, tt.host); got != tt.want {
+			t.Errorf("MatchesWildcard(%q, %q) = %v, want %v", tt.pattern, tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestMatchListener(t *testing.T) {
+	listeners := []InternalListener{
+		{Name: "https", Hostname: "", Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "https-with-hostname", Hostname: "second-example.org", Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "https-with-wildcard-hostname", Hostname: "*.wildcard.org", Protocol: gatewayv1.HTTPSProtocolType},
+		{Name: "https-with-hostname-matching-wildcard", Hostname: "fourth-example.wildcard.org", Protocol: gatewayv1.HTTPSProtocolType},
+	}
+
+	tests := []struct {
+		host      string
+		wantName  string
+		wantMatch MatchType
+	}{
+		{host: "example.org", wantName: "https", wantMatch: CatchAllMatch},
+		{host: "second-example.org", wantName: "https-with-hostname", wantMatch: ExactMatch},
+		{host: "third-example.wildcard.org", wantName: "https-with-wildcard-hostname", wantMatch: WildcardMatch},
+		{host: "fourth-example.wildcard.org", wantName: "https-with-hostname-matching-wildcard", wantMatch: ExactMatch},
+		{host: "fith-example.wildcard.org", wantName: "https-with-wildcard-hostname", wantMatch: WildcardMatch},
+		{host: "unknown-example.org", wantName: "https", wantMatch: CatchAllMatch},
+		{host: "", wantName: "https", wantMatch: CatchAllMatch},
+	}
+
+	for _, tt := range tests {
+		l, matchType := MatchListener(listeners, tt.host)
+		if l == nil {
+			t.Fatalf("MatchListener(%q) returned nil, want %q", tt.host, tt.wantName)
+		}
+		if l.Name != tt.wantName {
+			t.Errorf("MatchListener(%q) listener name = %q, want %q", tt.host, l.Name, tt.wantName)
+		}
+		if matchType != tt.wantMatch {
+			t.Errorf("MatchListener(%q) matchType = %v, want %v", tt.host, matchType, tt.wantMatch)
+		}
+	}
+}

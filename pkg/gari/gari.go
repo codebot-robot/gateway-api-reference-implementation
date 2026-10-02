@@ -302,11 +302,14 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			tlsConfig := &tls.Config{
 				GetCertificate: s.proxy.GetCertificate,
 			}
-			tlsLis := tls.NewListener(lis, tlsConfig)
-
 			srv := &http.Server{
-				Handler: s.proxy,
+				Handler:   s.proxy,
+				TLSConfig: tlsConfig,
 			}
+			if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
+				return fmt.Errorf("failed to configure HTTP/2 on HTTPS proxy: %w", err)
+			}
+			tlsLis := tls.NewListener(lis, tlsConfig)
 			go func() {
 				<-ctx.Done()
 				setupLog.Info("shutting down proxy HTTPS server")

@@ -158,10 +158,13 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 	secrets := st.GetSecrets()
 
 	var proxyRoutes []state.InternalRoute
+	var proxyListeners []state.InternalListener
 	for _, gw := range gateways {
-		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, st, controllerName)...)
+		gwListeners, gwRoutes := gw.BuildInternalState(routes, services, backendTLSPolicies, configMaps, st, controllerName)
+		proxyListeners = append(proxyListeners, gwListeners...)
+		proxyRoutes = append(proxyRoutes, gwRoutes...)
 	}
-	p.UpdateRoutes(proxyRoutes)
+	p.UpdateConfig(proxyListeners, proxyRoutes)
 
 	certsMap := make(map[string]*tls.Certificate)
 	var defaultCert *tls.Certificate
@@ -209,7 +212,7 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 									if listener.Hostname != nil && string(*listener.Hostname) != "" {
 										certsMap[strings.ToLower(string(*listener.Hostname))] = &certCopy
 									}
-									if defaultCert == nil {
+									if listener.Hostname == nil || string(*listener.Hostname) == "" || defaultCert == nil {
 										defaultCert = &certCopy
 									}
 								}
