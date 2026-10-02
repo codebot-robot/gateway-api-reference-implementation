@@ -217,14 +217,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				}
 				if string(parentRef.Name) == gw.Name && parentNamespace == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
-							// Also check if the route actually intersects/matches this listener's hostname
-							routeHostnames := route.GetHostnames()
-							listenerHostname := state.ValueOf(listener.Hostname)
-							effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
-							if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
-								attachedRoutes++
-								break
+						if port := state.ValueOf(parentRef.Port); port == 0 || port == listener.Port {
+							if route.IsAcceptedForParentRef(parentRef, ControllerName) {
+								// Also check if the route actually intersects/matches this listener's hostname
+								routeHostnames := route.GetHostnames()
+								listenerHostname := state.ValueOf(listener.Hostname)
+								effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
+								if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
+									attachedRoutes++
+									break
+								}
 							}
 						}
 					}

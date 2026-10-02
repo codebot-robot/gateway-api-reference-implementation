@@ -16,7 +16,15 @@ package state
 
 import (
 	"strings"
+
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+// IsHTTPRoute returns true if the group and kind represent an HTTPRoute in Gateway API.
+func IsHTTPRoute(group *gatewayv1.Group, kind gatewayv1.Kind) bool {
+	g := ValueOf(group)
+	return (g == "" || g == gatewayv1.GroupName) && kind == "HTTPRoute"
+}
 
 // IntersectHostnames calculates the intersection of route hostnames and a listener hostname.
 func IntersectHostnames(routeHostnames []string, listenerHostname string) []string {

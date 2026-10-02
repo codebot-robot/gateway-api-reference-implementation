@@ -147,3 +147,322 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 		})
 	}
 }
+
+func TestComputeAcceptedCondition(t *testing.T) {
+	gw := &GatewayState{
+		Gateway: &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "same-namespace",
+				Namespace: "gateway-conformance-infra",
+			},
+			Spec: gatewayv1.GatewaySpec{
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "http",
+						Port:     80,
+						Protocol: gatewayv1.HTTPProtocolType,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Namespaces: &gatewayv1.RouteNamespaces{
+								From: Ptr(gatewayv1.NamespacesFromSame),
+							},
+						},
+					},
+					{
+						Name:     "https",
+						Port:     443,
+						Hostname: Ptr(gatewayv1.Hostname("example.com")),
+						Protocol: gatewayv1.HTTPSProtocolType,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Namespaces: &gatewayv1.RouteNamespaces{
+								From: Ptr(gatewayv1.NamespacesFromAll),
+							},
+						},
+					},
+					{
+						Name:     "tcp",
+						Port:     9000,
+						Protocol: gatewayv1.TLSProtocolType,
+					},
+				},
+			},
+		},
+	}
+
+	gateways := []*GatewayState{gw}
+
+	tests := []struct {
+		name           string
+		route          *HTTPRouteState
+		parentRef      gatewayv1.ParentReference
+		expectedStatus metav1.ConditionStatus
+		expectedReason string
+	}{
+		{
+			name: "valid route matching http listener in same namespace",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name: "same-namespace",
+			},
+			expectedStatus: metav1.ConditionTrue,
+			expectedReason: string(gatewayv1.RouteReasonAccepted),
+		},
+		{
+			name: "unsupported parent group",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Group: Ptr(gatewayv1.Group("custom.io")),
+				Name:  "same-namespace",
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingParent),
+		},
+		{
+			name: "unsupported parent kind",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Kind: Ptr(gatewayv1.Kind("Service")),
+				Name: "same-namespace",
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingParent),
+		},
+		{
+			name: "gateway not found",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name: "non-existent-gw",
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingParent),
+		},
+		{
+			name: "invalid parentRef not matching listener port",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:      "same-namespace",
+				Namespace: Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				Port:      Ptr(gatewayv1.PortNumber(81)),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingParent),
+		},
+		{
+			name: "invalid parentRef not matching section name",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:        "same-namespace",
+				Namespace:   Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				Port:        Ptr(gatewayv1.PortNumber(80)),
+				SectionName: Ptr(gatewayv1.SectionName("http1")),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingParent),
+		},
+		{
+			name: "invalid parentRef section name not matching port",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:        "same-namespace",
+				Namespace:   Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				SectionName: Ptr(gatewayv1.SectionName("http")),
+				Port:        Ptr(gatewayv1.PortNumber(81)),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingParent),
+		},
+		{
+			name: "invalid cross namespace parent ref when listener allows only Same",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-web-backend",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:      "same-namespace",
+				Namespace: Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				Port:      Ptr(gatewayv1.PortNumber(80)),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNotAllowedByListeners),
+		},
+		{
+			name: "valid cross namespace parent ref when listener allows All",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-web-backend",
+					},
+					Spec: gatewayv1.HTTPRouteSpec{
+						Hostnames: []gatewayv1.Hostname{"example.com"},
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:        "same-namespace",
+				Namespace:   Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				SectionName: Ptr(gatewayv1.SectionName("https")),
+			},
+			expectedStatus: metav1.ConditionTrue,
+			expectedReason: string(gatewayv1.RouteReasonAccepted),
+		},
+		{
+			name: "no matching listener hostname",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-web-backend",
+					},
+					Spec: gatewayv1.HTTPRouteSpec{
+						Hostnames: []gatewayv1.Hostname{"other.com"},
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:        "same-namespace",
+				Namespace:   Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				SectionName: Ptr(gatewayv1.SectionName("https")),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNoMatchingListenerHostname),
+		},
+		{
+			name: "listener protocol not compatible (TCP listener only)",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:        "same-namespace",
+				Namespace:   Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
+				SectionName: Ptr(gatewayv1.SectionName("tcp")),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNotAllowedByListeners),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := tt.route.ComputeAcceptedCondition(tt.parentRef, gateways)
+			if cond.Status != tt.expectedStatus {
+				t.Errorf("ComputeAcceptedCondition() Status = %v, want %v", cond.Status, tt.expectedStatus)
+			}
+			if cond.Reason != tt.expectedReason {
+				t.Errorf("ComputeAcceptedCondition() Reason = %v, want %v", cond.Reason, tt.expectedReason)
+			}
+		})
+	}
+}
+
+func TestIsAcceptedForParentRef(t *testing.T) {
+	route := &HTTPRouteState{
+		HTTPRoute: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-route",
+				Namespace: "default",
+			},
+			Status: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef: gatewayv1.ParentReference{
+								Name: "gw-1",
+							},
+							ControllerName: "example.com/controller",
+							Conditions: []metav1.Condition{
+								{
+									Type:   string(gatewayv1.RouteConditionAccepted),
+									Status: metav1.ConditionTrue,
+								},
+							},
+						},
+						{
+							ParentRef: gatewayv1.ParentReference{
+								Name: "gw-2",
+								Port: Ptr(gatewayv1.PortNumber(81)),
+							},
+							ControllerName: "example.com/controller",
+							Conditions: []metav1.Condition{
+								{
+									Type:   string(gatewayv1.RouteConditionAccepted),
+									Status: metav1.ConditionFalse,
+									Reason: string(gatewayv1.RouteReasonNoMatchingParent),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if !route.IsAcceptedForParentRef(gatewayv1.ParentReference{Name: "gw-1"}, "example.com/controller") {
+		t.Errorf("expected route to be accepted for gw-1")
+	}
+
+	if route.IsAcceptedForParentRef(gatewayv1.ParentReference{Name: "gw-2", Port: Ptr(gatewayv1.PortNumber(81))}, "example.com/controller") {
+		t.Errorf("expected route NOT to be accepted for gw-2 with port 81")
+	}
+
+	if route.IsAcceptedForParentRef(gatewayv1.ParentReference{Name: "gw-nonexistent"}, "example.com/controller") {
+		t.Errorf("expected route NOT to be accepted for gw-nonexistent")
+	}
+}
