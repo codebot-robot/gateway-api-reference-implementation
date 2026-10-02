@@ -128,6 +128,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.modifyHeaders(r, *bestRule.RequestHeaderModifier)
 		}
 		if bestRule.Backend != nil {
+			if bestRule.Backend.RequestHeaderModifier != nil {
+				p.modifyHeaders(r, *bestRule.Backend.RequestHeaderModifier)
+			}
 			p.forward(w, r, *bestRule.Backend, bestRule.ResponseHeaderModifier)
 			return
 		}
@@ -318,9 +321,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
-	if respHeaderModifier != nil {
+	if respHeaderModifier != nil || backend.ResponseHeaderModifier != nil {
 		proxy.ModifyResponse = func(res *http.Response) error {
-			modifyHeaders(res.Header, *respHeaderModifier)
+			if backend.ResponseHeaderModifier != nil {
+				modifyHeaders(res.Header, *backend.ResponseHeaderModifier)
+			}
+			if respHeaderModifier != nil {
+				modifyHeaders(res.Header, *respHeaderModifier)
+			}
 			return nil
 		}
 	}
