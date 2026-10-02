@@ -32,20 +32,27 @@ they should *embrace* the reference implementation:
 
 - **GARI is the fallback.** Any configuration that is valid Gateway API works,
   because GARI can serve it.
-- **Acceleration is an extension.** An accelerator declares which features it
-  can handle. If an HTTPRoute uses only accelerated functionality, its traffic
-  is offloaded to the accelerator. Otherwise it stays on GARI.
+- **Acceleration is an extension.** An accelerated implementation embeds
+  GARI and uses hook points that GARI exposes to offload work it can do
+  faster. If an HTTPRoute uses only accelerated functionality, its traffic is
+  offloaded. Otherwise GARI serves it.
 
 So a user never has to ask "does my implementation support this feature?"
 The answer is always yes. The only question is whether it is *fast*, and
 that is a performance question rather than a correctness question.
 
-For accelerator authors, the bar to entry drops a lot. An accelerator can
-start with exact/prefix path matching on a single backend and still be
-useful, because everything else keeps working through GARI. It can then add
-features in order of how much traffic they carry.
+For accelerator authors, the bar to entry drops a lot. An accelerated
+implementation can start by offloading exact/prefix path matching on a single
+backend and still be complete, because everything else keeps working through
+the embedded GARI. It can then add features in order of how much traffic they
+carry.
 
-## How it fits the current architecture
+## Embedding GARI
+
+Rather than GARI driving a separate accelerator, the accelerated
+implementation embeds GARI. GARI is pure Go, so an implementation written in
+Go (for example, the control plane for an Envoy- or nginx-based gateway) can
+import it as a library and run it in-process.
 
 GARI already has a clean boundary between control plane and data plane:
 
@@ -57,30 +64,41 @@ GARI already has a clean boundary between control plane and data plane:
 3. The proxy (`pkg/proxy`) serves traffic from that list.
 
 All the hard Gateway API semantics (attachment, precedence, status
-conditions) live in steps 1 and 2. Acceleration fits at the same boundary:
+conditions) live in steps 1 and 2, and the embedding implementation gets them
+for free. Its own code only has to program its datapath for the routes it
+offloads:
 
 ```
-Gateway API objects ──► pkg/state ──► []InternalRoute ──┬─► accelerator (supported routes)
-                                                        └─► GARI proxy  (everything else)
+accelerated implementation (one process)
+│
+├─ embedded GARI: pkg/controller ──► pkg/state ──► []InternalRoute
+│                                                       │
+│                                          offload hook ┤
+│                                                       ├─► accelerated datapath (offloaded routes)
+│                                                       └─► GARI proxy          (everything else)
 ```
 
-An accelerator gets the same resolved model that GARI's own proxy consumes,
-so it does not need to reimplement Gateway API semantics. It only has to
-program its datapath for the routes it accepts.
+## Hook points
 
-## Deciding what to accelerate
-
-Each accelerator advertises the capabilities it supports, for example:
+GARI exposes hook points that let the embedding implementation claim work
+for offload. The first, and most important, is a route offload hook: for each
+resolved route (or group of routes; see below), GARI asks the embedder
+whether it will handle it. The embedder accepts only routes whose features it
+fully supports, for example:
 
 - match types (exact/prefix path, headers, query params, method)
 - filters (header modifiers, redirects, URL rewrites, mirroring, CORS)
 - backend features (weights, BackendTLSPolicy, h2c, WebSocket)
 - timeouts and retries
 
-For each route, GARI checks the features it uses against those capabilities.
-A route is accelerated only if *every* feature it uses is supported;
-otherwise it stays on GARI. That decision is made per route, not per
-Gateway, so one exotic route does not slow down the rest.
+Anything the embedder declines is served by GARI's own proxy. The decision is
+made per route, not per Gateway, so one exotic route does not slow down the
+rest.
+
+Because the embedder sees GARI's resolved internal model, the hooks become a
+Go API that we need to keep reasonably stable. We expect to add more hooks
+(for example, around listeners and TLS termination) as real accelerated
+implementations need them, rather than design them all up front.
 
 Open design questions:
 
@@ -89,21 +107,22 @@ Open design questions:
   a less specific match on an accelerated route). The unit of offload may
   need to be a set of routes that can be evaluated independently, such as a
   hostname on a listener, rather than a single HTTPRoute.
-- **Traffic steering.** How traffic reaches GARI for non-accelerated routes:
-  the accelerator forwarding unmatched requests to GARI, separate
-  addresses/listeners, or SNI-level splitting (see
+- **Traffic steering.** How traffic reaches the embedded GARI proxy for
+  routes that were not offloaded: the accelerated datapath forwarding
+  unmatched requests to it, separate addresses/listeners, or SNI-level
+  splitting (see
   [sni-reverse-tunnel.md](sni-reverse-tunnel.md)).
 - **Status.** Whether, and how, to show users that a route is accelerated (for
   example, a condition or annotation on the HTTPRoute) so that "it works but
   it is slow" can be diagnosed.
-- **Correctness.** An accelerator should behave like GARI for the routes it
-  accepts. Running the conformance suite with the accelerator enabled, so
-  that some tests hit the accelerator and others the fallback, is a natural
-  way to check that.
+- **Correctness.** Offloaded routes should behave exactly as GARI would serve
+  them. Running the conformance suite against the accelerated implementation,
+  so that some tests hit the accelerated datapath and others the fallback, is
+  a natural way to check that.
 
 ## Examples
 
-We plan to include accelerator examples in this repository, to prove that the
-extension point is real rather than theoretical. The first is an SNI proxy on
+We plan to include examples in this repository, to prove that the hook
+points are real rather than theoretical. The first is an SNI proxy on
 a front-end node that reverse-tunnels traffic into the cluster; see
 [sni-reverse-tunnel.md](sni-reverse-tunnel.md).

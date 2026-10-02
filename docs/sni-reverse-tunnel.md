@@ -63,12 +63,15 @@ This example sits at the "steering" end of acceleration. The front-end
 offloads connection acceptance and SNI-level demultiplexing, and GARI
 remains the full implementation behind it. It is the simplest case to start
 with because it needs no understanding of L7 features at all. Later
-accelerators can take on more (for example, terminating TLS and handling
-simple HTTPRoutes at the edge), with GARI as the fallback for everything else.
+accelerated implementations can take on more (for example, terminating TLS
+and handling simple HTTPRoutes at the edge), with GARI as the fallback for
+everything else.
 
-It also shows the extension point clearly: the front-end is driven entirely
-by what GARI announces, which in turn is derived from the same resolved
-state that drives GARI's own proxy.
+It also exercises the embedding model: the in-cluster tunnel client is a
+small program that embeds GARI. It uses a GARI hook point to learn the
+resolved listeners and hostnames, announces them to the front-end, and hands
+the tunnelled connections to the embedded GARI proxy. The front-end itself
+stays a simple, separate SNI proxy.
 
 ## Open questions
 
