@@ -429,12 +429,18 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				if string(parentRef.Name) != s.Name {
 					continue
 				}
-				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+				parentNamespace := route.Namespace
+				if ns := ValueOf(parentRef.Namespace); ns != "" {
+					parentNamespace = string(ns)
+				}
+				if parentNamespace != s.Namespace {
 					continue
 				}
 
 				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
+					continue
+				}
+				if port := ValueOf(parentRef.Port); port != 0 && port != listener.Port {
 					continue
 				}
 

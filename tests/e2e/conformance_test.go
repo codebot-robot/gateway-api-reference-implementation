@@ -109,6 +109,10 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteHeaderMatching,
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
+		tests.HTTPRouteInvalidCrossNamespaceParentRef,
+		tests.HTTPRouteInvalidParentRefNotMatchingListenerPort,
+		tests.HTTPRouteInvalidParentRefNotMatchingSectionName,
+		tests.HTTPRouteInvalidParentRefSectionNameNotMatchingPort,
 		tests.HTTPRouteListenerHostnameMatching,
 		tests.HTTPRouteMatching,
 		tests.HTTPRouteMethodMatching, // Fails on HTTPRouteMethodMatching/11 with headers under v1.5.0

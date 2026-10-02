@@ -17,7 +17,63 @@ package state
 import (
 	"reflect"
 	"testing"
+
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+func TestIsHTTPRoute(t *testing.T) {
+	tests := []struct {
+		name  string
+		group *gatewayv1.Group
+		kind  gatewayv1.Kind
+		want  bool
+	}{
+		{
+			name:  "nil group, HTTPRoute kind",
+			group: nil,
+			kind:  "HTTPRoute",
+			want:  true,
+		},
+		{
+			name:  "empty group, HTTPRoute kind",
+			group: Ptr(gatewayv1.Group("")),
+			kind:  "HTTPRoute",
+			want:  true,
+		},
+		{
+			name:  "standard group, HTTPRoute kind",
+			group: Ptr(gatewayv1.Group("gateway.networking.k8s.io")),
+			kind:  "HTTPRoute",
+			want:  true,
+		},
+		{
+			name:  "custom group, HTTPRoute kind",
+			group: Ptr(gatewayv1.Group("example.com")),
+			kind:  "HTTPRoute",
+			want:  false,
+		},
+		{
+			name:  "nil group, GRPCRoute kind",
+			group: nil,
+			kind:  "GRPCRoute",
+			want:  false,
+		},
+		{
+			name:  "standard group, TLSRoute kind",
+			group: Ptr(gatewayv1.Group("gateway.networking.k8s.io")),
+			kind:  "TLSRoute",
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsHTTPRoute(tt.group, tt.kind); got != tt.want {
+				t.Errorf("IsHTTPRoute(%v, %v) = %v, want %v", tt.group, tt.kind, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestIntersectHostnames(t *testing.T) {
 	tests := []struct {
