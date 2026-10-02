@@ -6,6 +6,12 @@ This skill outlines the process, best practices, and requirements for implementi
 
 When enabling or fixing a conformance test (e.g., enabling a test that was previously commented out, or resolving a failure in an active test), it is crucial to record detailed research, strategy, and findings.
 
+## Enabling Tests in Conformance Suite
+
+When enabling or adding a test in `tests/e2e/conformance_test.go`:
+- Insert the test into the `selectedTests` slice in **alphabetical order** by test name (do not append to the end of the slice).
+- Commented-out (known failing) tests should also be maintained in alphabetical order along with their explanatory comments.
+
 ## Strict Recording Requirements
 
 To ensure knowledge is preserved and shared without introducing merge conflicts or cluttering the codebase:
