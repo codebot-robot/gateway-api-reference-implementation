@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -41,12 +42,21 @@ func (f *stringSliceFlag) Set(val string) error {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "generate-certs" {
-		runGenerateCerts(os.Args[2:])
-		return
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := run(ctx, os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "generate-certs" {
+		return runGenerateCerts(args[1:])
 	}
 
-	fs := flag.NewFlagSet("snigateway-frontend", flag.ExitOnError)
+	fs := flag.NewFlagSet("snigateway-frontend", flag.ContinueOnError)
 
 	var listenAddrs stringSliceFlag
 	fs.Var(&listenAddrs, "listen", "Address to listen on (can be specified multiple times, default :443)")
@@ -56,8 +66,8 @@ func main() {
 	internalHostname := fs.String("internal-hostname", api.DefaultInternalHostname, "Internal SNI hostname for mTLS management API")
 	connectTimeout := fs.Duration("connect-timeout", 10*time.Second, "Timeout for client to dial back and claim pending connection")
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		log.Fatalf("Error parsing flags: %v", err)
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
 	if len(listenAddrs) == 0 {
@@ -66,22 +76,22 @@ func main() {
 
 	caCertPEM, err := os.ReadFile(*caCertPath)
 	if err != nil {
-		log.Fatalf("Error reading CA cert from %s: %v", *caCertPath, err)
+		return fmt.Errorf("reading CA cert from %s: %w", *caCertPath, err)
 	}
 
 	serverCertPEM, err := os.ReadFile(*serverCertPath)
 	if err != nil {
-		log.Fatalf("Error reading server cert from %s: %v", *serverCertPath, err)
+		return fmt.Errorf("reading server cert from %s: %w", *serverCertPath, err)
 	}
 
 	serverKeyPEM, err := os.ReadFile(*serverKeyPath)
 	if err != nil {
-		log.Fatalf("Error reading server key from %s: %v", *serverKeyPath, err)
+		return fmt.Errorf("reading server key from %s: %w", *serverKeyPath, err)
 	}
 
 	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
 	if err != nil {
-		log.Fatalf("Error creating server TLS config: %v", err)
+		return fmt.Errorf("creating server TLS config: %w", err)
 	}
 
 	srv, err := frontend.NewServer(frontend.ServerConfig{
@@ -91,40 +101,40 @@ func main() {
 		ConnectTimeout:   *connectTimeout,
 	})
 	if err != nil {
-		log.Fatalf("Error initializing frontend server: %v", err)
+		return fmt.Errorf("initializing frontend server: %w", err)
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
-		sig := <-sigCh
-		log.Printf("Received signal %v, shutting down...", sig)
+		<-ctx.Done()
+		log.Printf("Shutting down snigateway-frontend...")
 		_ = srv.Close()
 	}()
 
 	log.Printf("Starting snigateway-frontend listening on %v (internal SNI: %s)...", listenAddrs, *internalHostname)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("Server stopped: %v", err)
+		return fmt.Errorf("server stopped: %w", err)
 	}
+
+	return nil
 }
 
-func runGenerateCerts(args []string) {
-	fs := flag.NewFlagSet("generate-certs", flag.ExitOnError)
+func runGenerateCerts(args []string) error {
+	fs := flag.NewFlagSet("generate-certs", flag.ContinueOnError)
 	dir := fs.String("dir", ".", "Directory to write generated certificates to")
 	serverName := fs.String("server-name", api.DefaultInternalHostname, "Server SNI hostname")
 	clientCN := fs.String("client-name", "snigateway-client", "Client certificate CommonName")
 
 	if err := fs.Parse(args); err != nil {
-		log.Fatalf("Error parsing generate-certs flags: %v", err)
+		return err
 	}
 
 	if err := certs.GenerateAndWriteCertificates(*dir, *serverName, *clientCN); err != nil {
-		log.Fatalf("Error generating certificates: %v", err)
+		return fmt.Errorf("generating certificates: %w", err)
 	}
 
 	fmt.Printf("Successfully generated certificates in %s:\n", *dir)
-	fmt.Printf("  CA:     %s, %s\n", certs.CACertFilename, certs.CAKeyFilename)
-	fmt.Printf("  Server: %s, %s\n", certs.ServerCertFilename, certs.ServerKeyFilename)
-	fmt.Printf("  Client: %s, %s\n", certs.ClientCertFilename, certs.ClientKeyFilename)
+	fmt.Printf("  CA:     ca.crt, ca.key\n")
+	fmt.Printf("  Server: server.crt, server.key\n")
+	fmt.Printf("  Client: client.crt, client.key\n")
+	return nil
 }

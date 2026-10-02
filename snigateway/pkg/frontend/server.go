@@ -89,9 +89,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(api.RegistrationPath, s.handleRegistration)
-	mux.HandleFunc(api.ConnectionsPath, s.handleConnectionsStream)
-	mux.HandleFunc(api.ConnectionsPrefix, s.handleConnectionUpgrade)
+	mux.HandleFunc("/v1/registration", s.handleRegistration)
+	mux.HandleFunc("/v1/connections", s.handleConnectionsStream)
+	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -389,7 +389,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	connID := strings.TrimPrefix(r.URL.Path, api.ConnectionsPrefix)
+	connID := strings.TrimPrefix(r.URL.Path, "/v1/connections/")
 	if connID == "" {
 		http.Error(w, "missing connection id", http.StatusBadRequest)
 		return

@@ -18,18 +18,6 @@ const (
 	// DefaultInternalHostname is the default SNI hostname used for frontend mTLS API.
 	DefaultInternalHostname = "snigateway.internal"
 
-	// RegistrationPath is the path for registering hostnames.
-	RegistrationPath = "/v1/registration"
-
-	// ConnectionsPath is the path for the long-lived connections event stream.
-	ConnectionsPath = "/v1/connections"
-
-	// ConnectionsPrefix is the prefix for dialing back a connection by ID.
-	ConnectionsPrefix = "/v1/connections/"
-
-	// UpgradeHeader is the HTTP Upgrade header name.
-	UpgradeHeader = "Upgrade"
-
 	// UpgradeProtocol is the protocol value used in HTTP Upgrade for reverse tunnels.
 	UpgradeProtocol = "snigateway-tunnel"
 )

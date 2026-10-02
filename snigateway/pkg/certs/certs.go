@@ -29,15 +29,6 @@ import (
 	"time"
 )
 
-const (
-	CACertFilename     = "ca.crt"
-	CAKeyFilename      = "ca.key"
-	ServerCertFilename = "server.crt"
-	ServerKeyFilename  = "server.key"
-	ClientCertFilename = "client.crt"
-	ClientKeyFilename  = "client.key"
-)
-
 // CertificatePair holds PEM-encoded certificate and private key.
 type CertificatePair struct {
 	CertPEM []byte
@@ -209,12 +200,12 @@ func GenerateAndWriteCertificates(dir string, serverName string, clientCN string
 		data  []byte
 		perms os.FileMode
 	}{
-		{CACertFilename, certs.CA.CertPEM, 0644},
-		{CAKeyFilename, certs.CA.KeyPEM, 0600},
-		{ServerCertFilename, certs.Server.CertPEM, 0644},
-		{ServerKeyFilename, certs.Server.KeyPEM, 0600},
-		{ClientCertFilename, certs.Client.CertPEM, 0644},
-		{ClientKeyFilename, certs.Client.KeyPEM, 0600},
+		{"ca.crt", certs.CA.CertPEM, 0644},
+		{"ca.key", certs.CA.KeyPEM, 0600},
+		{"server.crt", certs.Server.CertPEM, 0644},
+		{"server.key", certs.Server.KeyPEM, 0600},
+		{"client.crt", certs.Client.CertPEM, 0644},
+		{"client.key", certs.Client.KeyPEM, 0600},
 	}
 
 	for _, f := range files {

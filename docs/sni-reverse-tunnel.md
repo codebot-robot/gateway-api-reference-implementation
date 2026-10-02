@@ -1,9 +1,8 @@
 # Example Accelerator: SNI Front-End with Reverse Tunnels
 
-This document describes an example of the
-[fallback + acceleration](accelerated-operations.md) model: a lightweight SNI
-proxy (`snigateway-frontend`) runs on a front-end node, and the cluster reverse-tunnels the TLS
-services it wants to expose to it. This serves as an example of functionality offload (offloading public ingress routing and connection termination) rather than performance offload.
+This document describes the design of the SNI reverse tunnel proxy (`snigateway`), which serves as an example of the "fallback + acceleration" model described in [docs/accelerated-operations.md](accelerated-operations.md) — albeit one based around **functionality offload** (offloading public ingress routing and connection termination) rather than performance offload.
+
+In this model, a lightweight SNI proxy (`snigateway-frontend`) runs on a front-end node (e.g. a public VM or edge node), while clusters located in private networks, behind firewalls, or behind NAT reverse-tunnel the TLS services they want to expose to it.
 
 ## Motivation
 

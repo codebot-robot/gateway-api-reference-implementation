@@ -90,7 +90,7 @@ func (c *Client) Register(ctx context.Context, hostnames []string) (*api.Registr
 		return nil, fmt.Errorf("marshaling registration request: %w", err)
 	}
 
-	url := fmt.Sprintf("https://%s%s", c.internalHostname, api.RegistrationPath)
+	url := fmt.Sprintf("https://%s/v1/registration", c.internalHostname)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("creating registration request: %w", err)
@@ -118,7 +118,12 @@ func (c *Client) Register(ctx context.Context, hostnames []string) (*api.Registr
 
 // StreamConnections opens a long-lived connections stream from the frontend and invokes onEvent for each incoming connection.
 func (c *Client) StreamConnections(ctx context.Context, onEvent func(ctx context.Context, event *api.ConnectionEvent) error) error {
-	url := fmt.Sprintf("https://%s%s", c.internalHostname, api.ConnectionsPath)
+	return c.StreamConnectionsWithReady(ctx, nil, onEvent)
+}
+
+// StreamConnectionsWithReady opens a connections stream, signals ready when connected, and invokes onEvent for each incoming connection.
+func (c *Client) StreamConnectionsWithReady(ctx context.Context, ready chan<- struct{}, onEvent func(ctx context.Context, event *api.ConnectionEvent) error) error {
+	url := fmt.Sprintf("https://%s/v1/connections", c.internalHostname)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("creating connections stream request: %w", err)
@@ -134,6 +139,10 @@ func (c *Client) StreamConnections(ctx context.Context, onEvent func(ctx context
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("connections stream failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if ready != nil {
+		close(ready)
 	}
 
 	reader := bufio.NewReader(resp.Body)
@@ -173,7 +182,7 @@ func (c *Client) DialTunnel(ctx context.Context, connID string) (net.Conn, error
 		return nil, fmt.Errorf("dialing frontend mTLS: %w", err)
 	}
 
-	urlPath := api.ConnectionsPrefix + connID
+	urlPath := "/v1/connections/" + connID
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlPath, nil)
 	if err != nil {
 		_ = tlsConn.Close()
@@ -233,12 +242,13 @@ func (c *Client) Serve(ctx context.Context, hostnames []string, handler func(ctx
 	})
 }
 
-// HandleTunnelConnects opens connections stream, registers hostnames, and for each event dials back and passes tunnel to handler.
+// Run opens connections stream, registers hostnames, and for each event dials back and passes tunnel to handler.
 func (c *Client) Run(ctx context.Context, hostnames []string, handler func(ctx context.Context, connID string, hostname string, tunnel net.Conn)) error {
 	errCh := make(chan error, 1)
+	readyCh := make(chan struct{})
 
 	go func() {
-		err := c.StreamConnections(ctx, func(ctx context.Context, event *api.ConnectionEvent) error {
+		err := c.StreamConnectionsWithReady(ctx, readyCh, func(ctx context.Context, event *api.ConnectionEvent) error {
 			go func(ev *api.ConnectionEvent) {
 				dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				defer cancel()
@@ -254,8 +264,14 @@ func (c *Client) Run(ctx context.Context, hostnames []string, handler func(ctx c
 		errCh <- err
 	}()
 
-	// Small delay to ensure stream is established before registration, then register
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-readyCh:
+	case err := <-errCh:
+		return fmt.Errorf("establishing connections stream: %w", err)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	if _, err := c.Register(ctx, hostnames); err != nil {
 		return fmt.Errorf("registering hostnames: %w", err)
 	}
