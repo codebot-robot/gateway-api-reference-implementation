@@ -135,6 +135,7 @@ func (r *HTTPRouteReconciler) updateProxy() {
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.HTTPRoute{}).
+		// A Gateway update invalidates all the HTTPRoutes that reference it
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			gw := obj.(*gatewayv1.Gateway)
 			var routeList gatewayv1.HTTPRouteList
@@ -148,7 +149,7 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					if parentNamespace := state.ValueOf(parentRef.Namespace); parentNamespace != "" {
 						targetNamespace = string(parentNamespace)
 					}
-					if string(parentRef.Name) == gw.Name && (targetNamespace == "" || targetNamespace == gw.Namespace) {
+					if string(parentRef.Name) == gw.Name && targetNamespace == gw.Namespace {
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
 								Namespace: route.Namespace,
@@ -161,6 +162,7 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return requests
 		})).
+		// A Service update invalidates all the HTTPRoutes that reference it
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			svc := obj.(*corev1.Service)
 			var routeList gatewayv1.HTTPRouteList
