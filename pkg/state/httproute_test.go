@@ -274,6 +274,75 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 			expectedStatus: metav1.ConditionTrue,
 			expectedReason: string(gatewayv1.RouteReasonResolvedRefs),
 		},
+		{
+			name: "partially invalid cross-namespace backend ref with selective ReferenceGrant",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-route",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										BackendRef: gatewayv1.BackendRef{
+											BackendObjectReference: gatewayv1.BackendObjectReference{
+												Namespace: Ptr(gatewayv1.Namespace("app-ns")),
+												Name:      "app-backend-v2",
+											},
+										},
+									},
+								},
+							},
+							{
+								BackendRefs: []gatewayv1.HTTPBackendRef{
+									{
+										BackendRef: gatewayv1.BackendRef{
+											BackendObjectReference: gatewayv1.BackendObjectReference{
+												Namespace: Ptr(gatewayv1.Namespace("app-ns")),
+												Name:      "app-backend-v1",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "app-ns", Name: "app-backend-v1"}: {},
+				{Namespace: "app-ns", Name: "app-backend-v2"}: {},
+			},
+			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "app-ns",
+						Name:      "grant-v1-only",
+					},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "HTTPRoute",
+								Namespace: "default",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "Service",
+								Name:  Ptr(gatewayv1beta1.ObjectName("app-backend-v1")),
+							},
+						},
+					},
+				},
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonRefNotPermitted),
+		},
 	}
 
 	for _, tt := range tests {
