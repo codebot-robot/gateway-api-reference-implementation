@@ -63,7 +63,10 @@ stays a simple, separate SNI proxy.
 
 The `snigateway` module contains the frontend and supporting packages:
 - `snigateway/cmd/snigateway-frontend`: The frontend server binary with `generate-certs` subcommand.
+- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client.
 - `snigateway/pkg/sni`: TLS ClientHello sniffing and parsing.
 - `snigateway/pkg/frontend`: Registration table, mTLS API server, and reverse-tunnel splicing.
 - `snigateway/pkg/certs`: In-memory and on-disk CA/server/client certificate generation.
 - `snigateway/pkg/client`: Reusable client library for in-cluster controllers.
+- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction, and connection manager.
+- `snigateway/k8s/`: Kubernetes manifests (RBAC, GatewayClass, Deployment, example Gateway/Route).
