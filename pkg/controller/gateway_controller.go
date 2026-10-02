@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type GatewayClassReconciler struct {
@@ -271,14 +272,17 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					ns = string(*ref.Namespace)
 				}
 				if ns != gw.Namespace {
-					resolvedRefsStatus = metav1.ConditionFalse
-					resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
-					resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted", ns, string(ref.Name))
+					referenceGrants := r.State.GetReferenceGrants()
+					if !state.IsReferencePermitted(gatewayv1.GroupName, "Gateway", gw.Namespace, string(group), string(kind), ns, string(ref.Name), referenceGrants) {
+						resolvedRefsStatus = metav1.ConditionFalse
+						resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
+						resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", ns, string(ref.Name))
 
-					programmedStatus = metav1.ConditionFalse
-					programmedReason = gatewayv1.ListenerReasonInvalid
-					programmedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted", ns, string(ref.Name))
-					break
+						programmedStatus = metav1.ConditionFalse
+						programmedReason = gatewayv1.ListenerReasonInvalid
+						programmedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", ns, string(ref.Name))
+						break
+					}
 				}
 
 				secret, ok := secrets[types.NamespacedName{Namespace: ns, Name: string(ref.Name)}]
@@ -505,6 +509,28 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					}
 					return requests
 				}
+			}
+			return nil
+		})).
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			rg := obj.(*gatewayv1beta1.ReferenceGrant)
+			var gwList gatewayv1.GatewayList
+			if err := r.List(ctx, &gwList); err == nil {
+				var requests []ctrl.Request
+				for _, gw := range gwList.Items {
+					for _, from := range rg.Spec.From {
+						if (string(from.Group) == gatewayv1.GroupName || string(from.Group) == "") && string(from.Kind) == "Gateway" && string(from.Namespace) == gw.Namespace {
+							requests = append(requests, ctrl.Request{
+								NamespacedName: types.NamespacedName{
+									Namespace: gw.Namespace,
+									Name:      gw.Name,
+								},
+							})
+							break
+						}
+					}
+				}
+				return requests
 			}
 			return nil
 		})).

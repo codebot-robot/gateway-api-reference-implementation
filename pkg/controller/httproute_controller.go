@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type HTTPRouteReconciler struct {
@@ -58,6 +59,8 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Update status
 	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
+	services := r.State.GetServices()
+	referenceGrants := r.State.GetReferenceGrants()
 	rs := state.HTTPRouteState{HTTPRoute: route}
 
 	var newParents []gatewayv1.RouteParentStatus
@@ -72,7 +75,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
 				acceptedCondition,
-				rs.ComputeResolvedRefsCondition(),
+				rs.ComputeResolvedRefsCondition(services, referenceGrants),
 			},
 		})
 	}
@@ -162,26 +165,58 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return requests
 		})).
-		// A Service update invalidates all the HTTPRoutes that reference it
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			svc := obj.(*corev1.Service)
+		// A ReferenceGrant update invalidates all the HTTPRoutes in referenced namespaces
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			rg := obj.(*gatewayv1beta1.ReferenceGrant)
 			var routeList gatewayv1.HTTPRouteList
-			if err := r.List(ctx, &routeList, client.InNamespace(svc.Namespace)); err != nil {
+			if err := r.List(ctx, &routeList); err != nil {
 				return nil
 			}
 			var requests []ctrl.Request
 			for _, route := range routeList.Items {
+				for _, from := range rg.Spec.From {
+					if (string(from.Group) == gatewayv1.GroupName || string(from.Group) == "") && string(from.Kind) == "HTTPRoute" && string(from.Namespace) == route.Namespace {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: route.Namespace,
+								Name:      route.Name,
+							},
+						})
+						break
+					}
+				}
+			}
+			return requests
+		})).
+		// A Service update invalidates all the HTTPRoutes that reference it
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			svc := obj.(*corev1.Service)
+			var routeList gatewayv1.HTTPRouteList
+			if err := r.List(ctx, &routeList); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, route := range routeList.Items {
+				matched := false
 				for _, rule := range route.Spec.Rules {
 					for _, bRef := range rule.BackendRefs {
-						if string(bRef.Name) == svc.Name {
+						bNs := route.Namespace
+						if bRef.Namespace != nil && string(*bRef.Namespace) != "" {
+							bNs = string(*bRef.Namespace)
+						}
+						if string(bRef.Name) == svc.Name && bNs == svc.Namespace {
 							requests = append(requests, ctrl.Request{
 								NamespacedName: types.NamespacedName{
 									Namespace: route.Namespace,
 									Name:      route.Name,
 								},
 							})
+							matched = true
 							break
 						}
+					}
+					if matched {
+						break
 					}
 				}
 			}

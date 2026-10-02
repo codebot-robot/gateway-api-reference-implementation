@@ -33,10 +33,11 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 	backendTLSPolicies := st.GetBackendTLSPolicies()
 	configMaps := st.GetConfigMaps()
 	secrets := st.GetSecrets()
+	referenceGrants := st.GetReferenceGrants()
 
 	var proxyRoutes []state.InternalRoute
 	for _, gw := range gateways {
-		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, referenceGrants, ControllerName)...)
 	}
 	p.UpdateRoutes(proxyRoutes)
 
@@ -53,6 +54,9 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 						ns := gw.Namespace
 						if ref.Namespace != nil && string(*ref.Namespace) != "" {
 							ns = string(*ref.Namespace)
+						}
+						if ns != gw.Namespace && !state.IsReferencePermitted(gatewayv1.GroupName, "Gateway", gw.Namespace, string(group), string(kind), ns, string(ref.Name), referenceGrants) {
+							continue
 						}
 						secret, ok := secrets[types.NamespacedName{Namespace: ns, Name: string(ref.Name)}]
 						if ok && secret != nil {
