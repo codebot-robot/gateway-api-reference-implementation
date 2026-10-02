@@ -16,6 +16,8 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -202,6 +204,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Compute listener status
 	routes := r.State.GetHTTPRoutes()
+	secrets := r.State.GetSecrets()
 	gs := state.GatewayState{Gateway: gw}
 	var newListenerStatuses []gatewayv1.ListenerStatus
 	for _, listener := range gw.Spec.Listeners {
@@ -229,13 +232,98 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		resolvedRefsStatus := metav1.ConditionTrue
+		resolvedRefsReason := gatewayv1.ListenerReasonResolvedRefs
+		resolvedRefsMessage := "All references resolved"
+
+		programmedStatus := metav1.ConditionTrue
+		programmedReason := gatewayv1.ListenerReasonProgrammed
+		programmedMessage := "Listener programmed"
+
+		if (listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType) && listener.TLS != nil {
+			if len(listener.TLS.CertificateRefs) == 0 {
+				resolvedRefsStatus = metav1.ConditionFalse
+				resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
+				resolvedRefsMessage = "No certificate refs specified"
+
+				programmedStatus = metav1.ConditionFalse
+				programmedReason = gatewayv1.ListenerReasonInvalid
+				programmedMessage = "Invalid TLS configuration: no certificate refs specified"
+			}
+			for _, ref := range listener.TLS.CertificateRefs {
+				group := state.ValueOf(ref.Group)
+				kind := state.ValueOf(ref.Kind)
+				if (group != "" && group != "core") || (kind != "" && kind != "Secret") {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
+					resolvedRefsMessage = fmt.Sprintf("Unsupported certificate ref group %q kind %q", group, kind)
+
+					programmedStatus = metav1.ConditionFalse
+					programmedReason = gatewayv1.ListenerReasonInvalid
+					programmedMessage = fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind)
+					break
+				}
+
+				ns := gw.Namespace
+				if ref.Namespace != nil && string(*ref.Namespace) != "" {
+					ns = string(*ref.Namespace)
+				}
+				if ns != gw.Namespace {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
+					resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted", ns, string(ref.Name))
+
+					programmedStatus = metav1.ConditionFalse
+					programmedReason = gatewayv1.ListenerReasonInvalid
+					programmedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted", ns, string(ref.Name))
+					break
+				}
+
+				secret, ok := secrets[types.NamespacedName{Namespace: ns, Name: string(ref.Name)}]
+				if !ok || secret == nil {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s not found", ns, string(ref.Name))
+
+					programmedStatus = metav1.ConditionFalse
+					programmedReason = gatewayv1.ListenerReasonInvalid
+					programmedMessage = fmt.Sprintf("Secret %s/%s not found", ns, string(ref.Name))
+					break
+				}
+
+				certBytes := secret.Data[corev1.TLSCertKey]
+				keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
+				if len(certBytes) == 0 || len(keyBytes) == 0 {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", ns, string(ref.Name))
+
+					programmedStatus = metav1.ConditionFalse
+					programmedReason = gatewayv1.ListenerReasonInvalid
+					programmedMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", ns, string(ref.Name))
+					break
+				}
+
+				if _, err := tls.X509KeyPair(certBytes, keyBytes); err != nil {
+					resolvedRefsStatus = metav1.ConditionFalse
+					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
+					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", ns, string(ref.Name), err)
+
+					programmedStatus = metav1.ConditionFalse
+					programmedReason = gatewayv1.ListenerReasonInvalid
+					programmedMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", ns, string(ref.Name), err)
+					break
+				}
+			}
+		}
+
 		conds := []metav1.Condition{
 			{
 				Type:               string(gatewayv1.ListenerConditionProgrammed),
-				Status:             metav1.ConditionTrue,
+				Status:             programmedStatus,
 				ObservedGeneration: gw.Generation,
-				Reason:             string(gatewayv1.ListenerReasonProgrammed),
-				Message:            "Listener programmed",
+				Reason:             string(programmedReason),
+				Message:            programmedMessage,
 			},
 			{
 				Type:               string(gatewayv1.ListenerConditionAccepted),
@@ -246,10 +334,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			},
 			{
 				Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-				Status:             metav1.ConditionTrue,
+				Status:             resolvedRefsStatus,
 				ObservedGeneration: gw.Generation,
-				Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-				Message:            "All references resolved",
+				Reason:             string(resolvedRefsReason),
+				Message:            resolvedRefsMessage,
 			},
 		}
 
@@ -411,6 +499,23 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					}
 					return requests
 				}
+			}
+			return nil
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			secret := obj.(*corev1.Secret)
+			var gwList gatewayv1.GatewayList
+			if err := r.List(ctx, &gwList, client.InNamespace(secret.Namespace)); err == nil {
+				var requests []ctrl.Request
+				for _, gw := range gwList.Items {
+					requests = append(requests, ctrl.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: gw.Namespace,
+							Name:      gw.Name,
+						},
+					})
+				}
+				return requests
 			}
 			return nil
 		})).

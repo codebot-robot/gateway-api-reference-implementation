@@ -231,6 +231,16 @@ func TestProxyRedirect(t *testing.T) {
 		expectedLocation string
 	}{
 		{
+			name: "303 redirect status code default path and host",
+			redirect: state.InternalRedirect{
+				StatusCode: state.Ptr(303),
+			},
+			initialURL:       "http://example.com/see-other",
+			initialHost:      "example.com",
+			expectedStatus:   303,
+			expectedLocation: "http://example.com/see-other",
+		},
+		{
 			name: "307 redirect status code default path and host",
 			redirect: state.InternalRedirect{
 				StatusCode: state.Ptr(307),
@@ -241,21 +251,126 @@ func TestProxyRedirect(t *testing.T) {
 			expectedLocation: "http://example.com/temporary",
 		},
 		{
-			name: "307 redirect with full path",
+			name: "308 redirect status code default path and host",
 			redirect: state.InternalRedirect{
-				StatusCode: state.Ptr(307),
-				Path: &state.InternalPathRedirect{
-					Type:  gatewayv1.FullPathHTTPPathModifier,
-					Value: "/new-path",
-				},
+				StatusCode: state.Ptr(308),
 			},
-			initialURL:       "http://example.com/old-path",
+			initialURL:       "http://example.com/permanent",
 			initialHost:      "example.com",
-			expectedStatus:   307,
-			expectedLocation: "http://example.com/new-path",
+			expectedStatus:   308,
+			expectedLocation: "http://example.com/permanent",
 		},
 		{
-			name: "307 redirect with scheme, hostname and port",
+			name: "302 default status code with hostname redirect",
+			redirect: state.InternalRedirect{
+				Hostname: state.Ptr(gatewayv1.PreciseHostname("example.org")),
+			},
+			initialURL:       "http://example.com/hostname-redirect",
+			initialHost:      "example.com",
+			expectedStatus:   302,
+			expectedLocation: "http://example.org/hostname-redirect",
+		},
+		{
+			name: "301 redirect with host and status code",
+			redirect: state.InternalRedirect{
+				Hostname:   state.Ptr(gatewayv1.PreciseHostname("example.org")),
+				StatusCode: state.Ptr(301),
+			},
+			initialURL:       "http://example.com/host-and-status",
+			initialHost:      "example.com",
+			expectedStatus:   301,
+			expectedLocation: "http://example.org/host-and-status",
+		},
+		{
+			name: "redirect with full path",
+			redirect: state.InternalRedirect{
+				StatusCode: state.Ptr(302),
+				Path: &state.InternalPathRedirect{
+					Type:  gatewayv1.FullPathHTTPPathModifier,
+					Value: "/full-path-replacement",
+				},
+			},
+			initialURL:       "http://example.com/full/path/original",
+			initialHost:      "example.com",
+			expectedStatus:   302,
+			expectedLocation: "http://example.com/full-path-replacement",
+		},
+		{
+			name: "redirect with prefix path replacement",
+			redirect: state.InternalRedirect{
+				StatusCode: state.Ptr(302),
+				Path: &state.InternalPathRedirect{
+					Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+					Value: "/replacement-prefix",
+				},
+			},
+			match: &state.InternalMatch{
+				Path: &state.InternalPathMatch{
+					Type:  gatewayv1.PathMatchPathPrefix,
+					Value: "/original-prefix",
+				},
+			},
+			initialURL:       "http://example.com/original-prefix/lemon",
+			initialHost:      "example.com",
+			expectedStatus:   302,
+			expectedLocation: "http://example.com/replacement-prefix/lemon",
+		},
+		{
+			name: "redirect with port override",
+			redirect: state.InternalRedirect{
+				Port: state.Ptr(gatewayv1.PortNumber(8083)),
+			},
+			initialURL:       "http://example.com/port",
+			initialHost:      "example.com",
+			expectedStatus:   302,
+			expectedLocation: "http://example.com:8083/port",
+		},
+		{
+			name: "redirect with scheme https and port 443 omitted",
+			redirect: state.InternalRedirect{
+				Scheme:   state.Ptr("https"),
+				Hostname: state.Ptr(gatewayv1.PreciseHostname("example.org")),
+				Port:     state.Ptr(gatewayv1.PortNumber(443)),
+			},
+			initialURL:       "http://example.com/scheme",
+			initialHost:      "example.com",
+			expectedStatus:   302,
+			expectedLocation: "https://example.org/scheme",
+		},
+		{
+			name: "redirect with scheme https and port nil omits port even if request had port 8080",
+			redirect: state.InternalRedirect{
+				Scheme:   state.Ptr("https"),
+				Hostname: state.Ptr(gatewayv1.PreciseHostname("example.org")),
+			},
+			initialURL:       "http://example.com:8080/scheme",
+			initialHost:      "example.com:8080",
+			expectedStatus:   302,
+			expectedLocation: "https://example.org/scheme",
+		},
+		{
+			name: "redirect with scheme nil inherits request port 8080",
+			redirect: state.InternalRedirect{
+				Hostname: state.Ptr(gatewayv1.PreciseHostname("example.org")),
+			},
+			initialURL:       "http://example.com:8080/scheme-nil-and-port-nil",
+			initialHost:      "example.com:8080",
+			expectedStatus:   302,
+			expectedLocation: "http://example.org:8080/scheme-nil-and-port-nil",
+		},
+		{
+			name: "redirect with scheme nil and explicit port 80 omits port 80",
+			redirect: state.InternalRedirect{
+				Hostname: state.Ptr(gatewayv1.PreciseHostname("example.org")),
+				Port:     state.Ptr(gatewayv1.PortNumber(80)),
+			},
+			initialURL:       "http://example.com:8080/scheme-nil-and-port-80",
+			initialHost:      "example.com:8080",
+			expectedStatus:   302,
+			expectedLocation: "http://example.org/scheme-nil-and-port-80",
+		},
+		{
+			name: "redirect with scheme https and custom port 8443",
 			redirect: state.InternalRedirect{
 				Scheme:     state.Ptr("https"),
 				Hostname:   state.Ptr(gatewayv1.PreciseHostname("foo.example.com")),

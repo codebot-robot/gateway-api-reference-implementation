@@ -582,6 +582,116 @@ func TestBuildInternalRoutes(t *testing.T) {
 			},
 		},
 		{
+			name: "route with request redirect full options",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "redirect-test",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											Path: &gatewayv1.HTTPPathMatch{
+												Type:  Ptr(gatewayv1.PathMatchPathPrefix),
+												Value: Ptr("/see-other"),
+											},
+										},
+									},
+									Filters: []gatewayv1.HTTPRouteFilter{
+										{
+											Type: gatewayv1.HTTPRouteFilterRequestRedirect,
+											RequestRedirect: &gatewayv1.HTTPRequestRedirectFilter{
+												Scheme:     Ptr("https"),
+												Hostname:   Ptr(gatewayv1.PreciseHostname("example.org")),
+												Port:       Ptr(gatewayv1.PortNumber(8443)),
+												StatusCode: Ptr(303),
+												Path: &gatewayv1.HTTPPathModifier{
+													Type:               gatewayv1.PrefixMatchHTTPPathModifier,
+													ReplacePrefixMatch: Ptr("/replacement-prefix"),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Matches: []InternalMatch{
+								{
+									Path: &InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/see-other",
+									},
+								},
+							},
+							Redirect: &InternalRedirect{
+								Scheme:     Ptr("https"),
+								Hostname:   Ptr(gatewayv1.PreciseHostname("example.org")),
+								Port:       Ptr(gatewayv1.PortNumber(8443)),
+								StatusCode: Ptr(303),
+								Path: &InternalPathRedirect{
+									Type:  gatewayv1.PrefixMatchHTTPPathModifier,
+									Value: "/replacement-prefix",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name: "invalid backend kind",
 			gateway: &GatewayState{
 				Gateway: &gatewayv1.Gateway{

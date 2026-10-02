@@ -34,20 +34,66 @@ import (
 
 // Proxy is a minimal implementation of a Gateway API proxy.
 type Proxy struct {
-	mu     sync.RWMutex
-	routes []state.InternalRoute
+	mu           sync.RWMutex
+	routes       []state.InternalRoute
+	certificates map[string]*tls.Certificate
+	defaultCert  *tls.Certificate
 }
 
 func NewProxy() *Proxy {
 	return &Proxy{
-		routes: []state.InternalRoute{},
+		routes:       []state.InternalRoute{},
+		certificates: make(map[string]*tls.Certificate),
 	}
+}
+
+func (p *Proxy) SetDefaultCertificate(cert *tls.Certificate) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.defaultCert = cert
 }
 
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.routes = routes
+}
+
+func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.certificates = certs
+	if defaultCert != nil {
+		p.defaultCert = defaultCert
+	}
+}
+
+func (p *Proxy) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if hello != nil && hello.ServerName != "" {
+		sni := strings.ToLower(hello.ServerName)
+		if cert, ok := p.certificates[sni]; ok {
+			return cert, nil
+		}
+		parts := strings.Split(sni, ".")
+		if len(parts) > 1 {
+			wildcard := "*." + strings.Join(parts[1:], ".")
+			if cert, ok := p.certificates[wildcard]; ok {
+				return cert, nil
+			}
+		}
+	}
+
+	if p.defaultCert != nil {
+		return p.defaultCert, nil
+	}
+
+	if hello != nil && hello.ServerName != "" {
+		return nil, fmt.Errorf("no certificate found for server name %s", hello.ServerName)
+	}
+	return nil, fmt.Errorf("no default certificate available")
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -140,36 +186,55 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 		RawQuery: r.URL.RawQuery,
 	}
 
-	// Inherit scheme
+	// Determine scheme
+	targetScheme := "http"
 	if r.TLS != nil {
-		newURL.Scheme = "https"
-	} else {
-		newURL.Scheme = "http"
+		targetScheme = "https"
 	}
 	if scheme := state.ValueOf(redirect.Scheme); scheme != "" {
-		newURL.Scheme = scheme
+		targetScheme = scheme
+	}
+	newURL.Scheme = targetScheme
+
+	// Determine host and port
+	inHost, inPort, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		inHost = r.Host
+		inPort = ""
 	}
 
-	// Inherit host and port
-	newURL.Host = r.Host
-
+	targetHost := inHost
 	if hostname := state.ValueOf(redirect.Hostname); hostname != "" {
-		h, port, err := net.SplitHostPort(newURL.Host)
-		if err != nil {
-			// No port in current Host
-			newURL.Host = string(hostname)
-		} else {
-			_ = h
-			newURL.Host = net.JoinHostPort(string(hostname), port)
-		}
+		targetHost = string(hostname)
 	}
 
-	if port := state.ValueOf(redirect.Port); port != 0 {
-		h, _, err := net.SplitHostPort(newURL.Host)
-		if err != nil {
-			h = newURL.Host
+	var targetPort string
+	if redirect.Port != nil {
+		targetPort = fmt.Sprintf("%d", *redirect.Port)
+	} else if redirect.Scheme != nil && *redirect.Scheme != "" {
+		// If redirect scheme is not-empty, the redirect port MUST be the well-known port associated with the redirect scheme.
+		// Specifically "http" to port 80 and "https" to port 443.
+		if targetScheme == "http" {
+			targetPort = "80"
+		} else if targetScheme == "https" {
+			targetPort = "443"
 		}
-		newURL.Host = net.JoinHostPort(h, fmt.Sprintf("%d", port))
+	} else {
+		// If redirect scheme is empty, the redirect port MUST be the Gateway Listener port.
+		targetPort = inPort
+	}
+
+	// Implementations SHOULD NOT add the port number in the 'Location' header if:
+	// - HTTP and port 80
+	// - HTTPS and port 443
+	if (targetScheme == "http" && targetPort == "80") || (targetScheme == "https" && targetPort == "443") {
+		targetPort = ""
+	}
+
+	if targetPort != "" {
+		newURL.Host = net.JoinHostPort(targetHost, targetPort)
+	} else {
+		newURL.Host = targetHost
 	}
 
 	if redirect.Path != nil {
