@@ -37,13 +37,17 @@ import (
 
 type BackendTLSPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	ControllerName   string
+	OnGatewaysUpdate func([]*gatewayv1.Gateway)
 }
 
 func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
+
+	controllerName := r.ControllerName
 
 	policy := &gatewayv1.BackendTLSPolicy{}
 	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
@@ -169,7 +173,7 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	for _, gw := range gateways {
 		usesPolicy := false
 		for _, route := range routes {
-			if route.MatchesGateway(gw.Gateway, ControllerName) {
+			if route.MatchesGateway(gw.Gateway, controllerName) {
 				for _, rule := range route.Spec.Rules {
 					for _, backendRef := range rule.BackendRefs {
 						if string(state.ValueOf(backendRef.Kind)) == "Service" || state.ValueOf(backendRef.Kind) == "" {
@@ -204,7 +208,7 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 					Namespace: state.Ptr(gatewayv1.Namespace(gw.Namespace)),
 					Name:      gatewayv1.ObjectName(gw.Name),
 				},
-				ControllerName: gatewayv1.GatewayController(ControllerName),
+				ControllerName: gatewayv1.GatewayController(controllerName),
 				Conditions: []metav1.Condition{
 					{
 						Type:               string(gatewayv1.PolicyConditionAccepted),
@@ -280,10 +284,13 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 }
 
 func (r *BackendTLSPolicyReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
+	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
 func (r *BackendTLSPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ControllerName == "" {
+		return fmt.Errorf("ControllerName is required")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.BackendTLSPolicy{}).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {

@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -24,14 +25,17 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type ReferenceGrantReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	ControllerName   string
+	OnGatewaysUpdate func([]*gatewayv1.Gateway)
 }
 
 func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -55,10 +59,13 @@ func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 
 func (r *ReferenceGrantReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
+	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
 func (r *ReferenceGrantReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ControllerName == "" {
+		return fmt.Errorf("ControllerName is required")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1beta1.ReferenceGrant{}).
 		Complete(r)

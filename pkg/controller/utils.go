@@ -17,6 +17,7 @@ package controller
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
@@ -24,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -44,7 +46,110 @@ func ResolveNamespacedName[N ~string, M ~string](namespace *N, name M, src clien
 	}
 }
 
-func updateProxy(st *state.State, p *proxy.Proxy) {
+// ReconcilerOptions contains configuration for setting up GARI reconcilers.
+type ReconcilerOptions struct {
+	ControllerName   string
+	OnGatewaysUpdate func([]*gatewayv1.Gateway)
+}
+
+// RegisterReconcilers registers all GARI reconcilers with the given Manager.
+func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts ReconcilerOptions) error {
+	controllerName := opts.ControllerName
+	if controllerName == "" {
+		controllerName = DefaultControllerName
+	}
+	if err := (&HTTPRouteReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
+	}
+
+	if err := (&GatewayClassReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		ControllerName: controllerName,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating GatewayClass controller: %w", err)
+	}
+
+	if err := (&GatewayReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Gateway controller: %w", err)
+	}
+
+	if err := (&ServiceReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Service controller: %w", err)
+	}
+
+	if err := (&BackendTLSPolicyReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
+	}
+
+	if err := (&ConfigMapReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating ConfigMap controller: %w", err)
+	}
+
+	if err := (&SecretReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Secret controller: %w", err)
+	}
+
+	if err := (&ReferenceGrantReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating ReferenceGrant controller: %w", err)
+	}
+
+	return nil
+}
+
+func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatewaysUpdate func([]*gatewayv1.Gateway)) {
+	if controllerName == "" {
+		controllerName = DefaultControllerName
+	}
 	gateways := st.GetGateways()
 	routes := st.GetHTTPRoutes()
 	services := st.GetServices()
@@ -54,7 +159,7 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 
 	var proxyRoutes []state.InternalRoute
 	for _, gw := range gateways {
-		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, st, ControllerName)...)
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, st, controllerName)...)
 	}
 	p.UpdateRoutes(proxyRoutes)
 
@@ -117,4 +222,14 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 	}
 
 	p.UpdateCertificates(certsMap, defaultCert)
+
+	if onGatewaysUpdate != nil {
+		var resolvedGws []*gatewayv1.Gateway
+		for _, gw := range gateways {
+			if gw.Gateway != nil {
+				resolvedGws = append(resolvedGws, gw.Gateway.DeepCopy())
+			}
+		}
+		onGatewaysUpdate(resolvedGws)
+	}
 }

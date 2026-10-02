@@ -38,7 +38,8 @@ import (
 
 type GatewayClassReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme         *runtime.Scheme
+	ControllerName string
 }
 
 func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -49,7 +50,7 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if gc.Spec.ControllerName != ControllerName {
+	if string(gc.Spec.ControllerName) != r.ControllerName {
 		return ctrl.Result{}, nil
 	}
 
@@ -103,6 +104,9 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 }
 
 func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ControllerName == "" {
+		return fmt.Errorf("ControllerName is required")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.GatewayClass{}).
 		Complete(r)
@@ -110,13 +114,17 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 type GatewayReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	ControllerName   string
+	OnGatewaysUpdate func([]*gatewayv1.Gateway)
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
+
+	controllerName := r.ControllerName
 
 	gw := &gatewayv1.Gateway{}
 	if err := r.Get(ctx, req.NamespacedName, gw); err != nil {
@@ -134,7 +142,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if gc.Spec.ControllerName != ControllerName {
+	if string(gc.Spec.ControllerName) != controllerName {
 		return ctrl.Result{}, nil
 	}
 
@@ -220,7 +228,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				if string(parentRef.Name) == gw.Name && parentNamespace == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
 						if port := state.ValueOf(parentRef.Port); port == 0 || port == listener.Port {
-							if route.IsAcceptedForParentRef(parentRef, ControllerName) {
+							if route.IsAcceptedForParentRef(parentRef, controllerName) {
 								// Also check if the route actually intersects/matches this listener's hostname
 								routeHostnames := route.GetHostnames()
 								listenerHostname := state.ValueOf(listener.Hostname)
@@ -471,10 +479,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 func (r *GatewayReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
+	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ControllerName == "" {
+		return fmt.Errorf("ControllerName is required")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
