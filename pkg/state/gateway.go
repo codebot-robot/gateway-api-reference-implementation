@@ -475,8 +475,6 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 				Hostnames: effectiveHostnames,
 			}
 
-			resolvedRefsCond := route.ComputeResolvedRefsCondition(services, refValidator)
-
 			for _, rule := range route.Spec.Rules {
 				var iRule InternalRule
 				for _, filter := range rule.Filters {
@@ -559,13 +557,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					}
 				}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
-					}
-				} else if iRule.Error != nil {
+				if iRule.Error != nil {
 					// retain filter error
 				} else if iRule.Redirect == nil {
 					for _, backendRef := range rule.BackendRefs {

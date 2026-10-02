@@ -2065,6 +2065,164 @@ func TestBuildInternalRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "partially invalid cross-namespace backend refs with selective ReferenceGrant",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route-partially-invalid",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											Path: &gatewayv1.HTTPPathMatch{
+												Type:  Ptr(gatewayv1.PathMatchPathPrefix),
+												Value: Ptr("/v2"),
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Namespace: Ptr(gatewayv1.Namespace("app-ns")),
+													Name:      "app-backend-v2",
+													Port:      Ptr(gatewayv1.PortNumber(8080)),
+												},
+											},
+										},
+									},
+								},
+								{
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Namespace: Ptr(gatewayv1.Namespace("app-ns")),
+													Name:      "app-backend-v1",
+													Port:      Ptr(gatewayv1.PortNumber(8080)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			services: map[types.NamespacedName]*corev1.Service{
+				{Namespace: "app-ns", Name: "app-backend-v1"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 8080}},
+					},
+				},
+				{Namespace: "app-ns", Name: "app-backend-v2"}: {
+					Spec: corev1.ServiceSpec{
+						Ports: []corev1.ServicePort{{Port: 8080}},
+					},
+				},
+			},
+			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "app-ns",
+						Name:      "grant-v1-only",
+					},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "HTTPRoute",
+								Namespace: "default",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "Service",
+								Name:  Ptr(gatewayv1beta1.ObjectName("app-backend-v1")),
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Matches: []InternalMatch{
+								{
+									Path: &InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/v2",
+									},
+								},
+							},
+							Error: &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.RouteConditionResolvedRefs),
+									Status:  metav1.ConditionFalse,
+									Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
+									Message: "Cross-namespace reference to service app-ns/app-backend-v2 is not permitted by any ReferenceGrant",
+								},
+								HTTPStatusCode: http.StatusInternalServerError,
+								HTTPMessage:    "Cross-namespace reference to service app-ns/app-backend-v2 is not permitted by any ReferenceGrant",
+							},
+						},
+						{
+							Backends: []InternalBackend{{Host: "app-backend-v1.app-ns.svc.cluster.local", Port: 8080, Weight: 1}},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
