@@ -15,5 +15,5 @@
 package controller
 
 const (
-	ControllerName = "github.com/gke-labs/gateway-api-reference-implementation"
+	DefaultControllerName = "github.com/gke-labs/gateway-api-reference-implementation"
 )

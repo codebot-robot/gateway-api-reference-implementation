@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
@@ -36,13 +37,17 @@ import (
 
 type HTTPRouteReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	ControllerName   string
+	OnGatewaysUpdate func([]*gatewayv1.Gateway)
 }
 
 func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
+
+	controllerName := r.ControllerName
 
 	route := &gatewayv1.HTTPRoute{}
 	if err := r.Get(ctx, req.NamespacedName, route); err != nil {
@@ -71,7 +76,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 		newParents = append(newParents, gatewayv1.RouteParentStatus{
 			ParentRef:      parentRef,
-			ControllerName: ControllerName,
+			ControllerName: gatewayv1.GatewayController(controllerName),
 			Conditions: []metav1.Condition{
 				acceptedCondition,
 				rs.ComputeResolvedRefsCondition(services, r.State),
@@ -131,10 +136,13 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *HTTPRouteReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
+	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ControllerName == "" {
+		return fmt.Errorf("ControllerName is required")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.HTTPRoute{}).
 		// A Gateway update invalidates all the HTTPRoutes that reference it

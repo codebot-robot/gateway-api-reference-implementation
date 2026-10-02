@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -32,9 +33,11 @@ import (
 
 type ConfigMapReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	State  *state.State
-	Proxy  *proxy.Proxy
+	Scheme           *runtime.Scheme
+	State            *state.State
+	Proxy            *proxy.Proxy
+	ControllerName   string
+	OnGatewaysUpdate func([]*gatewayv1.Gateway)
 }
 
 func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -58,10 +61,13 @@ func (r *ConfigMapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *ConfigMapReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy)
+	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
 func (r *ConfigMapReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ControllerName == "" {
+		return fmt.Errorf("ControllerName is required")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.ConfigMap{}).
 		Watches(&gatewayv1.BackendTLSPolicy{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
