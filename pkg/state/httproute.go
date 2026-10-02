@@ -20,9 +20,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type HTTPRouteState struct {
@@ -195,7 +195,7 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	}
 }
 
-func (s *HTTPRouteState) ComputeResolvedRefsCondition(services map[types.NamespacedName]*corev1.Service, referenceGrants []*gatewayv1beta1.ReferenceGrant) metav1.Condition {
+func (s *HTTPRouteState) ComputeResolvedRefsCondition(services map[types.NamespacedName]*corev1.Service, refValidator ReferenceGrantValidator) metav1.Condition {
 	resolvedRefsStatus := metav1.ConditionTrue
 	resolvedRefsReason := gatewayv1.RouteReasonResolvedRefs
 	resolvedRefsMessage := "All references resolved"
@@ -227,7 +227,16 @@ func (s *HTTPRouteState) ComputeResolvedRefsCondition(services map[types.Namespa
 			}
 
 			if backendNs != s.Namespace {
-				if !IsReferencePermitted(gatewayv1.GroupName, "HTTPRoute", s.Namespace, group, kind, backendNs, string(backendRef.Name), referenceGrants) {
+				from := Reference{
+					GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+					Namespace: s.Namespace,
+				}
+				to := Reference{
+					GroupKind: schema.GroupKind{Group: group, Kind: kind},
+					Namespace: backendNs,
+					Name:      string(backendRef.Name),
+				}
+				if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
 					resolvedRefsStatus = metav1.ConditionFalse
 					resolvedRefsReason = gatewayv1.RouteReasonRefNotPermitted
 					resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to service %s/%s is not permitted by any ReferenceGrant", backendNs, string(backendRef.Name))

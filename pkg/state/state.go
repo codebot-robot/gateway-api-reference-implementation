@@ -64,17 +64,6 @@ func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
 	delete(s.referenceGrants, name)
 }
 
-func (s *State) GetReferenceGrants() []*gatewayv1beta1.ReferenceGrant {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var rgs []*gatewayv1beta1.ReferenceGrant
-	for _, rg := range s.referenceGrants {
-		rgs = append(rgs, rg)
-	}
-	return rgs
-}
-
 func (s *State) UpsertSecret(secret *corev1.Secret) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

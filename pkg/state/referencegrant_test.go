@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
@@ -25,47 +26,48 @@ import (
 func TestIsReferencePermitted(t *testing.T) {
 	tests := []struct {
 		name            string
-		fromGroup       string
-		fromKind        string
-		fromNamespace   string
-		toGroup         string
-		toKind          string
-		toNamespace     string
-		toName          string
+		from            Reference
+		to              Reference
 		referenceGrants []*gatewayv1beta1.ReferenceGrant
 		expected        bool
 	}{
 		{
-			name:          "same namespace reference is always permitted",
-			fromGroup:     gatewayv1.GroupName,
-			fromKind:      "HTTPRoute",
-			fromNamespace: "default",
-			toGroup:       "",
-			toKind:        "Service",
-			toNamespace:   "default",
-			toName:        "my-service",
-			expected:      true,
+			name: "same namespace reference is always permitted",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+				Namespace: "default",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Service"},
+				Namespace: "default",
+				Name:      "my-service",
+			},
+			expected: true,
 		},
 		{
-			name:          "cross namespace reference without any grants is rejected",
-			fromGroup:     gatewayv1.GroupName,
-			fromKind:      "HTTPRoute",
-			fromNamespace: "default",
-			toGroup:       "",
-			toKind:        "Service",
-			toNamespace:   "target-ns",
-			toName:        "my-service",
-			expected:      false,
+			name: "cross namespace reference without any grants is rejected",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+				Namespace: "default",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Service"},
+				Namespace: "target-ns",
+				Name:      "my-service",
+			},
+			expected: false,
 		},
 		{
-			name:          "cross namespace reference with wildcard grant is permitted",
-			fromGroup:     gatewayv1.GroupName,
-			fromKind:      "HTTPRoute",
-			fromNamespace: "default",
-			toGroup:       "",
-			toKind:        "Service",
-			toNamespace:   "target-ns",
-			toName:        "my-service",
+			name: "cross namespace reference with wildcard grant is permitted",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+				Namespace: "default",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Service"},
+				Namespace: "target-ns",
+				Name:      "my-service",
+			},
 			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -92,14 +94,16 @@ func TestIsReferencePermitted(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:          "cross namespace reference with named grant matching specific service is permitted",
-			fromGroup:     gatewayv1.GroupName,
-			fromKind:      "HTTPRoute",
-			fromNamespace: "default",
-			toGroup:       "",
-			toKind:        "Service",
-			toNamespace:   "target-ns",
-			toName:        "my-service",
+			name: "cross namespace reference with named grant matching specific service is permitted",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+				Namespace: "default",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Service"},
+				Namespace: "target-ns",
+				Name:      "my-service",
+			},
 			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -127,14 +131,16 @@ func TestIsReferencePermitted(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:          "cross namespace reference with named grant for different service is rejected",
-			fromGroup:     gatewayv1.GroupName,
-			fromKind:      "HTTPRoute",
-			fromNamespace: "default",
-			toGroup:       "",
-			toKind:        "Service",
-			toNamespace:   "target-ns",
-			toName:        "other-service",
+			name: "cross namespace reference with named grant for different service is rejected",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+				Namespace: "default",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Service"},
+				Namespace: "target-ns",
+				Name:      "other-service",
+			},
 			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -162,14 +168,16 @@ func TestIsReferencePermitted(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:          "cross namespace reference with grant in wrong namespace is rejected",
-			fromGroup:     gatewayv1.GroupName,
-			fromKind:      "HTTPRoute",
-			fromNamespace: "default",
-			toGroup:       "",
-			toKind:        "Service",
-			toNamespace:   "target-ns",
-			toName:        "my-service",
+			name: "cross namespace reference with grant in wrong namespace is rejected",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+				Namespace: "default",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Service"},
+				Namespace: "target-ns",
+				Name:      "my-service",
+			},
 			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -199,13 +207,13 @@ func TestIsReferencePermitted(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := IsReferencePermitted(
-				tt.fromGroup, tt.fromKind, tt.fromNamespace,
-				tt.toGroup, tt.toKind, tt.toNamespace, tt.toName,
-				tt.referenceGrants,
-			)
+			st := NewState()
+			for _, rg := range tt.referenceGrants {
+				st.UpsertReferenceGrant(rg)
+			}
+			actual := st.IsReferencePermitted(tt.from, tt.to)
 			if actual != tt.expected {
-				t.Errorf("IsReferencePermitted() = %v, want %v", actual, tt.expected)
+				t.Errorf("st.IsReferencePermitted() = %v, want %v", actual, tt.expected)
 			}
 		})
 	}

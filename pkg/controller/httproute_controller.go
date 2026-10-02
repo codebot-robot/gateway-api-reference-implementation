@@ -60,7 +60,6 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
 	services := r.State.GetServices()
-	referenceGrants := r.State.GetReferenceGrants()
 	rs := state.HTTPRouteState{HTTPRoute: route}
 
 	var newParents []gatewayv1.RouteParentStatus
@@ -75,7 +74,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
 				acceptedCondition,
-				rs.ComputeResolvedRefsCondition(services, referenceGrants),
+				rs.ComputeResolvedRefsCondition(services, r.State),
 			},
 		})
 	}
@@ -148,11 +147,8 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			var requests []ctrl.Request
 			for _, route := range routeList.Items {
 				for _, parentRef := range route.Spec.ParentRefs {
-					targetNamespace := route.Namespace
-					if parentNamespace := state.ValueOf(parentRef.Namespace); parentNamespace != "" {
-						targetNamespace = string(parentNamespace)
-					}
-					if string(parentRef.Name) == gw.Name && targetNamespace == gw.Namespace {
+					gwKey := ResolveNamespacedName(parentRef.Namespace, parentRef.Name, &route)
+					if gwKey.Name == gw.Name && gwKey.Namespace == gw.Namespace {
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
 								Namespace: route.Namespace,
@@ -200,11 +196,8 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				matched := false
 				for _, rule := range route.Spec.Rules {
 					for _, bRef := range rule.BackendRefs {
-						bNs := route.Namespace
-						if bRef.Namespace != nil && string(*bRef.Namespace) != "" {
-							bNs = string(*bRef.Namespace)
-						}
-						if string(bRef.Name) == svc.Name && bNs == svc.Namespace {
+						svcKey := ResolveNamespacedName(bRef.Namespace, bRef.Name, &route)
+						if svcKey.Name == svc.Name && svcKey.Namespace == svc.Namespace {
 							requests = append(requests, ctrl.Request{
 								NamespacedName: types.NamespacedName{
 									Namespace: route.Namespace,

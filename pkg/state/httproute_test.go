@@ -278,7 +278,11 @@ func TestComputeResolvedRefsCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cond := tt.route.ComputeResolvedRefsCondition(tt.services, tt.referenceGrants)
+			st := NewState()
+			for _, rg := range tt.referenceGrants {
+				st.UpsertReferenceGrant(rg)
+			}
+			cond := tt.route.ComputeResolvedRefsCondition(tt.services, st)
 			if cond.Status != tt.expectedStatus {
 				t.Errorf("ComputeResolvedRefsCondition() Status = %v, want %v", cond.Status, tt.expectedStatus)
 			}
