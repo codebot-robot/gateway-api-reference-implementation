@@ -279,6 +279,7 @@ type InternalRule struct {
 	Redirect *InternalRedirect
 	Rewrite  *InternalRewrite
 	Timeouts *InternalTimeouts
+	Retry    *CompiledHTTPRouteRetry
 	// RequestHeaderModifier defines the request header modifications to apply.
 	RequestHeaderModifier *gatewayv1.HTTPHeaderFilter
 	// ResponseHeaderModifier defines the response header modifications to apply.
@@ -288,6 +289,37 @@ type InternalRule struct {
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
+}
+
+// CompiledHTTPRouteRetry represents the compiled retry configuration for a route rule.
+type CompiledHTTPRouteRetry struct {
+	Source *gatewayv1.HTTPRouteRetry
+
+	Codes    []int
+	Attempts *int
+	Backoff  *time.Duration
+}
+
+// ParseRetry parses gatewayv1.HTTPRouteRetry into CompiledHTTPRouteRetry, returning an error if duration strings are invalid.
+func ParseRetry(retry *gatewayv1.HTTPRouteRetry) (*CompiledHTTPRouteRetry, error) {
+	if retry == nil {
+		return nil, nil
+	}
+	ir := &CompiledHTTPRouteRetry{
+		Source:   retry,
+		Attempts: retry.Attempts,
+	}
+	for _, code := range retry.Codes {
+		ir.Codes = append(ir.Codes, int(code))
+	}
+	if retry.Backoff != nil {
+		d, err := time.ParseDuration(string(*retry.Backoff))
+		if err != nil {
+			return nil, err
+		}
+		ir.Backoff = &d
+	}
+	return ir, nil
 }
 
 // InternalTimeouts represents the timeout configuration for a route rule.

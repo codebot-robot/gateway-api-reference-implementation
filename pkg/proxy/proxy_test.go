@@ -15,7 +15,10 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1509,4 +1513,205 @@ func TestProxyCORS(t *testing.T) {
 			t.Errorf("expected absent Access-Control-Allow-Origin, got %s", got)
 		}
 	})
+}
+
+func TestProxyRetries(t *testing.T) {
+	var requestCount atomic.Int32
+	var failUntil atomic.Int32
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqNum := requestCount.Add(1)
+		if reqNum <= failUntil.Load() {
+			http.Error(w, "Temporary Error", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Success"))
+	}))
+	defer backendServer.Close()
+
+	u, _ := url.Parse(backendServer.URL)
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	p := NewProxy()
+	attempts := 3
+	backoff := 5 * time.Millisecond
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/retry",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+					Retry: &state.CompiledHTTPRouteRetry{
+						Codes:    []int{500},
+						Attempts: &attempts,
+						Backoff:  &backoff,
+					},
+				},
+			},
+		},
+	})
+
+	t.Run("succeeds after 2 retries", func(t *testing.T) {
+		requestCount.Store(0)
+		failUntil.Store(2) // Fails on attempt 0 and 1, succeeds on attempt 2 (1 initial + 2 retries = 3 requests)
+
+		req := httptest.NewRequest("GET", "http://example.com/retry", nil)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if count := requestCount.Load(); count != 3 {
+			t.Errorf("expected 3 requests to backend, got %d", count)
+		}
+	})
+
+	t.Run("fails when retries exceed max attempts", func(t *testing.T) {
+		requestCount.Store(0)
+		failUntil.Store(10) // Fails more times than max attempts (3 retries = 4 total requests)
+
+		req := httptest.NewRequest("GET", "http://example.com/retry", nil)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("expected status 500, got %d", resp.StatusCode)
+		}
+		if count := requestCount.Load(); count != 4 {
+			t.Errorf("expected 4 requests to backend (1 initial + 3 retries), got %d", count)
+		}
+	})
+}
+
+func TestProxyWebSocket(t *testing.T) {
+	// Backend server that supports HTTP 101 Switching Protocols
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack not supported", http.StatusInternalServerError)
+				return
+			}
+			conn, buf, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			// Write 101 response
+			resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+			conn.Write([]byte(resp))
+
+			// Echo loop
+			b := make([]byte, 1024)
+			for {
+				n, err := buf.Read(b)
+				if n > 0 {
+					conn.Write(b[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	u, _ := url.Parse(backendServer.URL)
+	host, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/ws",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:        host,
+							Port:        int32(port),
+							AppProtocol: state.Ptr("kubernetes.io/ws"),
+							Weight:      1,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	proxyServer := httptest.NewServer(p)
+	defer proxyServer.Close()
+
+	// Dial TCP to proxyServer and perform WebSocket handshake
+	proxyURL, _ := url.Parse(proxyServer.URL)
+	conn, err := net.Dial("tcp", proxyURL.Host)
+	if err != nil {
+		t.Fatalf("failed to dial proxy server: %v", err)
+	}
+	defer conn.Close()
+
+	handshake := "GET /ws HTTP/1.1\r\n" +
+		"Host: " + proxyURL.Host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"
+
+	if _, err := conn.Write([]byte(handshake)); err != nil {
+		t.Fatalf("failed to send handshake: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("expected status 101, got %d", resp.StatusCode)
+	}
+
+	// Send message and verify echo
+	msg := []byte("Hello WebSocket!")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("failed to write payload: %v", err)
+	}
+
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		t.Fatalf("failed to read echo: %v", err)
+	}
+	if !bytes.Equal(buf, msg) {
+		t.Errorf("got %q, want %q", string(buf), string(msg))
+	}
 }

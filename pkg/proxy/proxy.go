@@ -15,6 +15,8 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -28,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
@@ -302,7 +305,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if backend.RequestHeaderModifier != nil {
 				p.modifyHeaders(r, *backend.RequestHeaderModifier)
 			}
-			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.CORS, bestRule.Timeouts)
+			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.CORS, bestRule.Timeouts, bestRule.Retry)
 			return
 		}
 
@@ -509,7 +512,32 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts) {
+func isWebSocketRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		containsToken(r.Header.Get("Connection"), "upgrade")
+}
+
+func containsToken(header, token string) bool {
+	for _, v := range strings.Split(header, ",") {
+		if strings.EqualFold(strings.TrimSpace(v), token) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, timeouts *state.InternalTimeouts) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		http.Error(w, "Websocket hijacking not supported", http.StatusInternalServerError)
+		return
+	}
 	reqCtx := r.Context()
 	if timeouts != nil && timeouts.Request != nil && *timeouts.Request > 0 {
 		var cancel context.CancelFunc
@@ -525,7 +553,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	scheme := "http"
-	if state.ValueOf(backend.AppProtocol) == "https" {
+	if state.ValueOf(backend.AppProtocol) == "https" || state.ValueOf(backend.AppProtocol) == "wss" {
 		scheme = "https"
 	}
 
@@ -536,15 +564,52 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		RawQuery: r.URL.RawQuery,
 	}
 
-	outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), r.Body)
+	targetAddr := fmt.Sprintf("%s:%d", backend.Host, backend.Port)
+	var backendConn net.Conn
+	var err error
+
+	if scheme == "https" {
+		tlsConfig := &tls.Config{InsecureSkipVerify: false}
+		if backend.TLSConfig != nil {
+			if backend.TLSConfig.Hostname != "" {
+				tlsConfig.ServerName = backend.TLSConfig.Hostname
+			}
+			if len(backend.TLSConfig.CACerts) > 0 {
+				tlsConfig.RootCAs = x509.NewCertPool()
+				for _, cert := range backend.TLSConfig.CACerts {
+					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
+				}
+			} else {
+				tlsConfig.InsecureSkipVerify = true
+			}
+		} else {
+			tlsConfig.InsecureSkipVerify = true
+		}
+		var d net.Dialer
+		backendConn, err = tls.DialWithDialer(&d, "tcp", targetAddr, tlsConfig)
+	} else {
+		var d net.Dialer
+		backendConn, err = d.DialContext(backendCtx, "tcp", targetAddr)
+	}
+
 	if err != nil {
-		effectiveCORS := respCORS
-		if backend.CORS != nil {
-			effectiveCORS = backend.CORS
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
 		}
-		if effectiveCORS != nil {
-			applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
 		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer backendConn.Close()
+
+	outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), nil)
+	if err != nil {
 		if backend.ResponseHeaderModifier != nil {
 			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
 		}
@@ -556,7 +621,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	outReq.Header = r.Header.Clone()
-	removeHopByHopHeaders(outReq.Header)
+	for _, k := range hopByHopHeaders {
+		if strings.EqualFold(k, "Upgrade") || strings.EqualFold(k, "Connection") {
+			continue
+		}
+		outReq.Header.Del(k)
+	}
 
 	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
@@ -572,6 +642,123 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	outReq.Host = r.Host
+
+	log.Log.Info("Forwarding WebSocket handshake", "host", r.Host, "path", r.URL.Path, "target", targetURL.String())
+
+	if err := outReq.Write(backendConn); err != nil {
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	br := bufio.NewReader(backendConn)
+	resp, err := http.ReadResponse(br, outReq)
+	if err != nil {
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if backend.ResponseHeaderModifier != nil {
+		modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
+	}
+	if respHeaderModifier != nil {
+		modifyHeaders(resp.Header, *respHeaderModifier)
+	}
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		removeHopByHopHeaders(resp.Header)
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, "Hijack failed", http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	if err := resp.Write(clientConn); err != nil {
+		return
+	}
+
+	if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
+		bufferedBytes, _ := io.ReadAll(io.LimitReader(clientBuf, int64(clientBuf.Reader.Buffered())))
+		backendConn.Write(bufferedBytes)
+	}
+	if br.Buffered() > 0 {
+		bufferedBytes, _ := io.ReadAll(io.LimitReader(br, int64(br.Buffered())))
+		clientConn.Write(bufferedBytes)
+	}
+
+	errc := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(backendConn, clientConn)
+		errc <- err
+	}()
+	go func() {
+		_, err := io.Copy(clientConn, backendConn)
+		errc <- err
+	}()
+	<-errc
+}
+
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts, retry *state.CompiledHTTPRouteRetry) {
+	if isWebSocketRequest(r) {
+		p.forwardWebSocket(w, r, backend, respHeaderModifier, timeouts)
+		return
+	}
+
+	reqCtx := r.Context()
+	if timeouts != nil && timeouts.Request != nil && *timeouts.Request > 0 {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(reqCtx, *timeouts.Request)
+		defer cancel()
+	}
+
+	scheme := "http"
+	if state.ValueOf(backend.AppProtocol) == "https" {
+		scheme = "https"
+	}
+
+	targetURL := &url.URL{
+		Scheme:   scheme,
+		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+	}
+
+	var bodyBytes []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+	}
 
 	var transport http.RoundTripper
 	if scheme == "https" {
@@ -606,61 +793,187 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		transport = http.DefaultTransport
 	}
 
-	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", targetURL.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
+	maxRetries := 0
+	if retry != nil && retry.Attempts != nil && *retry.Attempts > 0 {
+		maxRetries = *retry.Attempts
+	}
 
-	resp, err := transport.RoundTrip(outReq)
-	if err != nil {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if reqCtx.Err() != nil {
+			effectiveCORS := respCORS
+			if backend.CORS != nil {
+				effectiveCORS = backend.CORS
+			}
+			if effectiveCORS != nil {
+				applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+			}
+			if backend.ResponseHeaderModifier != nil {
+				modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+			}
+			if respHeaderModifier != nil {
+				modifyHeaders(w.Header(), *respHeaderModifier)
+			}
+			if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+			} else {
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			}
+			return
+		}
+
+		if attempt > 0 && retry != nil && retry.Backoff != nil && *retry.Backoff > 0 {
+			select {
+			case <-time.After(*retry.Backoff):
+			case <-reqCtx.Done():
+				effectiveCORS := respCORS
+				if backend.CORS != nil {
+					effectiveCORS = backend.CORS
+				}
+				if effectiveCORS != nil {
+					applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+				}
+				if backend.ResponseHeaderModifier != nil {
+					modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+				}
+				if respHeaderModifier != nil {
+					modifyHeaders(w.Header(), *respHeaderModifier)
+				}
+				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+				return
+			}
+		}
+
+		backendCtx := reqCtx
+		var cancel context.CancelFunc
+		if timeouts != nil && timeouts.BackendRequest != nil && *timeouts.BackendRequest > 0 {
+			backendCtx, cancel = context.WithTimeout(reqCtx, *timeouts.BackendRequest)
+		}
+
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), bodyReader)
+		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
+			effectiveCORS := respCORS
+			if backend.CORS != nil {
+				effectiveCORS = backend.CORS
+			}
+			if effectiveCORS != nil {
+				applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+			}
+			if backend.ResponseHeaderModifier != nil {
+				modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+			}
+			if respHeaderModifier != nil {
+				modifyHeaders(w.Header(), *respHeaderModifier)
+			}
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			return
+		}
+
+		outReq.Header = r.Header.Clone()
+		removeHopByHopHeaders(outReq.Header)
+
+		if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
+				clientIP = prior + ", " + clientIP
+			}
+			outReq.Header.Set("X-Forwarded-For", clientIP)
+		} else if r.RemoteAddr != "" {
+			if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
+				outReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
+			} else {
+				outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
+			}
+		}
+
+		outReq.Host = r.Host
+
+		log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", targetURL.String(), "appProtocol", state.ValueOf(backend.AppProtocol), "attempt", attempt)
+
+		resp, err := transport.RoundTrip(outReq)
+		if cancel != nil {
+			cancel()
+		}
+
+		if err != nil {
+			if attempt < maxRetries && reqCtx.Err() == nil {
+				continue
+			}
+			effectiveCORS := respCORS
+			if backend.CORS != nil {
+				effectiveCORS = backend.CORS
+			}
+			if effectiveCORS != nil {
+				applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+			}
+			if backend.ResponseHeaderModifier != nil {
+				modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+			}
+			if respHeaderModifier != nil {
+				modifyHeaders(w.Header(), *respHeaderModifier)
+			}
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+				return
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+				return
+			}
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			return
+		}
+
+		shouldRetry := false
+		if retry != nil && attempt < maxRetries {
+			for _, code := range retry.Codes {
+				if resp.StatusCode == code {
+					shouldRetry = true
+					break
+				}
+			}
+		}
+
+		if shouldRetry {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 1024*1024))
+			resp.Body.Close()
+			continue
+		}
+
+		defer resp.Body.Close()
+
 		effectiveCORS := respCORS
 		if backend.CORS != nil {
 			effectiveCORS = backend.CORS
 		}
 		if effectiveCORS != nil {
-			applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+			applyCORSHeaders(resp.Header, r, effectiveCORS, false)
 		}
+
 		if backend.ResponseHeaderModifier != nil {
-			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+			modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
 		}
 		if respHeaderModifier != nil {
-			modifyHeaders(w.Header(), *respHeaderModifier)
+			modifyHeaders(resp.Header, *respHeaderModifier)
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
-			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-			return
+
+		removeHopByHopHeaders(resp.Header)
+
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
 		}
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
-			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
-			return
-		}
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
 		return
 	}
-	defer resp.Body.Close()
-
-	effectiveCORS := respCORS
-	if backend.CORS != nil {
-		effectiveCORS = backend.CORS
-	}
-	if effectiveCORS != nil {
-		applyCORSHeaders(resp.Header, r, effectiveCORS, false)
-	}
-
-	if backend.ResponseHeaderModifier != nil {
-		modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
-	}
-	if respHeaderModifier != nil {
-		modifyHeaders(resp.Header, *respHeaderModifier)
-	}
-
-	removeHopByHopHeaders(resp.Header)
-
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 func matchOrigin(allowedOrigins []gatewayv1.CORSOrigin, reqOrigin string) bool {
