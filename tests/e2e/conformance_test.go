@@ -119,7 +119,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteInvalidReferenceGrant,
 		tests.HTTPRouteListenerHostnameMatching,
 		tests.HTTPRouteMatching,
-		tests.HTTPRouteMethodMatching, // Fails on HTTPRouteMethodMatching/11 with headers under v1.5.0
+		tests.HTTPRouteMethodMatching,
 		tests.HTTPRoutePartiallyInvalidViaInvalidReferenceGrant,
 		tests.HTTPRoutePathMatchOrder,
 		tests.HTTPRouteRedirectHostAndStatus,

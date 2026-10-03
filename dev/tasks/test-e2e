@@ -61,5 +61,4 @@ echo "Running basic E2E tests..."
 go test -v ./tests/e2e/... -run TestGatewayAPI
 
 echo "Running Gateway API Conformance tests..."
-# We expect these to fail initially, so we don't fail the task.
-go test -v ./tests/e2e/... -run TestConformance || echo "Conformance tests failed (expected)"
+go test -v ./tests/e2e/... -run TestConformance
