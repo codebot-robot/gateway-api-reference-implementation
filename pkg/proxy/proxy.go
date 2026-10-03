@@ -125,10 +125,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if len(listeners) > 0 {
 		if r.TLS != nil {
+			reqHost := r.Host
+			reqPort := int32(443)
+			if h, pStr, err := net.SplitHostPort(reqHost); err == nil {
+				reqHost = h
+				if p, err := strconv.Atoi(pStr); err == nil {
+					reqPort = int32(p)
+				}
+			}
+			reqHost = strings.ToLower(reqHost)
+
 			var httpsListeners []state.InternalListener
 			for _, l := range listeners {
 				if l.Protocol == gatewayv1.HTTPSProtocolType {
-					httpsListeners = append(httpsListeners, l)
+					if l.Port == 0 || int32(l.Port) == reqPort {
+						httpsListeners = append(httpsListeners, l)
+					}
 				}
 			}
 
@@ -139,12 +151,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, fmt.Sprintf("No listener for server name %s", sni), http.StatusNotFound)
 					return
 				}
-
-				reqHost := r.Host
-				if h, _, err := net.SplitHostPort(reqHost); err == nil {
-					reqHost = h
-				}
-				reqHost = strings.ToLower(reqHost)
 
 				reqHostListeners, reqMatchType := state.MatchListeners(httpsListeners, reqHost)
 
@@ -198,20 +204,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				routes = connRoutes
 			}
 		} else {
+			reqHost := r.Host
+			reqPort := int32(80)
+			if h, pStr, err := net.SplitHostPort(reqHost); err == nil {
+				reqHost = h
+				if p, err := strconv.Atoi(pStr); err == nil {
+					reqPort = int32(p)
+				}
+			}
+			reqHost = strings.ToLower(reqHost)
+
 			var httpListeners []state.InternalListener
 			for _, l := range listeners {
 				if l.Protocol == gatewayv1.HTTPProtocolType {
-					httpListeners = append(httpListeners, l)
+					if l.Port == 0 || int32(l.Port) == reqPort {
+						httpListeners = append(httpListeners, l)
+					}
 				}
 			}
 
 			if len(httpListeners) > 0 {
-				reqHost := r.Host
-				if h, _, err := net.SplitHostPort(reqHost); err == nil {
-					reqHost = h
-				}
-				reqHost = strings.ToLower(reqHost)
-
 				reqHostListeners, _ := state.MatchListeners(httpListeners, reqHost)
 				if len(reqHostListeners) == 0 {
 					http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)

@@ -68,11 +68,12 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	gateways := r.State.GetGateways()
+	namespaces := r.State.GetNamespaces()
 	var desiredParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {
 		acceptedCondition := validationCondition
 		if acceptedCondition.Status == metav1.ConditionTrue {
-			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways)
+			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways, namespaces)
 		}
 
 		desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
@@ -187,6 +188,24 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						break
 					}
 				}
+			}
+			return requests
+		})).
+		// A Namespace update invalidates all the HTTPRoutes in that namespace
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			ns := obj.(*corev1.Namespace)
+			var routeList gatewayv1.HTTPRouteList
+			if err := r.List(ctx, &routeList, client.InNamespace(ns.Name)); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, route := range routeList.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: route.Namespace,
+						Name:      route.Name,
+					},
+				})
 			}
 			return requests
 		})).

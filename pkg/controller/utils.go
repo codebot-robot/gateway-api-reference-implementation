@@ -143,6 +143,17 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		return fmt.Errorf("error creating ReferenceGrant controller: %w", err)
 	}
 
+	if err := (&NamespaceReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating Namespace controller: %w", err)
+	}
+
 	return nil
 }
 
