@@ -113,3 +113,50 @@ func TestRegistrationTable(t *testing.T) {
 		t.Fatalf("expected client-a for new.domain.com")
 	}
 }
+
+func TestRegistrationTable_MultipleClientsPerHostname(t *testing.T) {
+	tbl := NewRegistrationTable()
+
+	// Register 2 clients for the same exact hostname
+	tbl.Register("client-1", []string{"shared.example.com", "*.shared.wildcard"})
+	tbl.Register("client-2", []string{"shared.example.com", "*.shared.wildcard"})
+
+	// Matching exact hostname should round-robin between client-1 and client-2
+	m1, ok1 := tbl.Match("shared.example.com")
+	m2, ok2 := tbl.Match("shared.example.com")
+	m3, ok3 := tbl.Match("shared.example.com")
+
+	if !ok1 || !ok2 || !ok3 {
+		t.Fatalf("expected matches for shared.example.com")
+	}
+	if m1 != "client-1" || m2 != "client-2" || m3 != "client-1" {
+		t.Fatalf("expected round robin [client-1, client-2, client-1], got [%s, %s, %s]", m1, m2, m3)
+	}
+
+	// Matching wildcard should also round-robin
+	w1, wok1 := tbl.Match("foo.shared.wildcard")
+	w2, wok2 := tbl.Match("bar.shared.wildcard")
+	w3, wok3 := tbl.Match("baz.shared.wildcard")
+
+	if !wok1 || !wok2 || !wok3 {
+		t.Fatalf("expected matches for wildcard")
+	}
+	if w1 != "client-1" || w2 != "client-2" || w3 != "client-1" {
+		t.Fatalf("expected round robin wildcard [client-1, client-2, client-1], got [%s, %s, %s]", w1, w2, w3)
+	}
+
+	// Unregister client-1; client-2 should now get all requests
+	tbl.Unregister("client-1")
+	u1, uok1 := tbl.Match("shared.example.com")
+	u2, uok2 := tbl.Match("shared.example.com")
+	if !uok1 || !uok2 || u1 != "client-2" || u2 != "client-2" {
+		t.Fatalf("expected client-2 after client-1 unregistered, got [%s, %s]", u1, u2)
+	}
+
+	// Unregister client-2; hostname should be not found
+	tbl.Unregister("client-2")
+	_, uok3 := tbl.Match("shared.example.com")
+	if uok3 {
+		t.Fatalf("expected not found after all clients unregistered")
+	}
+}

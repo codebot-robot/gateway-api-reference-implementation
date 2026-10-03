@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -52,9 +53,10 @@ type Server struct {
 	authorizer Authorizer
 	table      *RegistrationTable
 
-	mu      sync.RWMutex
-	clients map[string]chan *api.ConnectionEvent // clientID -> active event stream channel
-	pending map[string]chan net.Conn             // connectionID -> dialback tunnel channel
+	mu        sync.RWMutex
+	clients   map[string][]chan *api.ConnectionEvent // clientID -> slice of active event stream channels
+	clientsRR map[string]int                         // clientID -> round-robin counter for event stream selection
+	pending   map[string]chan net.Conn               // connectionID -> dialback tunnel channel
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -92,7 +94,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		clients:          make(map[string]chan *api.ConnectionEvent),
+		clients:          make(map[string][]chan *api.ConnectionEvent),
+		clientsRR:        make(map[string]int),
 		pending:          make(map[string]chan net.Conn),
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
@@ -215,17 +218,24 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 2. Otherwise look up in registration table
 	clientID, found := s.table.Match(cleanSNI)
 	if !found {
+		log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
 		// No client registered for this hostname; close connection
 		_ = peekedConn.Close()
 		return
 	}
 
-	// Find active event channel for client
-	s.mu.RLock()
-	eventCh, active := s.clients[clientID]
-	s.mu.RUnlock()
+	// Find active event channel for client (round-robin across active streams for this client)
+	s.mu.Lock()
+	var eventCh chan *api.ConnectionEvent
+	if streams, ok := s.clients[clientID]; ok && len(streams) > 0 {
+		idx := s.clientsRR[clientID] % len(streams)
+		s.clientsRR[clientID]++
+		eventCh = streams[idx]
+	}
+	s.mu.Unlock()
 
-	if !active || eventCh == nil {
+	if eventCh == nil {
+		log.Printf("Frontend: rejecting connection with SNI %q: client %q has no active event stream", sniHostname, clientID)
 		_ = peekedConn.Close()
 		return
 	}
@@ -254,6 +264,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	select {
 	case eventCh <- event:
 	case <-time.After(s.config.ConnectTimeout):
+		log.Printf("Frontend: timed out sending event for conn %s (SNI: %q) to client %s", connID, sniHostname, clientID)
 		_ = peekedConn.Close()
 		return
 	}
@@ -267,6 +278,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		spliceConnections(peekedConn, dialedConn)
 	case <-time.After(s.config.ConnectTimeout):
+		log.Printf("Frontend: timed out waiting for dialback for conn %s (SNI: %q) from client %s", connID, sniHostname, clientID)
 		_ = peekedConn.Close()
 	}
 }
@@ -344,11 +356,13 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.table.Register(clientIdentity.ID, req.Hostnames)
+	registered := s.table.GetRegisteredHostnames(clientIdentity.ID)
+	log.Printf("Frontend: client %q registered hostnames: %v", clientIdentity.ID, registered)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
 		Status:    "registered",
-		Hostnames: s.table.GetRegisteredHostnames(clientIdentity.ID),
+		Hostnames: registered,
 	})
 }
 
@@ -373,16 +387,29 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 	eventCh := make(chan *api.ConnectionEvent, 64)
 
 	s.mu.Lock()
-	s.clients[clientIdentity.ID] = eventCh
+	s.clients[clientIdentity.ID] = append(s.clients[clientIdentity.ID], eventCh)
+	activeStreamCount := len(s.clients[clientIdentity.ID])
 	s.mu.Unlock()
+	log.Printf("Frontend: client %q connected to event stream (active streams: %d)", clientIdentity.ID, activeStreamCount)
 
 	defer func() {
 		s.mu.Lock()
-		if s.clients[clientIdentity.ID] == eventCh {
+		var remaining []chan *api.ConnectionEvent
+		for _, ch := range s.clients[clientIdentity.ID] {
+			if ch != eventCh {
+				remaining = append(remaining, ch)
+			}
+		}
+		if len(remaining) == 0 {
 			delete(s.clients, clientIdentity.ID)
+			delete(s.clientsRR, clientIdentity.ID)
+			s.table.Unregister(clientIdentity.ID)
+			log.Printf("Frontend: client %q all event streams closed and unregistered", clientIdentity.ID)
+		} else {
+			s.clients[clientIdentity.ID] = remaining
+			log.Printf("Frontend: client %q event stream closed (remaining active streams: %d)", clientIdentity.ID, len(remaining))
 		}
 		s.mu.Unlock()
-		s.table.Unregister(clientIdentity.ID)
 	}()
 
 	w.Header().Set("Content-Type", "application/x-ndjson")

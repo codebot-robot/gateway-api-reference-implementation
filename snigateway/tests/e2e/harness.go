@@ -209,6 +209,15 @@ func (h *Harness) GetPodLogsInNamespace(namespace, name string) string {
 	return string(out)
 }
 
+func (h *Harness) DumpDeploymentLogs(namespace, name string) {
+	out, err := exec.Command("kubectl", "logs", "deployment/"+name, "--namespace", namespace, "--all-containers=true").CombinedOutput()
+	if err != nil {
+		h.t.Logf("Failed to get deployment logs for %s/%s: %v\nOutput: %s", namespace, name, err, string(out))
+		return
+	}
+	h.t.Logf("=== Logs for deployment %s/%s ===\n%s\n=== End of logs for %s/%s ===", namespace, name, string(out), namespace, name)
+}
+
 func (h *Harness) runCmd(name string, args ...string) string {
 	cmd := exec.Command(name, args...)
 	var stdout, stderr bytes.Buffer

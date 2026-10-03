@@ -101,11 +101,21 @@ func TestSNIGateway(t *testing.T) {
 		h.runCmd("kubectl", "delete", "gateway", "snigateway-test", "--namespace=default", "--ignore-not-found")
 	})
 
+	dumpLogsIfFailed := func(currentT *testing.T) {
+		if currentT.Failed() || t.Failed() {
+			currentT.Log("Dumping snigateway-frontend and snigateway-controller logs on test failure:")
+			h.DumpDeploymentLogs(frontendNS, "snigateway-frontend")
+			h.DumpDeploymentLogs("default", "snigateway-controller")
+		}
+	}
+	t.Cleanup(func() { dumpLogsIfFailed(t) })
+
 	// Wait for controller to reconcile and register
 	time.Sleep(5 * time.Second)
 
 	// Assertion 1: Valid SNI request terminates TLS with Gateway cert and reaches backend
 	t.Run("Valid SNI reaches backend with Gateway TLS cert", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
 		clientPod := "sni-client-valid"
 		h.DeletePod(clientPod)
 		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
@@ -135,6 +145,7 @@ func TestSNIGateway(t *testing.T) {
 
 	// Assertion 2: Unregistered SNI hostname is rejected (connection closed)
 	t.Run("Unregistered SNI is rejected", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
 		clientPod := "sni-client-unregistered"
 		h.DeletePod(clientPod)
 		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
@@ -156,6 +167,7 @@ func TestSNIGateway(t *testing.T) {
 
 	// Assertion 3: Adding a second HTTPS listener hostname to the Gateway makes it routable without restarting
 	t.Run("Adding second HTTPS listener dynamically registers and routes", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
 		// Update Gateway with two listeners: echo.snigateway.test and echo2.snigateway.test
 		h.KubectlApplyContent(h.SNIMultiListenerGatewayManifest())
 		h.KubectlApplyContent(h.SNIHTTPRouteManifest("echo2-route", "snigateway-test", "echo2.snigateway.test", "backend", 8080))
