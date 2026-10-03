@@ -278,6 +278,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					break
 				}
 
+				if kind == "" {
+					kind = "Secret"
+				}
+
 				secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
 				if secretKey.Namespace != gw.Namespace {
 					from := state.Reference{
@@ -555,16 +559,39 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			if err := r.List(ctx, &gwList); err == nil {
 				var requests []ctrl.Request
 				for _, gw := range gwList.Items {
+					match := false
 					for _, from := range rg.Spec.From {
 						if (string(from.Group) == gatewayv1.GroupName || string(from.Group) == "") && string(from.Kind) == "Gateway" && string(from.Namespace) == gw.Namespace {
-							requests = append(requests, ctrl.Request{
-								NamespacedName: types.NamespacedName{
-									Namespace: gw.Namespace,
-									Name:      gw.Name,
-								},
-							})
+							match = true
 							break
 						}
+					}
+					if !match {
+						for _, listener := range gw.Spec.Listeners {
+							if listener.TLS != nil {
+								for _, ref := range listener.TLS.CertificateRefs {
+									refNs := gw.Namespace
+									if ref.Namespace != nil && string(*ref.Namespace) != "" {
+										refNs = string(*ref.Namespace)
+									}
+									if refNs == rg.Namespace {
+										match = true
+										break
+									}
+								}
+							}
+							if match {
+								break
+							}
+						}
+					}
+					if match {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: gw.Namespace,
+								Name:      gw.Name,
+							},
+						})
 					}
 				}
 				return requests
@@ -574,15 +601,25 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			secret := obj.(*corev1.Secret)
 			var gwList gatewayv1.GatewayList
-			if err := r.List(ctx, &gwList, client.InNamespace(secret.Namespace)); err == nil {
+			if err := r.List(ctx, &gwList); err == nil {
 				var requests []ctrl.Request
 				for _, gw := range gwList.Items {
-					requests = append(requests, ctrl.Request{
-						NamespacedName: types.NamespacedName{
-							Namespace: gw.Namespace,
-							Name:      gw.Name,
-						},
-					})
+					for _, listener := range gw.Spec.Listeners {
+						if listener.TLS != nil {
+							for _, ref := range listener.TLS.CertificateRefs {
+								secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, &gw)
+								if secretKey.Namespace == secret.Namespace && secretKey.Name == secret.Name {
+									requests = append(requests, ctrl.Request{
+										NamespacedName: types.NamespacedName{
+											Namespace: gw.Namespace,
+											Name:      gw.Name,
+										},
+									})
+									break
+								}
+							}
+						}
+					}
 				}
 				return requests
 			}

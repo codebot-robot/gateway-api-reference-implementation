@@ -203,6 +203,116 @@ func TestIsReferencePermitted(t *testing.T) {
 			},
 			expected: false,
 		},
+		{
+			name: "gateway cross-namespace secret with wildcard grant is permitted",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+				Namespace: "infra-ns",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Secret"},
+				Namespace: "backend-ns",
+				Name:      "my-secret",
+			},
+			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "backend-ns",
+						Name:      "allow-gateway-secrets",
+					},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "Gateway",
+								Namespace: "infra-ns",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "Secret",
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "gateway cross-namespace secret with specific name grant is permitted",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+				Namespace: "infra-ns",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Secret"},
+				Namespace: "backend-ns",
+				Name:      "my-secret",
+			},
+			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "backend-ns",
+						Name:      "allow-specific-secret",
+					},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "Gateway",
+								Namespace: "infra-ns",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "Secret",
+								Name:  Ptr(gatewayv1.ObjectName("my-secret")),
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "gateway cross-namespace secret with wrong name grant is rejected",
+			from: Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+				Namespace: "infra-ns",
+			},
+			to: Reference{
+				GroupKind: schema.GroupKind{Group: "", Kind: "Secret"},
+				Namespace: "backend-ns",
+				Name:      "my-secret",
+			},
+			referenceGrants: []*gatewayv1beta1.ReferenceGrant{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "backend-ns",
+						Name:      "allow-other-secret",
+					},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "Gateway",
+								Namespace: "infra-ns",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "Secret",
+								Name:  Ptr(gatewayv1.ObjectName("other-secret")),
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {

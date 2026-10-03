@@ -101,6 +101,10 @@ func TestConformance(t *testing.T) {
 		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
 		tests.GatewayInvalidTLSConfiguration,
 		tests.GatewayObservedGenerationBump,
+		tests.GatewaySecretInvalidReferenceGrant,
+		tests.GatewaySecretMissingReferenceGrant,
+		tests.GatewaySecretReferenceGrantAllInNamespace,
+		tests.GatewaySecretReferenceGrantSpecific,
 		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
 		tests.HTTPRoute308Redirect,
