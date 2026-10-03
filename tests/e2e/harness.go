@@ -229,9 +229,8 @@ func (h *Harness) DeployController() {
 	h.runCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
 	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never"}]}}}}`)
 	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "--type=json", "-p", `[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--enable-h2c"}]`)
-	h.runCmd("kubectl", "annotate", "deployment/gari-controller", "restartedAt="+time.Now().Format(time.RFC3339), "--namespace=default", "--overwrite")
-
-	h.WaitForDeployment("gari-controller", 2*time.Minute)
+	h.runCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
+	h.runCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 }
 
 func (h *Harness) BackendManifest() string {
