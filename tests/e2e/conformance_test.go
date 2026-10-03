@@ -106,6 +106,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRoute308Redirect,
 		tests.HTTPRouteBackendProtocolH2C,
 		tests.HTTPRouteBackendRequestHeaderModifier,
+		tests.HTTPRouteCORS,
 		tests.HTTPRouteDisallowedKind,
 		tests.HTTPRouteExactPathMatching,
 		tests.HTTPRouteHeaderMatching,

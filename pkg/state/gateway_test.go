@@ -2317,3 +2317,140 @@ func TestMatchRoute_Method(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildInternalRoutesCORS(t *testing.T) {
+	allowCreds := true
+	corsFilter := &gatewayv1.HTTPCORSFilter{
+		AllowOrigins:     []gatewayv1.CORSOrigin{"https://www.foo.com", "https://*.bar.com"},
+		AllowMethods:     []gatewayv1.HTTPMethodWithWildcard{"GET", "POST", "OPTIONS"},
+		AllowHeaders:     []gatewayv1.HTTPHeaderName{"x-header-1", "x-header-2"},
+		ExposeHeaders:    []gatewayv1.HTTPHeaderName{"x-header-3"},
+		AllowCredentials: &allowCreds,
+		MaxAge:           3600,
+	}
+
+	hr := &HTTPRouteState{
+		HTTPRoute: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "cors-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name: "reference-gateway",
+						},
+					},
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Filters: []gatewayv1.HTTPRouteFilter{
+							{
+								Type: gatewayv1.HTTPRouteFilterCORS,
+								CORS: corsFilter,
+							},
+						},
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Path: &gatewayv1.HTTPPathMatch{
+									Type:  Ptr(gatewayv1.PathMatchPathPrefix),
+									Value: Ptr("/cors"),
+								},
+							},
+						},
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: Ptr(gatewayv1.PortNumber(80)),
+									},
+								},
+								Filters: []gatewayv1.HTTPRouteFilter{
+									{
+										Type: gatewayv1.HTTPRouteFilterCORS,
+										CORS: corsFilter,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{Port: 80},
+				},
+			},
+		},
+	}
+
+	hr.Compile(services, nil, nil, nil)
+
+	if len(hr.Internal.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(hr.Internal.Rules))
+	}
+	rule := hr.Internal.Rules[0]
+	if rule.CORS == nil {
+		t.Fatalf("expected rule CORS to be populated, got nil")
+	}
+	if len(rule.CORS.AllowOrigins) != 2 {
+		t.Errorf("expected 2 allow origins, got %d", len(rule.CORS.AllowOrigins))
+	}
+	if len(rule.Backends) != 1 {
+		t.Fatalf("expected 1 backend, got %d", len(rule.Backends))
+	}
+	backend := rule.Backends[0]
+	if backend.CORS == nil {
+		t.Fatalf("expected backend CORS to be populated, got nil")
+	}
+}
+
+func TestMatchRouteCORSPreflightMethod(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							Method: Ptr(gatewayv1.HTTPMethod("POST")),
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/submit",
+							},
+						},
+					},
+					CORS: &gatewayv1.HTTPCORSFilter{
+						AllowOrigins: []gatewayv1.CORSOrigin{"https://example.com"},
+					},
+					Backends: []InternalBackend{{Host: "post-backend", Port: 80, Weight: 1}},
+				},
+			},
+		},
+	}
+
+	// Normal OPTIONS without CORS headers should not match POST rule
+	req1, _ := http.NewRequest("OPTIONS", "http://example.com/submit", nil)
+	rule, _ := MatchRoute(routes, req1)
+	if rule != nil {
+		t.Errorf("expected no match for normal OPTIONS, got %v", rule.Backends)
+	}
+
+	// Preflight OPTIONS with Access-Control-Request-Method: POST and Origin should match
+	req2, _ := http.NewRequest("OPTIONS", "http://example.com/submit", nil)
+	req2.Header.Set("Origin", "https://example.com")
+	req2.Header.Set("Access-Control-Request-Method", "POST")
+	rule, _ = MatchRoute(routes, req2)
+	if rule == nil {
+		t.Fatalf("expected preflight OPTIONS to match POST rule with CORS, got nil")
+	}
+	if rule.Backends[0].Host != "post-backend" {
+		t.Errorf("expected post-backend, got %s", rule.Backends[0].Host)
+	}
+}

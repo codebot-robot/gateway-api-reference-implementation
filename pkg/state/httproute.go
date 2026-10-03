@@ -271,6 +271,9 @@ func CompileHTTPRoute(
 			case gatewayv1.HTTPRouteFilterResponseHeaderModifier:
 				iRule.ResponseHeaderModifier = filter.ResponseHeaderModifier
 
+			case gatewayv1.HTTPRouteFilterCORS:
+				iRule.CORS = filter.CORS
+
 			default:
 				msg := fmt.Sprintf("unsupported filter type: %s", filter.Type)
 				errCond := NewCondition(
@@ -570,6 +573,7 @@ func CompileHTTPRoute(
 				// Backend filters
 				var backendReqHeaderModifier *gatewayv1.HTTPHeaderFilter
 				var backendRespHeaderModifier *gatewayv1.HTTPHeaderFilter
+				var backendCORS *gatewayv1.HTTPCORSFilter
 				var backendFilterErr error
 				for _, filter := range backendRef.Filters {
 					switch filter.Type {
@@ -577,6 +581,8 @@ func CompileHTTPRoute(
 						backendReqHeaderModifier = filter.RequestHeaderModifier
 					case gatewayv1.HTTPRouteFilterResponseHeaderModifier:
 						backendRespHeaderModifier = filter.ResponseHeaderModifier
+					case gatewayv1.HTTPRouteFilterCORS:
+						backendCORS = filter.CORS
 					default:
 						backendFilterErr = fmt.Errorf("Unsupported backend filter type: %s", filter.Type)
 					}
@@ -616,6 +622,7 @@ func CompileHTTPRoute(
 					Weight:                 weight,
 					RequestHeaderModifier:  backendReqHeaderModifier,
 					ResponseHeaderModifier: backendRespHeaderModifier,
+					CORS:                   backendCORS,
 				})
 			}
 		}

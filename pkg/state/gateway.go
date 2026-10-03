@@ -283,6 +283,8 @@ type InternalRule struct {
 	RequestHeaderModifier *gatewayv1.HTTPHeaderFilter
 	// ResponseHeaderModifier defines the response header modifications to apply.
 	ResponseHeaderModifier *gatewayv1.HTTPHeaderFilter
+	// CORS defines the CORS filter configuration to apply.
+	CORS *gatewayv1.HTTPCORSFilter
 	// Error, if non-nil, indicates that this rule is invalid and should
 	// return an error response if matched.
 	Error *ErrorState
@@ -340,6 +342,7 @@ type InternalBackend struct {
 	Weight                 int32
 	RequestHeaderModifier  *gatewayv1.HTTPHeaderFilter
 	ResponseHeaderModifier *gatewayv1.HTTPHeaderFilter
+	CORS                   *gatewayv1.HTTPCORSFilter
 	Error                  *ErrorState
 }
 
@@ -371,7 +374,13 @@ type InternalMatch struct {
 func (im *InternalMatch) Matches(method, path string, query url.Values, header http.Header) bool {
 	if im.Method != nil {
 		if string(*im.Method) != method {
-			return false
+			if method == http.MethodOptions && header.Get("Origin") != "" && header.Get("Access-Control-Request-Method") != "" {
+				if !strings.EqualFold(string(*im.Method), header.Get("Access-Control-Request-Method")) {
+					return false
+				}
+			} else {
+				return false
+			}
 		}
 	}
 	if im.Path != nil {

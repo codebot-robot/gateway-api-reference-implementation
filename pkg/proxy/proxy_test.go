@@ -1274,3 +1274,239 @@ func TestProxyNoBackendRefs(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyCORS(t *testing.T) {
+	backendCalled := false
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalled = true
+		w.Header().Set("X-Backend-Header", "present")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	u, _ := url.Parse(backendServer.URL)
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+
+	allowCredsTrue := true
+	allowCredsFalse := false
+
+	ruleCORS := &gatewayv1.HTTPCORSFilter{
+		AllowOrigins:     []gatewayv1.CORSOrigin{"https://www.foo.com", "https://*.bar.com"},
+		AllowMethods:     []gatewayv1.HTTPMethodWithWildcard{"GET", "POST", "OPTIONS"},
+		AllowHeaders:     []gatewayv1.HTTPHeaderName{"x-header-1", "x-header-2"},
+		ExposeHeaders:    []gatewayv1.HTTPHeaderName{"x-header-3", "x-header-4"},
+		AllowCredentials: &allowCredsTrue,
+		MaxAge:           3600,
+	}
+
+	wildcardCORS := &gatewayv1.HTTPCORSFilter{
+		AllowOrigins:     []gatewayv1.CORSOrigin{"*"},
+		AllowMethods:     []gatewayv1.HTTPMethodWithWildcard{"*"},
+		AllowHeaders:     []gatewayv1.HTTPHeaderName{"*"},
+		AllowCredentials: &allowCredsFalse,
+	}
+
+	routes := []state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					CORS: ruleCORS,
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/cors-1",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+				},
+				{
+					CORS: wildcardCORS,
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/cors-wildcard",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p := NewProxy()
+	p.UpdateRoutes(routes)
+
+	t.Run("preflight exact origin allowed", func(t *testing.T) {
+		backendCalled = false
+		req := httptest.NewRequest("OPTIONS", "http://example.com/cors-1", nil)
+		req.Header.Set("Origin", "https://www.foo.com")
+		req.Header.Set("Access-Control-Request-Method", "GET")
+		req.Header.Set("Access-Control-Request-Headers", "x-header-1, x-header-2")
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		resp := w.Result()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if backendCalled {
+			t.Errorf("backend should not be called on preflight OPTIONS")
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://www.foo.com" {
+			t.Errorf("expected Access-Control-Allow-Origin https://www.foo.com, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "true" {
+			t.Errorf("expected Access-Control-Allow-Credentials true, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
+			t.Errorf("expected Access-Control-Allow-Methods GET, POST, OPTIONS, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Headers"); got != "x-header-1, x-header-2" {
+			t.Errorf("expected Access-Control-Allow-Headers x-header-1, x-header-2, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Expose-Headers"); got != "x-header-3, x-header-4" {
+			t.Errorf("expected Access-Control-Expose-Headers x-header-3, x-header-4, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Max-Age"); got != "3600" {
+			t.Errorf("expected Access-Control-Max-Age 3600, got %s", got)
+		}
+	})
+
+	t.Run("preflight wildcard domain origin allowed", func(t *testing.T) {
+		backendCalled = false
+		req := httptest.NewRequest("OPTIONS", "http://example.com/cors-1", nil)
+		req.Header.Set("Origin", "https://xpto.www.bar.com")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		resp := w.Result()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if backendCalled {
+			t.Errorf("backend should not be called on preflight OPTIONS")
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://xpto.www.bar.com" {
+			t.Errorf("expected Access-Control-Allow-Origin https://xpto.www.bar.com, got %s", got)
+		}
+	})
+
+	t.Run("preflight non-matching origin denied", func(t *testing.T) {
+		backendCalled = false
+		req := httptest.NewRequest("OPTIONS", "http://example.com/cors-1", nil)
+		req.Header.Set("Origin", "https://unauthorized.org")
+		req.Header.Set("Access-Control-Request-Method", "GET")
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		resp := w.Result()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if backendCalled {
+			t.Errorf("backend should not be called on preflight OPTIONS")
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("expected absent Access-Control-Allow-Origin, got %s", got)
+		}
+	})
+
+	t.Run("preflight wildcard origin and methods with allowCredentials false", func(t *testing.T) {
+		backendCalled = false
+		req := httptest.NewRequest("OPTIONS", "http://example.com/cors-wildcard", nil)
+		req.Header.Set("Origin", "https://anydomain.com:9999")
+		req.Header.Set("Access-Control-Request-Method", "PUT")
+		req.Header.Set("Access-Control-Request-Headers", "custom-header")
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		resp := w.Result()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("expected Access-Control-Allow-Origin *, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Errorf("expected absent Access-Control-Allow-Credentials, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Methods"); got != "PUT" && got != "*" {
+			t.Errorf("expected Access-Control-Allow-Methods PUT or *, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Headers"); got != "custom-header" && got != "*" {
+			t.Errorf("expected Access-Control-Allow-Headers custom-header or *, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Max-Age"); got != "5" {
+			t.Errorf("expected default Access-Control-Max-Age 5, got %s", got)
+		}
+	})
+
+	t.Run("simple request matching origin forwards and sets CORS headers", func(t *testing.T) {
+		backendCalled = false
+		req := httptest.NewRequest("GET", "http://example.com/cors-1", nil)
+		req.Header.Set("Origin", "https://www.foo.com")
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		resp := w.Result()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if !backendCalled {
+			t.Errorf("expected backend to be called for simple GET request")
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://www.foo.com" {
+			t.Errorf("expected Access-Control-Allow-Origin https://www.foo.com, got %s", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "true" {
+			t.Errorf("expected Access-Control-Allow-Credentials true, got %s", got)
+		}
+		if got := resp.Header.Get("X-Backend-Header"); got != "present" {
+			t.Errorf("expected backend response headers to be preserved, got %s", got)
+		}
+	})
+
+	t.Run("simple request non-matching origin forwards without CORS headers", func(t *testing.T) {
+		backendCalled = false
+		req := httptest.NewRequest("GET", "http://example.com/cors-1", nil)
+		req.Header.Set("Origin", "https://evil.com")
+
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+		resp := w.Result()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if !backendCalled {
+			t.Errorf("expected backend to be called")
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("expected absent Access-Control-Allow-Origin, got %s", got)
+		}
+	})
+}

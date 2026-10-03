@@ -745,12 +745,14 @@ func TestHTTPRouteValidate_Filters(t *testing.T) {
 									{Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier},
 									{Type: gatewayv1.HTTPRouteFilterRequestRedirect},
 									{Type: gatewayv1.HTTPRouteFilterURLRewrite},
+									{Type: gatewayv1.HTTPRouteFilterCORS},
 								},
 								BackendRefs: []gatewayv1.HTTPBackendRef{
 									{
 										Filters: []gatewayv1.HTTPRouteFilter{
 											{Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier},
 											{Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier},
+											{Type: gatewayv1.HTTPRouteFilterCORS},
 										},
 									},
 								},
