@@ -1715,3 +1715,140 @@ func TestProxyWebSocket(t *testing.T) {
 		t.Errorf("got %q, want %q", string(buf), string(msg))
 	}
 }
+
+func TestProxy_ListenerPortMatching(t *testing.T) {
+	// Setup mock backends
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v2")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s2.Close()
+
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v3")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3.Close()
+
+	u1, _ := url.Parse(s1.URL)
+	u2, _ := url.Parse(s2.URL)
+	u3, _ := url.Parse(s3.URL)
+
+	port1, _ := strconv.Atoi(u1.Port())
+	port2, _ := strconv.Atoi(u2.Port())
+	port3, _ := strconv.Atoi(u3.Port())
+
+	listeners := []state.InternalListener{
+		{
+			Name:     "listener-1",
+			Hostname: "foo.com",
+			Protocol: gatewayv1.HTTPProtocolType,
+			Port:     80,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"foo.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: []state.InternalBackend{{Host: u1.Hostname(), Port: int32(port1), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "listener-2",
+			Hostname: "foo.com",
+			Protocol: gatewayv1.HTTPProtocolType,
+			Port:     8080,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"foo.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "listener-3",
+			Hostname: "bar.com",
+			Protocol: gatewayv1.HTTPProtocolType,
+			Port:     8080,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"bar.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "listener-4",
+			Hostname: "foo.com",
+			Protocol: gatewayv1.HTTPProtocolType,
+			Port:     8090,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"foo.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: []state.InternalBackend{{Host: u3.Hostname(), Port: int32(port3), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "listener-5",
+			Hostname: "bar.com",
+			Protocol: gatewayv1.HTTPProtocolType,
+			Port:     8090,
+			Routes:   nil, // no routes attached
+		},
+	}
+
+	p := NewProxy()
+	p.UpdateListeners(listeners)
+
+	cases := []struct {
+		host        string
+		wantStatus  int
+		wantBackend string
+	}{
+		{host: "foo.com", wantStatus: 200, wantBackend: "v1"},
+		{host: "foo.com:8080", wantStatus: 200, wantBackend: "v2"},
+		{host: "bar.com:8080", wantStatus: 200, wantBackend: "v2"},
+		{host: "foo.com:8090", wantStatus: 200, wantBackend: "v3"},
+		{host: "bar.com:8090", wantStatus: 404},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://"+tc.host+"/", nil)
+			req.Host = tc.host
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("host %q: status code = %d, want %d", tc.host, resp.StatusCode, tc.wantStatus)
+			}
+			if tc.wantBackend != "" {
+				if got := resp.Header.Get("X-Backend"); got != tc.wantBackend {
+					t.Errorf("host %q: backend = %q, want %q", tc.host, got, tc.wantBackend)
+				}
+			}
+		})
+	}
+}

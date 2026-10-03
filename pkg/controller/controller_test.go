@@ -187,10 +187,16 @@ func TestServiceAndSecretAndConfigMapReconcilers(t *testing.T) {
 			Namespace: "default",
 		},
 	}
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "my-ns",
+			Labels: map[string]string{"env": "test"},
+		},
+	}
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(svc, secret, cm).
+		WithObjects(svc, secret, cm, ns).
 		Build()
 
 	svcReconciler := &ServiceReconciler{
@@ -217,6 +223,14 @@ func TestServiceAndSecretAndConfigMapReconcilers(t *testing.T) {
 		ControllerName:   "test-controller",
 		OnGatewaysUpdate: onUpdate,
 	}
+	nsReconciler := &NamespaceReconciler{
+		Client:           client,
+		Scheme:           scheme,
+		State:            st,
+		Proxy:            p,
+		ControllerName:   "test-controller",
+		OnGatewaysUpdate: onUpdate,
+	}
 
 	ctx := t.Context()
 
@@ -236,6 +250,15 @@ func TestServiceAndSecretAndConfigMapReconcilers(t *testing.T) {
 	_, err = cmReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-cm"}})
 	if err != nil || !hookCalled {
 		t.Fatalf("ConfigMapReconciler failed or hook not called: err=%v, hookCalled=%v", err, hookCalled)
+	}
+
+	hookCalled = false
+	_, err = nsReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "my-ns"}})
+	if err != nil || !hookCalled {
+		t.Fatalf("NamespaceReconciler failed or hook not called: err=%v, hookCalled=%v", err, hookCalled)
+	}
+	if len(st.GetNamespaces()) != 1 || st.GetNamespaces()["my-ns"] == nil {
+		t.Fatalf("expected namespace in state, got %v", st.GetNamespaces())
 	}
 }
 
@@ -275,6 +298,10 @@ func TestReconcilerSetupWithManager_RequiresControllerName(t *testing.T) {
 		{
 			name:     "ReferenceGrantReconciler",
 			setupErr: (&ReferenceGrantReconciler{}).SetupWithManager(nil),
+		},
+		{
+			name:     "NamespaceReconciler",
+			setupErr: (&NamespaceReconciler{}).SetupWithManager(nil),
 		},
 	}
 

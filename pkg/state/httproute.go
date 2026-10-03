@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -685,7 +686,7 @@ func (s *HTTPRouteState) Validate() error {
 }
 
 // ComputeAcceptedCondition calculates the RouteConditionAccepted condition for a given parentRef and gateways.
-func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentReference, gateways []*GatewayState) metav1.Condition {
+func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentReference, gateways []*GatewayState, namespaces ...map[string]*corev1.Namespace) metav1.Condition {
 	if s.Internal == nil {
 		s.Compile(nil, nil, nil, nil)
 	}
@@ -779,8 +780,22 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 			case gatewayv1.NamespacesFromAll:
 				// Allowed
 			case gatewayv1.NamespacesFromSelector:
-				if s.Namespace != gw.Namespace && listener.AllowedRoutes.Namespaces.Selector == nil {
-					continue
+				if listener.AllowedRoutes.Namespaces.Selector != nil {
+					sel, err := metav1.LabelSelectorAsSelector(listener.AllowedRoutes.Namespaces.Selector)
+					if err != nil {
+						continue
+					}
+					var nsObj *corev1.Namespace
+					if len(namespaces) > 0 && namespaces[0] != nil {
+						nsObj = namespaces[0][s.Namespace]
+					}
+					if nsObj != nil {
+						if !sel.Matches(labels.Set(nsObj.Labels)) {
+							continue
+						}
+					} else if s.Namespace != gw.Namespace && len(namespaces) > 0 && namespaces[0] != nil {
+						continue
+					}
 				}
 			}
 		} else {

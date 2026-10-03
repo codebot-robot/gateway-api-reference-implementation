@@ -769,3 +769,138 @@ func TestMatchRoute_QueryParamPrecedence(t *testing.T) {
 		t.Errorf("Expected method-wins-backend, got %v", rule4)
 	}
 }
+
+func TestMatchRoute_MatchingAcrossRoutes(t *testing.T) {
+	// Replicating HTTPRouteMatchingAcrossRoutes conformance test setup
+	// Route 1 (matching-part1): example.com, example.net
+	//   rule 1: PathPrefix / -> v1
+	//   rule 2: Header version: one -> v1
+	// Route 2 (matching-part2): example.com
+	//   rule 1: PathPrefix /v2 -> v2
+	//   rule 2: Header version: two -> v2
+	routes := []InternalRoute{
+		{
+			Hostnames: []string{"example.com", "example.net"},
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{Path: &InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+					},
+					Backends: []InternalBackend{{Host: "infra-backend-v1"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Headers: []InternalHeaderMatch{
+								{Name: "version", MatchExactValue: "one", Type: gatewayv1.HeaderMatchExact},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "infra-backend-v1"}},
+				},
+			},
+		},
+		{
+			Hostnames: []string{"example.com"},
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{Path: &InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/v2"}},
+					},
+					Backends: []InternalBackend{{Host: "infra-backend-v2"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Headers: []InternalHeaderMatch{
+								{Name: "version", MatchExactValue: "two", Type: gatewayv1.HeaderMatchExact},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "infra-backend-v2"}},
+				},
+			},
+		},
+	}
+
+	testCases := []struct {
+		name        string
+		host        string
+		path        string
+		headerName  string
+		headerValue string
+		wantBackend string
+	}{
+		{
+			name:        "example.com / -> v1",
+			host:        "example.com",
+			path:        "/",
+			wantBackend: "infra-backend-v1",
+		},
+		{
+			name:        "example.com /example -> v1",
+			host:        "example.com",
+			path:        "/example",
+			wantBackend: "infra-backend-v1",
+		},
+		{
+			name:        "example.net /example -> v1",
+			host:        "example.net",
+			path:        "/example",
+			wantBackend: "infra-backend-v1",
+		},
+		{
+			name:        "example.com /example with Version: one -> v1",
+			host:        "example.com",
+			path:        "/example",
+			headerName:  "Version",
+			headerValue: "one",
+			wantBackend: "infra-backend-v1",
+		},
+		{
+			name:        "example.com /v2 -> v2",
+			host:        "example.com",
+			path:        "/v2",
+			wantBackend: "infra-backend-v2",
+		},
+		{
+			name:        "example.net /v2 -> v1",
+			host:        "example.net",
+			path:        "/v2",
+			wantBackend: "infra-backend-v1",
+		},
+		{
+			name:        "example.com /v2/example -> v2",
+			host:        "example.com",
+			path:        "/v2/example",
+			wantBackend: "infra-backend-v2",
+		},
+		{
+			name:        "example.com / with Version: two -> v2",
+			host:        "example.com",
+			path:        "/",
+			headerName:  "Version",
+			headerValue: "two",
+			wantBackend: "infra-backend-v2",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", "http://"+tc.host+tc.path, nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+			if tc.headerName != "" {
+				req.Header.Set(tc.headerName, tc.headerValue)
+			}
+			rule, _ := MatchRoute(routes, req)
+			if rule == nil {
+				t.Fatalf("MatchRoute returned nil rule")
+			}
+			if len(rule.Backends) == 0 || rule.Backends[0].Host != tc.wantBackend {
+				t.Errorf("got backend %v, want %s", rule.Backends, tc.wantBackend)
+			}
+		})
+	}
+}

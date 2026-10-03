@@ -1478,3 +1478,88 @@ func TestHTTPRouteValidate_Retry(t *testing.T) {
 		})
 	}
 }
+
+func TestComputeAcceptedCondition_AllowedRoutesNamespacesSelector(t *testing.T) {
+	gw := &GatewayState{
+		Gateway: &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-gateway",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.GatewaySpec{
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "http",
+						Protocol: gatewayv1.HTTPProtocolType,
+						Port:     80,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Namespaces: &gatewayv1.RouteNamespaces{
+								From: Ptr(gatewayv1.NamespacesFromSelector),
+								Selector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"gateway-conformance": "backend",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	parentRef := gatewayv1.ParentReference{
+		Name:      "test-gateway",
+		Namespace: Ptr(gatewayv1.Namespace("default")),
+	}
+
+	routeInMatchingNs := &HTTPRouteState{
+		HTTPRoute: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-route-1",
+				Namespace: "matching-ns",
+			},
+		},
+	}
+
+	routeInNonMatchingNs := &HTTPRouteState{
+		HTTPRoute: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-route-2",
+				Namespace: "other-ns",
+			},
+		},
+	}
+
+	nsMap := map[string]*corev1.Namespace{
+		"matching-ns": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "matching-ns",
+				Labels: map[string]string{
+					"gateway-conformance": "backend",
+				},
+			},
+		},
+		"other-ns": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "other-ns",
+				Labels: map[string]string{
+					"other": "label",
+				},
+			},
+		},
+	}
+
+	cond1 := routeInMatchingNs.ComputeAcceptedCondition(parentRef, []*GatewayState{gw}, nsMap)
+	if cond1.Status != metav1.ConditionTrue {
+		t.Errorf("expected route in matching-ns to be Accepted True, got %v (%s)", cond1.Status, cond1.Reason)
+	}
+
+	cond2 := routeInNonMatchingNs.ComputeAcceptedCondition(parentRef, []*GatewayState{gw}, nsMap)
+	if cond2.Status != metav1.ConditionFalse {
+		t.Errorf("expected route in other-ns to be Accepted False, got %v (%s)", cond2.Status, cond2.Reason)
+	}
+	if cond2.Reason != string(gatewayv1.RouteReasonNotAllowedByListeners) {
+		t.Errorf("expected reason %s, got %s", gatewayv1.RouteReasonNotAllowedByListeners, cond2.Reason)
+	}
+}

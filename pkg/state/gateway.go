@@ -618,8 +618,8 @@ func isBetterCandidate(current, best *routeMatchCandidate) bool {
 }
 
 func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
-	if m.Path == nil {
-		return ""
+	if m.Path == nil || m.Path.Type == "" {
+		return gatewayv1.PathMatchPathPrefix
 	}
 	return m.Path.Type
 }
@@ -638,8 +638,8 @@ func getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
 }
 
 func getPathLen(m *InternalMatch) int {
-	if m.Path == nil {
-		return 0
+	if m.Path == nil || m.Path.Value == "" {
+		return 1
 	}
 	return len(m.Path.Value)
 }
@@ -654,6 +654,11 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 
 	var internalListeners []InternalListener
 	var allInternalRoutes []InternalRoute
+
+	var nsMap map[string]*corev1.Namespace
+	if st, ok := refValidator.(*State); ok {
+		nsMap = st.GetNamespaces()
+	}
 
 	for _, listener := range s.Spec.Listeners {
 		// Check if listener is compatible with HTTPRoute
@@ -700,7 +705,7 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 				}
 
 				// Dynamically compute acceptance for this listener
-				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
+				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap); cond.Status == metav1.ConditionTrue {
 					bound = true
 					matchingParentRef = parentRef
 					break

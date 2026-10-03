@@ -13,7 +13,7 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services", "configmaps", "secrets"]
+  resources: ["services", "configmaps", "secrets", "namespaces"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]

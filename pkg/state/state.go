@@ -35,6 +35,7 @@ type State struct {
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
 	secrets            map[types.NamespacedName]*corev1.Secret
 	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	namespaces         map[string]*corev1.Namespace
 }
 
 func NewState() *State {
@@ -46,7 +47,33 @@ func NewState() *State {
 		configMaps:         make(map[types.NamespacedName]*corev1.ConfigMap),
 		secrets:            make(map[types.NamespacedName]*corev1.Secret),
 		referenceGrants:    make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant),
+		namespaces:         make(map[string]*corev1.Namespace),
 	}
+}
+
+func (s *State) UpsertNamespace(ns *corev1.Namespace) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.namespaces[ns.Name] = ns
+}
+
+func (s *State) DeleteNamespace(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.namespaces, name)
+}
+
+func (s *State) GetNamespaces() map[string]*corev1.Namespace {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	namespaces := make(map[string]*corev1.Namespace)
+	for k, v := range s.namespaces {
+		namespaces[k] = v
+	}
+	return namespaces
 }
 
 func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
