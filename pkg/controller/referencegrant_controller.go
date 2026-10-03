@@ -45,17 +45,32 @@ func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Get(ctx, req.NamespacedName, rg); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteReferenceGrant(req.NamespacedName)
+			r.recomputeAndSyncRoutes(ctx)
 			r.updateProxy()
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	r.State.UpsertReferenceGrant(rg)
+	r.recomputeAndSyncRoutes(ctx)
 	r.updateProxy()
 
 	l.Info("Updated ReferenceGrant in state")
 
 	return ctrl.Result{}, nil
+}
+
+func (r *ReferenceGrantReconciler) recomputeAndSyncRoutes(ctx context.Context) {
+	services := r.State.GetServices()
+	policies := r.State.GetBackendTLSPolicies()
+	configMaps := r.State.GetConfigMaps()
+
+	// Recompile all routes stored in state against the updated reference grants
+	for _, route := range r.State.GetHTTPRoutes() {
+		if route.HTTPRoute != nil {
+			route.Compile(services, policies, configMaps, r.State)
+		}
+	}
 }
 
 func (r *ReferenceGrantReconciler) updateProxy() {

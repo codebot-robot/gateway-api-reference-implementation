@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -225,7 +226,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bestRule, bestMatch := state.MatchRoute(routes, r)
 
 	if bestRule != nil {
+		cors := bestRule.CORS
+		if cors == nil && len(bestRule.Backends) > 0 {
+			cors = bestRule.Backends[0].CORS
+		}
+
+		// Handle CORS preflight request
+		if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && cors != nil {
+			applyCORSHeaders(w.Header(), r, cors, true)
+			if bestRule.ResponseHeaderModifier != nil {
+				modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		if bestRule.Redirect != nil {
+			if bestRule.CORS != nil {
+				applyCORSHeaders(w.Header(), r, bestRule.CORS, false)
+			}
 			if bestRule.ResponseHeaderModifier != nil {
 				modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
 			}
@@ -233,6 +252,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Error != nil {
+			if bestRule.CORS != nil {
+				applyCORSHeaders(w.Header(), r, bestRule.CORS, false)
+			}
 			if bestRule.ResponseHeaderModifier != nil {
 				modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
 			}
@@ -251,6 +273,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if len(bestRule.Backends) > 0 {
 			backend, err := pickBackend(bestRule.Backends)
 			if err != nil {
+				if bestRule.CORS != nil {
+					applyCORSHeaders(w.Header(), r, bestRule.CORS, false)
+				}
 				if bestRule.ResponseHeaderModifier != nil {
 					modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
 				}
@@ -258,6 +283,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if backend.Error != nil {
+				effectiveCORS := bestRule.CORS
+				if backend.CORS != nil {
+					effectiveCORS = backend.CORS
+				}
+				if effectiveCORS != nil {
+					applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+				}
 				if bestRule.ResponseHeaderModifier != nil {
 					modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
 				}
@@ -270,7 +302,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if backend.RequestHeaderModifier != nil {
 				p.modifyHeaders(r, *backend.RequestHeaderModifier)
 			}
-			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.Timeouts)
+			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.CORS, bestRule.Timeouts)
 			return
 		}
 
@@ -477,7 +509,7 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, timeouts *state.InternalTimeouts) {
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts) {
 	reqCtx := r.Context()
 	if timeouts != nil && timeouts.Request != nil && *timeouts.Request > 0 {
 		var cancel context.CancelFunc
@@ -506,6 +538,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 
 	outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), r.Body)
 	if err != nil {
+		effectiveCORS := respCORS
+		if backend.CORS != nil {
+			effectiveCORS = backend.CORS
+		}
+		if effectiveCORS != nil {
+			applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+		}
 		if backend.ResponseHeaderModifier != nil {
 			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
 		}
@@ -571,6 +610,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
+		effectiveCORS := respCORS
+		if backend.CORS != nil {
+			effectiveCORS = backend.CORS
+		}
+		if effectiveCORS != nil {
+			applyCORSHeaders(w.Header(), r, effectiveCORS, false)
+		}
 		if backend.ResponseHeaderModifier != nil {
 			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
 		}
@@ -591,6 +637,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 	defer resp.Body.Close()
 
+	effectiveCORS := respCORS
+	if backend.CORS != nil {
+		effectiveCORS = backend.CORS
+	}
+	if effectiveCORS != nil {
+		applyCORSHeaders(resp.Header, r, effectiveCORS, false)
+	}
+
 	if backend.ResponseHeaderModifier != nil {
 		modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
 	}
@@ -607,6 +661,194 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func matchOrigin(allowedOrigins []gatewayv1.CORSOrigin, reqOrigin string) bool {
+	if len(allowedOrigins) == 0 || reqOrigin == "" {
+		return false
+	}
+	u, err := url.Parse(reqOrigin)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	reqScheme := strings.ToLower(u.Scheme)
+	reqHost := u.Hostname()
+	reqPort := u.Port()
+	if reqPort == "" {
+		if reqScheme == "http" {
+			reqPort = "80"
+		} else if reqScheme == "https" {
+			reqPort = "443"
+		}
+	}
+
+	for _, allowed := range allowedOrigins {
+		allowedStr := string(allowed)
+		if allowedStr == "*" {
+			return true
+		}
+		au, err := url.Parse(allowedStr)
+		if err != nil || au.Scheme == "" || au.Host == "" {
+			continue
+		}
+		allowedScheme := strings.ToLower(au.Scheme)
+		allowedHost := au.Hostname()
+		allowedPort := au.Port()
+		if allowedPort == "" {
+			if allowedScheme == "http" {
+				allowedPort = "80"
+			} else if allowedScheme == "https" {
+				allowedPort = "443"
+			}
+		}
+
+		if allowedScheme != reqScheme {
+			continue
+		}
+		if allowedPort != reqPort {
+			continue
+		}
+
+		if allowedHost == "*" {
+			return true
+		}
+		if strings.HasPrefix(allowedHost, "*.") {
+			suffix := strings.ToLower(allowedHost[1:])
+			reqHostLower := strings.ToLower(reqHost)
+			if strings.HasSuffix(reqHostLower, suffix) && len(reqHostLower) > len(suffix) {
+				return true
+			}
+		}
+		if strings.EqualFold(allowedHost, reqHost) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsWildcardOrigin(origins []gatewayv1.CORSOrigin) bool {
+	for _, o := range origins {
+		if string(o) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsWildcardMethod(methods []gatewayv1.HTTPMethodWithWildcard) bool {
+	for _, m := range methods {
+		if string(m) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsWildcardHeader(headers []gatewayv1.HTTPHeaderName) bool {
+	for _, h := range headers {
+		if string(h) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func applyCORSHeaders(header http.Header, r *http.Request, cors *gatewayv1.HTTPCORSFilter, isPreflight bool) bool {
+	if cors == nil {
+		return false
+	}
+	reqOrigin := r.Header.Get("Origin")
+	if reqOrigin == "" {
+		return false
+	}
+	if !matchOrigin(cors.AllowOrigins, reqOrigin) {
+		return false
+	}
+
+	allowCredentials := cors.AllowCredentials != nil && *cors.AllowCredentials
+
+	// Access-Control-Allow-Origin
+	if allowCredentials {
+		header.Set("Access-Control-Allow-Origin", reqOrigin)
+	} else if containsWildcardOrigin(cors.AllowOrigins) {
+		header.Set("Access-Control-Allow-Origin", "*")
+	} else {
+		header.Set("Access-Control-Allow-Origin", reqOrigin)
+	}
+
+	// Access-Control-Allow-Credentials
+	if allowCredentials {
+		header.Set("Access-Control-Allow-Credentials", "true")
+	} else {
+		header.Del("Access-Control-Allow-Credentials")
+		for k := range header {
+			if strings.EqualFold(k, "Access-Control-Allow-Credentials") {
+				delete(header, k)
+			}
+		}
+	}
+
+	// Access-Control-Expose-Headers
+	if len(cors.ExposeHeaders) > 0 {
+		if containsWildcardHeader(cors.ExposeHeaders) {
+			if !allowCredentials {
+				header.Set("Access-Control-Expose-Headers", "*")
+			}
+		} else {
+			headers := make([]string, len(cors.ExposeHeaders))
+			for i, h := range cors.ExposeHeaders {
+				headers[i] = string(h)
+			}
+			header.Set("Access-Control-Expose-Headers", strings.Join(headers, ", "))
+		}
+	}
+
+	if isPreflight {
+		// Access-Control-Allow-Methods
+		if len(cors.AllowMethods) > 0 {
+			if containsWildcardMethod(cors.AllowMethods) {
+				reqMethod := r.Header.Get("Access-Control-Request-Method")
+				if reqMethod != "" {
+					header.Set("Access-Control-Allow-Methods", reqMethod)
+				} else if !allowCredentials {
+					header.Set("Access-Control-Allow-Methods", "*")
+				}
+			} else {
+				methods := make([]string, len(cors.AllowMethods))
+				for i, m := range cors.AllowMethods {
+					methods[i] = string(m)
+				}
+				header.Set("Access-Control-Allow-Methods", strings.Join(methods, ", "))
+			}
+		}
+
+		// Access-Control-Allow-Headers
+		if len(cors.AllowHeaders) > 0 {
+			if containsWildcardHeader(cors.AllowHeaders) {
+				reqHeaders := r.Header.Get("Access-Control-Request-Headers")
+				if reqHeaders != "" {
+					header.Set("Access-Control-Allow-Headers", reqHeaders)
+				} else if !allowCredentials {
+					header.Set("Access-Control-Allow-Headers", "*")
+				}
+			} else {
+				headers := make([]string, len(cors.AllowHeaders))
+				for i, h := range cors.AllowHeaders {
+					headers[i] = string(h)
+				}
+				header.Set("Access-Control-Allow-Headers", strings.Join(headers, ", "))
+			}
+		}
+
+		// Access-Control-Max-Age
+		maxAge := cors.MaxAge
+		if maxAge <= 0 {
+			maxAge = 5
+		}
+		header.Set("Access-Control-Max-Age", strconv.Itoa(int(maxAge)))
+	}
+
+	return true
 }
 
 // pickBackend selects a backend from the list based on their weights.
