@@ -92,6 +92,8 @@ func runClientCLI(args []string) {
 	insecure := fs.Bool("insecure", false, "Skip TLS verification")
 	expectFail := fs.Bool("expect-fail", false, "Expect request / TLS connection to fail/be closed")
 	timeout := fs.Duration("timeout", 10*time.Second, "Request timeout")
+	retries := fs.Int("retries", 15, "Number of retries for request on failure")
+	retryInterval := fs.Duration("retry-interval", 1*time.Second, "Interval between retries")
 
 	if err := fs.Parse(args); err != nil {
 		log.Fatalf("Failed to parse client flags: %v", err)
@@ -164,21 +166,60 @@ func runClientCLI(args []string) {
 	}
 
 	log.Printf("Sending request to %s (Host: %s, ConnectTo: %s, SNI: %s)", targetURL, *hostHeader, *connectTo, *sni)
-	req, err := http.NewRequest("GET", targetURL, nil)
-	if err != nil {
-		log.Fatalf("Failed to create request: %v", err)
-	}
-	if *hostHeader != "" {
-		req.Host = *hostHeader
+
+	var resp *http.Response
+	var lastErr error
+
+	maxAttempts := 1
+	if !*expectFail && *retries > 0 {
+		maxAttempts = *retries + 1
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		if *expectFail {
-			fmt.Printf("Connection rejected as expected: %v\n", err)
-			return
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(*retryInterval)
+			log.Printf("Retrying request (attempt %d/%d)...", attempt, maxAttempts)
 		}
-		log.Fatalf("Request failed: %v", err)
+
+		capturedPeerCerts = nil
+		req, err := http.NewRequest("GET", targetURL, nil)
+		if err != nil {
+			log.Fatalf("Failed to create request: %v", err)
+		}
+		if *hostHeader != "" {
+			req.Host = *hostHeader
+		}
+
+		resp, err = client.Do(req)
+		if *expectFail {
+			if err != nil {
+				fmt.Printf("Connection rejected as expected: %v\n", err)
+				return
+			}
+			defer resp.Body.Close()
+			log.Fatalf("Expected connection to fail, but request succeeded with status %s", resp.Status)
+		}
+
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				lastErr = nil
+				break
+			}
+			// If not 200 and we have attempts remaining, retry
+			if attempt < maxAttempts {
+				resp.Body.Close()
+				lastErr = fmt.Errorf("unexpected status: %s", resp.Status)
+				continue
+			}
+			lastErr = nil
+			break
+		}
+
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		log.Fatalf("Request failed: %v", lastErr)
 	}
 	defer resp.Body.Close()
 
