@@ -175,7 +175,10 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 				for _, ref := range listener.TLS.CertificateRefs {
 					group := state.ValueOf(ref.Group)
 					kind := state.ValueOf(ref.Kind)
-					if (group == "" || group == "core") && (kind == "" || kind == "Secret") {
+					if kind == "" {
+						kind = "Secret"
+					}
+					if (group == "" || group == "core") && kind == "Secret" {
 						secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
 						from := state.Reference{
 							GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
