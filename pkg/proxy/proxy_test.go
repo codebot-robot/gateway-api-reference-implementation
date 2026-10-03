@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -1027,6 +1028,144 @@ func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
 			if tc.wantBackend != "" {
 				if got := resp.Header.Get("X-Backend"); got != tc.wantBackend {
 					t.Errorf("serverName %q, host %q: backend = %q, want %q", tc.serverName, tc.host, got, tc.wantBackend)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyTimeouts(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if delayStr := r.URL.Query().Get("delay"); delayStr != "" {
+			if d, err := time.ParseDuration(delayStr); err == nil {
+				time.Sleep(d)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	u, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("failed to split host and port: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("failed to parse port: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		timeouts       *state.InternalTimeouts
+		respModifier   *gatewayv1.HTTPHeaderFilter
+		requestPath    string
+		expectedStatus int
+		expectRespHead string
+	}{
+		{
+			name: "request completes within request timeout",
+			timeouts: &state.InternalTimeouts{
+				Request: state.Ptr(200 * time.Millisecond),
+			},
+			requestPath:    "/test",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "request exceeds request timeout",
+			timeouts: &state.InternalTimeouts{
+				Request: state.Ptr(50 * time.Millisecond),
+			},
+			requestPath:    "/test?delay=200ms",
+			expectedStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name: "request exceeds backendRequest timeout",
+			timeouts: &state.InternalTimeouts{
+				BackendRequest: state.Ptr(50 * time.Millisecond),
+			},
+			requestPath:    "/test?delay=200ms",
+			expectedStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name: "zero duration disables timeout",
+			timeouts: &state.InternalTimeouts{
+				Request: state.Ptr(0 * time.Second),
+			},
+			requestPath:    "/test?delay=50ms",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "both set - backendRequest timeout exceeded before request timeout",
+			timeouts: &state.InternalTimeouts{
+				Request:        state.Ptr(200 * time.Millisecond),
+				BackendRequest: state.Ptr(50 * time.Millisecond),
+			},
+			requestPath:    "/test?delay=100ms",
+			expectedStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name: "both set - request timeout exceeded before backendRequest timeout",
+			timeouts: &state.InternalTimeouts{
+				Request:        state.Ptr(50 * time.Millisecond),
+				BackendRequest: state.Ptr(200 * time.Millisecond),
+			},
+			requestPath:    "/test?delay=100ms",
+			expectedStatus: http.StatusGatewayTimeout,
+		},
+		{
+			name: "timeout applies response header modifier",
+			timeouts: &state.InternalTimeouts{
+				Request: state.Ptr(50 * time.Millisecond),
+			},
+			respModifier: &gatewayv1.HTTPHeaderFilter{
+				Set: []gatewayv1.HTTPHeader{
+					{Name: "X-Timeout-Header", Value: "applied"},
+				},
+			},
+			requestPath:    "/test?delay=200ms",
+			expectedStatus: http.StatusGatewayTimeout,
+			expectRespHead: "applied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewProxy()
+			p.UpdateRoutes([]state.InternalRoute{
+				{
+					Rules: []state.InternalRule{
+						{
+							Timeouts: tt.timeouts,
+							Backends: []state.InternalBackend{
+								{
+									Host:   host,
+									Port:   int32(port),
+									Weight: 1,
+								},
+							},
+							ResponseHeaderModifier: tt.respModifier,
+						},
+					},
+				},
+			})
+
+			req := httptest.NewRequest("GET", "http://example.com"+tt.requestPath, nil)
+			w := httptest.NewRecorder()
+
+			p.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("expected status %d, got %d", tt.expectedStatus, resp.StatusCode)
+			}
+			if tt.expectRespHead != "" {
+				if got := resp.Header.Get("X-Timeout-Header"); got != tt.expectRespHead {
+					t.Errorf("expected X-Timeout-Header %q, got %q", tt.expectRespHead, got)
 				}
 			}
 		})

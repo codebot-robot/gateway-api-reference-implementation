@@ -18,11 +18,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -269,7 +270,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if backend.RequestHeaderModifier != nil {
 				p.modifyHeaders(r, *backend.RequestHeaderModifier)
 			}
-			p.forward(w, r, backend, bestRule.ResponseHeaderModifier)
+			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.Timeouts)
 			return
 		}
 	}
@@ -446,31 +447,88 @@ func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.
 	http.Redirect(w, r, newURL.String(), statusCode)
 }
 
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter) {
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailers",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	for _, k := range hopByHopHeaders {
+		h.Del(k)
+	}
+	if c := h.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+}
+
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, timeouts *state.InternalTimeouts) {
+	reqCtx := r.Context()
+	if timeouts != nil && timeouts.Request != nil && *timeouts.Request > 0 {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(reqCtx, *timeouts.Request)
+		defer cancel()
+	}
+
+	backendCtx := reqCtx
+	if timeouts != nil && timeouts.BackendRequest != nil && *timeouts.BackendRequest > 0 {
+		var cancel context.CancelFunc
+		backendCtx, cancel = context.WithTimeout(backendCtx, *timeouts.BackendRequest)
+		defer cancel()
+	}
+
 	scheme := "http"
 	if state.ValueOf(backend.AppProtocol) == "https" {
 		scheme = "https"
 	}
 
-	target := &url.URL{
-		Scheme: scheme,
-		Host:   fmt.Sprintf("%s:%d", backend.Host, backend.Port),
+	targetURL := &url.URL{
+		Scheme:   scheme,
+		Host:     fmt.Sprintf("%s:%d", backend.Host, backend.Port),
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
 
-	if respHeaderModifier != nil || backend.ResponseHeaderModifier != nil {
-		proxy.ModifyResponse = func(res *http.Response) error {
-			if backend.ResponseHeaderModifier != nil {
-				modifyHeaders(res.Header, *backend.ResponseHeaderModifier)
-			}
-			if respHeaderModifier != nil {
-				modifyHeaders(res.Header, *respHeaderModifier)
-			}
-			return nil
+	outReq.Header = r.Header.Clone()
+	removeHopByHopHeaders(outReq.Header)
+
+	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
+			clientIP = prior + ", " + clientIP
+		}
+		outReq.Header.Set("X-Forwarded-For", clientIP)
+	} else if r.RemoteAddr != "" {
+		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
+			outReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
+		} else {
+			outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
 		}
 	}
 
+	outReq.Host = r.Host
+
+	var transport http.RoundTripper
 	if scheme == "https" {
 		tlsConfig := &tls.Config{InsecureSkipVerify: false}
 		if backend.TLSConfig != nil {
@@ -488,21 +546,61 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		} else {
 			tlsConfig.InsecureSkipVerify = true
 		}
-		proxy.Transport = &http.Transport{
+		transport = &http.Transport{
 			TLSClientConfig: tlsConfig,
 		}
 	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
-		proxy.Transport = &http2.Transport{
+		transport = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, network, addr)
 			},
 		}
+	} else {
+		transport = http.DefaultTransport
 	}
 
-	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", target.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
-	proxy.ServeHTTP(w, r)
+	log.Log.Info("Forwarding request", "host", r.Host, "path", r.URL.Path, "target", targetURL.String(), "appProtocol", state.ValueOf(backend.AppProtocol))
+
+	resp, err := transport.RoundTrip(outReq)
+	if err != nil {
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(backendCtx.Err(), context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+			return
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			http.Error(w, "Gateway Timeout", http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if backend.ResponseHeaderModifier != nil {
+		modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
+	}
+	if respHeaderModifier != nil {
+		modifyHeaders(resp.Header, *respHeaderModifier)
+	}
+
+	removeHopByHopHeaders(resp.Header)
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 // pickBackend selects a backend from the list based on their weights.
