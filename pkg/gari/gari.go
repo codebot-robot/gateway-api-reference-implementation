@@ -29,6 +29,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -41,6 +42,14 @@ import (
 )
 
 var setupLog = ctrl.Log.WithName("gari")
+
+// AddressProvider returns the addresses to report in Gateway.status.addresses.
+// An empty result means the address is not assigned yet.
+type AddressProvider = controller.AddressProvider
+
+// AddressWatcher is an optional interface an AddressProvider can implement
+// to register custom watches with the Gateway controller.
+type AddressWatcher = controller.AddressWatcher
 
 // DefaultScheme creates a new runtime.Scheme initialized with client-go and Gateway API schemes.
 func DefaultScheme() *runtime.Scheme {
@@ -106,6 +115,18 @@ type Options struct {
 	// OnGatewaysUpdate is an optional hook invoked whenever configuration is pushed
 	// to the proxy with the currently resolved Gateways.
 	OnGatewaysUpdate func(gateways []*gatewayv1.Gateway)
+
+	// AddressProvider is an optional hook that returns addresses to report in Gateway.status.addresses.
+	// If nil or returns no addresses, Gateways report Programmed=False with reason AddressNotAssigned.
+	AddressProvider AddressProvider
+
+	// GatewayScope is an optional filter restricting which Gateways this instance serves.
+	// If set, only Gateways with matching namespace and name are reconciled and served.
+	GatewayScope *types.NamespacedName
+
+	// GatewayFilter is an optional filter func restricting which Gateways this instance serves.
+	// If set, only Gateways for which GatewayFilter returns true are reconciled and served.
+	GatewayFilter func(gw *gatewayv1.Gateway) bool
 
 	// Manager is an optional controller-runtime manager. If provided, New will
 	// register reconcilers with it instead of creating a new manager.
@@ -229,6 +250,9 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
 		ControllerName:   s.opts.ControllerName,
 		OnGatewaysUpdate: s.opts.OnGatewaysUpdate,
+		AddressProvider:  s.opts.AddressProvider,
+		GatewayScope:     s.opts.GatewayScope,
+		GatewayFilter:    s.opts.GatewayFilter,
 	})
 }
 

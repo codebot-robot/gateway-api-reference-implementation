@@ -19,6 +19,7 @@ import (
 	"os"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -28,6 +29,13 @@ var setupLog = ctrl.Log.WithName("setup")
 func main() {
 	opts := gari.DefaultOptions()
 
+	var (
+		serviceName      string
+		serviceNamespace string
+	)
+
+	flag.StringVar(&serviceName, "service-name", singlepod.DefaultServiceName, "The name of the Service whose LoadBalancer address is used for Gateways.")
+	flag.StringVar(&serviceNamespace, "service-namespace", singlepod.DefaultServiceNamespace, "The namespace of the Service whose LoadBalancer address is used for Gateways.")
 	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to.")
@@ -43,6 +51,8 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
+
+	opts.AddressProvider = singlepod.NewAddressProvider(nil, serviceNamespace, serviceName)
 
 	ctx := ctrl.SetupSignalHandler()
 	if err := gari.Run(ctx, opts); err != nil {
