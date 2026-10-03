@@ -403,7 +403,35 @@ func TestComputeAcceptedCondition(t *testing.T) {
 		},
 	}
 
-	gateways := []*GatewayState{gw}
+	tlsGw := &GatewayState{
+		Gateway: &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "tlsroutes-only",
+				Namespace: "gateway-conformance-infra",
+			},
+			Spec: gatewayv1.GatewaySpec{
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "tls",
+						Port:     443,
+						Protocol: gatewayv1.TLSProtocolType,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Namespaces: &gatewayv1.RouteNamespaces{
+								From: Ptr(gatewayv1.NamespacesFromSame),
+							},
+							Kinds: []gatewayv1.RouteGroupKind{
+								{
+									Kind: "TLSRoute",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	gateways := []*GatewayState{gw, tlsGw}
 
 	tests := []struct {
 		name           string
@@ -608,6 +636,23 @@ func TestComputeAcceptedCondition(t *testing.T) {
 				Name:        "same-namespace",
 				Namespace:   Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
 				SectionName: Ptr(gatewayv1.SectionName("tcp")),
+			},
+			expectedStatus: metav1.ConditionFalse,
+			expectedReason: string(gatewayv1.RouteReasonNotAllowedByListeners),
+		},
+		{
+			name: "disallowed kind on gateway with only TLSRoute listeners",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "disallowed-kind",
+						Namespace: "gateway-conformance-infra",
+					},
+				},
+			},
+			parentRef: gatewayv1.ParentReference{
+				Name:      "tlsroutes-only",
+				Namespace: Ptr(gatewayv1.Namespace("gateway-conformance-infra")),
 			},
 			expectedStatus: metav1.ConditionFalse,
 			expectedReason: string(gatewayv1.RouteReasonNotAllowedByListeners),

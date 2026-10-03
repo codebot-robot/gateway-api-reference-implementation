@@ -1171,3 +1171,106 @@ func TestProxyTimeouts(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyNoBackendRefs(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backendServer.Close()
+
+	host, portStr, err := net.SplitHostPort(backendServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split host port: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+
+	routes := []state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/omitted-no-forward",
+							},
+						},
+					},
+					Backends: nil,
+				},
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/empty-no-forward",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{},
+				},
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/forward",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p := NewProxy()
+	p.UpdateRoutes(routes)
+
+	cases := []struct {
+		name       string
+		path       string
+		wantStatus int
+	}{
+		{
+			name:       "omitted backendRefs returns 500",
+			path:       "/omitted-no-forward",
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "empty backendRefs returns 500",
+			path:       "/empty-no-forward",
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "valid backend forwards normally",
+			path:       "/forward",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "unmatched path returns 404",
+			path:       "/unknown",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com"+tc.path, nil)
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("path %q: status code = %d, want %d", tc.path, resp.StatusCode, tc.wantStatus)
+			}
+		})
+	}
+}

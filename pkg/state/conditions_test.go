@@ -166,4 +166,26 @@ func TestUpdateRouteParentStatuses(t *testing.T) {
 	if result[0].Conditions[0].LastTransitionTime != t0 {
 		t.Errorf("expected Accepted LastTransitionTime preserved, got %v", result[0].Conditions[0].LastTransitionTime)
 	}
+
+	// Test ObservedGeneration bump
+	desiredBumped := []gatewayv1.RouteParentStatus{
+		{
+			ParentRef:      parentRef,
+			ControllerName: controller,
+			Conditions: []metav1.Condition{
+				NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Route accepted", 2),
+				NewCondition("ResolvedRefs", metav1.ConditionTrue, "ResolvedRefs", "Resolved", 2),
+			},
+		},
+	}
+	resultBumped, updatedBumped := UpdateRouteParentStatuses(result, desiredBumped)
+	if !updatedBumped {
+		t.Errorf("expected updated=true when observedGeneration changes")
+	}
+	if resultBumped[0].Conditions[0].ObservedGeneration != 2 {
+		t.Errorf("expected ObservedGeneration 2, got %d", resultBumped[0].Conditions[0].ObservedGeneration)
+	}
+	if resultBumped[0].Conditions[0].LastTransitionTime != t0 {
+		t.Errorf("expected Accepted LastTransitionTime preserved on generation bump, got %v", resultBumped[0].Conditions[0].LastTransitionTime)
+	}
 }
