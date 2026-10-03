@@ -273,6 +273,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.forward(w, r, backend, bestRule.ResponseHeaderModifier, bestRule.Timeouts)
 			return
 		}
+
+		if bestRule.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *bestRule.ResponseHeaderModifier)
+		}
+		http.Error(w, "No backend refs specified", http.StatusInternalServerError)
+		return
 	}
 
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
