@@ -1852,3 +1852,183 @@ func TestProxy_ListenerPortMatching(t *testing.T) {
 		})
 	}
 }
+
+func TestProxyRequestMirror(t *testing.T) {
+	// 1. Primary backend
+	primaryCh := make(chan *http.Request, 10)
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCh <- r
+		w.Header().Set("X-Primary-Backend", "true")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("primary response"))
+	}))
+	defer primaryServer.Close()
+
+	primaryHost, primaryPortStr, _ := net.SplitHostPort(primaryServer.Listener.Addr().String())
+	primaryPort, _ := strconv.Atoi(primaryPortStr)
+
+	// 2. Mirror backend 1
+	mirror1Ch := make(chan *http.Request, 10)
+	mirror1Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirror1Ch <- r
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mirror1Server.Close()
+
+	mirror1Host, mirror1PortStr, _ := net.SplitHostPort(mirror1Server.Listener.Addr().String())
+	mirror1Port, _ := strconv.Atoi(mirror1PortStr)
+
+	// 3. Mirror backend 2
+	mirror2Ch := make(chan *http.Request, 10)
+	mirror2Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirror2Ch <- r
+		w.WriteHeader(http.StatusInternalServerError) // response does not affect client
+	}))
+	defer mirror2Server.Close()
+
+	mirror2Host, mirror2PortStr, _ := net.SplitHostPort(mirror2Server.Listener.Addr().String())
+	mirror2Port, _ := strconv.Atoi(mirror2PortStr)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "X-Modified-Header", Value: "modified-val"},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   primaryHost,
+							Port:   int32(primaryPort),
+							Weight: 1,
+						},
+					},
+					Mirrors: []state.InternalMirror{
+						{
+							Backend: state.InternalBackend{
+								Host: mirror1Host,
+								Port: int32(mirror1Port),
+							},
+							Numerator:   100,
+							Denominator: 100,
+						},
+						{
+							Backend: state.InternalBackend{
+								Host: mirror2Host,
+								Port: int32(mirror2Port),
+							},
+							Numerator:   100,
+							Denominator: 100,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("POST", "http://example.com/test-path?param=1", strings.NewReader("hello mirror"))
+	w := httptest.NewRecorder()
+
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Verify primary received request with modified header and body
+	select {
+	case r := <-primaryCh:
+		if r.URL.Path != "/test-path" {
+			t.Errorf("primary path = %q, want /test-path", r.URL.Path)
+		}
+		if r.Header.Get("X-Modified-Header") != "modified-val" {
+			t.Errorf("primary X-Modified-Header = %q, want modified-val", r.Header.Get("X-Modified-Header"))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for primary request")
+	}
+
+	// Verify mirror 1 received request with modified header and body
+	select {
+	case r := <-mirror1Ch:
+		if r.URL.Path != "/test-path" {
+			t.Errorf("mirror1 path = %q, want /test-path", r.URL.Path)
+		}
+		if r.Header.Get("X-Modified-Header") != "modified-val" {
+			t.Errorf("mirror1 X-Modified-Header = %q, want modified-val", r.Header.Get("X-Modified-Header"))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mirror 1 request")
+	}
+
+	// Verify mirror 2 received request
+	select {
+	case r := <-mirror2Ch:
+		if r.URL.Path != "/test-path" {
+			t.Errorf("mirror2 path = %q, want /test-path", r.URL.Path)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for mirror 2 request")
+	}
+}
+
+func TestProxyRequestMirror_BodyTooLarge(t *testing.T) {
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer primaryServer.Close()
+
+	primaryHost, primaryPortStr, _ := net.SplitHostPort(primaryServer.Listener.Addr().String())
+	primaryPort, _ := strconv.Atoi(primaryPortStr)
+
+	mirrorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mirrorServer.Close()
+
+	mirrorHost, mirrorPortStr, _ := net.SplitHostPort(mirrorServer.Listener.Addr().String())
+	mirrorPort, _ := strconv.Atoi(mirrorPortStr)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{
+							Host:   primaryHost,
+							Port:   int32(primaryPort),
+							Weight: 1,
+						},
+					},
+					Mirrors: []state.InternalMirror{
+						{
+							Backend: state.InternalBackend{
+								Host: mirrorHost,
+								Port: int32(mirrorPort),
+							},
+							Numerator:   100,
+							Denominator: 100,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	// Body larger than 8MB limit
+	largeBody := bytes.NewReader(bytes.Repeat([]byte("a"), 8*1024*1024+1))
+	req := httptest.NewRequest("POST", "http://example.com/test-large", largeBody)
+	w := httptest.NewRecorder()
+
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413 (Payload Too Large), got %d", resp.StatusCode)
+	}
+}
