@@ -455,6 +455,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	r.State.UpsertGateway(gw)
+	_ = gs // keep for now
+	r.updateProxy()
+
 	if updated {
 		gw.Status.Conditions = newConditions
 		gw.Status.Addresses = newAddresses
@@ -464,10 +468,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	}
-
-	r.State.UpsertGateway(gw)
-	_ = gs // keep for now
-	r.updateProxy()
 
 	if ip == "" && hostname == "" {
 		l.V(1).Info("gari-proxy service has no LoadBalancer address yet")
@@ -490,6 +490,29 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
+		// A GatewayClass update invalidates all Gateways that reference it
+		Watches(&gatewayv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			gc := obj.(*gatewayv1.GatewayClass)
+			if string(gc.Spec.ControllerName) != r.ControllerName {
+				return nil
+			}
+			var gwList gatewayv1.GatewayList
+			if err := r.List(ctx, &gwList); err == nil {
+				var requests []ctrl.Request
+				for _, gw := range gwList.Items {
+					if string(gw.Spec.GatewayClassName) == gc.Name {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: gw.Namespace,
+								Name:      gw.Name,
+							},
+						})
+					}
+				}
+				return requests
+			}
+			return nil
+		})).
 		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			// When an HTTPRoute changes, reconcile all Gateways it references
 			route := obj.(*gatewayv1.HTTPRoute)
