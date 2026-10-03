@@ -112,9 +112,36 @@ func CompileHTTPRoute(
 	}
 
 	var compiledRules []InternalRule
+	seenRuleNames := make(map[gatewayv1.SectionName]bool)
 
 	for _, rule := range route.Spec.Rules {
-		iRule := InternalRule{}
+		iRule := InternalRule{
+			Name: rule.Name,
+		}
+
+		if rule.Name != nil {
+			if seenRuleNames[*rule.Name] {
+				msg := fmt.Sprintf("duplicate rule name: %s", *rule.Name)
+				errCond := NewCondition(
+					string(gatewayv1.RouteConditionAccepted),
+					metav1.ConditionFalse,
+					string(gatewayv1.RouteReasonUnsupportedValue),
+					msg,
+					route.Generation,
+				)
+				if validationCondition.Status == metav1.ConditionTrue {
+					validationCondition = errCond
+				}
+				if iRule.Error == nil {
+					iRule.Error = &ErrorState{
+						Condition:      errCond,
+						HTTPStatusCode: http.StatusInternalServerError,
+						HTTPMessage:    msg,
+					}
+				}
+			}
+			seenRuleNames[*rule.Name] = true
+		}
 
 		// 0. Process rule timeouts
 		if timeouts, err := ParseTimeouts(rule.Timeouts); err != nil {
@@ -318,6 +345,69 @@ func CompileHTTPRoute(
 					}
 				}
 				iMatch.Headers = append(iMatch.Headers, hm)
+			}
+			seenQueryParams := make(map[string]bool)
+			for _, qp := range match.QueryParams {
+				qpName := string(qp.Name)
+				if seenQueryParams[qpName] {
+					continue
+				}
+				seenQueryParams[qpName] = true
+
+				qpType := ValueOf(qp.Type)
+				if qpType == "" {
+					qpType = gatewayv1.QueryParamMatchExact
+				}
+				iqp := InternalQueryParamMatch{
+					Type:            qpType,
+					Name:            qpName,
+					MatchExactValue: qp.Value,
+				}
+				if qpType == gatewayv1.QueryParamMatchRegularExpression {
+					re, err := regexp.Compile(qp.Value)
+					if err != nil {
+						msg := fmt.Sprintf("invalid regular expression in query param match: %v", err)
+						errCond := NewCondition(
+							string(gatewayv1.RouteConditionAccepted),
+							metav1.ConditionFalse,
+							string(gatewayv1.RouteReasonUnsupportedValue),
+							msg,
+							route.Generation,
+						)
+						if validationCondition.Status == metav1.ConditionTrue {
+							validationCondition = errCond
+						}
+						if iRule.Error == nil {
+							iRule.Error = &ErrorState{
+								Condition:      errCond,
+								HTTPStatusCode: http.StatusInternalServerError,
+								HTTPMessage:    msg,
+							}
+						}
+					} else {
+						iqp.MatchRegularExpressionValue = re
+					}
+				} else if qpType != gatewayv1.QueryParamMatchExact {
+					msg := fmt.Sprintf("unsupported query param match type: %s", qpType)
+					errCond := NewCondition(
+						string(gatewayv1.RouteConditionAccepted),
+						metav1.ConditionFalse,
+						string(gatewayv1.RouteReasonUnsupportedValue),
+						msg,
+						route.Generation,
+					)
+					if validationCondition.Status == metav1.ConditionTrue {
+						validationCondition = errCond
+					}
+					if iRule.Error == nil {
+						iRule.Error = &ErrorState{
+							Condition:      errCond,
+							HTTPStatusCode: http.StatusInternalServerError,
+							HTTPMessage:    msg,
+						}
+					}
+				}
+				iMatch.QueryParams = append(iMatch.QueryParams, iqp)
 			}
 			iRule.Matches = append(iRule.Matches, iMatch)
 		}

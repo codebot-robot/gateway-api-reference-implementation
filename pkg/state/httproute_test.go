@@ -1092,6 +1092,202 @@ func TestCompileHTTPRoute(t *testing.T) {
 			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
 		}
 	})
+
+	t.Run("compiles query params correctly and deduplicates names", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "query-params", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								QueryParams: []gatewayv1.HTTPQueryParamMatch{
+									{
+										Name:  "animal",
+										Value: "whale",
+									},
+									{
+										Name:  "animal",
+										Value: "dolphin", // Duplicate query param name should be ignored
+									},
+									{
+										Type:  Ptr(gatewayv1.QueryParamMatchRegularExpression),
+										Name:  "species",
+										Value: "^whale-.*$",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Fatalf("expected ValidationCondition True, got %v: %s", internal.ValidationCondition.Status, internal.ValidationCondition.Message)
+		}
+		if len(internal.Rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(internal.Rules))
+		}
+		matches := internal.Rules[0].Matches
+		if len(matches) != 1 {
+			t.Fatalf("expected 1 match, got %d", len(matches))
+		}
+		qps := matches[0].QueryParams
+		if len(qps) != 2 {
+			t.Fatalf("expected 2 query params (deduplicated), got %d", len(qps))
+		}
+		if qps[0].Name != "animal" || qps[0].MatchExactValue != "whale" || qps[0].Type != gatewayv1.QueryParamMatchExact {
+			t.Errorf("unexpected qp[0]: %+v", qps[0])
+		}
+		if qps[1].Name != "species" || qps[1].MatchRegularExpressionValue == nil || qps[1].Type != gatewayv1.QueryParamMatchRegularExpression {
+			t.Errorf("unexpected qp[1]: %+v", qps[1])
+		}
+	})
+
+	t.Run("compiles invalid query param regex with error condition", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-qp-regex", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								QueryParams: []gatewayv1.HTTPQueryParamMatch{
+									{
+										Type:  Ptr(gatewayv1.QueryParamMatchRegularExpression),
+										Name:  "animal",
+										Value: "[invalid",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", internal.ValidationCondition.Status)
+		}
+		if internal.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %s", internal.ValidationCondition.Reason)
+		}
+		if len(internal.Rules) != 1 || internal.Rules[0].Error == nil {
+			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
+		}
+	})
+
+	t.Run("compiles unsupported query param type with error condition", func(t *testing.T) {
+		unknownType := gatewayv1.QueryParamMatchType("UnknownType")
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "unknown-qp-type", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								QueryParams: []gatewayv1.HTTPQueryParamMatch{
+									{
+										Type:  &unknownType,
+										Name:  "animal",
+										Value: "whale",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", internal.ValidationCondition.Status)
+		}
+		if internal.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %s", internal.ValidationCondition.Reason)
+		}
+	})
+
+	t.Run("compiles named rules and rejects duplicate rule names", func(t *testing.T) {
+		ruleName1 := gatewayv1.SectionName("rule-1")
+		ruleName2 := gatewayv1.SectionName("rule-2")
+
+		validRoute := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-named-rules", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Name: &ruleName1,
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{Path: &gatewayv1.HTTPPathMatch{Value: Ptr("/rule1")}},
+						},
+					},
+					{
+						Name: &ruleName2,
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{Path: &gatewayv1.HTTPPathMatch{Value: Ptr("/rule2")}},
+						},
+					},
+					{
+						// Unnamed rule alongside named rules is valid
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{Path: &gatewayv1.HTTPPathMatch{Value: Ptr("/unnamed")}},
+						},
+					},
+				},
+			},
+		}
+
+		internalValid := CompileHTTPRoute(validRoute, nil, nil, nil, nil)
+		if internalValid.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Fatalf("expected valid named route ValidationCondition True, got %v", internalValid.ValidationCondition.Status)
+		}
+		if len(internalValid.Rules) != 3 {
+			t.Fatalf("expected 3 rules, got %d", len(internalValid.Rules))
+		}
+		if internalValid.Rules[0].Name == nil || *internalValid.Rules[0].Name != ruleName1 {
+			t.Errorf("expected rule 0 name rule-1, got %v", internalValid.Rules[0].Name)
+		}
+		if internalValid.Rules[1].Name == nil || *internalValid.Rules[1].Name != ruleName2 {
+			t.Errorf("expected rule 1 name rule-2, got %v", internalValid.Rules[1].Name)
+		}
+		if internalValid.Rules[2].Name != nil {
+			t.Errorf("expected rule 2 name nil, got %v", internalValid.Rules[2].Name)
+		}
+
+		// Duplicate rule names
+		duplicateRoute := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "duplicate-named-rules", Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Name: &ruleName1,
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{Path: &gatewayv1.HTTPPathMatch{Value: Ptr("/rule1")}},
+						},
+					},
+					{
+						Name: &ruleName1, // duplicate name
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{Path: &gatewayv1.HTTPPathMatch{Value: Ptr("/rule2")}},
+						},
+					},
+				},
+			},
+		}
+
+		internalDup := CompileHTTPRoute(duplicateRoute, nil, nil, nil, nil)
+		if internalDup.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected duplicate rule names ValidationCondition False, got %v", internalDup.ValidationCondition.Status)
+		}
+		if internalDup.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %s", internalDup.ValidationCondition.Reason)
+		}
+	})
 }
 
 func TestHTTPRouteValidate_Timeouts(t *testing.T) {
