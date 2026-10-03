@@ -1424,3 +1424,57 @@ func TestHTTPRouteValidate_Timeouts(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPRouteValidate_Retry(t *testing.T) {
+	tests := []struct {
+		name        string
+		route       *HTTPRouteState
+		expectError bool
+	}{
+		{
+			name: "valid retry configuration with attempts and codes",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Retry: &gatewayv1.HTTPRouteRetry{
+									Codes:    []gatewayv1.HTTPRouteRetryStatusCode{500, 502, 503, 504},
+									Attempts: Ptr(3),
+									Backoff:  Ptr(gatewayv1.Duration("100ms")),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid retry backoff string",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Retry: &gatewayv1.HTTPRouteRetry{
+									Backoff: Ptr(gatewayv1.Duration("invalid-duration")),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.route.Validate()
+			if (err != nil) != tt.expectError {
+				t.Errorf("Validate() err = %v, expectError = %v", err, tt.expectError)
+			}
+		})
+	}
+}

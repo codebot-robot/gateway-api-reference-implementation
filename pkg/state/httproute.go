@@ -166,6 +166,29 @@ func CompileHTTPRoute(
 			iRule.Timeouts = timeouts
 		}
 
+		// 0b. Process rule retry
+		if retry, err := ParseRetry(rule.Retry); err != nil {
+			errCond := NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonUnsupportedValue),
+				err.Error(),
+				route.Generation,
+			)
+			if validationCondition.Status == metav1.ConditionTrue {
+				validationCondition = errCond
+			}
+			if iRule.Error == nil {
+				iRule.Error = &ErrorState{
+					Condition:      errCond,
+					HTTPStatusCode: http.StatusInternalServerError,
+					HTTPMessage:    err.Error(),
+				}
+			}
+		} else {
+			iRule.Retry = retry
+		}
+
 		// 1. Process rule filters
 		for _, filter := range rule.Filters {
 			switch filter.Type {
@@ -529,6 +552,9 @@ func CompileHTTPRoute(
 					for _, p := range svc.Spec.Ports {
 						if p.Port == port {
 							appProtocol = p.AppProtocol
+							if svc.Spec.ClusterIP == corev1.ClusterIPNone && p.TargetPort.IntValue() > 0 {
+								port = int32(p.TargetPort.IntValue())
+							}
 							break
 						}
 					}
