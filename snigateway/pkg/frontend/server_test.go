@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 )
@@ -295,4 +296,74 @@ func TestRejectionWithoutValidClientCertificate(t *testing.T) {
 			t.Fatal("expected request with untrusted client cert to fail, got nil err")
 		}
 	})
+}
+
+func TestStreamReconnectKeepsRegistration(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerAndClient(t)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+
+	ctx1, cancel1 := context.WithCancel(t.Context())
+	ready1 := make(chan struct{})
+
+	go func() {
+		_ = c.StreamConnectionsWithReady(ctx1, ready1, func(ctx context.Context, event *api.ConnectionEvent) error {
+			return nil
+		})
+	}()
+
+	select {
+	case <-ready1:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream 1 timed out connecting")
+	}
+
+	// Register hostnames with frontend
+	if _, err := c.Register(ctx1, []string{"app.example.com"}); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	if registered := srv.RegistrationTable().GetRegisteredHostnames("test-cluster-client"); len(registered) != 1 || registered[0] != "app.example.com" {
+		t.Fatalf("expected [app.example.com] registered, got %v", registered)
+	}
+
+	// Connect stream 2 (reconnect) before stream 1 completes
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	ready2 := make(chan struct{})
+
+	go func() {
+		_ = c.StreamConnectionsWithReady(ctx2, ready2, func(ctx context.Context, event *api.ConnectionEvent) error {
+			return nil
+		})
+	}()
+
+	select {
+	case <-ready2:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream 2 timed out connecting")
+	}
+
+	// Now close stream 1
+	cancel1()
+	time.Sleep(100 * time.Millisecond)
+
+	// Stream 1 exiting must NOT unregister the hostnames because stream 2 is active
+	if registered := srv.RegistrationTable().GetRegisteredHostnames("test-cluster-client"); len(registered) != 1 || registered[0] != "app.example.com" {
+		t.Fatalf("expected hostnames to remain registered after stream 1 closed, got %v", registered)
+	}
+
+	// Now close stream 2 (the active stream)
+	cancel2()
+	time.Sleep(100 * time.Millisecond)
+
+	// Active stream 2 closing with no replacement must unregister
+	if registered := srv.RegistrationTable().GetRegisteredHostnames("test-cluster-client"); len(registered) != 0 {
+		t.Fatalf("expected hostnames to be unregistered after active stream 2 closed, got %v", registered)
+	}
 }

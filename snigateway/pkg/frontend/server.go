@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -205,6 +206,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 2. Otherwise look up in registration table
 	clientID, found := s.table.Match(cleanSNI)
 	if !found {
+		log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
 		// No client registered for this hostname; close connection
 		_ = peekedConn.Close()
 		return
@@ -216,6 +218,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.mu.RUnlock()
 
 	if !active || eventCh == nil {
+		log.Printf("Frontend: rejecting connection with SNI %q: client %q has no active event stream", sniHostname, clientID)
 		_ = peekedConn.Close()
 		return
 	}
@@ -244,6 +247,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	select {
 	case eventCh <- event:
 	case <-time.After(s.config.ConnectTimeout):
+		log.Printf("Frontend: timed out sending event for conn %s (SNI: %q) to client %s", connID, sniHostname, clientID)
 		_ = peekedConn.Close()
 		return
 	}
@@ -257,6 +261,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		spliceConnections(peekedConn, dialedConn)
 	case <-time.After(s.config.ConnectTimeout):
+		log.Printf("Frontend: timed out waiting for dialback for conn %s (SNI: %q) from client %s", connID, sniHostname, clientID)
 		_ = peekedConn.Close()
 	}
 }
@@ -312,11 +317,13 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.table.Register(clientID, req.Hostnames)
+	registered := s.table.GetRegisteredHostnames(clientID)
+	log.Printf("Frontend: client %q registered hostnames: %v", clientID, registered)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
 		Status:    "registered",
-		Hostnames: s.table.GetRegisteredHostnames(clientID),
+		Hostnames: registered,
 	})
 }
 
@@ -343,14 +350,18 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 	s.mu.Lock()
 	s.clients[clientID] = eventCh
 	s.mu.Unlock()
+	log.Printf("Frontend: client %q connected to event stream", clientID)
 
 	defer func() {
 		s.mu.Lock()
 		if s.clients[clientID] == eventCh {
 			delete(s.clients, clientID)
+			s.table.Unregister(clientID)
+			log.Printf("Frontend: client %q event stream closed and unregistered", clientID)
+		} else {
+			log.Printf("Frontend: old event stream for client %q closed (newer stream is active)", clientID)
 		}
 		s.mu.Unlock()
-		s.table.Unregister(clientID)
 	}()
 
 	w.Header().Set("Content-Type", "application/x-ndjson")

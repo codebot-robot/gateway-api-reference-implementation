@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
@@ -216,5 +217,180 @@ func TestManager_EndToEnd(t *testing.T) {
 	_, err = httpClient.Get("https://app1.example.com/test")
 	if err == nil {
 		t.Fatalf("expected GET app1 to fail after unregistration, but succeeded")
+	}
+}
+
+func TestManager_StreamReconnect(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "snigateway-mgr-reconn-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := certs.GenerateAndWriteCertificates(tempDir, "snigateway.internal", "mgr-client"); err != nil {
+		t.Fatalf("GenerateAndWriteCertificates failed: %v", err)
+	}
+
+	caCertPEM, err := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	if err != nil {
+		t.Fatalf("reading ca.crt: %v", err)
+	}
+	serverCertPEM, err := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	if err != nil {
+		t.Fatalf("reading server.crt: %v", err)
+	}
+	serverKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	if err != nil {
+		t.Fatalf("reading server.key: %v", err)
+	}
+	clientCertPEM, err := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	if err != nil {
+		t.Fatalf("reading client.crt: %v", err)
+	}
+	clientKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "client.key"))
+	if err != nil {
+		t.Fatalf("reading client.key: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	serverAddr := ln.Addr().String()
+
+	srv, err := frontend.NewServer(frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	mgr := NewManager(c, WithBackoff(50*time.Millisecond, 100*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = mgr.Run(ctx)
+	}()
+
+	mgr.UpdateHostnames([]string{"echo.snigateway.test"})
+
+	tlsCert, err := tls.X509KeyPair(serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("tls.X509KeyPair: %v", err)
+	}
+
+	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	})
+
+	httpSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("response from " + r.Host))
+		}),
+	}
+	defer httpSrv.Close()
+
+	go func() {
+		_ = httpSrv.Serve(tlsLis)
+	}()
+
+	// Wait for initial registration
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		regHosts := srv.RegistrationTable().GetRegisteredHostnames("mgr-client")
+		if slices.Equal(regHosts, []string{"echo.snigateway.test"}) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "echo.snigateway.test",
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         "echo.snigateway.test",
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := httpClient.Get("https://echo.snigateway.test/test")
+	if err != nil {
+		t.Fatalf("initial HTTP GET failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Connect an overlapping second stream with the same client certificate to simulate reconnect / old stream displacement
+	ctxOverlap, cancelOverlap := context.WithCancel(t.Context())
+	overlapReady := make(chan struct{})
+	overlapClient := client.NewClient(serverAddr, clientTLS)
+	go func() {
+		_ = overlapClient.StreamConnectionsWithReady(ctxOverlap, overlapReady, func(ctx context.Context, event *api.ConnectionEvent) error {
+			return nil
+		})
+	}()
+
+	select {
+	case <-overlapReady:
+	case <-time.After(3 * time.Second):
+		t.Fatal("overlap stream timed out connecting")
+	}
+
+	// Close the overlapping stream; Manager should recover and re-register
+	cancelOverlap()
+
+	// Wait for Manager to reconnect and re-register
+	deadline = time.Now().Add(5 * time.Second)
+	var regHosts []string
+	for time.Now().Before(deadline) {
+		regHosts = srv.RegistrationTable().GetRegisteredHostnames("mgr-client")
+		if slices.Equal(regHosts, []string{"echo.snigateway.test"}) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !slices.Equal(regHosts, []string{"echo.snigateway.test"}) {
+		t.Fatalf("hostnames not re-registered after stream reconnect, got: %v", regHosts)
+	}
+
+	// Verify traffic still works
+	resp2, err := httpClient.Get("https://echo.snigateway.test/test")
+	if err != nil {
+		t.Fatalf("HTTP GET after reconnect failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200 after reconnect, got %d", resp2.StatusCode)
 	}
 }
