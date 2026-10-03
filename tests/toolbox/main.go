@@ -15,12 +15,20 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
+	"time"
 )
 
 func main() {
@@ -33,14 +41,7 @@ func main() {
 	case "server":
 		runServer()
 	case "client":
-		if len(os.Args) < 3 {
-			log.Fatal("Usage: toolbox client <url> [hostname]")
-		}
-		hostname := ""
-		if len(os.Args) >= 4 {
-			hostname = os.Args[3]
-		}
-		runClient(os.Args[2], hostname)
+		runClientCLI(os.Args[2:])
 	default:
 		log.Fatalf("Unknown mode: %s", mode)
 	}
@@ -82,22 +83,115 @@ func runServer() {
 	}
 }
 
-func runClient(targetURL, hostname string) {
-	log.Printf("Sending request to %s (Host: %s)", targetURL, hostname)
-	client := &http.Client{}
+func runClientCLI(args []string) {
+	fs := flag.NewFlagSet("client", flag.ExitOnError)
+	connectTo := fs.String("connect-to", "", "Address to connect to (e.g. host:port or ip:port), overriding target URL host")
+	sni := fs.String("sni", "", "SNI server name to send during TLS handshake")
+	hostHeader := fs.String("host", "", "HTTP Host header")
+	caCertPath := fs.String("ca-cert", "", "Path to CA cert PEM file to trust")
+	insecure := fs.Bool("insecure", false, "Skip TLS verification")
+	expectFail := fs.Bool("expect-fail", false, "Expect request / TLS connection to fail/be closed")
+	timeout := fs.Duration("timeout", 10*time.Second, "Request timeout")
+
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("Failed to parse client flags: %v", err)
+	}
+
+	remaining := fs.Args()
+	if len(remaining) < 1 {
+		log.Fatal("Usage: toolbox client [flags] <url> [hostname]")
+	}
+
+	targetURL := remaining[0]
+	if len(remaining) >= 2 && *hostHeader == "" {
+		*hostHeader = remaining[1]
+	}
+
+	var rootCAs *x509.CertPool
+	if *caCertPath != "" {
+		caData, err := os.ReadFile(*caCertPath)
+		if err != nil {
+			log.Fatalf("Failed to read CA cert from %s: %v", *caCertPath, err)
+		}
+		rootCAs = x509.NewCertPool()
+		if !rootCAs.AppendCertsFromPEM(caData) {
+			log.Fatalf("Failed to append CA cert from %s", *caCertPath)
+		}
+	}
+
+	var capturedPeerCerts []*x509.Certificate
+
+	transport := &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialAddr := addr
+			if *connectTo != "" {
+				dialAddr = *connectTo
+			}
+			serverName := *sni
+			if serverName == "" {
+				u, err := url.Parse(targetURL)
+				if err == nil {
+					serverName = u.Hostname()
+				}
+			}
+			tlsConfig := &tls.Config{
+				ServerName:         serverName,
+				RootCAs:            rootCAs,
+				InsecureSkipVerify: *insecure,
+			}
+			dialer := &net.Dialer{Timeout: *timeout}
+			conn, err := tls.DialWithDialer(dialer, network, dialAddr, tlsConfig)
+			if err != nil {
+				return nil, err
+			}
+			cs := conn.ConnectionState()
+			capturedPeerCerts = cs.PeerCertificates
+			return conn, nil
+		},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialAddr := addr
+			if *connectTo != "" {
+				dialAddr = *connectTo
+			}
+			dialer := &net.Dialer{Timeout: *timeout}
+			return dialer.DialContext(ctx, network, dialAddr)
+		},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   *timeout,
+	}
+
+	log.Printf("Sending request to %s (Host: %s, ConnectTo: %s, SNI: %s)", targetURL, *hostHeader, *connectTo, *sni)
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		log.Fatalf("Failed to create request: %v", err)
 	}
-	if hostname != "" {
-		req.Host = hostname
+	if *hostHeader != "" {
+		req.Host = *hostHeader
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if *expectFail {
+			fmt.Printf("Connection rejected as expected: %v\n", err)
+			return
+		}
 		log.Fatalf("Request failed: %v", err)
 	}
 	defer resp.Body.Close()
+
+	if *expectFail {
+		log.Fatalf("Expected connection to fail, but request succeeded with status %s", resp.Status)
+	}
+
+	if len(capturedPeerCerts) > 0 {
+		leaf := capturedPeerCerts[0]
+		fmt.Printf("PeerCertSubjectCN: %s\n", leaf.Subject.CommonName)
+		fmt.Printf("PeerCertDNSNames: %s\n", strings.Join(leaf.DNSNames, ","))
+		fmt.Printf("PeerCertIssuerCN: %s\n", leaf.Issuer.CommonName)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

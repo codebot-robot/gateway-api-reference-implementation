@@ -149,8 +149,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Find the LoadBalancer IP of the gari-proxy service
 	var svc corev1.Service
 	if err := r.Get(ctx, client.ObjectKey{Name: "gari-proxy", Namespace: "default"}, &svc); err != nil {
-		l.Error(err, "unable to fetch gari-proxy service")
-		return ctrl.Result{}, err
+		if !apierrors.IsNotFound(err) {
+			l.Error(err, "unable to fetch gari-proxy service")
+			return ctrl.Result{}, err
+		}
 	}
 
 	var ip string
