@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -904,4 +906,298 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 		}
 	}
 	return nil
+}
+
+type fakeAddressProvider struct {
+	addresses []gatewayv1.GatewayStatusAddress
+	err       error
+}
+
+func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error) {
+	return f.addresses, f.err
+}
+
+type fakeAddressWatcherProvider struct {
+	fakeAddressProvider
+	setupWatchesCalled bool
+}
+
+func (f *fakeAddressWatcherProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
+	f.setupWatchesCalled = true
+	return nil
+}
+
+func TestGatewayReconciler_AddressProvider(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-gc",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	// 1. With address provider returning IP and Hostname
+	ipType := gatewayv1.IPAddressType
+	hostType := gatewayv1.HostnameAddressType
+	provider := &fakeAddressProvider{
+		addresses: []gatewayv1.GatewayStatusAddress{
+			{Type: &ipType, Value: "1.2.3.4"},
+			{Type: &hostType, Value: "gateway.example.com"},
+		},
+	}
+
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		Proxy:           p,
+		ControllerName:  "test-controller",
+		AddressProvider: provider,
+	}
+
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	if len(reconciledGW.Status.Addresses) != 2 {
+		t.Fatalf("expected 2 addresses, got %d", len(reconciledGW.Status.Addresses))
+	}
+	if reconciledGW.Status.Addresses[0].Value != "1.2.3.4" || state.ValueOf(reconciledGW.Status.Addresses[0].Type) != gatewayv1.IPAddressType {
+		t.Errorf("expected IP address 1.2.3.4, got %+v", reconciledGW.Status.Addresses[0])
+	}
+	if reconciledGW.Status.Addresses[1].Value != "gateway.example.com" || state.ValueOf(reconciledGW.Status.Addresses[1].Type) != gatewayv1.HostnameAddressType {
+		t.Errorf("expected hostname gateway.example.com, got %+v", reconciledGW.Status.Addresses[1])
+	}
+
+	progCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	// 2. Re-reconcile when provider signals a change (addresses change)
+	provider.addresses = []gatewayv1.GatewayStatusAddress{
+		{Type: &ipType, Value: "5.6.7.8"},
+	}
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error re-reconciling gateway: %v", err)
+	}
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	if len(reconciledGW.Status.Addresses) != 1 || reconciledGW.Status.Addresses[0].Value != "5.6.7.8" {
+		t.Errorf("expected updated address 5.6.7.8, got %+v", reconciledGW.Status.Addresses)
+	}
+
+	// 3. With address provider returning empty slice -> Programmed=False, reason AddressNotAssigned
+	provider.addresses = nil
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	if len(reconciledGW.Status.Addresses) != 0 {
+		t.Errorf("expected 0 addresses, got %d", len(reconciledGW.Status.Addresses))
+	}
+	progCond = findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected Programmed=False/AddressNotAssigned, got %+v", progCond)
+	}
+
+	// 4. With nil address provider -> Programmed=False, reason AddressNotAssigned
+	r.AddressProvider = nil
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	if len(reconciledGW.Status.Addresses) != 0 {
+		t.Errorf("expected 0 addresses, got %d", len(reconciledGW.Status.Addresses))
+	}
+	progCond = findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Errorf("expected Programmed=False/AddressNotAssigned, got %+v", progCond)
+	}
+}
+
+func TestGatewayReconciler_AddressWatcher(t *testing.T) {
+	watcher := &fakeAddressWatcherProvider{}
+	r := &GatewayReconciler{
+		ControllerName:  "test-controller",
+		AddressProvider: watcher,
+	}
+
+	// SetupWithManager should invoke SetupWatches on the provider
+	// We verify that watcher implements AddressWatcher
+	var _ AddressWatcher = watcher
+
+	if _, ok := r.AddressProvider.(AddressWatcher); !ok {
+		t.Fatalf("expected AddressProvider to implement AddressWatcher")
+	}
+}
+
+func containsGateway(gws []*state.GatewayState, key types.NamespacedName) bool {
+	for _, gw := range gws {
+		if gw.Gateway != nil && gw.Gateway.Namespace == key.Namespace && gw.Gateway.Name == key.Name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestGatewayReconciler_GatewayFilter(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-gc",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	gwProd := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-prod",
+			Namespace: "default",
+			Labels:    map[string]string{"env": "prod"},
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	gwDev := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-dev",
+			Namespace: "default",
+			Labels:    map[string]string{"env": "dev"},
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gwProd, gwDev).
+		WithStatusSubresource(gwProd, gwDev).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		Proxy:          p,
+		ControllerName: "test-controller",
+		GatewayFilter: func(gw *gatewayv1.Gateway) bool {
+			return gw.Labels["env"] == "prod"
+		},
+	}
+
+	ctx := t.Context()
+
+	// 1. Reconcile gw-prod (matches filter) -> accepted & stored in state
+	prodKey := types.NamespacedName{Namespace: "default", Name: "gw-prod"}
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: prodKey})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling prod gateway: %v", err)
+	}
+
+	var resProd gatewayv1.Gateway
+	if err := client.Get(ctx, prodKey, &resProd); err != nil {
+		t.Fatalf("failed to get prod gateway: %v", err)
+	}
+	if len(resProd.Status.Conditions) == 0 {
+		t.Errorf("expected conditions on prod Gateway, got none")
+	}
+	if !containsGateway(st.GetGateways(), prodKey) {
+		t.Errorf("expected prod gateway in state")
+	}
+
+	// 2. Reconcile gw-dev (does not match filter) -> ignored & not in state
+	devKey := types.NamespacedName{Namespace: "default", Name: "gw-dev"}
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: devKey})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling dev gateway: %v", err)
+	}
+
+	var resDev gatewayv1.Gateway
+	if err := client.Get(ctx, devKey, &resDev); err != nil {
+		t.Fatalf("failed to get dev gateway: %v", err)
+	}
+	if len(resDev.Status.Conditions) != 0 {
+		t.Errorf("expected no conditions on dev Gateway, got %+v", resDev.Status.Conditions)
+	}
+	if containsGateway(st.GetGateways(), devKey) {
+		t.Errorf("expected dev gateway NOT in state")
+	}
 }

@@ -50,6 +50,8 @@ func ResolveNamespacedName[N ~string, M ~string](namespace *N, name M, src clien
 type ReconcilerOptions struct {
 	ControllerName   string
 	OnGatewaysUpdate func([]*gatewayv1.Gateway)
+	AddressProvider  AddressProvider
+	GatewayFilter    func(gw *gatewayv1.Gateway) bool
 }
 
 // RegisterReconcilers registers all GARI reconcilers with the given Manager.
@@ -84,6 +86,8 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		Proxy:            p,
 		ControllerName:   controllerName,
 		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		AddressProvider:  opts.AddressProvider,
+		GatewayFilter:    opts.GatewayFilter,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
