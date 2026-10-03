@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -867,5 +868,167 @@ func TestProxy_BackendResponseHeaderModifier(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Backend-Resp"); got != "backend-resp" {
 		t.Errorf("expected X-Backend-Resp 'backend-resp', got %q", got)
+	}
+}
+
+func TestProxy_HTTPSListenerDetectMisdirectedRequests(t *testing.T) {
+	// Setup mock backends
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s1.Close()
+	u1, _ := url.Parse(s1.URL)
+	port1, _ := strconv.Atoi(u1.Port())
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v2")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s2.Close()
+	u2, _ := url.Parse(s2.URL)
+	port2, _ := strconv.Atoi(u2.Port())
+
+	s3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend", "v3")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3.Close()
+	u3, _ := url.Parse(s3.URL)
+	port3, _ := strconv.Atoi(u3.Port())
+
+	listeners := []state.InternalListener{
+		{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"example.org"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/detect-misdirected-requests"},
+								},
+							},
+							Backends: []state.InternalBackend{{Host: u1.Hostname(), Port: int32(port1), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "https-with-hostname",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "second-example.org",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"second-example.org"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/detect-misdirected-requests"},
+								},
+							},
+							Backends: []state.InternalBackend{{Host: u2.Hostname(), Port: int32(port2), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "https-with-wildcard-hostname",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "*.wildcard.org",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"*.wildcard.org"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/detect-misdirected-requests"},
+								},
+							},
+							Backends: []state.InternalBackend{{Host: u3.Hostname(), Port: int32(port3), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "https-with-hostname-matching-wildcard",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "fourth-example.wildcard.org",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"fourth-example.wildcard.org"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/detect-misdirected-requests"},
+								},
+							},
+							Backends: []state.InternalBackend{{Host: u1.Hostname(), Port: int32(port1), Weight: 1}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p := NewProxy()
+	p.UpdateListeners(listeners)
+
+	cases := []struct {
+		serverName  string
+		host        string
+		wantStatus  int
+		wantBackend string
+	}{
+		{serverName: "example.org", host: "example.org", wantStatus: 200, wantBackend: "v1"},
+		{serverName: "example.org", host: "second-example.org", wantStatus: 421},
+		{serverName: "example.org", host: "unknown-example.org", wantStatus: 404},
+
+		{serverName: "second-example.org", host: "second-example.org", wantStatus: 200, wantBackend: "v2"},
+		{serverName: "second-example.org", host: "example.org", wantStatus: 421},
+		{serverName: "second-example.org", host: "unknown-example.org", wantStatus: 421},
+
+		{serverName: "third-example.wildcard.org", host: "third-example.wildcard.org", wantStatus: 200, wantBackend: "v3"},
+		{serverName: "third-example.wildcard.org", host: "fith-example.wildcard.org", wantStatus: 200, wantBackend: "v3"},
+		{serverName: "third-example.wildcard.org", host: "fourth-example.wildcard.org", wantStatus: 421},
+		{serverName: "third-example.wildcard.org", host: "second-example.org", wantStatus: 421},
+		{serverName: "third-example.wildcard.org", host: "unknown-example.org", wantStatus: 421},
+
+		{serverName: "fourth-example.wildcard.org", host: "fourth-example.wildcard.org", wantStatus: 200, wantBackend: "v1"},
+		{serverName: "fourth-example.wildcard.org", host: "fith-example.wildcard.org", wantStatus: 421},
+
+		{serverName: "unknown-example.org", host: "example.org", wantStatus: 200, wantBackend: "v1"},
+		{serverName: "unknown-example.org", host: "unknown-example.org", wantStatus: 404},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.serverName+"->"+tc.host, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "https://"+tc.host+"/detect-misdirected-requests", nil)
+			req.Host = tc.host
+			req.TLS = &tls.ConnectionState{
+				ServerName: tc.serverName,
+			}
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("serverName %q, host %q: status code = %d, want %d", tc.serverName, tc.host, resp.StatusCode, tc.wantStatus)
+			}
+			if tc.wantBackend != "" {
+				if got := resp.Header.Get("X-Backend"); got != tc.wantBackend {
+					t.Errorf("serverName %q, host %q: backend = %q, want %q", tc.serverName, tc.host, got, tc.wantBackend)
+				}
+			}
+		})
 	}
 }

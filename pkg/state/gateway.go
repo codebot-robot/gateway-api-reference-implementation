@@ -52,6 +52,150 @@ func (s *HTTPRouteState) GetNamespace() string {
 	return s.Namespace
 }
 
+// MatchType represents how specifically a hostname matched a listener.
+type MatchType int
+
+const (
+	NoMatch MatchType = iota
+	CatchAllMatch
+	WildcardMatch
+	ExactMatch
+)
+
+// InternalListener represents the computed configuration of a Gateway listener for the proxy.
+type InternalListener struct {
+	Name        string
+	Protocol    gatewayv1.ProtocolType
+	Port        gatewayv1.PortNumber
+	Hostname    string
+	GatewayName types.NamespacedName
+	Routes      []InternalRoute
+}
+
+type listenerMatchCandidate struct {
+	listener       *InternalListener
+	matchType      MatchType
+	hostnameLength int
+}
+
+// MatchesWildcard reports whether a hostname matches a wildcard pattern (e.g. *.example.com).
+func MatchesWildcard(pattern, host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	cleanHost := strings.ToLower(host)
+	cleanPattern := strings.ToLower(pattern)
+	if !strings.HasPrefix(cleanPattern, "*.") {
+		return false
+	}
+	suffix := cleanPattern[1:]
+	return len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix)
+}
+
+// MatchListeners finds all listeners that match a given host with the highest specificity (Exact > Wildcard > CatchAll).
+func MatchListeners(listeners []InternalListener, host string) ([]InternalListener, MatchType) {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	cleanHost := strings.ToLower(host)
+
+	var (
+		bestMatchType      = NoMatch
+		bestHostnameLength = -1
+	)
+
+	for i := range listeners {
+		l := &listeners[i]
+		h := strings.ToLower(l.Hostname)
+
+		if h == "" || h == "*" {
+			candidate := &listenerMatchCandidate{
+				listener:       l,
+				matchType:      CatchAllMatch,
+				hostnameLength: 0,
+			}
+			if isBetterListenerMatch(candidate, &listenerMatchCandidate{matchType: bestMatchType, hostnameLength: bestHostnameLength}) {
+				bestMatchType = CatchAllMatch
+				bestHostnameLength = 0
+			}
+			continue
+		}
+
+		if cleanHost != "" && h == cleanHost {
+			candidate := &listenerMatchCandidate{
+				listener:       l,
+				matchType:      ExactMatch,
+				hostnameLength: len(h),
+			}
+			if isBetterListenerMatch(candidate, &listenerMatchCandidate{matchType: bestMatchType, hostnameLength: bestHostnameLength}) {
+				bestMatchType = ExactMatch
+				bestHostnameLength = len(h)
+			}
+			continue
+		}
+
+		if cleanHost != "" && strings.HasPrefix(h, "*.") {
+			suffix := h[1:]
+			if len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix) {
+				candidate := &listenerMatchCandidate{
+					listener:       l,
+					matchType:      WildcardMatch,
+					hostnameLength: len(h),
+				}
+				if isBetterListenerMatch(candidate, &listenerMatchCandidate{matchType: bestMatchType, hostnameLength: bestHostnameLength}) {
+					bestMatchType = WildcardMatch
+					bestHostnameLength = len(h)
+				}
+			}
+		}
+	}
+
+	if bestMatchType == NoMatch {
+		return nil, NoMatch
+	}
+
+	var matched []InternalListener
+	for i := range listeners {
+		l := &listeners[i]
+		h := strings.ToLower(l.Hostname)
+
+		if bestMatchType == CatchAllMatch && (h == "" || h == "*") {
+			matched = append(matched, *l)
+		} else if bestMatchType == ExactMatch && cleanHost != "" && h == cleanHost {
+			matched = append(matched, *l)
+		} else if bestMatchType == WildcardMatch && cleanHost != "" && strings.HasPrefix(h, "*.") && len(h) == bestHostnameLength {
+			suffix := h[1:]
+			if len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix) {
+				matched = append(matched, *l)
+			}
+		}
+	}
+
+	return matched, bestMatchType
+}
+
+// MatchListener finds the best matching listener for a given host among a slice of listeners.
+func MatchListener(listeners []InternalListener, host string) (*InternalListener, MatchType) {
+	matched, matchType := MatchListeners(listeners, host)
+	if len(matched) == 0 {
+		return nil, NoMatch
+	}
+	return &matched[0], matchType
+}
+
+func isBetterListenerMatch(current, best *listenerMatchCandidate) bool {
+	if best == nil {
+		return true
+	}
+	if current.matchType != best.matchType {
+		return current.matchType > best.matchType
+	}
+	if current.hostnameLength != best.hostnameLength {
+		return current.hostnameLength > best.hostnameLength
+	}
+	return false
+}
+
 // InternalRoute represents the computed state for a route, used by the proxy.
 type InternalRoute struct {
 	Hostnames []string
@@ -396,7 +540,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) ([]InternalListener, []InternalRoute) {
 	for _, route := range routes {
 		if route.HTTPRoute == nil {
 			continue
@@ -404,7 +548,8 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 		route.Compile(services, backendTLSPolicies, configMaps, refValidator)
 	}
 
-	var internalRoutes []InternalRoute
+	var internalListeners []InternalListener
+	var allInternalRoutes []InternalRoute
 
 	for _, listener := range s.Spec.Listeners {
 		// Check if listener is compatible with HTTPRoute
@@ -412,7 +557,15 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			continue
 		}
 
-		listenerHostname := ValueOf(listener.Hostname)
+		iListener := InternalListener{
+			Name:        string(listener.Name),
+			Protocol:    listener.Protocol,
+			Port:        listener.Port,
+			Hostname:    string(ValueOf(listener.Hostname)),
+			GatewayName: types.NamespacedName{Namespace: s.Namespace, Name: s.Name},
+		}
+
+		var listenerRoutes []InternalRoute
 
 		for _, route := range routes {
 			if route.HTTPRoute == nil || route.Internal == nil {
@@ -456,19 +609,29 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 
 			// Calculate intersected hostnames
 			routeHostnames := route.GetHostnames()
+			listenerHostname := ValueOf(listener.Hostname)
 			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
 			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
 				// No intersection, skip this listener
 				continue
 			}
 
-			internalRoutes = append(internalRoutes, InternalRoute{
+			ir := InternalRoute{
 				Hostnames: effectiveHostnames,
 				Rules:     route.Internal.Rules,
-			})
+			}
+			listenerRoutes = append(listenerRoutes, ir)
+			allInternalRoutes = append(allInternalRoutes, ir)
 			_ = matchingParentRef // keep for now
 		}
+		iListener.Routes = listenerRoutes
+		internalListeners = append(internalListeners, iListener)
 	}
 
-	return internalRoutes
+	return internalListeners, allInternalRoutes
+}
+
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) []InternalRoute {
+	_, allInternalRoutes := s.BuildInternalState(routes, services, backendTLSPolicies, configMaps, refValidator, controllerName)
+	return allInternalRoutes
 }
