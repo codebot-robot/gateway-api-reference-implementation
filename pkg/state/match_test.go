@@ -16,6 +16,7 @@ package state
 
 import (
 	"net/http"
+	"regexp"
 	"testing"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -477,5 +478,294 @@ func TestMatchListener(t *testing.T) {
 		if matchType != tt.wantMatch {
 			t.Errorf("MatchListener(%q) matchType = %v, want %v", tt.host, matchType, tt.wantMatch)
 		}
+	}
+}
+
+func TestMatchRoute_QueryParamMatching(t *testing.T) {
+	routes := []InternalRoute{
+		{
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "animal",
+									MatchExactValue: "whale",
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "whale-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "animal",
+									MatchExactValue: "dolphin",
+								},
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "color",
+									MatchExactValue: "blue",
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "blue-dolphin-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "ANIMAL",
+									MatchExactValue: "Whale",
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "case-sensitive-whale-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:                        gatewayv1.QueryParamMatchRegularExpression,
+									Name:                        "species",
+									MatchRegularExpressionValue: regexp.MustCompile("^shark-.*$"),
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "regex-shark-backend"}},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name            string
+		url             string
+		expectedBackend string
+		expectMatch     bool
+	}{
+		{
+			name:            "Exact query param match",
+			url:             "http://example.com/?animal=whale",
+			expectedBackend: "whale-backend",
+			expectMatch:     true,
+		},
+		{
+			name:            "Exact match with extra irrelevant param",
+			url:             "http://example.com/?animal=whale&other=xyz",
+			expectedBackend: "whale-backend",
+			expectMatch:     true,
+		},
+		{
+			name:            "Multiple query params match",
+			url:             "http://example.com/?animal=dolphin&color=blue",
+			expectedBackend: "blue-dolphin-backend",
+			expectMatch:     true,
+		},
+		{
+			name:        "Multiple query params partially match - should not match",
+			url:         "http://example.com/?animal=dolphin&color=red",
+			expectMatch: false,
+		},
+		{
+			name:            "Case sensitive match",
+			url:             "http://example.com/?ANIMAL=Whale",
+			expectedBackend: "case-sensitive-whale-backend",
+			expectMatch:     true,
+		},
+		{
+			name:        "Case mismatch - should not match",
+			url:         "http://example.com/?animal=Whale",
+			expectMatch: false,
+		},
+		{
+			name:            "Regex query param match",
+			url:             "http://example.com/?species=shark-hammerhead",
+			expectedBackend: "regex-shark-backend",
+			expectMatch:     true,
+		},
+		{
+			name:        "Regex query param mismatch",
+			url:         "http://example.com/?species=whale-blue",
+			expectMatch: false,
+		},
+		{
+			name:            "Repeated query param in request matches first value",
+			url:             "http://example.com/?animal=whale&animal=dolphin",
+			expectedBackend: "whale-backend",
+			expectMatch:     true,
+		},
+		{
+			name:        "Repeated query param where first does not match",
+			url:         "http://example.com/?animal=dolphin&animal=whale",
+			expectMatch: false,
+		},
+		{
+			name:        "Missing query param",
+			url:         "http://example.com/",
+			expectMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", tt.url, nil)
+			if err != nil {
+				t.Fatalf("Failed to create request: %v", err)
+			}
+			rule, _ := MatchRoute(routes, req)
+			if !tt.expectMatch {
+				if rule != nil {
+					t.Fatalf("Expected no match, got backend %v", rule.Backends)
+				}
+				return
+			}
+			if rule == nil {
+				t.Fatalf("Expected match, got nil")
+			}
+			if len(rule.Backends) == 0 || rule.Backends[0].Host != tt.expectedBackend {
+				t.Errorf("Expected backend %s, got %v", tt.expectedBackend, rule.Backends)
+			}
+		})
+	}
+}
+
+func TestMatchRoute_QueryParamPrecedence(t *testing.T) {
+	methodGet := gatewayv1.HTTPMethodGet
+	routes := []InternalRoute{
+		{
+			Rules: []InternalRule{
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "no-query-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "animal",
+									MatchExactValue: "whale",
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "one-query-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "animal",
+									MatchExactValue: "whale",
+								},
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "color",
+									MatchExactValue: "blue",
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "two-query-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+							Headers: []InternalHeaderMatch{
+								{
+									Type:            gatewayv1.HeaderMatchExact,
+									Name:            "version",
+									MatchExactValue: "v1",
+								},
+							},
+							QueryParams: []InternalQueryParamMatch{
+								{
+									Type:            gatewayv1.QueryParamMatchExact,
+									Name:            "animal",
+									MatchExactValue: "whale",
+								},
+							},
+						},
+					},
+					Backends: []InternalBackend{{Host: "header-wins-backend"}},
+				},
+				{
+					Matches: []InternalMatch{
+						{
+							Path: &InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+							Method: &methodGet,
+						},
+					},
+					Backends: []InternalBackend{{Host: "method-wins-backend"}},
+				},
+			},
+		},
+	}
+
+	// 1. One query param match wins over zero query param matches
+	req1, _ := http.NewRequest("POST", "http://example.com/?animal=whale", nil)
+	rule1, _ := MatchRoute(routes, req1)
+	if rule1 == nil || len(rule1.Backends) == 0 || rule1.Backends[0].Host != "one-query-backend" {
+		t.Errorf("Expected one-query-backend, got %v", rule1)
+	}
+
+	// 2. Two query param matches win over one query param match
+	req2, _ := http.NewRequest("POST", "http://example.com/?animal=whale&color=blue", nil)
+	rule2, _ := MatchRoute(routes, req2)
+	if rule2 == nil || len(rule2.Backends) == 0 || rule2.Backends[0].Host != "two-query-backend" {
+		t.Errorf("Expected two-query-backend, got %v", rule2)
+	}
+
+	// 3. Header match wins over query param match
+	req3, _ := http.NewRequest("POST", "http://example.com/?animal=whale&color=blue", nil)
+	req3.Header.Set("version", "v1")
+	rule3, _ := MatchRoute(routes, req3)
+	if rule3 == nil || len(rule3.Backends) == 0 || rule3.Backends[0].Host != "header-wins-backend" {
+		t.Errorf("Expected header-wins-backend, got %v", rule3)
+	}
+
+	// 4. Method match wins over header / query param matches when header is absent
+	req4, _ := http.NewRequest("GET", "http://example.com/?animal=whale&color=blue", nil)
+	rule4, _ := MatchRoute(routes, req4)
+	if rule4 == nil || len(rule4.Backends) == 0 || rule4.Backends[0].Host != "method-wins-backend" {
+		t.Errorf("Expected method-wins-backend, got %v", rule4)
 	}
 }
