@@ -116,6 +116,29 @@ func CompileHTTPRoute(
 	for _, rule := range route.Spec.Rules {
 		iRule := InternalRule{}
 
+		// 0. Process rule timeouts
+		if timeouts, err := ParseTimeouts(rule.Timeouts); err != nil {
+			errCond := NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonUnsupportedValue),
+				err.Error(),
+				route.Generation,
+			)
+			if validationCondition.Status == metav1.ConditionTrue {
+				validationCondition = errCond
+			}
+			if iRule.Error == nil {
+				iRule.Error = &ErrorState{
+					Condition:      errCond,
+					HTTPStatusCode: http.StatusInternalServerError,
+					HTTPMessage:    err.Error(),
+				}
+			}
+		} else {
+			iRule.Timeouts = timeouts
+		}
+
 		// 1. Process rule filters
 		for _, filter := range rule.Filters {
 			switch filter.Type {

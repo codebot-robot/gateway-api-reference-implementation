@@ -16,6 +16,7 @@ package state
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1002,4 +1003,181 @@ func TestCompileHTTPRoute(t *testing.T) {
 			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
 		}
 	})
+
+	t.Run("compiles timeouts on rule", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "timeout-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Timeouts: &gatewayv1.HTTPRouteTimeouts{
+							Request:        Ptr(gatewayv1.Duration("10s")),
+							BackendRequest: Ptr(gatewayv1.Duration("5s")),
+						},
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "app-svc",
+										Port: Ptr(gatewayv1.PortNumber(80)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		services := map[types.NamespacedName]*corev1.Service{
+			{Namespace: "default", Name: "app-svc"}: {
+				Spec: corev1.ServiceSpec{
+					Ports: []corev1.ServicePort{{Port: 80}},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, services, nil, nil, nil)
+		if internal == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		if internal.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ValidationCondition True, got %v", internal.ValidationCondition.Status)
+		}
+		if len(internal.Rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d", len(internal.Rules))
+		}
+		if internal.Rules[0].Timeouts == nil {
+			t.Fatalf("expected non-nil Timeouts on rule")
+		}
+		if internal.Rules[0].Timeouts.Request == nil || *internal.Rules[0].Timeouts.Request != 10*time.Second {
+			t.Errorf("expected Request timeout 10s, got %v", internal.Rules[0].Timeouts.Request)
+		}
+		if internal.Rules[0].Timeouts.BackendRequest == nil || *internal.Rules[0].Timeouts.BackendRequest != 5*time.Second {
+			t.Errorf("expected BackendRequest timeout 5s, got %v", internal.Rules[0].Timeouts.BackendRequest)
+		}
+	})
+
+	t.Run("invalid timeout sets ValidationCondition False and rule error", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "invalid-timeout-route",
+				Namespace: "default",
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Timeouts: &gatewayv1.HTTPRouteTimeouts{
+							Request: Ptr(gatewayv1.Duration("invalid-duration")),
+						},
+					},
+				},
+			},
+		}
+
+		internal := CompileHTTPRoute(route, nil, nil, nil, nil)
+		if internal == nil {
+			t.Fatalf("expected non-nil InternalHTTPRoute")
+		}
+		if internal.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", internal.ValidationCondition.Status)
+		}
+		if internal.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected ValidationCondition reason UnsupportedValue, got %v", internal.ValidationCondition.Reason)
+		}
+		if len(internal.Rules) != 1 || internal.Rules[0].Error == nil {
+			t.Fatalf("expected rule with ErrorState, got %+v", internal.Rules)
+		}
+	})
+}
+
+func TestHTTPRouteValidate_Timeouts(t *testing.T) {
+	tests := []struct {
+		name        string
+		route       *HTTPRouteState
+		expectError bool
+	}{
+		{
+			name: "valid request and backendRequest timeouts",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Timeouts: &gatewayv1.HTTPRouteTimeouts{
+									Request:        Ptr(gatewayv1.Duration("10s")),
+									BackendRequest: Ptr(gatewayv1.Duration("5s")),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "valid 0s timeouts (disabled)",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Timeouts: &gatewayv1.HTTPRouteTimeouts{
+									Request:        Ptr(gatewayv1.Duration("0s")),
+									BackendRequest: Ptr(gatewayv1.Duration("0s")),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid request timeout string",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Timeouts: &gatewayv1.HTTPRouteTimeouts{
+									Request: Ptr(gatewayv1.Duration("invalid-duration")),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "invalid backendRequest timeout string",
+			route: &HTTPRouteState{
+				HTTPRoute: &gatewayv1.HTTPRoute{
+					Spec: gatewayv1.HTTPRouteSpec{
+						Rules: []gatewayv1.HTTPRouteRule{
+							{
+								Timeouts: &gatewayv1.HTTPRouteTimeouts{
+									BackendRequest: Ptr(gatewayv1.Duration("not-a-duration")),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.route.Validate()
+			if (err != nil) != tt.expectError {
+				t.Errorf("Validate() err = %v, expectError = %v", err, tt.expectError)
+			}
+		})
+	}
 }

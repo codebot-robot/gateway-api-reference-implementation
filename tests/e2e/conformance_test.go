@@ -136,6 +136,8 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteRewriteHost,
 		tests.HTTPRouteRewritePath,
 		tests.HTTPRouteSimpleSameNamespace,
+		tests.HTTPRouteTimeoutBackendRequest,
+		tests.HTTPRouteTimeoutRequest,
 		tests.HTTPRouteWeight,
 	}
 
