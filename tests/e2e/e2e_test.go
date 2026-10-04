@@ -44,6 +44,12 @@ func TestGatewayAPI(t *testing.T) {
 	h.DeployBackend()
 
 	// 4. Create Gateway API Resources
+	certPEM, keyPEM, err := GenerateTestCertificate("example.com", "example.com")
+	if err != nil {
+		t.Fatalf("Failed to generate test certificate: %v", err)
+	}
+	h.CreateTLSSecret("gateway-tls-cert", "default", certPEM, keyPEM)
+
 	h.KubectlApplyContent(h.ExampleGatewayManifest())
 	// Give the controller some time to reconcile
 	time.Sleep(5 * time.Second)
@@ -70,7 +76,7 @@ func TestGatewayAPI(t *testing.T) {
 		}
 	}
 
-	// 7. Run Client Pod (HTTPS - verify Alt-Svc header)
+	// 7. Run Client Pod (HTTPS - verify Alt-Svc header and certificate)
 	httpsClientPodName := "test-client-https"
 	h.DeletePod(httpsClientPodName)
 
@@ -82,8 +88,11 @@ func TestGatewayAPI(t *testing.T) {
 	if !strings.Contains(httpsLogs, "Status: 200 OK") {
 		t.Errorf("Expected HTTPS 200 OK, got: %s", httpsLogs)
 	}
-	if !strings.Contains(httpsLogs, "Header-Alt-Svc: h3=\":443\"") {
-		t.Errorf("Expected Alt-Svc header advertising h3=\":443\", got: %s", httpsLogs)
+	if !strings.Contains(httpsLogs, "Header-Alt-Svc: h3=\":443\"; ma=86400") {
+		t.Errorf("Expected Alt-Svc header advertising h3=\":443\"; ma=86400, got: %s", httpsLogs)
+	}
+	if !strings.Contains(httpsLogs, "PeerCertDNSNames: example.com") {
+		t.Errorf("Expected PeerCertDNSNames example.com, got: %s", httpsLogs)
 	}
 
 	// 8. Run Client Pod (HTTP/3 over QUIC)

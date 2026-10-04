@@ -16,8 +16,16 @@ package e2e
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -308,6 +316,12 @@ spec:
   - name: https
     protocol: HTTPS
     port: 443
+    hostname: "example.com"
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - kind: Secret
+        name: gateway-tls-cert
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -323,6 +337,68 @@ spec:
     - name: backend
       port: 8080
 `
+}
+
+func (h *Harness) CreateTLSSecret(name, namespace string, certPEM, keyPEM []byte) {
+	h.t.Logf("Creating TLS secret %s/%s", namespace, name)
+	content := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: kubernetes.io/tls
+data:
+  tls.crt: %s
+  tls.key: %s
+`, name, namespace, base64.StdEncoding.EncodeToString(certPEM), base64.StdEncoding.EncodeToString(keyPEM))
+	h.KubectlApplyContent(content)
+}
+
+// GenerateTestCertificate generates a self-signed ECDSA certificate and private key for testing.
+func GenerateTestCertificate(commonName string, dnsNames ...string) (certPEM, keyPEM []byte, err error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generating key: %w", err)
+	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generating serial: %w", err)
+	}
+
+	if len(dnsNames) == 0 {
+		dnsNames = []string{commonName}
+	}
+
+	now := time.Now().Add(-1 * time.Hour)
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   commonName,
+			Organization: []string{"gari-e2e-test"},
+		},
+		DNSNames:              dnsNames,
+		NotBefore:             now,
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating cert: %w", err)
+	}
+
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshaling key: %w", err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	return certPEM, keyPEM, nil
 }
 
 func (h *Harness) ClientManifest(url string, host string) string {

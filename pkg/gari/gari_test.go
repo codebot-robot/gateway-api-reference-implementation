@@ -590,7 +590,7 @@ func TestHTTP3_Enabled_AltSvcAndQUICRouting(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=2592000`, advertisedPort)
+	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=86400`, advertisedPort)
 	if altSvc := resp.Header.Get("Alt-Svc"); altSvc != expectedAltSvc {
 		t.Errorf("expected Alt-Svc %q, got %q", expectedAltSvc, altSvc)
 	}
@@ -723,9 +723,136 @@ func TestHTTP3_AutomaticAdvertisedPort(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=2592000`, h3Port)
+	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=86400`, h3Port)
 	if altSvc := resp.Header.Get("Alt-Svc"); altSvc != expectedAltSvc {
 		t.Errorf("expected Alt-Svc %q, got %q", expectedAltSvc, altSvc)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for proxy shutdown")
+	}
+}
+
+func TestHTTP3_StripBackendAltSvc(t *testing.T) {
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create HTTPS listener: %v", err)
+	}
+	defer httpsLis.Close()
+
+	h3Conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP packet conn: %v", err)
+	}
+	defer h3Conn.Close()
+
+	// Backend returns its own Alt-Svc headers
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Alt-Svc", `h3=":9999"; ma=100`)
+		w.Header().Add("Alt-Svc", `h3-29=":9999"; ma=100`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-response"))
+	}))
+	defer backend.Close()
+
+	host, portStr, _ := net.SplitHostPort(backend.Listener.Addr().String())
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	advertisedPort := 9443
+
+	opts := Options{
+		HTTPSListener:            httpsLis,
+		HTTP3PacketConn:          h3Conn,
+		ProxyHTTP3AdvertisedPort: advertisedPort,
+		ProxyAddr:                "",
+		Scheme:                   DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	p.UpdateListeners([]state.InternalListener{
+		{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "example.com",
+			Port:     443,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/foo",
+									},
+								},
+							},
+							Backends: []state.InternalBackend{
+								{
+									Host:   host,
+									Port:   int32(port),
+									Weight: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	tcpTr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	tcpClient := &http.Client{Transport: tcpTr, Timeout: 2 * time.Second}
+	reqURL := "https://" + httpsLis.Addr().String() + "/foo"
+
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		req, _ := http.NewRequest("GET", reqURL, nil)
+		req.Host = "example.com"
+		resp, err = tcpClient.Do(req)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to HTTPS listener: %v", err)
+	}
+	defer resp.Body.Close()
+
+	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=86400`, advertisedPort)
+	altSvcValues := resp.Header.Values("Alt-Svc")
+	if len(altSvcValues) != 1 {
+		t.Fatalf("expected exactly 1 Alt-Svc header, got %d: %v", len(altSvcValues), altSvcValues)
+	}
+	if altSvcValues[0] != expectedAltSvc {
+		t.Errorf("expected Alt-Svc %q, got %q", expectedAltSvc, altSvcValues[0])
 	}
 
 	cancel()

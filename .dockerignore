@@ -1,0 +1,8 @@
+.git
+.build
+.devcontainer
+.agents
+.ap
+docs
+tests/e2e/artifacts
+*.md
