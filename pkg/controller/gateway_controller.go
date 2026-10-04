@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -133,6 +134,18 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// AddressProvider returns the addresses to report in Gateway.status.addresses.
+// An empty result means the address is not assigned yet.
+type AddressProvider interface {
+	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error)
+}
+
+// AddressWatcher is an optional interface that an AddressProvider can implement
+// to register custom watches with the Gateway controller.
+type AddressWatcher interface {
+	SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error
+}
+
 type GatewayReconciler struct {
 	client.Client
 	Scheme           *runtime.Scheme
@@ -140,6 +153,15 @@ type GatewayReconciler struct {
 	Proxy            *proxy.Proxy
 	ControllerName   string
 	OnGatewaysUpdate func([]*gatewayv1.Gateway)
+	AddressProvider  AddressProvider
+	GatewayFilter    func(gw *gatewayv1.Gateway) bool
+}
+
+func (r *GatewayReconciler) inScope(gw *gatewayv1.Gateway) bool {
+	if r.GatewayFilter != nil && !r.GatewayFilter(gw) {
+		return false
+	}
+	return true
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -156,6 +178,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if !r.inScope(gw) {
+		r.State.DeleteGateway(req.NamespacedName)
+		r.updateProxy()
+		return ctrl.Result{}, nil
+	}
+
 	// Check if the GatewayClass is managed by us
 	gc := &gatewayv1.GatewayClass{}
 	if err := r.Get(ctx, client.ObjectKey{Name: string(gw.Spec.GatewayClassName)}, gc); err != nil {
@@ -164,23 +192,19 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if string(gc.Spec.ControllerName) != controllerName {
+		r.State.DeleteGateway(req.NamespacedName)
+		r.updateProxy()
 		return ctrl.Result{}, nil
 	}
 
-	// Find the LoadBalancer IP of the gari-proxy service
-	var svc corev1.Service
-	if err := r.Get(ctx, client.ObjectKey{Name: "gari-proxy", Namespace: "default"}, &svc); err != nil {
-		if !apierrors.IsNotFound(err) {
-			l.Error(err, "unable to fetch gari-proxy service")
+	var providedAddresses []gatewayv1.GatewayStatusAddress
+	if r.AddressProvider != nil {
+		var err error
+		providedAddresses, err = r.AddressProvider.GatewayAddresses(ctx, gw)
+		if err != nil {
+			l.Error(err, "unable to fetch gateway addresses from address provider")
 			return ctrl.Result{}, err
 		}
-	}
-
-	var ip string
-	var hostname string
-	if len(svc.Status.LoadBalancer.Ingress) > 0 {
-		ip = svc.Status.LoadBalancer.Ingress[0].IP
-		hostname = svc.Status.LoadBalancer.Ingress[0].Hostname
 	}
 
 	// Compute listener status
@@ -481,10 +505,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonInvalid
 		gwProgrammedMessage = "Gateway is not accepted"
-	} else if ip == "" && hostname == "" {
+	} else if len(providedAddresses) == 0 {
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
-		gwProgrammedMessage = "Waiting for LoadBalancer IP address to be assigned to the Gateway"
+		gwProgrammedMessage = "Waiting for address to be assigned to the Gateway"
 	}
 
 	newConditions := []metav1.Condition{
@@ -515,20 +539,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	newAddresses := make([]gatewayv1.GatewayStatusAddress, 0)
+	var newAddresses []gatewayv1.GatewayStatusAddress
 	if gwAcceptedStatus == metav1.ConditionTrue {
-		if ip != "" {
-			newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
-				Type:  state.Ptr(gatewayv1.IPAddressType),
-				Value: ip,
-			})
-		}
-		if hostname != "" {
-			newAddresses = append(newAddresses, gatewayv1.GatewayStatusAddress{
-				Type:  state.Ptr(gatewayv1.HostnameAddressType),
-				Value: hostname,
-			})
-		}
+		newAddresses = providedAddresses
 	}
 
 	updated := false
@@ -621,12 +634,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	if ip == "" && hostname == "" {
-		l.V(1).Info("gari-proxy service has no LoadBalancer address yet")
-	} else if ip != "" {
-		l.Info("Updated Gateway status", "address", ip)
+	if len(newAddresses) == 0 {
+		l.V(1).Info("Gateway has no address assigned yet")
 	} else {
-		l.Info("Updated Gateway status", "hostname", hostname)
+		l.Info("Updated Gateway status", "addresses", newAddresses)
 	}
 
 	return ctrl.Result{}, nil
@@ -640,7 +651,7 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ControllerName == "" {
 		return fmt.Errorf("ControllerName is required")
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.Gateway{}).
 		// A GatewayClass update invalidates all Gateways that reference it
 		Watches(&gatewayv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
@@ -680,25 +691,6 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 			}
 			return requests
-		})).
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			svc := obj.(*corev1.Service)
-			if svc.Name == "gari-proxy" && svc.Namespace == "default" {
-				var gwList gatewayv1.GatewayList
-				if err := r.List(ctx, &gwList); err == nil {
-					var requests []ctrl.Request
-					for _, gw := range gwList.Items {
-						requests = append(requests, ctrl.Request{
-							NamespacedName: types.NamespacedName{
-								Namespace: gw.Namespace,
-								Name:      gw.Name,
-							},
-						})
-					}
-					return requests
-				}
-			}
-			return nil
 		})).
 		// A ReferenceGrant update invalidates all gateways that might use it
 		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
@@ -772,8 +764,15 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return requests
 			}
 			return nil
-		})).
-		Complete(r)
+		}))
+
+	if watcher, ok := r.AddressProvider.(AddressWatcher); ok {
+		if err := watcher.SetupWatches(mgr, bldr); err != nil {
+			return fmt.Errorf("error setting up address provider watches: %w", err)
+		}
+	}
+
+	return bldr.Complete(r)
 }
 
 func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
