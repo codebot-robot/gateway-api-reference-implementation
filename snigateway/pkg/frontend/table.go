@@ -21,20 +21,25 @@ import (
 )
 
 // RegistrationTable maps registered hostnames to client identifiers.
-// It supports exact hostnames and wildcard hostnames (*.example.com), with exact match taking precedence.
+// It supports multiple clients registering the same hostname, and supports exact hostnames
+// as well as wildcard hostnames (*.example.com), with exact match taking precedence.
 type RegistrationTable struct {
 	mu          sync.RWMutex
 	clientHosts map[string][]string // clientID -> registered host patterns
-	exact       map[string]string   // normalized exact hostname -> clientID
-	wildcard    map[string]string   // normalized wildcard pattern (*.example.com) -> clientID
+	exact       map[string][]string // normalized exact hostname -> slice of clientIDs
+	wildcard    map[string][]string // normalized wildcard pattern (*.example.com) -> slice of clientIDs
+	exactRR     map[string]int      // round-robin counter per exact hostname
+	wildcardRR  map[string]int      // round-robin counter per wildcard pattern
 }
 
 // NewRegistrationTable creates a new empty RegistrationTable.
 func NewRegistrationTable() *RegistrationTable {
 	return &RegistrationTable{
 		clientHosts: make(map[string][]string),
-		exact:       make(map[string]string),
-		wildcard:    make(map[string]string),
+		exact:       make(map[string][]string),
+		wildcard:    make(map[string][]string),
+		exactRR:     make(map[string]int),
+		wildcardRR:  make(map[string]int),
 	}
 }
 
@@ -62,9 +67,9 @@ func (t *RegistrationTable) Register(clientID string, hostnames []string) {
 		}
 		registered = append(registered, h)
 		if strings.HasPrefix(h, "*.") {
-			t.wildcard[h] = clientID
+			t.wildcard[h] = append(t.wildcard[h], clientID)
 		} else {
-			t.exact[h] = clientID
+			t.exact[h] = append(t.exact[h], clientID)
 		}
 	}
 	t.clientHosts[clientID] = registered
@@ -77,16 +82,34 @@ func (t *RegistrationTable) Unregister(clientID string) {
 	t.unregisterLocked(clientID)
 }
 
+func removeFromSlice(slice []string, val string) []string {
+	var res []string
+	for _, item := range slice {
+		if item != val {
+			res = append(res, item)
+		}
+	}
+	return res
+}
+
 func (t *RegistrationTable) unregisterLocked(clientID string) {
 	if previous, exists := t.clientHosts[clientID]; exists {
 		for _, h := range previous {
 			if strings.HasPrefix(h, "*.") {
-				if t.wildcard[h] == clientID {
+				newSlice := removeFromSlice(t.wildcard[h], clientID)
+				if len(newSlice) == 0 {
 					delete(t.wildcard, h)
+					delete(t.wildcardRR, h)
+				} else {
+					t.wildcard[h] = newSlice
 				}
 			} else {
-				if t.exact[h] == clientID {
+				newSlice := removeFromSlice(t.exact[h], clientID)
+				if len(newSlice) == 0 {
 					delete(t.exact, h)
+					delete(t.exactRR, h)
+				} else {
+					t.exact[h] = newSlice
 				}
 			}
 		}
@@ -96,36 +119,45 @@ func (t *RegistrationTable) unregisterLocked(clientID string) {
 
 // Match looks up the best matching clientID for a given incoming SNI hostname.
 // Exact match wins. If no exact match, longest matching wildcard pattern wins.
+// If multiple clients are registered for the matched pattern, selection is round-robined.
 func (t *RegistrationTable) Match(hostname string) (string, bool) {
 	cleanHost := CleanHostname(hostname)
 	if cleanHost == "" {
 		return "", false
 	}
 
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	// 1. Exact match
-	if clientID, ok := t.exact[cleanHost]; ok {
-		return clientID, true
+	if clients, ok := t.exact[cleanHost]; ok && len(clients) > 0 {
+		idx := t.exactRR[cleanHost] % len(clients)
+		t.exactRR[cleanHost]++
+		return clients[idx], true
 	}
 
 	// 2. Wildcard match (longest matching wildcard suffix wins)
-	var bestClientID string
+	var bestPattern string
 	bestPatternLen := -1
 
-	for pattern, clientID := range t.wildcard {
+	for pattern, clients := range t.wildcard {
+		if len(clients) == 0 {
+			continue
+		}
 		suffix := pattern[1:] // e.g. .example.com
 		if len(cleanHost) > len(suffix) && strings.HasSuffix(cleanHost, suffix) {
 			if len(pattern) > bestPatternLen {
 				bestPatternLen = len(pattern)
-				bestClientID = clientID
+				bestPattern = pattern
 			}
 		}
 	}
 
 	if bestPatternLen >= 0 {
-		return bestClientID, true
+		clients := t.wildcard[bestPattern]
+		idx := t.wildcardRR[bestPattern] % len(clients)
+		t.wildcardRR[bestPattern]++
+		return clients[idx], true
 	}
 
 	return "", false

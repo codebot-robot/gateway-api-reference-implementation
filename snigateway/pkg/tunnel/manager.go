@@ -193,6 +193,7 @@ func (m *Manager) Run(ctx context.Context) error {
 			}
 
 			readyCh := make(chan struct{})
+			readyDone := make(chan struct{})
 
 			// Handle ready state as soon as connection stream is established
 			go func() {
@@ -203,6 +204,7 @@ func (m *Manager) Run(ctx context.Context) error {
 					m.generation++
 					m.mu.Unlock()
 					m.triggerRegistration()
+				case <-readyDone:
 				case <-ctx.Done():
 				}
 			}()
@@ -225,6 +227,7 @@ func (m *Manager) Run(ctx context.Context) error {
 				}(event)
 				return nil
 			})
+			close(readyDone)
 
 			m.mu.Lock()
 			m.connected = false
