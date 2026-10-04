@@ -50,15 +50,27 @@ This journal documents the implementation of foundational support for `ListenerS
 - **Fast-Path Data Plane & Port Mapping**:
   - In GARI's single-pod fast path, the controller maps listener ports to the proxy service. In Part 1, all conformance tests utilize ports already mapped in `k8s/controller.yaml` (ports 80, 443, 8080, 8090). Dynamic port provisioning is deferred to future work.
 
-## 3. Pitfalls & Guidance for Follow-Up (Part 2)
+## 3. Pitfalls & Guidance for Follow-Up (Part 2 & Effective Listener Model)
 
-Future ListenerSet work (conflicts, route kinds/namespaces, ReferenceGrant, parent sectionName, dual parentRefs, route status scoping) should keep the following in mind:
-- **Listener Conditions in Status**:
-  - Currently in Part 1, `conds` for accepted ListenerSet listeners default to `True` for `ResolvedRefs`, `Accepted`, and `Programmed`. Part 2 needs dynamic condition calculation to report hostname conflicts, port/protocol conflicts, and unresolved secret references.
-- **ReferenceGrant for ListenerSet Secrets**:
-  - Cross-namespace Secret references on a ListenerSet require a `ReferenceGrant` with `from: {group: gateway.networking.k8s.io, kind: ListenerSet, namespace: <ls-namespace>}` to `to: {group: "", kind: Secret, name: <secret-name>}`.
-- **Route Status Scoping**:
-  - When a route references a `ListenerSet`, `route.status.parents` must report `parentRef` matching the `ListenerSet` (with `kind: ListenerSet`) and the controller name.
+As part of Issue #611 (Step 1 of `docs/incremental-state.md`), the codebase was refactored into a single **Effective Listener** compiled model in `pkg/state/compiled.go`. Future ListenerSet work (conflicts, route kinds/namespaces, ReferenceGrant, parent sectionName, dual parentRefs, route status scoping) should build on this model:
+
+- **Unified Model Architecture (`pkg/state/compiled.go`)**:
+  - `CompileModel`: Takes snapshots of Gateways, ListenerSets, HTTPRoutes, Services, BackendTLSPolicies, ConfigMaps, Secrets, Namespaces, and ReferenceGrantValidator. Compiles a `*CompiledModel` with `Gateways map[types.NamespacedName]*CompiledGateway` and `HTTPRoutes map[types.NamespacedName]*CompiledRoute`.
+  - `EffectiveListener`: Represents a compiled listener originating from either a Gateway or an attached ListenerSet. Records `Owner` (`Kind`, `Namespace`, `Name`), `ParentGateway`, listener spec (`Name`, `Port`, `Protocol`, `Hostname`, `TLS`, `AllowedRoutes`), `SupportedKinds`, `Conditions`, `AttachedRoutes`, and `Routes`.
+- **Where to Add Listener Validation & Conflicts**:
+  - `ValidateListener` (`pkg/state/compiled.go`): Runs once over any listener spec (Gateway or ListenerSet). Protocol support, route kind validity, TLS configuration, secret existence, keypair checks, and cross-namespace `ReferenceGrant` checks (with `Owner.Kind` and `Owner.Namespace`) are all located here.
+  - For conflict detection across a Gateway and its ListenerSets (Part 2), add a pass over `cg.EffectiveListeners` in `CompileModel`.
+- **Where Route Binding Happens**:
+  - `bindRouteParentRef` (`pkg/state/compiled.go`): Resolves parent (Gateway or ListenerSet -> parent Gateway), candidate effective listeners, sectionName/port matching, protocol compatibility, `AllowedRoutes` kinds, `AllowedRoutes` namespaces (evaluated against `el.Owner.Namespace`), and hostname intersection.
+  - The binding pass increments `el.AttachedRoutes` and appends `InternalRoute` to `el.Routes` in one place.
+- **Where Status Is Computed**:
+  - Pure functions in `pkg/state/compiled.go`:
+    - `ComputeDesiredGatewayStatus(gw, compiledGw, providedAddresses)`
+    - `ComputeDesiredListenerSetStatus(ls, parentGW, namespaces, compiledGw)`
+    - `ComputeDesiredHTTPRouteStatus(route, compiledRoute, controllerName)`
+  - Controllers (`GatewayReconciler`, `ListenerSetReconciler`, `HTTPRouteReconciler`) call these pure functions and update Kubernetes status when `updated == true`.
+- **Certificate Extraction**:
+  - `ExtractCertificates(gateways, secrets, refValidator)`: Extracts TLS certificates across all effective listeners with owner-aware `ReferenceGrant` validation. Fallback `defaultCert` selection is restricted to listeners where `el.Owner.Kind == "Gateway"`.
 
 ## 4. Conformance Test Results
 

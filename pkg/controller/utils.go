@@ -15,15 +15,10 @@
 package controller
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -176,154 +171,17 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 	if controllerName == "" {
 		controllerName = DefaultControllerName
 	}
-	gateways := st.GetGateways()
-	routes := st.GetHTTPRoutes()
-	services := st.GetServices()
-	backendTLSPolicies := st.GetBackendTLSPolicies()
-	configMaps := st.GetConfigMaps()
-	secrets := st.GetSecrets()
+	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
+	compiled := st.CompileModel(controllerName)
+	if p != nil {
+		proxyListeners, proxyRoutes := state.BuildProxyConfig(compiled.GatewaysList())
+		p.UpdateConfig(proxyListeners, proxyRoutes)
 
-	var proxyRoutes []state.InternalRoute
-	var proxyListeners []state.InternalListener
-	for _, gw := range gateways {
-		gwListeners, gwRoutes := gw.BuildInternalState(routes, services, backendTLSPolicies, configMaps, st, controllerName)
-		proxyListeners = append(proxyListeners, gwListeners...)
-		proxyRoutes = append(proxyRoutes, gwRoutes...)
+		certsMap, defaultCert := state.ExtractCertificates(compiled.GatewaysList(), st.GetSecrets(), st)
+		p.UpdateCertificates(certsMap, defaultCert)
 	}
-	p.UpdateConfig(proxyListeners, proxyRoutes)
-
-	certsMap := make(map[string]*tls.Certificate)
-	var defaultCert *tls.Certificate
-
-	for _, gw := range gateways {
-		for _, listener := range gw.Spec.Listeners {
-			if (listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType) && listener.TLS != nil {
-				for _, ref := range listener.TLS.CertificateRefs {
-					group := state.ValueOf(ref.Group)
-					kind := state.ValueOf(ref.Kind)
-					if kind == "" {
-						kind = "Secret"
-					}
-					if group == "" && kind == "Secret" {
-						secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
-						from := state.Reference{
-							GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
-							Namespace: gw.Namespace,
-						}
-						to := state.Reference{
-							GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-							Namespace: secretKey.Namespace,
-							Name:      secretKey.Name,
-						}
-						if secretKey.Namespace != gw.Namespace && !st.IsReferencePermitted(from, to) {
-							continue
-						}
-						secret, ok := secrets[secretKey]
-						if ok && secret != nil {
-							certBytes := secret.Data[corev1.TLSCertKey]
-							keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
-							if len(certBytes) > 0 && len(keyBytes) > 0 {
-								tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
-								if err == nil {
-									certCopy := tlsCert
-									if len(certCopy.Certificate) > 0 {
-										leaf, err := x509.ParseCertificate(certCopy.Certificate[0])
-										if err == nil {
-											certCopy.Leaf = leaf
-											if leaf.Subject.CommonName != "" {
-												certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy
-											}
-											for _, dnsName := range leaf.DNSNames {
-												certsMap[strings.ToLower(dnsName)] = &certCopy
-											}
-										}
-									}
-									if listener.Hostname != nil && string(*listener.Hostname) != "" {
-										certsMap[strings.ToLower(string(*listener.Hostname))] = &certCopy
-									}
-									if listener.Hostname == nil || string(*listener.Hostname) == "" || defaultCert == nil {
-										defaultCert = &certCopy
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	listenerSets := st.GetListenerSets()
-	namespaces := st.GetNamespaces()
-	for _, gw := range gateways {
-		for _, ls := range listenerSets {
-			if !state.IsListenerSetParent(ls.ListenerSet, gw.Gateway) || !state.IsListenerSetAllowed(ls.ListenerSet, gw.Gateway, namespaces) {
-				continue
-			}
-			for _, listener := range ls.Spec.Listeners {
-				if (listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType) && listener.TLS != nil {
-					for _, ref := range listener.TLS.CertificateRefs {
-						group := state.ValueOf(ref.Group)
-						kind := state.ValueOf(ref.Kind)
-						if kind == "" {
-							kind = "Secret"
-						}
-						if group == "" && kind == "Secret" {
-							secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, ls.ListenerSet)
-							from := state.Reference{
-								GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
-								Namespace: ls.Namespace,
-							}
-							to := state.Reference{
-								GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-								Namespace: secretKey.Namespace,
-								Name:      secretKey.Name,
-							}
-							if secretKey.Namespace != ls.Namespace && !st.IsReferencePermitted(from, to) {
-								continue
-							}
-							secret, ok := secrets[secretKey]
-							if ok && secret != nil {
-								certBytes := secret.Data[corev1.TLSCertKey]
-								keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
-								if len(certBytes) > 0 && len(keyBytes) > 0 {
-									tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
-									if err == nil {
-										certCopy := tlsCert
-										if len(certCopy.Certificate) > 0 {
-											leaf, err := x509.ParseCertificate(certCopy.Certificate[0])
-											if err == nil {
-												certCopy.Leaf = leaf
-												if leaf.Subject.CommonName != "" {
-													certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy
-												}
-												for _, dnsName := range leaf.DNSNames {
-													certsMap[strings.ToLower(dnsName)] = &certCopy
-												}
-											}
-										}
-										if listener.Hostname != nil && string(*listener.Hostname) != "" {
-											certsMap[strings.ToLower(string(*listener.Hostname))] = &certCopy
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	p.UpdateCertificates(certsMap, defaultCert)
 
 	if onGatewaysUpdate != nil {
-		var resolvedGws []*gatewayv1.Gateway
-		for _, gw := range gateways {
-			if gw.Gateway != nil {
-				resolvedGws = append(resolvedGws, gw.Gateway.DeepCopy())
-			}
-		}
-		onGatewaysUpdate(resolvedGws)
+		onGatewaysUpdate(compiled.ResolvedGateways())
 	}
 }
