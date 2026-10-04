@@ -209,6 +209,15 @@ func (h *Harness) GetPodLogsInNamespace(namespace, name string) string {
 	return string(out)
 }
 
+func (h *Harness) GetPodIP(name string) string {
+	return h.GetPodIPInNamespace("default", name)
+}
+
+func (h *Harness) GetPodIPInNamespace(namespace, name string) string {
+	out := h.runCmd("kubectl", "get", "pod", name, "--namespace", namespace, "-o", "jsonpath={.status.podIP}")
+	return strings.TrimSpace(out)
+}
+
 func (h *Harness) DumpDeploymentLogs(namespace, name string) {
 	out, err := exec.Command("kubectl", "logs", "deployment/"+name, "--namespace", namespace, "--all-containers=true").CombinedOutput()
 	if err != nil {

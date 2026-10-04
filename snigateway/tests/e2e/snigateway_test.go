@@ -144,6 +144,13 @@ func TestSNIGateway(t *testing.T) {
 		if !strings.Contains(logs, "X-Forwarded-For") {
 			t.Errorf("Expected X-Forwarded-For header containing real client IP in backend response, got: %s", logs)
 		}
+		clientPodIP := h.GetPodIP(clientPod)
+		t.Logf("Client Pod IP: %s", clientPodIP)
+		if clientPodIP == "" {
+			t.Errorf("Expected non-empty client pod IP")
+		} else if !strings.Contains(logs, clientPodIP) {
+			t.Errorf("Expected X-Forwarded-For to contain client pod IP %s, got logs: %s", clientPodIP, logs)
+		}
 	})
 
 	// Assertion 2: Unregistered SNI hostname is rejected (connection closed)
@@ -242,34 +249,42 @@ func TestSNIGateway(t *testing.T) {
 		}
 	})
 
-	// Assertion 5: Running two replicas, killing one, and verifying failover
-	t.Run("Kill one of two replicas and verify connections keep succeeding", func(t *testing.T) {
+	// Assertion 5: Running two replicas, force-killing one, and verifying failover with zero client retries
+	t.Run("Kill one of two replicas and verify connections keep succeeding with zero retries", func(t *testing.T) {
 		t.Cleanup(func() { dumpLogsIfFailed(t) })
 
-		// Scale down controller to 1 replica (terminating one of the replicas)
-		h.runCmd("kubectl", "scale", "deployment/snigateway-controller", "--replicas=1", "--namespace=default")
-		h.WaitForDeploymentInNamespace("default", "snigateway-controller", 1*time.Minute)
-
-		time.Sleep(2 * time.Second)
-
-		clientPod := "sni-client-failover"
-		h.DeletePod(clientPod)
-		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
-			"client",
-			"--connect-to=" + frontendAddr,
-			"--sni=echo.snigateway.test",
-			"--insecure",
-			"https://echo.snigateway.test/",
-		}))
-		h.WaitForPodSuccess(clientPod, 1*time.Minute)
-		logs := h.GetPodLogs(clientPod)
-		t.Logf("Failover client logs: %s", logs)
-
-		if !strings.Contains(logs, "Status: 200 OK") {
-			t.Errorf("Expected 200 OK after killing one replica, got: %s", logs)
+		// Find one of the running controller replica pods
+		podListOut := h.runCmd("kubectl", "get", "pods", "--namespace=default", "-l", "app=snigateway-controller", "--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
+		pods := strings.Fields(podListOut)
+		if len(pods) < 2 {
+			t.Fatalf("expected at least 2 running snigateway-controller pods, got %d: %v", len(pods), pods)
 		}
-		if !strings.Contains(logs, "\"hostname\":\"echo.snigateway.test\"") && !strings.Contains(logs, "\"host\": \"echo.snigateway.test\"") {
-			t.Errorf("Expected hostname echo.snigateway.test in response body after failover, got: %s", logs)
+
+		// Force-kill the first replica so its pooled connections become dead without clean session close
+		h.runCmd("kubectl", "delete", "pod", pods[0], "--namespace=default", "--grace-period=0", "--force")
+
+		// Immediately send multiple requests with --retries=0 to verify frontend replay-until-first-byte failover
+		for i := 1; i <= 5; i++ {
+			clientPod := fmt.Sprintf("sni-client-failover-%d", i)
+			h.DeletePod(clientPod)
+			h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
+				"client",
+				"--connect-to=" + frontendAddr,
+				"--sni=echo.snigateway.test",
+				"--insecure",
+				"--retries=0",
+				"https://echo.snigateway.test/",
+			}))
+			h.WaitForPodSuccess(clientPod, 1*time.Minute)
+			logs := h.GetPodLogs(clientPod)
+			t.Logf("Failover client %d logs: %s", i, logs)
+
+			if !strings.Contains(logs, "Status: 200 OK") {
+				t.Errorf("Request %d: Expected 200 OK after killing replica, got: %s", i, logs)
+			}
+			if !strings.Contains(logs, "\"hostname\":\"echo.snigateway.test\"") && !strings.Contains(logs, "\"host\": \"echo.snigateway.test\"") {
+				t.Errorf("Request %d: Expected hostname echo.snigateway.test in response body, got: %s", i, logs)
+			}
 		}
 	})
 }
