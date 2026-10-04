@@ -38,13 +38,14 @@ import (
 
 // ServerConfig holds configuration options for the frontend server.
 type ServerConfig struct {
-	ListenAddrs      []string
-	InternalHostname string
-	ServerTLSConfig  *tls.Config
-	ConnectTimeout   time.Duration
-	ReadSNITimeout   time.Duration
-	Authorizer       Authorizer
-	Transport        *PoolTransport
+	ListenAddrs       []string
+	InternalHostname  string
+	ServerTLSConfig   *tls.Config
+	ConnectTimeout    time.Duration
+	PerAttemptTimeout time.Duration
+	ReadSNITimeout    time.Duration
+	Authorizer        Authorizer
+	Transport         *PoolTransport
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -73,6 +74,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 10 * time.Second
+	}
+	if cfg.PerAttemptTimeout <= 0 {
+		cfg.PerAttemptTimeout = 2 * time.Second
 	}
 	if cfg.ReadSNITimeout <= 0 {
 		cfg.ReadSNITimeout = 5 * time.Second
@@ -203,7 +207,16 @@ func (s *Server) Close() error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+func setTCPKeepAlive(conn net.Conn) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+	}
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
+	setTCPKeepAlive(conn)
+
 	sniHostname, peekedConn, err := sni.SniffSNI(conn, s.config.ReadSNITimeout)
 	if err != nil {
 		_ = peekedConn.Close()
@@ -222,24 +235,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 2. Otherwise look up matching sessions in registration table
-	sessions := s.table.MatchSessions(cleanSNI)
-	if len(sessions) == 0 {
-		log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
-		_ = peekedConn.Close()
-		return
+	// 2. Otherwise route to backend with failover/replay loop
+	var rawClientConn net.Conn = peekedConn
+	var peekedBytes []byte
+	if pc, ok := peekedConn.(*sni.PeekedConn); ok {
+		peekedBytes = pc.PeekedBytes()
+		rawClientConn = pc.RawConn()
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), s.config.ConnectTimeout)
-	defer cancel()
-
-	tunnelConn, chosenSession, err := s.pool.GetConnForSessions(ctx, sessions)
-	if err != nil {
-		log.Printf("Frontend: failed to get tunnel connection for SNI %q: %v", sniHostname, err)
-		_ = peekedConn.Close()
-		return
-	}
-	_ = chosenSession
 
 	proxyHdr := &proxyproto.Header{
 		Command:   proxyproto.CommandProxy,
@@ -247,14 +249,80 @@ func (s *Server) handleConnection(conn net.Conn) {
 		DstAddr:   peekedConn.LocalAddr(),
 		Authority: sniHostname,
 	}
-	if _, err := tunnelConn.Write(proxyHdr.Format()); err != nil {
-		log.Printf("Frontend: failed to write PROXY header on tunnel connection: %v", err)
-		_ = tunnelConn.Close()
-		_ = peekedConn.Close()
+	proxyBytes := proxyHdr.Format()
+
+	deadline := time.Now().Add(s.config.ConnectTimeout)
+	var committedTunnel net.Conn
+	var initialBackendBytes []byte
+
+	for {
+		now := time.Now()
+		if now.After(deadline) {
+			log.Printf("Frontend: connect timeout reached for SNI %q", sniHostname)
+			_ = peekedConn.Close()
+			return
+		}
+
+		remaining := time.Until(deadline)
+		attemptTimeout := s.config.PerAttemptTimeout
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+
+		sessions := s.table.MatchSessions(cleanSNI)
+		if len(sessions) == 0 {
+			log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
+			_ = peekedConn.Close()
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		tunnelConn, _, err := s.pool.GetConnForSessions(ctx, sessions)
+		cancel()
+
+		if err != nil {
+			// Pool timeout on this attempt, continue until total deadline
+			continue
+		}
+
+		setTCPKeepAlive(tunnelConn)
+
+		// Set write deadline for PROXY header + peeked ClientHello
+		_ = tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout))
+		if _, err := tunnelConn.Write(proxyBytes); err != nil {
+			_ = tunnelConn.Close()
+			continue
+		}
+		if _, err := tunnelConn.Write(peekedBytes); err != nil {
+			_ = tunnelConn.Close()
+			continue
+		}
+
+		// Set read deadline to wait for the first byte from the backend
+		_ = tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout))
+		buf := make([]byte, 4096)
+		n, err := tunnelConn.Read(buf)
+		if err != nil || n == 0 {
+			// Failed or unresponsive backend/tunnel connection; drop and replay on next attempt
+			_ = tunnelConn.Close()
+			continue
+		}
+
+		// First byte received from backend! Clear deadlines and commit splice
+		_ = tunnelConn.SetDeadline(time.Time{})
+		committedTunnel = tunnelConn
+		initialBackendBytes = buf[:n]
+		break
+	}
+
+	// Write initial backend byte(s) to client
+	if _, err := rawClientConn.Write(initialBackendBytes); err != nil {
+		_ = committedTunnel.Close()
+		_ = rawClientConn.Close()
 		return
 	}
 
-	spliceConnections(peekedConn, tunnelConn)
+	spliceConnections(rawClientConn, committedTunnel)
 }
 
 func spliceConnections(c1, c2 net.Conn) {

@@ -615,3 +615,228 @@ func TestMultipleSessionsLoadBalancing(t *testing.T) {
 		t.Fatalf("expected status 200 after session 1 closed, got: %d", resp.StatusCode)
 	}
 }
+
+func TestFailover_DeadPooledConnection(t *testing.T) {
+	_, serverAddr, generated, cleanup := setupTestServerAndClient(t)
+	defer cleanup()
+
+	backendCert, err := generateTestBackendCert("failover.example.com")
+	if err != nil {
+		t.Fatalf("failed to generate backend cert: %v", err)
+	}
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	sessID, _, err := c.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	if _, err := c.Register(ctx, sessID, []string{"failover.example.com"}); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	// Dial 1st connection and immediately close it on backend side (dead pooled connection)
+	deadConn, err := c.DialTunnel(ctx, sessID)
+	if err != nil {
+		t.Fatalf("DialTunnel deadConn failed: %v", err)
+	}
+	_ = deadConn.Close()
+
+	// Dial 2nd connection that is healthy and serves backend TLS
+	healthyConn, err := c.DialTunnel(ctx, sessID)
+	if err != nil {
+		t.Fatalf("DialTunnel healthyConn failed: %v", err)
+	}
+	defer healthyConn.Close()
+
+	go func() {
+		bufReader := bufio.NewReader(healthyConn)
+		hdr, err := proxyproto.Decode(bufReader)
+		if err != nil {
+			return
+		}
+		var remaining []byte
+		if bufReader.Buffered() > 0 {
+			remaining = make([]byte, bufReader.Buffered())
+			_, _ = io.ReadFull(bufReader, remaining)
+		}
+		proxyConn := proxyproto.NewConn(healthyConn, hdr.SrcAddr, hdr.DstAddr, remaining)
+		tlsConn := tls.Server(proxyConn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
+		defer tlsConn.Close()
+		buf := make([]byte, 1024)
+		_, _ = tlsConn.Read(buf)
+		_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 18\r\n\r\nrecovered-from-rst"))
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "failover.example.com",
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         "failover.example.com",
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := httpClient.Get("https://failover.example.com/test")
+	if err != nil {
+		t.Fatalf("expected successful replay after dead pooled connection, got: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "recovered-from-rst" {
+		t.Fatalf("expected response 'recovered-from-rst', got %q", string(body))
+	}
+}
+
+func TestFailover_UnresponsiveBackend(t *testing.T) {
+	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	serverAddr := ln.Addr().String()
+
+	// Configure with short PerAttemptTimeout (200ms) for fast test execution
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:   serverTLS,
+		InternalHostname:  "snigateway.internal",
+		ConnectTimeout:    5 * time.Second,
+		PerAttemptTimeout: 200 * time.Millisecond,
+		ReadSNITimeout:    2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	backendCert, err := generateTestBackendCert("unresponsive.example.com")
+	if err != nil {
+		t.Fatalf("generateTestBackendCert: %v", err)
+	}
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c1 := client.NewClient(serverAddr, clientTLS)
+	c2 := client.NewClient(serverAddr, clientTLS)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Session 1: unresponsive (reads PROXY header + ClientHello, but sleeps and never responds)
+	sessID1, _, err := c1.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession 1 failed: %v", err)
+	}
+	if _, err := c1.Register(ctx, sessID1, []string{"unresponsive.example.com"}); err != nil {
+		t.Fatalf("Register 1 failed: %v", err)
+	}
+
+	conn1, err := c1.DialTunnel(ctx, sessID1)
+	if err != nil {
+		t.Fatalf("DialTunnel 1 failed: %v", err)
+	}
+	defer conn1.Close()
+
+	go func() {
+		buf := make([]byte, 4096)
+		_, _ = conn1.Read(buf)
+		// Sleep without responding to trigger per-attempt timeout on frontend
+		time.Sleep(2 * time.Second)
+	}()
+
+	// Session 2: responsive healthy backend
+	sessID2, _, err := c2.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession 2 failed: %v", err)
+	}
+	if _, err := c2.Register(ctx, sessID2, []string{"unresponsive.example.com"}); err != nil {
+		t.Fatalf("Register 2 failed: %v", err)
+	}
+
+	conn2, err := c2.DialTunnel(ctx, sessID2)
+	if err != nil {
+		t.Fatalf("DialTunnel 2 failed: %v", err)
+	}
+	defer conn2.Close()
+
+	go func() {
+		bufReader := bufio.NewReader(conn2)
+		hdr, err := proxyproto.Decode(bufReader)
+		if err != nil {
+			return
+		}
+		var remaining []byte
+		if bufReader.Buffered() > 0 {
+			remaining = make([]byte, bufReader.Buffered())
+			_, _ = io.ReadFull(bufReader, remaining)
+		}
+		proxyConn := proxyproto.NewConn(conn2, hdr.SrcAddr, hdr.DstAddr, remaining)
+		tlsConn := tls.Server(proxyConn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
+		defer tlsConn.Close()
+		buf := make([]byte, 1024)
+		_, _ = tlsConn.Read(buf)
+		_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 17\r\n\r\nfailover-success!"))
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "unresponsive.example.com",
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         "unresponsive.example.com",
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := httpClient.Get("https://unresponsive.example.com/test")
+	if err != nil {
+		t.Fatalf("expected failover to succeed on healthy session, got: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "failover-success!" {
+		t.Fatalf("expected response 'failover-success!', got %q", string(body))
+	}
+}

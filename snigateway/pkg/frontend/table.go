@@ -25,12 +25,12 @@ import (
 // as well as wildcard hostnames (*.example.com), with exact match taking precedence.
 type RegistrationTable struct {
 	mu              sync.RWMutex
-	sessionHosts    map[string][]string        // sessionID -> registered host patterns
+	sessionHosts    map[string][]string       // sessionID -> registered host patterns
 	sessionIdentity map[string]ClientIdentity // sessionID -> client identity
-	exact           map[string][]string        // normalized exact hostname -> slice of sessionIDs
-	wildcard        map[string][]string        // normalized wildcard pattern (*.example.com) -> slice of sessionIDs
-	exactRR         map[string]int             // round-robin counter per exact hostname
-	wildcardRR      map[string]int             // round-robin counter per wildcard pattern
+	exact           map[string][]string       // normalized exact hostname -> slice of sessionIDs
+	wildcard        map[string][]string       // normalized wildcard pattern (*.example.com) -> slice of sessionIDs
+	exactRR         map[string]int            // round-robin counter per exact hostname
+	wildcardRR      map[string]int            // round-robin counter per wildcard pattern
 }
 
 // NewRegistrationTable creates a new empty RegistrationTable.

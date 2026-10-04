@@ -8,13 +8,15 @@ The `snigateway` architecture consists of two main components:
 1. **`snigateway-frontend`**: Runs on a publicly accessible frontend node (e.g. edge node, VPS, or public VM):
    - Listens on one or more TLS ports (e.g. `:443`).
    - Peeks at the TLS ClientHello of incoming connections to determine the requested SNI hostname without consuming stream bytes.
-   - If the SNI hostname is `snigateway.internal`, it serves the mTLS management API (authenticated via a shared CA).
-   - For other hostnames, it matches against registered hostnames and splices the raw client TLS connection into a reverse tunnel dialed back by the cluster controller.
+   - If the SNI hostname is `snigateway.internal`, it serves the mTLS management API (authenticated via trusted CAs).
+   - Manages session-scoped hostname registrations and maintains a warm pool of pre-dialed reverse tunnel connections.
+   - Sends PROXY protocol v2 headers (with `PP2_TYPE_AUTHORITY` SNI TLV) on activated connections, carrying real client source/dest IPs.
+   - Implements replay-until-first-byte health checking and failover across healthy backend replicas.
 2. **`snigateway` (Controller)**: Runs inside a Kubernetes cluster (e.g. home lab, edge site, private network):
    - Embeds GARI (`pkg/gari`) in-process.
-   - Establishes an outbound mTLS reverse tunnel connection to `snigateway-frontend`.
-   - Uses GARI's `OnGatewaysUpdate` hook to dynamically announce the SNI hostnames for its HTTPS/TLS listeners.
-   - Feeds reverse-tunnelled connections to GARI's HTTPS proxy server via a custom tunnel `net.Listener`, terminating TLS and routing HTTP traffic within the cluster.
+   - Establishes an outbound session and maintains a warm pool of idle pre-dialed mTLS reverse tunnel connections (`--tunnel-pool-size`, default 4).
+   - Uses GARI's `OnGatewaysUpdate` hook to dynamically register SNI hostnames for its HTTPS/TLS listeners.
+   - Feeds reverse-tunnelled connections to GARI's HTTPS proxy server via a custom tunnel `net.Listener`, parsing PROXY v2 headers to expose real client IPs.
 
 ---
 
@@ -180,11 +182,12 @@ The TLS handshake will be routed through the reverse tunnel and terminated insid
 ## Components & Packages
 
 - `snigateway/cmd/snigateway-frontend`: Frontend server binary with `generate-certs` subcommand.
-- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client.
+- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client with `--tunnel-pool-size`.
 - `snigateway/deploy/frontend/`: Systemd unit and VM deployment guide for `snigateway-frontend`.
+- `snigateway/pkg/proxyproto`: PROXY protocol v2 header encoding/decoding and `PP2_TYPE_AUTHORITY` TLV support.
 - `snigateway/pkg/sni`: TLS ClientHello sniffing and parsing.
-- `snigateway/pkg/frontend`: Registration table, mTLS API server, and reverse-tunnel splicing.
+- `snigateway/pkg/frontend`: Registration table, session management, warm pool transport, and failover splicing.
 - `snigateway/pkg/certs`: In-memory and on-disk CA/server/client certificate generation.
 - `snigateway/pkg/client`: Reusable client library for mTLS API and reverse-tunnel dialbacks.
-- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and connection manager.
+- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and pool connection manager.
 - `snigateway/k8s/`: Kubernetes manifests (RBAC, GatewayClass, Deployment, example Gateway/Route).

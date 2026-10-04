@@ -443,8 +443,8 @@ spec:
 	h.WaitForDeploymentInNamespace(namespace, "snigateway-frontend", 2*time.Minute)
 }
 
-func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, frontendAddr string) {
-	h.t.Log("Deploying snigateway controller")
+func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, frontendAddr string, replicas int) {
+	h.t.Logf("Deploying snigateway controller with %d replicas", replicas)
 	gitRoot := h.GetGitRoot()
 
 	h.CreateGenericSecret("snigateway-client-cert", "default", map[string][]byte{
@@ -455,7 +455,7 @@ func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, f
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "snigateway/k8s/controller.yaml"))
 	h.runCmd("kubectl", "set", "image", "deployment/snigateway-controller", "controller=snigateway:e2e", "--namespace=default")
-	h.runCmd("kubectl", "patch", "deployment", "snigateway-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never"}]}}}}`, "--namespace=default")
+	h.runCmd("kubectl", "patch", "deployment", "snigateway-controller", "-p", fmt.Sprintf(`{"spec":{"replicas":%d,"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never"}]}}}}`, replicas), "--namespace=default")
 	patchArg := fmt.Sprintf(`[{"op": "replace", "path": "/spec/template/spec/containers/0/args/1", "value": "--frontend=%s"}]`, frontendAddr)
 	h.runCmd("kubectl", "patch", "deployment", "snigateway-controller", "--type=json", "-p", patchArg, "--namespace=default")
 	h.runCmd("kubectl", "rollout", "restart", "deployment/snigateway-controller", "--namespace=default")
@@ -463,11 +463,15 @@ func (h *Harness) DeploySNIGatewayController(infraCerts *certs.GeneratedCerts, f
 }
 
 func (h *Harness) SNIGatewayManifest(hostname, secretName string) string {
+	return h.SNIGatewayManifestWithName("snigateway-test", hostname, secretName)
+}
+
+func (h *Harness) SNIGatewayManifestWithName(gwName, hostname, secretName string) string {
 	return fmt.Sprintf(`
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: snigateway-test
+  name: %s
   namespace: default
 spec:
   gatewayClassName: snigateway
@@ -481,7 +485,7 @@ spec:
       certificateRefs:
       - kind: Secret
         name: %s
-`, hostname, secretName)
+`, gwName, hostname, secretName)
 }
 
 func (h *Harness) SNIMultiListenerGatewayManifest() string {

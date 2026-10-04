@@ -16,11 +16,9 @@ package tunnel
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"io"
-	"net"
 	"slices"
 	"sync"
 	"time"
@@ -362,23 +360,4 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 			dialOne()
 		}
 	}
-}
-
-type prefixedConn struct {
-	net.Conn
-	r io.Reader
-}
-
-func newPrefixedConn(conn net.Conn, prefix []byte) net.Conn {
-	if len(prefix) == 0 {
-		return conn
-	}
-	return &prefixedConn{
-		Conn: conn,
-		r:    io.MultiReader(bytes.NewReader(prefix), conn),
-	}
-}
-
-func (c *prefixedConn) Read(b []byte) (int, error) {
-	return c.r.Read(b)
 }

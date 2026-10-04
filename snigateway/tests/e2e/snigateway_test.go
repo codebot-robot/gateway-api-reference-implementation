@@ -64,9 +64,9 @@ func TestSNIGateway(t *testing.T) {
 		h.runCmd("kubectl", "delete", "namespace", frontendNS, "--ignore-not-found")
 	})
 
-	// 6. Deploy snigateway controller
+	// 6. Deploy snigateway controller with 2 replicas
 	frontendAddr := fmt.Sprintf("snigateway-frontend.%s.svc.cluster.local:443", frontendNS)
-	h.DeploySNIGatewayController(infraCerts, frontendAddr)
+	h.DeploySNIGatewayController(infraCerts, frontendAddr, 2)
 	t.Cleanup(func() {
 		h.runCmd("kubectl", "delete", "deployment", "snigateway-controller", "--namespace=default", "--ignore-not-found")
 		h.runCmd("kubectl", "delete", "secret", "snigateway-client-cert", "--namespace=default", "--ignore-not-found")
@@ -110,11 +110,11 @@ func TestSNIGateway(t *testing.T) {
 	}
 	t.Cleanup(func() { dumpLogsIfFailed(t) })
 
-	// Wait for controller to reconcile and register
+	// Wait for controller replicas to reconcile and register
 	time.Sleep(5 * time.Second)
 
-	// Assertion 1: Valid SNI request terminates TLS with Gateway cert and reaches backend
-	t.Run("Valid SNI reaches backend with Gateway TLS cert", func(t *testing.T) {
+	// Assertion 1: Valid SNI request terminates TLS with Gateway cert and reaches backend, carrying client IP
+	t.Run("Valid SNI reaches backend with Gateway TLS cert and real client IP", func(t *testing.T) {
 		t.Cleanup(func() { dumpLogsIfFailed(t) })
 		clientPod := "sni-client-valid"
 		h.DeletePod(clientPod)
@@ -140,6 +140,9 @@ func TestSNIGateway(t *testing.T) {
 		}
 		if strings.Contains(logs, "snigateway.internal") {
 			t.Errorf("Presented cert should NOT be frontend internal cert, got: %s", logs)
+		}
+		if !strings.Contains(logs, "X-Forwarded-For") {
+			t.Errorf("Expected X-Forwarded-For header containing real client IP in backend response, got: %s", logs)
 		}
 	})
 
@@ -210,10 +213,11 @@ func TestSNIGateway(t *testing.T) {
 			h.runCmd("kubectl", "delete", "secret", "disallowed-tls-cert", "--namespace=default", "--ignore-not-found")
 		})
 
-		h.KubectlApplyContent(h.SNIGatewayManifest("disallowed.example.com", "disallowed-tls-cert"))
-		h.KubectlApplyContent(h.SNIHTTPRouteManifest("disallowed-route", "snigateway-test", "disallowed.example.com", "backend", 8080))
+		h.KubectlApplyContent(h.SNIGatewayManifestWithName("disallowed-gw", "disallowed.example.com", "disallowed-tls-cert"))
+		h.KubectlApplyContent(h.SNIHTTPRouteManifest("disallowed-route", "disallowed-gw", "disallowed.example.com", "backend", 8080))
 		t.Cleanup(func() {
 			h.runCmd("kubectl", "delete", "httproute", "disallowed-route", "--namespace=default", "--ignore-not-found")
+			h.runCmd("kubectl", "delete", "gateway", "disallowed-gw", "--namespace=default", "--ignore-not-found")
 		})
 
 		// Wait for controller reconciliation attempt
@@ -235,6 +239,37 @@ func TestSNIGateway(t *testing.T) {
 
 		if !strings.Contains(logs, "Connection rejected as expected") {
 			t.Errorf("Expected connection to disallowed hostname to be rejected, got logs: %s", logs)
+		}
+	})
+
+	// Assertion 5: Running two replicas, killing one, and verifying failover
+	t.Run("Kill one of two replicas and verify connections keep succeeding", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
+
+		// Scale down controller to 1 replica (terminating one of the replicas)
+		h.runCmd("kubectl", "scale", "deployment/snigateway-controller", "--replicas=1", "--namespace=default")
+		h.WaitForDeploymentInNamespace("default", "snigateway-controller", 1*time.Minute)
+
+		time.Sleep(2 * time.Second)
+
+		clientPod := "sni-client-failover"
+		h.DeletePod(clientPod)
+		h.KubectlApplyContent(h.SNIClientPodManifest(clientPod, []string{
+			"client",
+			"--connect-to=" + frontendAddr,
+			"--sni=echo.snigateway.test",
+			"--insecure",
+			"https://echo.snigateway.test/",
+		}))
+		h.WaitForPodSuccess(clientPod, 1*time.Minute)
+		logs := h.GetPodLogs(clientPod)
+		t.Logf("Failover client logs: %s", logs)
+
+		if !strings.Contains(logs, "Status: 200 OK") {
+			t.Errorf("Expected 200 OK after killing one replica, got: %s", logs)
+		}
+		if !strings.Contains(logs, "\"hostname\":\"echo.snigateway.test\"") && !strings.Contains(logs, "\"host\": \"echo.snigateway.test\"") {
+			t.Errorf("Expected hostname echo.snigateway.test in response body after failover, got: %s", logs)
 		}
 	})
 }
