@@ -22,7 +22,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -65,172 +64,24 @@ func (r *ListenerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
-	namespaces := r.State.GetNamespaces()
-	acceptedCond, programmedCond := state.ComputeListenerSetAcceptedCondition(ls, gw, namespaces)
-	newConditions := []metav1.Condition{programmedCond, acceptedCond}
-
-	for i, newCond := range newConditions {
-		newConditions[i].LastTransitionTime = metav1.Now()
-		for _, oldCond := range ls.Status.Conditions {
-			if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
-				newConditions[i].LastTransitionTime = oldCond.LastTransitionTime
-				break
-			}
-		}
-	}
-
-	var newListenerStatuses []gatewayv1.ListenerEntryStatus
-	if acceptedCond.Status == metav1.ConditionTrue {
-		routes := r.State.GetHTTPRoutes()
-		for _, listener := range ls.Spec.Listeners {
-			attachedRoutes := 0
-			for _, route := range routes {
-				for _, parentRef := range route.Spec.ParentRefs {
-					pGroup := state.ValueOf(parentRef.Group)
-					pKind := state.ValueOf(parentRef.Kind)
-					if (pGroup == "" || pGroup == gatewayv1.GroupName) && pKind == "ListenerSet" {
-						pNs := route.Namespace
-						if ns := state.ValueOf(parentRef.Namespace); ns != "" {
-							pNs = string(ns)
-						}
-						if string(parentRef.Name) == ls.Name && pNs == ls.Namespace {
-							if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-								if port := state.ValueOf(parentRef.Port); port == 0 || port == listener.Port {
-									if route.IsAcceptedForParentRef(parentRef, r.ControllerName) {
-										routeHostnames := route.GetHostnames()
-										listenerHostname := state.ValueOf(listener.Hostname)
-										effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
-										if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
-											attachedRoutes++
-											break
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// TODO: In Part 2, compute dynamic conditions for each listener (e.g. conflicts, invalid secret/ReferenceGrant refs, protocol support, etc.) instead of hard-coding them to True.
-			conds := []metav1.Condition{
-				{
-					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: ls.Generation,
-					Reason:             string(gatewayv1.ListenerReasonResolvedRefs),
-					Message:            "All references resolved",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: ls.Generation,
-					Reason:             string(gatewayv1.ListenerReasonAccepted),
-					Message:            "Listener accepted",
-				},
-				{
-					Type:               string(gatewayv1.ListenerConditionProgrammed),
-					Status:             metav1.ConditionTrue,
-					ObservedGeneration: ls.Generation,
-					Reason:             string(gatewayv1.ListenerReasonProgrammed),
-					Message:            "Listener programmed",
-				},
-			}
-
-			var oldListener *gatewayv1.ListenerEntryStatus
-			for _, ol := range ls.Status.Listeners {
-				if ol.Name == listener.Name {
-					oldListener = &ol
-					break
-				}
-			}
-
-			for i, newCond := range conds {
-				conds[i].LastTransitionTime = metav1.Now()
-				if oldListener != nil {
-					for _, oldCond := range oldListener.Conditions {
-						if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
-							conds[i].LastTransitionTime = oldCond.LastTransitionTime
-							break
-						}
-					}
-				}
-			}
-
-			newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerEntryStatus{
-				Name:           listener.Name,
-				SupportedKinds: []gatewayv1.RouteGroupKind{{Group: state.Ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: "HTTPRoute"}},
-				AttachedRoutes: int32(attachedRoutes),
-				Conditions:     conds,
-			})
-		}
-	}
-
-	updated := false
-	if len(ls.Status.Conditions) != len(newConditions) || len(ls.Status.Listeners) != len(newListenerStatuses) {
-		updated = true
-	} else {
-		for i := range newConditions {
-			matched := false
-			for j := range ls.Status.Conditions {
-				if ls.Status.Conditions[j].Type == newConditions[i].Type {
-					if ls.Status.Conditions[j].Status == newConditions[i].Status &&
-						ls.Status.Conditions[j].ObservedGeneration == newConditions[i].ObservedGeneration &&
-						ls.Status.Conditions[j].Reason == newConditions[i].Reason &&
-						ls.Status.Conditions[j].Message == newConditions[i].Message {
-						matched = true
-					}
-					break
-				}
-			}
-			if !matched {
-				updated = true
-				break
-			}
-		}
-		if !updated {
-			for i := range newListenerStatuses {
-				if ls.Status.Listeners[i].Name != newListenerStatuses[i].Name ||
-					ls.Status.Listeners[i].AttachedRoutes != newListenerStatuses[i].AttachedRoutes ||
-					len(ls.Status.Listeners[i].Conditions) != len(newListenerStatuses[i].Conditions) {
-					updated = true
-					break
-				}
-				for j := range newListenerStatuses[i].Conditions {
-					matched := false
-					for k := range ls.Status.Listeners[i].Conditions {
-						if ls.Status.Listeners[i].Conditions[k].Type == newListenerStatuses[i].Conditions[j].Type {
-							if ls.Status.Listeners[i].Conditions[k].Status == newListenerStatuses[i].Conditions[j].Status &&
-								ls.Status.Listeners[i].Conditions[k].ObservedGeneration == newListenerStatuses[i].Conditions[j].ObservedGeneration &&
-								ls.Status.Listeners[i].Conditions[k].Reason == newListenerStatuses[i].Conditions[j].Reason {
-								matched = true
-							}
-							break
-						}
-					}
-					if !matched {
-						updated = true
-						break
-					}
-				}
-				if updated {
-					break
-				}
-			}
-		}
-	}
-
 	r.State.UpsertListenerSet(ls)
-	r.updateProxy()
+
+	compiled := r.State.CompileModel(r.ControllerName)
+	compiledGw := compiled.Gateways[gwKey]
+
+	namespaces := r.State.GetNamespaces()
+	newStatus, updated := state.ComputeDesiredListenerSetStatus(ls, gw, namespaces, compiledGw)
 
 	if updated {
-		ls.Status.Conditions = newConditions
-		ls.Status.Listeners = newListenerStatuses
+		ls.Status = newStatus
 		if err := r.Status().Update(ctx, ls); err != nil {
 			l.Error(err, "unable to update ListenerSet status")
 			return ctrl.Result{}, err
 		}
 	}
+
+	r.State.UpsertListenerSet(ls)
+	r.updateProxy()
 
 	return ctrl.Result{}, nil
 }

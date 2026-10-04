@@ -115,7 +115,7 @@ func (h *Harness) GetGitRoot() string {
 
 func (h *Harness) DockerBuild(tag, dockerfile, context string) {
 	h.t.Logf("Building docker image %s", tag)
-	h.runCmd("docker", "build", "-t", tag, "-f", dockerfile, context)
+	h.runCmd("docker", "build", "--no-cache", "-t", tag, "-f", dockerfile, context)
 }
 
 func (h *Harness) KindLoad(tag string) {

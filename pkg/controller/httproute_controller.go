@@ -22,7 +22,6 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -57,39 +56,14 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Compile and store in state
-	validationCondition := r.State.UpsertHTTPRoute(route)
+	r.State.UpsertHTTPRoute(route)
 
-	// Fetch route state with compiled internal route
-	rs := r.State.GetHTTPRoute(req.NamespacedName)
-	if rs == nil {
-		rs = &state.HTTPRouteState{HTTPRoute: route}
-		rs.Compile(r.State.GetServices(), r.State.GetBackendTLSPolicies(), r.State.GetConfigMaps(), r.State)
-	}
+	compiled := r.State.CompileModel(controllerName)
+	compiledRoute := compiled.HTTPRoutes[req.NamespacedName]
 
-	gateways := r.State.GetGateways()
-	namespaces := r.State.GetNamespaces()
-	listenerSets := r.State.GetListenerSets()
-	var desiredParents []gatewayv1.RouteParentStatus
-	for _, parentRef := range route.Spec.ParentRefs {
-		acceptedCondition := validationCondition
-		if acceptedCondition.Status == metav1.ConditionTrue {
-			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways, namespaces, listenerSets)
-		}
-
-		desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
-			ParentRef:      parentRef,
-			ControllerName: gatewayv1.GatewayController(controllerName),
-			Conditions: []metav1.Condition{
-				acceptedCondition,
-				rs.Internal.ResolvedRefsCondition,
-			},
-		})
-	}
-
-	newParents, updated := state.UpdateRouteParentStatuses(route.Status.Parents, desiredParents)
+	newStatus, updated := state.ComputeDesiredHTTPRouteStatus(route, compiledRoute, controllerName)
 	if updated {
-		route.Status.Parents = newParents
+		route.Status = newStatus
 		if err := r.Status().Update(ctx, route); err != nil {
 			l.Error(err, "unable to update HTTPRoute status")
 			return ctrl.Result{}, err

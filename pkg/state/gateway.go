@@ -14,7 +14,6 @@
 package state
 
 import (
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -654,189 +653,44 @@ func getPathLen(m *InternalMatch) int {
 }
 
 func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) ([]InternalListener, []InternalRoute) {
-	for _, route := range routes {
-		if route.HTTPRoute == nil {
-			continue
+	var httpRoutes []*gatewayv1.HTTPRoute
+	for _, r := range routes {
+		if r != nil && r.HTTPRoute != nil {
+			httpRoutes = append(httpRoutes, r.HTTPRoute)
 		}
-		route.Compile(services, backendTLSPolicies, configMaps, refValidator)
 	}
-
-	var internalListeners []InternalListener
-	var allInternalRoutes []InternalRoute
 
 	var nsMap map[string]*corev1.Namespace
-	var listenerSets []*ListenerSetState
+	var listenerSetsList []*gatewayv1.ListenerSet
+	var secrets map[types.NamespacedName]*corev1.Secret
 	if st, ok := refValidator.(*State); ok {
 		nsMap = st.GetNamespaces()
-		listenerSets = st.GetListenerSets()
+		for _, ls := range st.GetListenerSets() {
+			if ls != nil && ls.ListenerSet != nil {
+				listenerSetsList = append(listenerSetsList, ls.ListenerSet)
+			}
+		}
+		secrets = st.GetSecrets()
 	}
 
-	for _, listener := range s.Spec.Listeners {
-		// Check if listener is compatible with HTTPRoute
-		if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
-			continue
-		}
+	compiled := CompileModel(ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{s.Gateway},
+		ListenerSets:       listenerSetsList,
+		HTTPRoutes:         httpRoutes,
+		Services:           services,
+		BackendTLSPolicies: backendTLSPolicies,
+		ConfigMaps:         configMaps,
+		Secrets:            secrets,
+		Namespaces:         nsMap,
+		RefValidator:       refValidator,
+		ControllerName:     controllerName,
+	})
 
-		iListener := InternalListener{
-			Name:        string(listener.Name),
-			Protocol:    listener.Protocol,
-			Port:        listener.Port,
-			Hostname:    string(ValueOf(listener.Hostname)),
-			GatewayName: types.NamespacedName{Namespace: s.Namespace, Name: s.Name},
-		}
-
-		var listenerRoutes []InternalRoute
-
-		for _, route := range routes {
-			if route.HTTPRoute == nil || route.Internal == nil {
-				continue
-			}
-
-			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
-			bound := false
-			for i := range route.Spec.ParentRefs {
-				parentRef := &route.Spec.ParentRefs[i]
-				pKind := ValueOf(parentRef.Kind)
-				if pKind != "" && pKind != "Gateway" {
-					continue
-				}
-				pGroup := ValueOf(parentRef.Group)
-				if pGroup != "" && pGroup != gatewayv1.GroupName {
-					continue
-				}
-				if string(parentRef.Name) != s.Name {
-					continue
-				}
-				parentNamespace := route.Namespace
-				if ns := ValueOf(parentRef.Namespace); ns != "" {
-					parentNamespace = string(ns)
-				}
-				if parentNamespace != s.Namespace {
-					continue
-				}
-
-				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
-					continue
-				}
-				if port := ValueOf(parentRef.Port); port != 0 && port != listener.Port {
-					continue
-				}
-
-				// Dynamically compute acceptance for this listener
-				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap, listenerSets); cond.Status == metav1.ConditionTrue {
-					bound = true
-					break
-				}
-			}
-
-			if !bound {
-				continue
-			}
-
-			// Calculate intersected hostnames
-			routeHostnames := route.GetHostnames()
-			listenerHostname := ValueOf(listener.Hostname)
-			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
-			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
-				// No intersection, skip this listener
-				continue
-			}
-
-			ir := InternalRoute{
-				Hostnames: effectiveHostnames,
-				Rules:     route.Internal.Rules,
-			}
-			listenerRoutes = append(listenerRoutes, ir)
-			allInternalRoutes = append(allInternalRoutes, ir)
-		}
-		iListener.Routes = listenerRoutes
-		internalListeners = append(internalListeners, iListener)
+	cg := compiled.Gateways[types.NamespacedName{Namespace: s.Namespace, Name: s.Name}]
+	if cg == nil {
+		return nil, nil
 	}
-
-	for _, lsState := range listenerSets {
-		if !IsListenerSetParent(lsState.ListenerSet, s.Gateway) || !IsListenerSetAllowed(lsState.ListenerSet, s.Gateway, nsMap) {
-			continue
-		}
-
-		for _, listener := range lsState.Spec.Listeners {
-			if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
-				continue
-			}
-
-			iListener := InternalListener{
-				Name:        fmt.Sprintf("%s/%s/%s", lsState.Namespace, lsState.Name, listener.Name),
-				Protocol:    listener.Protocol,
-				Port:        listener.Port,
-				Hostname:    string(ValueOf(listener.Hostname)),
-				GatewayName: types.NamespacedName{Namespace: s.Namespace, Name: s.Name},
-			}
-
-			var listenerRoutes []InternalRoute
-
-			for _, route := range routes {
-				if route.HTTPRoute == nil || route.Internal == nil {
-					continue
-				}
-
-				bound := false
-				for i := range route.Spec.ParentRefs {
-					parentRef := &route.Spec.ParentRefs[i]
-					pKind := ValueOf(parentRef.Kind)
-					if pKind != "ListenerSet" {
-						continue
-					}
-					pGroup := ValueOf(parentRef.Group)
-					if pGroup != "" && pGroup != gatewayv1.GroupName {
-						continue
-					}
-					if string(parentRef.Name) != lsState.Name {
-						continue
-					}
-					parentNamespace := route.Namespace
-					if ns := ValueOf(parentRef.Namespace); ns != "" {
-						parentNamespace = string(ns)
-					}
-					if parentNamespace != lsState.Namespace {
-						continue
-					}
-
-					if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
-						continue
-					}
-					if port := ValueOf(parentRef.Port); port != 0 && port != listener.Port {
-						continue
-					}
-
-					if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap, listenerSets); cond.Status == metav1.ConditionTrue {
-						bound = true
-						break
-					}
-				}
-
-				if !bound {
-					continue
-				}
-
-				routeHostnames := route.GetHostnames()
-				listenerHostname := ValueOf(listener.Hostname)
-				effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
-				if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
-					continue
-				}
-
-				ir := InternalRoute{
-					Hostnames: effectiveHostnames,
-					Rules:     route.Internal.Rules,
-				}
-				listenerRoutes = append(listenerRoutes, ir)
-				allInternalRoutes = append(allInternalRoutes, ir)
-			}
-			iListener.Routes = listenerRoutes
-			internalListeners = append(internalListeners, iListener)
-		}
-	}
-
-	return internalListeners, allInternalRoutes
+	return BuildProxyConfig([]*CompiledGateway{cg})
 }
 
 func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) []InternalRoute {

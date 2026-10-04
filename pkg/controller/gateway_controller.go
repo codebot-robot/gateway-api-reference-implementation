@@ -16,7 +16,6 @@ package controller
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
@@ -25,7 +24,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -197,6 +195,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	r.State.UpsertGateway(gw)
+
 	var providedAddresses []gatewayv1.GatewayStatusAddress
 	if r.AddressProvider != nil {
 		var err error
@@ -207,448 +207,26 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// Compute listener status
-	routes := r.State.GetHTTPRoutes()
-	secrets := r.State.GetSecrets()
-	gs := state.GatewayState{Gateway: gw}
-	var newListenerStatuses []gatewayv1.ListenerStatus
-	acceptedListenersCount := 0
+	compiled := r.State.CompileModel(controllerName)
+	compiledGw := compiled.Gateways[req.NamespacedName]
 
-	for _, listener := range gw.Spec.Listeners {
-		isSupported := isSupportedProtocol(listener.Protocol)
-
-		listenerAcceptedStatus := metav1.ConditionTrue
-		listenerAcceptedReason := gatewayv1.ListenerReasonAccepted
-		listenerAcceptedMessage := "Listener accepted"
-
-		listenerProgrammedStatus := metav1.ConditionTrue
-		listenerProgrammedReason := gatewayv1.ListenerReasonProgrammed
-		listenerProgrammedMessage := "Listener programmed"
-
-		resolvedRefsStatus := metav1.ConditionTrue
-		resolvedRefsReason := gatewayv1.ListenerReasonResolvedRefs
-		resolvedRefsMessage := "All references resolved"
-
-		var supportedKinds []gatewayv1.RouteGroupKind
-		hasInvalidRouteKind := false
-
-		if !isSupported {
-			listenerAcceptedStatus = metav1.ConditionFalse
-			listenerAcceptedReason = gatewayv1.ListenerReasonUnsupportedProtocol
-			listenerAcceptedMessage = fmt.Sprintf("Protocol %q is not supported", listener.Protocol)
-
-			listenerProgrammedStatus = metav1.ConditionFalse
-			listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-			listenerProgrammedMessage = fmt.Sprintf("Protocol %q is not supported", listener.Protocol)
-
-			supportedKinds = []gatewayv1.RouteGroupKind{}
-			if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
-				for _, k := range listener.AllowedRoutes.Kinds {
-					if !isValidRouteKindForProtocol(listener.Protocol, k.Group, k.Kind) {
-						hasInvalidRouteKind = true
-					}
-				}
-			}
-		} else {
-			if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
-				supportedKinds = []gatewayv1.RouteGroupKind{}
-				for _, k := range listener.AllowedRoutes.Kinds {
-					if isValidRouteKindForProtocol(listener.Protocol, k.Group, k.Kind) {
-						alreadyPresent := false
-						for _, sk := range supportedKinds {
-							if sk.Kind == k.Kind && state.ValueOf(sk.Group) == gatewayv1.GroupName {
-								alreadyPresent = true
-								break
-							}
-						}
-						if !alreadyPresent {
-							supportedKinds = append(supportedKinds, gatewayv1.RouteGroupKind{
-								Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
-								Kind:  k.Kind,
-							})
-						}
-					} else {
-						hasInvalidRouteKind = true
-					}
-				}
-			} else {
-				supportedKinds = defaultSupportedKindsForProtocol(listener.Protocol)
-			}
-		}
-
-		if hasInvalidRouteKind {
-			resolvedRefsStatus = metav1.ConditionFalse
-			resolvedRefsReason = gatewayv1.ListenerReasonInvalidRouteKinds
-			resolvedRefsMessage = "One or more route kinds are not supported"
-
-			listenerProgrammedStatus = metav1.ConditionFalse
-			listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-			listenerProgrammedMessage = "One or more route kinds are not supported"
-		}
-
-		needsTLSSecretValidation := isSupported && (listener.Protocol == gatewayv1.HTTPSProtocolType || (listener.Protocol == gatewayv1.TLSProtocolType && listener.TLS != nil && (listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayv1.TLSModeTerminate))) && listener.TLS != nil
-		if needsTLSSecretValidation {
-			if len(listener.TLS.CertificateRefs) == 0 {
-				resolvedRefsStatus = metav1.ConditionFalse
-				resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-				resolvedRefsMessage = "No certificate refs specified"
-
-				listenerProgrammedStatus = metav1.ConditionFalse
-				listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-				listenerProgrammedMessage = "Invalid TLS configuration: no certificate refs specified"
-			}
-			for _, ref := range listener.TLS.CertificateRefs {
-				group := state.ValueOf(ref.Group)
-				kind := state.ValueOf(ref.Kind)
-				if (group != "" && group != "core") || (kind != "" && kind != "Secret") {
-					resolvedRefsStatus = metav1.ConditionFalse
-					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Unsupported certificate ref group %q kind %q", group, kind)
-
-					listenerProgrammedStatus = metav1.ConditionFalse
-					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-					listenerProgrammedMessage = fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind)
-					break
-				}
-
-				if kind == "" {
-					kind = "Secret"
-				}
-
-				secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
-				if secretKey.Namespace != gw.Namespace {
-					from := state.Reference{
-						GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
-						Namespace: gw.Namespace,
-					}
-					to := state.Reference{
-						GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-						Namespace: secretKey.Namespace,
-						Name:      secretKey.Name,
-					}
-					if !r.State.IsReferencePermitted(from, to) {
-						resolvedRefsStatus = metav1.ConditionFalse
-						resolvedRefsReason = gatewayv1.ListenerReasonRefNotPermitted
-						resolvedRefsMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
-
-						listenerProgrammedStatus = metav1.ConditionFalse
-						listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-						listenerProgrammedMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
-						break
-					}
-				}
-
-				secret, ok := secrets[secretKey]
-				if !ok || secret == nil {
-					resolvedRefsStatus = metav1.ConditionFalse
-					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
-
-					listenerProgrammedStatus = metav1.ConditionFalse
-					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-					listenerProgrammedMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
-					break
-				}
-
-				certBytes := secret.Data[corev1.TLSCertKey]
-				keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
-				if len(certBytes) == 0 || len(keyBytes) == 0 {
-					resolvedRefsStatus = metav1.ConditionFalse
-					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
-
-					listenerProgrammedStatus = metav1.ConditionFalse
-					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-					listenerProgrammedMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
-					break
-				}
-
-				if _, err := tls.X509KeyPair(certBytes, keyBytes); err != nil {
-					resolvedRefsStatus = metav1.ConditionFalse
-					resolvedRefsReason = gatewayv1.ListenerReasonInvalidCertificateRef
-					resolvedRefsMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
-
-					listenerProgrammedStatus = metav1.ConditionFalse
-					listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
-					listenerProgrammedMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
-					break
-				}
-			}
-		}
-
-		attachedRoutes := 0
-		if isSupported {
-			httpRouteAllowed := false
-			if listener.AllowedRoutes == nil || len(listener.AllowedRoutes.Kinds) == 0 {
-				httpRouteAllowed = (listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType)
-			} else {
-				for _, k := range listener.AllowedRoutes.Kinds {
-					if state.IsHTTPRoute(k.Group, k.Kind) {
-						httpRouteAllowed = true
-						break
-					}
-				}
-			}
-
-			if httpRouteAllowed {
-				for _, route := range routes {
-					for _, parentRef := range route.Spec.ParentRefs {
-						parentNamespace := route.Namespace
-						if ns := state.ValueOf(parentRef.Namespace); ns != "" {
-							parentNamespace = string(ns)
-						}
-						if string(parentRef.Name) == gw.Name && parentNamespace == gw.Namespace {
-							if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-								if port := state.ValueOf(parentRef.Port); port == 0 || port == listener.Port {
-									if route.IsAcceptedForParentRef(parentRef, controllerName) {
-										routeHostnames := route.GetHostnames()
-										listenerHostname := state.ValueOf(listener.Hostname)
-										effectiveHostnames := state.IntersectHostnames(routeHostnames, string(listenerHostname))
-										if len(effectiveHostnames) > 0 || len(routeHostnames) == 0 {
-											attachedRoutes++
-											break
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		conds := []metav1.Condition{
-			{
-				Type:               string(gatewayv1.ListenerConditionProgrammed),
-				Status:             listenerProgrammedStatus,
-				ObservedGeneration: gw.Generation,
-				Reason:             string(listenerProgrammedReason),
-				Message:            listenerProgrammedMessage,
-			},
-			{
-				Type:               string(gatewayv1.ListenerConditionAccepted),
-				Status:             listenerAcceptedStatus,
-				ObservedGeneration: gw.Generation,
-				Reason:             string(listenerAcceptedReason),
-				Message:            listenerAcceptedMessage,
-			},
-			{
-				Type:               string(gatewayv1.ListenerConditionResolvedRefs),
-				Status:             resolvedRefsStatus,
-				ObservedGeneration: gw.Generation,
-				Reason:             string(resolvedRefsReason),
-				Message:            resolvedRefsMessage,
-			},
-		}
-
-		var oldListener *gatewayv1.ListenerStatus
-		for _, ol := range gw.Status.Listeners {
-			if ol.Name == listener.Name {
-				oldListener = &ol
-				break
-			}
-		}
-
-		for i, newCond := range conds {
-			conds[i].LastTransitionTime = metav1.Now()
-			if oldListener != nil {
-				for _, oldCond := range oldListener.Conditions {
-					if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
-						conds[i].LastTransitionTime = oldCond.LastTransitionTime
-						break
-					}
-				}
-			}
-		}
-
-		if listenerAcceptedStatus == metav1.ConditionTrue {
-			acceptedListenersCount++
-		}
-
-		newListenerStatuses = append(newListenerStatuses, gatewayv1.ListenerStatus{
-			Name:           listener.Name,
-			SupportedKinds: supportedKinds,
-			AttachedRoutes: int32(attachedRoutes),
-			Conditions:     conds,
-		})
-	}
-
-	totalListeners := len(gw.Spec.Listeners)
-
-	gwAcceptedStatus := metav1.ConditionTrue
-	gwAcceptedReason := gatewayv1.GatewayReasonAccepted
-	gwAcceptedMessage := "Gateway accepted by reference implementation"
-
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
-		gwAcceptedStatus = metav1.ConditionFalse
-		gwAcceptedReason = gatewayv1.GatewayReasonInvalidParameters
-		gwAcceptedMessage = "Invalid infrastructure parametersRef: parametersRef is not supported"
-	} else if totalListeners == 0 {
-		gwAcceptedStatus = metav1.ConditionFalse
-		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
-		gwAcceptedMessage = "No listeners configured on Gateway"
-	} else if acceptedListenersCount == 0 {
-		gwAcceptedStatus = metav1.ConditionFalse
-		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
-		gwAcceptedMessage = "No listeners are accepted"
-	} else if acceptedListenersCount < totalListeners {
-		gwAcceptedStatus = metav1.ConditionTrue
-		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
-		gwAcceptedMessage = "One or more listeners have invalid configuration"
-	}
-
-	gwProgrammedStatus := metav1.ConditionTrue
-	gwProgrammedReason := gatewayv1.GatewayReasonProgrammed
-	gwProgrammedMessage := "Gateway programmed by reference implementation"
-
-	if gwAcceptedStatus == metav1.ConditionFalse {
-		gwProgrammedStatus = metav1.ConditionFalse
-		gwProgrammedReason = gatewayv1.GatewayReasonInvalid
-		gwProgrammedMessage = "Gateway is not accepted"
-	} else if len(providedAddresses) == 0 {
-		gwProgrammedStatus = metav1.ConditionFalse
-		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
-		gwProgrammedMessage = "Waiting for address to be assigned to the Gateway"
-	}
-
-	newConditions := []metav1.Condition{
-		{
-			Type:               string(gatewayv1.GatewayConditionProgrammed),
-			Status:             gwProgrammedStatus,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gwProgrammedReason),
-			Message:            gwProgrammedMessage,
-		},
-		{
-			Type:               string(gatewayv1.GatewayConditionAccepted),
-			Status:             gwAcceptedStatus,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gwAcceptedReason),
-			Message:            gwAcceptedMessage,
-		},
-	}
-
-	// Preserve LastTransitionTime for Gateway conditions if Status hasn't changed
-	for i, newCond := range newConditions {
-		newConditions[i].LastTransitionTime = metav1.Now()
-		for _, oldCond := range gw.Status.Conditions {
-			if oldCond.Type == newCond.Type && oldCond.Status == newCond.Status {
-				newConditions[i].LastTransitionTime = oldCond.LastTransitionTime
-				break
-			}
-		}
-	}
-
-	var newAddresses []gatewayv1.GatewayStatusAddress
-	if gwAcceptedStatus == metav1.ConditionTrue {
-		newAddresses = providedAddresses
-	}
-
-	// Compute attached listener sets count
-	listenerSets := r.State.GetListenerSets()
-	namespaces := r.State.GetNamespaces()
-	attachedListenerSetsCount := int32(0)
-	for _, ls := range listenerSets {
-		if state.IsListenerSetParent(ls.ListenerSet, gw) && state.IsListenerSetAllowed(ls.ListenerSet, gw, namespaces) {
-			attachedListenerSetsCount++
-		}
-	}
-
-	updated := false
-	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) || gw.Status.AttachedListenerSets == nil || *gw.Status.AttachedListenerSets != attachedListenerSetsCount {
-		updated = true
-	} else {
-		for i := range newConditions {
-			matched := false
-			for j := range gw.Status.Conditions {
-				if gw.Status.Conditions[j].Type == newConditions[i].Type {
-					if gw.Status.Conditions[j].Status == newConditions[i].Status &&
-						gw.Status.Conditions[j].ObservedGeneration == newConditions[i].ObservedGeneration &&
-						gw.Status.Conditions[j].Reason == newConditions[i].Reason &&
-						gw.Status.Conditions[j].Message == newConditions[i].Message {
-						matched = true
-					}
-					break
-				}
-			}
-			if !matched {
-				updated = true
-				break
-			}
-		}
-		if !updated {
-			for i := range newAddresses {
-				if state.ValueOf(gw.Status.Addresses[i].Type) != state.ValueOf(newAddresses[i].Type) ||
-					gw.Status.Addresses[i].Value != newAddresses[i].Value {
-					updated = true
-					break
-				}
-			}
-		}
-		if !updated {
-			for i := range newListenerStatuses {
-				if gw.Status.Listeners[i].Name != newListenerStatuses[i].Name ||
-					gw.Status.Listeners[i].AttachedRoutes != newListenerStatuses[i].AttachedRoutes ||
-					len(gw.Status.Listeners[i].Conditions) != len(newListenerStatuses[i].Conditions) ||
-					len(gw.Status.Listeners[i].SupportedKinds) != len(newListenerStatuses[i].SupportedKinds) {
-					updated = true
-					break
-				}
-				for k := range newListenerStatuses[i].SupportedKinds {
-					if state.ValueOf(gw.Status.Listeners[i].SupportedKinds[k].Group) != state.ValueOf(newListenerStatuses[i].SupportedKinds[k].Group) ||
-						gw.Status.Listeners[i].SupportedKinds[k].Kind != newListenerStatuses[i].SupportedKinds[k].Kind {
-						updated = true
-						break
-					}
-				}
-				if updated {
-					break
-				}
-				// Also check if conditions changed (optional but safer)
-				for j := range newListenerStatuses[i].Conditions {
-					matched := false
-					for k := range gw.Status.Listeners[i].Conditions {
-						if gw.Status.Listeners[i].Conditions[k].Type == newListenerStatuses[i].Conditions[j].Type {
-							if gw.Status.Listeners[i].Conditions[k].Status == newListenerStatuses[i].Conditions[j].Status &&
-								gw.Status.Listeners[i].Conditions[k].ObservedGeneration == newListenerStatuses[i].Conditions[j].ObservedGeneration &&
-								gw.Status.Listeners[i].Conditions[k].Reason == newListenerStatuses[i].Conditions[j].Reason &&
-								gw.Status.Listeners[i].Conditions[k].Message == newListenerStatuses[i].Conditions[j].Message {
-								matched = true
-							}
-							break
-						}
-					}
-					if !matched {
-						updated = true
-						break
-					}
-				}
-				if updated {
-					break
-				}
-			}
-		}
-	}
-
-	r.State.UpsertGateway(gw)
-	_ = gs // keep for now
-	r.updateProxy()
+	newStatus, updated := state.ComputeDesiredGatewayStatus(gw, compiledGw, providedAddresses)
 
 	if updated {
-		gw.Status.Conditions = newConditions
-		gw.Status.Addresses = newAddresses
-		gw.Status.Listeners = newListenerStatuses
-		gw.Status.AttachedListenerSets = &attachedListenerSetsCount
+		gw.Status = newStatus
 		if err := r.Status().Update(ctx, gw); err != nil {
 			l.Error(err, "unable to update Gateway status")
 			return ctrl.Result{}, err
 		}
 	}
 
-	if len(newAddresses) == 0 {
+	r.State.UpsertGateway(gw)
+	r.updateProxy()
+
+	if len(gw.Status.Addresses) == 0 {
 		l.V(1).Info("Gateway has no address assigned yet")
 	} else {
-		l.Info("Updated Gateway status", "addresses", newAddresses)
+		l.Info("Updated Gateway status", "addresses", gw.Status.Addresses)
 	}
 
 	return ctrl.Result{}, nil
@@ -812,63 +390,4 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return bldr.Complete(r)
-}
-
-func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
-	switch protocol {
-	case gatewayv1.HTTPProtocolType,
-		gatewayv1.HTTPSProtocolType,
-		gatewayv1.TLSProtocolType,
-		gatewayv1.TCPProtocolType,
-		gatewayv1.UDPProtocolType:
-		return true
-	default:
-		return false
-	}
-}
-
-func isValidRouteKindForProtocol(protocol gatewayv1.ProtocolType, group *gatewayv1.Group, kind gatewayv1.Kind) bool {
-	grp := state.ValueOf(group)
-	if grp != "" && grp != gatewayv1.GroupName {
-		return false
-	}
-	switch protocol {
-	case gatewayv1.HTTPProtocolType, gatewayv1.HTTPSProtocolType:
-		return kind == "HTTPRoute" || kind == "GRPCRoute"
-	case gatewayv1.TLSProtocolType:
-		return kind == "TLSRoute"
-	case gatewayv1.TCPProtocolType:
-		return kind == "TCPRoute"
-	case gatewayv1.UDPProtocolType:
-		return kind == "UDPRoute"
-	default:
-		return false
-	}
-}
-
-func defaultSupportedKindsForProtocol(protocol gatewayv1.ProtocolType) []gatewayv1.RouteGroupKind {
-	switch protocol {
-	case gatewayv1.HTTPProtocolType, gatewayv1.HTTPSProtocolType:
-		return []gatewayv1.RouteGroupKind{{
-			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
-			Kind:  gatewayv1.Kind("HTTPRoute"),
-		}}
-	case gatewayv1.TLSProtocolType:
-		return []gatewayv1.RouteGroupKind{{
-			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
-			Kind:  gatewayv1.Kind("TLSRoute"),
-		}}
-	case gatewayv1.TCPProtocolType:
-		return []gatewayv1.RouteGroupKind{{
-			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
-			Kind:  gatewayv1.Kind("TCPRoute"),
-		}}
-	case gatewayv1.UDPProtocolType:
-		return []gatewayv1.RouteGroupKind{{
-			Group: state.Ptr(gatewayv1.Group(gatewayv1.GroupName)),
-			Kind:  gatewayv1.Kind("UDPRoute"),
-		}}
-	default:
-		return []gatewayv1.RouteGroupKind{}
-	}
 }
