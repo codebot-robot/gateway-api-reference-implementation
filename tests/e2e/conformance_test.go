@@ -158,6 +158,11 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteTimeoutBackendRequest,
 		tests.HTTPRouteTimeoutRequest,
 		tests.HTTPRouteWeight,
+		tests.ListenerSetAllowedNamespaceNone,
+		tests.ListenerSetAllowedNamespaceSame,
+		tests.ListenerSetAllowedNamespaceSelector,
+		tests.ListenerSetDefaultNotAllowed,
+		tests.ListenerSetHTTPRouting,
 	}
 
 	cSuite.Setup(t, selectedTests)

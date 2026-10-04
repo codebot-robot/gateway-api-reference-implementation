@@ -664,8 +664,10 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 	var allInternalRoutes []InternalRoute
 
 	var nsMap map[string]*corev1.Namespace
+	var listenerSets []*ListenerSetState
 	if st, ok := refValidator.(*State); ok {
 		nsMap = st.GetNamespaces()
+		listenerSets = st.GetListenerSets()
 	}
 
 	for _, listener := range s.Spec.Listeners {
@@ -694,6 +696,14 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 			var matchingParentRef *gatewayv1.ParentReference
 			for i := range route.Spec.ParentRefs {
 				parentRef := &route.Spec.ParentRefs[i]
+				pKind := ValueOf(parentRef.Kind)
+				if pKind != "" && pKind != "Gateway" {
+					continue
+				}
+				pGroup := ValueOf(parentRef.Group)
+				if pGroup != "" && pGroup != gatewayv1.GroupName {
+					continue
+				}
 				if string(parentRef.Name) != s.Name {
 					continue
 				}
@@ -713,7 +723,7 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 				}
 
 				// Dynamically compute acceptance for this listener
-				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap); cond.Status == metav1.ConditionTrue {
+				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap, listenerSets); cond.Status == metav1.ConditionTrue {
 					bound = true
 					matchingParentRef = parentRef
 					break
@@ -743,6 +753,92 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 		}
 		iListener.Routes = listenerRoutes
 		internalListeners = append(internalListeners, iListener)
+	}
+
+	for _, lsState := range listenerSets {
+		if !IsListenerSetParent(lsState.ListenerSet, s.Gateway) || !IsListenerSetAllowed(lsState.ListenerSet, s.Gateway, nsMap) {
+			continue
+		}
+
+		for _, listener := range lsState.Spec.Listeners {
+			if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
+				continue
+			}
+
+			iListener := InternalListener{
+				Name:        string(listener.Name),
+				Protocol:    listener.Protocol,
+				Port:        listener.Port,
+				Hostname:    string(ValueOf(listener.Hostname)),
+				GatewayName: types.NamespacedName{Namespace: s.Namespace, Name: s.Name},
+			}
+
+			var listenerRoutes []InternalRoute
+
+			for _, route := range routes {
+				if route.HTTPRoute == nil || route.Internal == nil {
+					continue
+				}
+
+				bound := false
+				var matchingParentRef *gatewayv1.ParentReference
+				for i := range route.Spec.ParentRefs {
+					parentRef := &route.Spec.ParentRefs[i]
+					pKind := ValueOf(parentRef.Kind)
+					if pKind != "ListenerSet" {
+						continue
+					}
+					pGroup := ValueOf(parentRef.Group)
+					if pGroup != "" && pGroup != gatewayv1.GroupName {
+						continue
+					}
+					if string(parentRef.Name) != lsState.Name {
+						continue
+					}
+					parentNamespace := route.Namespace
+					if ns := ValueOf(parentRef.Namespace); ns != "" {
+						parentNamespace = string(ns)
+					}
+					if parentNamespace != lsState.Namespace {
+						continue
+					}
+
+					if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
+						continue
+					}
+					if port := ValueOf(parentRef.Port); port != 0 && port != listener.Port {
+						continue
+					}
+
+					if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap, listenerSets); cond.Status == metav1.ConditionTrue {
+						bound = true
+						matchingParentRef = parentRef
+						break
+					}
+				}
+
+				if !bound {
+					continue
+				}
+
+				routeHostnames := route.GetHostnames()
+				listenerHostname := ValueOf(listener.Hostname)
+				effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
+				if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
+					continue
+				}
+
+				ir := InternalRoute{
+					Hostnames: effectiveHostnames,
+					Rules:     route.Internal.Rules,
+				}
+				listenerRoutes = append(listenerRoutes, ir)
+				allInternalRoutes = append(allInternalRoutes, ir)
+				_ = matchingParentRef
+			}
+			iListener.Routes = listenerRoutes
+			internalListeners = append(internalListeners, iListener)
+		}
 	}
 
 	return internalListeners, allInternalRoutes

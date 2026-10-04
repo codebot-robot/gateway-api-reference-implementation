@@ -154,6 +154,17 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		return fmt.Errorf("error creating Namespace controller: %w", err)
 	}
 
+	if err := (&ListenerSetReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		State:            st,
+		Proxy:            p,
+		ControllerName:   controllerName,
+		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating ListenerSet controller: %w", err)
+	}
+
 	return nil
 }
 
@@ -228,6 +239,71 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 									}
 									if listener.Hostname == nil || string(*listener.Hostname) == "" || defaultCert == nil {
 										defaultCert = &certCopy
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	listenerSets := st.GetListenerSets()
+	namespaces := st.GetNamespaces()
+	for _, gw := range gateways {
+		for _, ls := range listenerSets {
+			if !state.IsListenerSetParent(ls.ListenerSet, gw.Gateway) || !state.IsListenerSetAllowed(ls.ListenerSet, gw.Gateway, namespaces) {
+				continue
+			}
+			for _, listener := range ls.Spec.Listeners {
+				if (listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == gatewayv1.TLSProtocolType) && listener.TLS != nil {
+					for _, ref := range listener.TLS.CertificateRefs {
+						group := state.ValueOf(ref.Group)
+						kind := state.ValueOf(ref.Kind)
+						if kind == "" {
+							kind = "Secret"
+						}
+						if (group == "" || group == "core") && kind == "Secret" {
+							secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, ls.ListenerSet)
+							from := state.Reference{
+								GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
+								Namespace: ls.Namespace,
+							}
+							to := state.Reference{
+								GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+								Namespace: secretKey.Namespace,
+								Name:      secretKey.Name,
+							}
+							if secretKey.Namespace != ls.Namespace && !st.IsReferencePermitted(from, to) {
+								continue
+							}
+							secret, ok := secrets[secretKey]
+							if ok && secret != nil {
+								certBytes := secret.Data[corev1.TLSCertKey]
+								keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
+								if len(certBytes) > 0 && len(keyBytes) > 0 {
+									tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
+									if err == nil {
+										certCopy := tlsCert
+										if len(certCopy.Certificate) > 0 {
+											leaf, err := x509.ParseCertificate(certCopy.Certificate[0])
+											if err == nil {
+												certCopy.Leaf = leaf
+												if leaf.Subject.CommonName != "" {
+													certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy
+												}
+												for _, dnsName := range leaf.DNSNames {
+													certsMap[strings.ToLower(dnsName)] = &certCopy
+												}
+											}
+										}
+										if listener.Hostname != nil && string(*listener.Hostname) != "" {
+											certsMap[strings.ToLower(string(*listener.Hostname))] = &certCopy
+										}
+										if listener.Hostname == nil || string(*listener.Hostname) == "" || defaultCert == nil {
+											defaultCert = &certCopy
+										}
 									}
 								}
 							}

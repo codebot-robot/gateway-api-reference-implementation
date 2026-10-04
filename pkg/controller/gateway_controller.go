@@ -395,8 +395,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		})
 	}
 
+	// Compute attached listener sets count
+	listenerSets := r.State.GetListenerSets()
+	namespaces := r.State.GetNamespaces()
+	attachedListenerSetsCount := int32(0)
+	for _, ls := range listenerSets {
+		if state.IsListenerSetParent(ls.ListenerSet, gw) && state.IsListenerSetAllowed(ls.ListenerSet, gw, namespaces) {
+			attachedListenerSetsCount++
+		}
+	}
+
 	updated := false
-	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) {
+	if len(gw.Status.Conditions) != len(newConditions) || len(gw.Status.Addresses) != len(newAddresses) || len(gw.Status.Listeners) != len(newListenerStatuses) || gw.Status.AttachedListenerSets == nil || *gw.Status.AttachedListenerSets != attachedListenerSetsCount {
 		updated = true
 	} else {
 		for i := range newConditions {
@@ -467,6 +477,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		gw.Status.Conditions = newConditions
 		gw.Status.Addresses = newAddresses
 		gw.Status.Listeners = newListenerStatuses
+		gw.Status.AttachedListenerSets = &attachedListenerSetsCount
 		if err := r.Status().Update(ctx, gw); err != nil {
 			l.Error(err, "unable to update Gateway status")
 			return ctrl.Result{}, err
@@ -619,6 +630,34 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 								}
 							}
 						}
+					}
+				}
+				return requests
+			}
+			return nil
+		})).
+		Watches(&gatewayv1.ListenerSet{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			ls := obj.(*gatewayv1.ListenerSet)
+			gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, ls)
+			return []ctrl.Request{
+				{
+					NamespacedName: gwKey,
+				},
+			}
+		})).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			var gwList gatewayv1.GatewayList
+			if err := r.List(ctx, &gwList); err == nil {
+				var requests []ctrl.Request
+				for _, gw := range gwList.Items {
+					if gw.Spec.AllowedListeners != nil && gw.Spec.AllowedListeners.Namespaces != nil &&
+						state.ValueOf(gw.Spec.AllowedListeners.Namespaces.From) == gatewayv1.NamespacesFromSelector {
+						requests = append(requests, ctrl.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: gw.Namespace,
+								Name:      gw.Name,
+							},
+						})
 					}
 				}
 				return requests

@@ -661,7 +661,7 @@ func TestComputeAcceptedCondition(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cond := tt.route.ComputeAcceptedCondition(tt.parentRef, gateways)
+			cond := tt.route.ComputeAcceptedCondition(tt.parentRef, gateways, nil, nil)
 			if cond.Status != tt.expectedStatus {
 				t.Errorf("ComputeAcceptedCondition() Status = %v, want %v", cond.Status, tt.expectedStatus)
 			}
@@ -860,7 +860,7 @@ func TestComputeAcceptedCondition_UnknownFilter(t *testing.T) {
 		},
 	}
 
-	cond := route.ComputeAcceptedCondition(gatewayv1.ParentReference{Name: "test-gateway"}, []*GatewayState{gw})
+	cond := route.ComputeAcceptedCondition(gatewayv1.ParentReference{Name: "test-gateway"}, []*GatewayState{gw}, nil, nil)
 	if cond.Status != metav1.ConditionFalse {
 		t.Errorf("expected Accepted status False, got %v", cond.Status)
 	}
@@ -1551,12 +1551,12 @@ func TestComputeAcceptedCondition_AllowedRoutesNamespacesSelector(t *testing.T) 
 		},
 	}
 
-	cond1 := routeInMatchingNs.ComputeAcceptedCondition(parentRef, []*GatewayState{gw}, nsMap)
+	cond1 := routeInMatchingNs.ComputeAcceptedCondition(parentRef, []*GatewayState{gw}, nsMap, nil)
 	if cond1.Status != metav1.ConditionTrue {
 		t.Errorf("expected route in matching-ns to be Accepted True, got %v (%s)", cond1.Status, cond1.Reason)
 	}
 
-	cond2 := routeInNonMatchingNs.ComputeAcceptedCondition(parentRef, []*GatewayState{gw}, nsMap)
+	cond2 := routeInNonMatchingNs.ComputeAcceptedCondition(parentRef, []*GatewayState{gw}, nsMap, nil)
 	if cond2.Status != metav1.ConditionFalse {
 		t.Errorf("expected route in other-ns to be Accepted False, got %v (%s)", cond2.Status, cond2.Reason)
 	}
