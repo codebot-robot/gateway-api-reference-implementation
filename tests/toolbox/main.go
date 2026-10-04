@@ -92,7 +92,7 @@ func runClientCLI(args []string) {
 	insecure := fs.Bool("insecure", false, "Skip TLS verification")
 	expectFail := fs.Bool("expect-fail", false, "Expect request / TLS connection to fail/be closed")
 	timeout := fs.Duration("timeout", 10*time.Second, "Request timeout")
-	retries := fs.Int("retries", 15, "Number of retries for request on failure")
+	retries := fs.Int("retries", 30, "Number of retries for request on failure")
 	retryInterval := fs.Duration("retry-interval", 1*time.Second, "Interval between retries")
 
 	if err := fs.Parse(args); err != nil {
