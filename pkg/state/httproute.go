@@ -572,8 +572,8 @@ func (s *HTTPRouteState) Validate() error {
 	return nil
 }
 
-// ComputeAcceptedCondition calculates the RouteConditionAccepted condition for a given parentRef and gateways.
-func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentReference, gateways []*GatewayState, namespaces ...map[string]*corev1.Namespace) metav1.Condition {
+// ComputeAcceptedCondition calculates the RouteConditionAccepted condition for a given parentRef and gateways/listenerSets.
+func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentReference, gateways []*GatewayState, namespaces map[string]*corev1.Namespace, listenerSets []*ListenerSetState) metav1.Condition {
 	if s.Internal == nil {
 		s.Compile(nil, nil, nil, nil)
 	}
@@ -592,12 +592,173 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		)
 	}
 
-	if kind := ValueOf(parentRef.Kind); kind != "" && kind != "Gateway" {
+	kind := ValueOf(parentRef.Kind)
+	if kind == "" {
+		kind = "Gateway"
+	}
+	if kind != "Gateway" && kind != "ListenerSet" {
 		return NewCondition(
 			string(gatewayv1.RouteConditionAccepted),
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNoMatchingParent),
 			fmt.Sprintf("Unsupported parent kind: %s", kind),
+			s.Generation,
+		)
+	}
+
+	if kind == "ListenerSet" {
+		targetNamespace := s.Namespace
+		if parentNamespace := ValueOf(parentRef.Namespace); parentNamespace != "" {
+			targetNamespace = string(parentNamespace)
+		}
+		var targetLS *ListenerSetState
+		for _, ls := range listenerSets {
+			if ls.Name == string(parentRef.Name) && ls.Namespace == targetNamespace {
+				targetLS = ls
+				break
+			}
+		}
+
+		if targetLS == nil {
+			return NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonNoMatchingParent),
+				"ListenerSet not found",
+				s.Generation,
+			)
+		}
+
+		var parentGW *GatewayState
+		gwNs := targetLS.Namespace
+		if ns := ValueOf(targetLS.Spec.ParentRef.Namespace); ns != "" {
+			gwNs = string(ns)
+		}
+		for _, g := range gateways {
+			if g.Name == string(targetLS.Spec.ParentRef.Name) && g.Namespace == gwNs {
+				parentGW = g
+				break
+			}
+		}
+
+		if parentGW == nil || !IsListenerSetAllowed(targetLS.ListenerSet, parentGW.Gateway, namespaces) {
+			return NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonNoMatchingParent),
+				"Parent ListenerSet is not accepted by Gateway",
+				s.Generation,
+			)
+		}
+
+		hasMatchingListener := false
+		hasAllowedListener := false
+		hasMatchingHostname := false
+
+		for _, listener := range targetLS.Spec.Listeners {
+			if sectionName := ValueOf(parentRef.SectionName); sectionName != "" && sectionName != listener.Name {
+				continue
+			}
+			if port := ValueOf(parentRef.Port); port != 0 && port != listener.Port {
+				continue
+			}
+			hasMatchingListener = true
+
+			// Check protocol compatibility
+			if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
+				continue
+			}
+
+			// Check AllowedRoutes kinds
+			if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
+				kindAllowed := false
+				for _, k := range listener.AllowedRoutes.Kinds {
+					if IsHTTPRoute(k.Group, k.Kind) {
+						kindAllowed = true
+						break
+					}
+				}
+				if !kindAllowed {
+					continue
+				}
+			}
+
+			// Check AllowedRoutes namespaces
+			if listener.AllowedRoutes != nil && listener.AllowedRoutes.Namespaces != nil && listener.AllowedRoutes.Namespaces.From != nil {
+				switch *listener.AllowedRoutes.Namespaces.From {
+				case gatewayv1.NamespacesFromSame:
+					if s.Namespace != targetLS.Namespace {
+						continue
+					}
+				case gatewayv1.NamespacesFromAll:
+					// Allowed
+				case gatewayv1.NamespacesFromSelector:
+					if listener.AllowedRoutes.Namespaces.Selector != nil {
+						sel, err := metav1.LabelSelectorAsSelector(listener.AllowedRoutes.Namespaces.Selector)
+						if err != nil {
+							continue
+						}
+						var nsObj *corev1.Namespace
+						if namespaces != nil {
+							nsObj = namespaces[s.Namespace]
+						}
+						if nsObj != nil {
+							if !sel.Matches(labels.Set(nsObj.Labels)) {
+								continue
+							}
+						} else if s.Namespace != targetLS.Namespace && namespaces != nil {
+							continue
+						}
+					}
+				}
+			} else {
+				// Default is Same namespace
+				if s.Namespace != targetLS.Namespace {
+					continue
+				}
+			}
+
+			hasAllowedListener = true
+
+			effectiveHostnames := IntersectHostnames(s.GetHostnames(), string(ValueOf(listener.Hostname)))
+			if len(effectiveHostnames) > 0 || len(s.Spec.Hostnames) == 0 {
+				hasMatchingHostname = true
+				break
+			}
+		}
+
+		if hasMatchingHostname {
+			return NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionTrue,
+				string(gatewayv1.RouteReasonAccepted),
+				"Route accepted by reference implementation",
+				s.Generation,
+			)
+		}
+		if hasAllowedListener {
+			return NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonNoMatchingListenerHostname),
+				"No matching listener hostname",
+				s.Generation,
+			)
+		}
+		if hasMatchingListener {
+			return NewCondition(
+				string(gatewayv1.RouteConditionAccepted),
+				metav1.ConditionFalse,
+				string(gatewayv1.RouteReasonNotAllowedByListeners),
+				"Not allowed by listener permissions or protocol",
+				s.Generation,
+			)
+		}
+		return NewCondition(
+			string(gatewayv1.RouteConditionAccepted),
+			metav1.ConditionFalse,
+			string(gatewayv1.RouteReasonNoMatchingParent),
+			"No matching listener for parentRef",
 			s.Generation,
 		)
 	}
@@ -673,14 +834,14 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 						continue
 					}
 					var nsObj *corev1.Namespace
-					if len(namespaces) > 0 && namespaces[0] != nil {
-						nsObj = namespaces[0][s.Namespace]
+					if namespaces != nil {
+						nsObj = namespaces[s.Namespace]
 					}
 					if nsObj != nil {
 						if !sel.Matches(labels.Set(nsObj.Labels)) {
 							continue
 						}
-					} else if s.Namespace != gw.Namespace && len(namespaces) > 0 && namespaces[0] != nil {
+					} else if s.Namespace != gw.Namespace && namespaces != nil {
 						continue
 					}
 				}
@@ -769,6 +930,14 @@ func (s *HTTPRouteState) IsAcceptedForParentRef(parentRef gatewayv1.ParentRefere
 	if ns := ValueOf(parentRef.Namespace); ns != "" {
 		parentNamespace = string(ns)
 	}
+	pKind := ValueOf(parentRef.Kind)
+	if pKind == "" {
+		pKind = "Gateway"
+	}
+	pGroup := ValueOf(parentRef.Group)
+	if pGroup == "" {
+		pGroup = gatewayv1.GroupName
+	}
 	for _, ps := range s.HTTPRoute.Status.Parents {
 		if string(ps.ControllerName) != controllerName {
 			continue
@@ -777,12 +946,20 @@ func (s *HTTPRouteState) IsAcceptedForParentRef(parentRef gatewayv1.ParentRefere
 		if ns := ValueOf(ps.ParentRef.Namespace); ns != "" {
 			psNamespace = string(ns)
 		}
+		psKind := ValueOf(ps.ParentRef.Kind)
+		if psKind == "" {
+			psKind = "Gateway"
+		}
+		psGroup := ValueOf(ps.ParentRef.Group)
+		if psGroup == "" {
+			psGroup = gatewayv1.GroupName
+		}
 		if string(ps.ParentRef.Name) == string(parentRef.Name) &&
 			psNamespace == parentNamespace &&
+			psKind == pKind &&
+			psGroup == pGroup &&
 			ValueOf(ps.ParentRef.SectionName) == ValueOf(parentRef.SectionName) &&
-			ValueOf(ps.ParentRef.Port) == ValueOf(parentRef.Port) &&
-			ValueOf(ps.ParentRef.Group) == ValueOf(parentRef.Group) &&
-			ValueOf(ps.ParentRef.Kind) == ValueOf(parentRef.Kind) {
+			ValueOf(ps.ParentRef.Port) == ValueOf(parentRef.Port) {
 			for _, c := range ps.Conditions {
 				if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
 					return true

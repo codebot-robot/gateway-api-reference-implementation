@@ -69,11 +69,12 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	gateways := r.State.GetGateways()
 	namespaces := r.State.GetNamespaces()
+	listenerSets := r.State.GetListenerSets()
 	var desiredParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {
 		acceptedCondition := validationCondition
 		if acceptedCondition.Status == metav1.ConditionTrue {
-			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways, namespaces)
+			acceptedCondition = rs.ComputeAcceptedCondition(parentRef, gateways, namespaces, listenerSets)
 		}
 
 		desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
@@ -206,6 +207,32 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 						Name:      route.Name,
 					},
 				})
+			}
+			return requests
+		})).
+		// A ListenerSet update invalidates all HTTPRoutes that reference it
+		Watches(&gatewayv1.ListenerSet{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			ls := obj.(*gatewayv1.ListenerSet)
+			var routeList gatewayv1.HTTPRouteList
+			if err := r.List(ctx, &routeList); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, route := range routeList.Items {
+				for _, parentRef := range route.Spec.ParentRefs {
+					if string(state.ValueOf(parentRef.Kind)) == "ListenerSet" {
+						lsKey := ResolveNamespacedName(parentRef.Namespace, parentRef.Name, &route)
+						if lsKey.Name == ls.Name && lsKey.Namespace == ls.Namespace {
+							requests = append(requests, ctrl.Request{
+								NamespacedName: types.NamespacedName{
+									Namespace: route.Namespace,
+									Name:      route.Name,
+								},
+							})
+							break
+						}
+					}
+				}
 			}
 			return requests
 		})).

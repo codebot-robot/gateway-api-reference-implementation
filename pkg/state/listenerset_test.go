@@ -1,0 +1,312 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package state
+
+import (
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+func TestIsListenerSetParent(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		ls       *gatewayv1.ListenerSet
+		expected bool
+	}{
+		{
+			name: "exact match same namespace",
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ls-1",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.ListenerSetSpec{
+					ParentRef: gatewayv1.ParentGatewayReference{
+						Name: "test-gw",
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "explicit namespace match",
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ls-2",
+					Namespace: "other-ns",
+				},
+				Spec: gatewayv1.ListenerSetSpec{
+					ParentRef: gatewayv1.ParentGatewayReference{
+						Name:      "test-gw",
+						Namespace: Ptr(gatewayv1.Namespace("default")),
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "different gateway name",
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ls-3",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.ListenerSetSpec{
+					ParentRef: gatewayv1.ParentGatewayReference{
+						Name: "other-gw",
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "unsupported parent group",
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ls-4",
+					Namespace: "default",
+				},
+				Spec: gatewayv1.ListenerSetSpec{
+					ParentRef: gatewayv1.ParentGatewayReference{
+						Group: Ptr(gatewayv1.Group("example.com")),
+						Name:  "test-gw",
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsListenerSetParent(tt.ls, gw)
+			if got != tt.expected {
+				t.Errorf("IsListenerSetParent() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsListenerSetAllowed(t *testing.T) {
+	sameFrom := gatewayv1.NamespacesFromSame
+	allFrom := gatewayv1.NamespacesFromAll
+	noneFrom := gatewayv1.NamespacesFromNone
+	selectorFrom := gatewayv1.NamespacesFromSelector
+
+	namespaces := map[string]*corev1.Namespace{
+		"default": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "default",
+				Labels: map[string]string{"env": "prod"},
+			},
+		},
+		"tenant-a": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "tenant-a",
+				Labels: map[string]string{"env": "prod", "tenant": "a"},
+			},
+		},
+		"tenant-b": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "tenant-b",
+				Labels: map[string]string{"env": "dev"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		gw       *gatewayv1.Gateway
+		ls       *gatewayv1.ListenerSet
+		expected bool
+	}{
+		{
+			name: "default not allowed (nil AllowedListeners)",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "default"},
+			},
+			expected: false,
+		},
+		{
+			name: "AllowedListeners From: None",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: &noneFrom,
+						},
+					},
+				},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "default"},
+			},
+			expected: false,
+		},
+		{
+			name: "AllowedListeners From: Same (same namespace)",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: &sameFrom,
+						},
+					},
+				},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "default"},
+			},
+			expected: true,
+		},
+		{
+			name: "AllowedListeners From: Same (different namespace)",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: &sameFrom,
+						},
+					},
+				},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "tenant-a"},
+			},
+			expected: false,
+		},
+		{
+			name: "AllowedListeners From: All (different namespace)",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: &allFrom,
+						},
+					},
+				},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "tenant-a"},
+			},
+			expected: true,
+		},
+		{
+			name: "AllowedListeners From: Selector (matches labels)",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: &selectorFrom,
+							Selector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"env": "prod"},
+							},
+						},
+					},
+				},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "tenant-a"},
+			},
+			expected: true,
+		},
+		{
+			name: "AllowedListeners From: Selector (does not match labels)",
+			gw: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: &selectorFrom,
+							Selector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"env": "prod"},
+							},
+						},
+					},
+				},
+			},
+			ls: &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "tenant-b"},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsListenerSetAllowed(tt.ls, tt.gw, namespaces)
+			if got != tt.expected {
+				t.Errorf("IsListenerSetAllowed() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestStateListenerSetOperations(t *testing.T) {
+	st := NewState()
+	now := time.Now()
+
+	ls1 := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "ls-b",
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(now.Add(1 * time.Minute)),
+		},
+	}
+	ls2 := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "ls-a",
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(now),
+		},
+	}
+
+	st.UpsertListenerSet(ls1)
+	st.UpsertListenerSet(ls2)
+
+	got := st.GetListenerSets()
+	if len(got) != 2 {
+		t.Fatalf("expected 2 ListenerSets, got %d", len(got))
+	}
+	if got[0].Name != "ls-a" || got[1].Name != "ls-b" {
+		t.Errorf("expected sorted [ls-a, ls-b], got [%s, %s]", got[0].Name, got[1].Name)
+	}
+
+	st.DeleteListenerSet(types.NamespacedName{Namespace: "default", Name: "ls-a"})
+	got = st.GetListenerSets()
+	if len(got) != 1 || got[0].Name != "ls-b" {
+		t.Errorf("expected 1 ListenerSet [ls-b], got %v", got)
+	}
+}

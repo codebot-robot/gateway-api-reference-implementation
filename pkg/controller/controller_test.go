@@ -1201,3 +1201,237 @@ func TestGatewayReconciler_GatewayFilter(t *testing.T) {
 		t.Errorf("expected dev gateway NOT in state")
 	}
 }
+
+func TestListenerSetReconciler(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-class",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+
+	sameFrom := gatewayv1.NamespacesFromSame
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: &sameFrom,
+				},
+			},
+		},
+	}
+
+	lsAllowed := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "ls-allowed",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "test-gw",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	lsDisallowed := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "ls-disallowed",
+			Namespace:  "other-ns",
+			Generation: 1,
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name:      "test-gw",
+				Namespace: state.Ptr(gatewayv1.Namespace("default")),
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc, gw, lsAllowed, lsDisallowed).
+		WithStatusSubresource(gw, lsAllowed, lsDisallowed).
+		Build()
+
+	r := &ListenerSetReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		Proxy:          p,
+		ControllerName: DefaultControllerName,
+	}
+
+	ctx := t.Context()
+
+	// 1. Reconcile allowed ListenerSet
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "ls-allowed"}})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling allowed listener set: %v", err)
+	}
+
+	var reconciledLS gatewayv1.ListenerSet
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "ls-allowed"}, &reconciledLS); err != nil {
+		t.Fatalf("failed to get allowed listener set: %v", err)
+	}
+
+	acceptedCond := findCondition(reconciledLS.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True for allowed ListenerSet, got %+v", acceptedCond)
+	}
+	progCond := findCondition(reconciledLS.Status.Conditions, string(gatewayv1.ListenerSetConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Programmed=True for allowed ListenerSet, got %+v", progCond)
+	}
+	if len(reconciledLS.Status.Listeners) != 1 {
+		t.Fatalf("expected 1 listener status, got %d", len(reconciledLS.Status.Listeners))
+	}
+	if reconciledLS.Status.Listeners[0].Name != "http" {
+		t.Errorf("expected listener status name 'http', got %s", reconciledLS.Status.Listeners[0].Name)
+	}
+
+	// 2. Reconcile disallowed ListenerSet
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "other-ns", Name: "ls-disallowed"}})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling disallowed listener set: %v", err)
+	}
+
+	var reconciledDisallowedLS gatewayv1.ListenerSet
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "other-ns", Name: "ls-disallowed"}, &reconciledDisallowedLS); err != nil {
+		t.Fatalf("failed to get disallowed listener set: %v", err)
+	}
+
+	disallowedAcceptedCond := findCondition(reconciledDisallowedLS.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted))
+	if disallowedAcceptedCond == nil || disallowedAcceptedCond.Status != metav1.ConditionFalse || disallowedAcceptedCond.Reason != string(gatewayv1.ListenerSetReasonNotAllowed) {
+		t.Errorf("expected Accepted=False/NotAllowed for disallowed ListenerSet, got %+v", disallowedAcceptedCond)
+	}
+}
+
+func TestGatewayReconciler_AttachedListenerSets(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-class",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+
+	sameFrom := gatewayv1.NamespacesFromSame
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: &sameFrom,
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	ls1 := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ls-1",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "test-gw",
+			},
+		},
+	}
+	ls2 := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ls-2",
+			Namespace: "other-ns",
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name:      "test-gw",
+				Namespace: state.Ptr(gatewayv1.Namespace("default")),
+			},
+		},
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	st.UpsertListenerSet(ls1)
+	st.UpsertListenerSet(ls2)
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		Proxy:          p,
+		ControllerName: DefaultControllerName,
+	}
+
+	ctx := t.Context()
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var resGW gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-gw"}, &resGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	if resGW.Status.AttachedListenerSets == nil {
+		t.Fatalf("expected AttachedListenerSets to be non-nil")
+	}
+	if *resGW.Status.AttachedListenerSets != 1 {
+		t.Errorf("expected AttachedListenerSets to be 1, got %d", *resGW.Status.AttachedListenerSets)
+	}
+}
