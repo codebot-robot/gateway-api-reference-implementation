@@ -58,6 +58,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	r.State.UpsertHTTPRoute(route)
 
+	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
 	compiled := r.State.CompileModel(controllerName)
 	compiledRoute := compiled.HTTPRoutes[req.NamespacedName]
 

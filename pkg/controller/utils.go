@@ -171,6 +171,7 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 	if controllerName == "" {
 		controllerName = DefaultControllerName
 	}
+	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
 	compiled := st.CompileModel(controllerName)
 	if p != nil {
 		proxyListeners, proxyRoutes := state.BuildProxyConfig(compiled.GatewaysList())

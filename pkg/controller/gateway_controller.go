@@ -207,6 +207,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
+	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
 	compiled := r.State.CompileModel(controllerName)
 	compiledGw := compiled.Gateways[req.NamespacedName]
 

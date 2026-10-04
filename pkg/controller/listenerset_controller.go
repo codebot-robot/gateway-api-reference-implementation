@@ -64,8 +64,12 @@ func (r *ListenerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
+	if gw != nil {
+		r.State.UpsertGateway(gw)
+	}
 	r.State.UpsertListenerSet(ls)
 
+	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
 	compiled := r.State.CompileModel(r.ControllerName)
 	compiledGw := compiled.Gateways[gwKey]
 

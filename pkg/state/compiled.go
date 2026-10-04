@@ -305,7 +305,7 @@ func ValidateListener(
 			for _, ref := range listener.TLS.CertificateRefs {
 				group := ValueOf(ref.Group)
 				kind := ValueOf(ref.Kind)
-				if (group != "" && group != "core") || (kind != "" && kind != "Secret") {
+				if group != "" || (kind != "" && kind != "Secret") {
 					tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
 					tlsInvalidMessage = fmt.Sprintf("Unsupported certificate ref group %q kind %q", group, kind)
 					tlsProgrammedMessage = fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind)
@@ -860,7 +860,7 @@ func ExtractCertificates(
 				if kind == "" {
 					kind = "Secret"
 				}
-				if (group != "" && group != "core") || kind != "Secret" {
+				if group != "" || kind != "Secret" {
 					continue
 				}
 
@@ -1092,23 +1092,19 @@ func ComputeDesiredListenerSetStatus(
 				}
 			}
 
-			supportedKinds := []gatewayv1.RouteGroupKind{{Group: Ptr(gatewayv1.Group(gatewayv1.GroupName)), Kind: "HTTPRoute"}}
-			attachedRoutes := int32(0)
-			var conds []metav1.Condition
-			if matchedEl != nil {
-				supportedKinds = matchedEl.SupportedKinds
-				attachedRoutes = matchedEl.AttachedRoutes
-				conds = make([]metav1.Condition, len(matchedEl.Conditions))
-				copy(conds, matchedEl.Conditions)
-			} else {
-				supportedKinds, conds = ValidateListener(
-					ListenerEntryToSpec(l),
-					ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name},
-					ls.Generation,
-					nil,
-					nil,
-				)
+			if matchedEl == nil {
+				// If an accepted ListenerSet listener is not found in the compiled model,
+				// it indicates an internal inconsistency (e.g. missing compiled Gateway model).
+				// We skip setting status for this listener rather than attempting a fallback
+				// re-validation without secrets or a ReferenceGrant validator, which would
+				// incorrectly report TLS certificate references as invalid.
+				continue
 			}
+
+			supportedKinds := matchedEl.SupportedKinds
+			attachedRoutes := matchedEl.AttachedRoutes
+			conds := make([]metav1.Condition, len(matchedEl.Conditions))
+			copy(conds, matchedEl.Conditions)
 
 			var oldListener *gatewayv1.ListenerEntryStatus
 			for _, ol := range desiredStatus.Listeners {

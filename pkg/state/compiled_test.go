@@ -879,3 +879,109 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateListener_CertificateRefGroup(t *testing.T) {
+	certPEM, keyPEM := generateTestCertPEM(t, "example.com")
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "my-secret"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-secret"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       certPEM,
+				corev1.TLSPrivateKeyKey: keyPEM,
+			},
+		},
+	}
+
+	coreGroup := gatewayv1.Group("core")
+	emptyGroup := gatewayv1.Group("")
+	customGroup := gatewayv1.Group("example.com")
+
+	tests := []struct {
+		name               string
+		group              *gatewayv1.Group
+		kind               *gatewayv1.Kind
+		expectProgrammed   metav1.ConditionStatus
+		expectResolvedRefs metav1.ConditionStatus
+		expectReason       string
+	}{
+		{
+			name:               "nil group accepted",
+			group:              nil,
+			kind:               Ptr(gatewayv1.Kind("Secret")),
+			expectProgrammed:   metav1.ConditionTrue,
+			expectResolvedRefs: metav1.ConditionTrue,
+			expectReason:       string(gatewayv1.ListenerReasonResolvedRefs),
+		},
+		{
+			name:               "empty group accepted",
+			group:              &emptyGroup,
+			kind:               Ptr(gatewayv1.Kind("Secret")),
+			expectProgrammed:   metav1.ConditionTrue,
+			expectResolvedRefs: metav1.ConditionTrue,
+			expectReason:       string(gatewayv1.ListenerReasonResolvedRefs),
+		},
+		{
+			name:               "core group rejected",
+			group:              &coreGroup,
+			kind:               Ptr(gatewayv1.Kind("Secret")),
+			expectProgrammed:   metav1.ConditionFalse,
+			expectResolvedRefs: metav1.ConditionFalse,
+			expectReason:       string(gatewayv1.ListenerReasonInvalidCertificateRef),
+		},
+		{
+			name:               "custom group rejected",
+			group:              &customGroup,
+			kind:               Ptr(gatewayv1.Kind("Secret")),
+			expectProgrammed:   metav1.ConditionFalse,
+			expectResolvedRefs: metav1.ConditionFalse,
+			expectReason:       string(gatewayv1.ListenerReasonInvalidCertificateRef),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			listener := gatewayv1.Listener{
+				Name:     "https",
+				Port:     443,
+				Protocol: gatewayv1.HTTPSProtocolType,
+				TLS: &gatewayv1.ListenerTLSConfig{
+					CertificateRefs: []gatewayv1.SecretObjectReference{
+						{
+							Group: tc.group,
+							Kind:  tc.kind,
+							Name:  "my-secret",
+						},
+					},
+				},
+			}
+
+			_, conds := ValidateListener(
+				ListenerToSpec(listener),
+				ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "gw"},
+				1,
+				secrets,
+				nil,
+			)
+
+			var progCond, resCond *metav1.Condition
+			for i := range conds {
+				if conds[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+					progCond = &conds[i]
+				}
+				if conds[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
+					resCond = &conds[i]
+				}
+			}
+
+			if progCond == nil || progCond.Status != tc.expectProgrammed {
+				t.Errorf("expected Programmed condition %v, got %v", tc.expectProgrammed, progCond)
+			}
+			if resCond == nil || resCond.Status != tc.expectResolvedRefs {
+				t.Errorf("expected ResolvedRefs condition %v, got %v", tc.expectResolvedRefs, resCond)
+			}
+			if resCond != nil && resCond.Reason != tc.expectReason {
+				t.Errorf("expected ResolvedRefs reason %q, got %q", tc.expectReason, resCond.Reason)
+			}
+		})
+	}
+}
