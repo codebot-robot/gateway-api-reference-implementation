@@ -613,7 +613,7 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		}
 		var targetLS *ListenerSetState
 		for _, ls := range listenerSets {
-			if ls.Name == string(parentRef.Name) && (targetNamespace == "" || ls.Namespace == "" || ls.Namespace == targetNamespace) {
+			if ls.Name == string(parentRef.Name) && ls.Namespace == targetNamespace {
 				targetLS = ls
 				break
 			}
@@ -635,7 +635,7 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 			gwNs = string(ns)
 		}
 		for _, g := range gateways {
-			if g.Name == string(targetLS.Spec.ParentRef.Name) && (gwNs == "" || g.Namespace == "" || g.Namespace == gwNs) {
+			if g.Name == string(targetLS.Spec.ParentRef.Name) && g.Namespace == gwNs {
 				parentGW = g
 				break
 			}

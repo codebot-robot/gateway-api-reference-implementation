@@ -204,7 +204,7 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 					if kind == "" {
 						kind = "Secret"
 					}
-					if (group == "" || group == "core") && kind == "Secret" {
+					if group == "" && kind == "Secret" {
 						secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, gw)
 						from := state.Reference{
 							GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
@@ -268,7 +268,7 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 						if kind == "" {
 							kind = "Secret"
 						}
-						if (group == "" || group == "core") && kind == "Secret" {
+						if group == "" && kind == "Secret" {
 							secretKey := ResolveNamespacedName(ref.Namespace, ref.Name, ls.ListenerSet)
 							from := state.Reference{
 								GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
@@ -304,9 +304,6 @@ func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatew
 										}
 										if listener.Hostname != nil && string(*listener.Hostname) != "" {
 											certsMap[strings.ToLower(string(*listener.Hostname))] = &certCopy
-										}
-										if listener.Hostname == nil || string(*listener.Hostname) == "" || defaultCert == nil {
-											defaultCert = &certCopy
 										}
 									}
 								}

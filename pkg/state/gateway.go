@@ -14,6 +14,7 @@
 package state
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -693,7 +694,6 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 
 			// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 			bound := false
-			var matchingParentRef *gatewayv1.ParentReference
 			for i := range route.Spec.ParentRefs {
 				parentRef := &route.Spec.ParentRefs[i]
 				pKind := ValueOf(parentRef.Kind)
@@ -725,7 +725,6 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 				// Dynamically compute acceptance for this listener
 				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap, listenerSets); cond.Status == metav1.ConditionTrue {
 					bound = true
-					matchingParentRef = parentRef
 					break
 				}
 			}
@@ -749,7 +748,6 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 			}
 			listenerRoutes = append(listenerRoutes, ir)
 			allInternalRoutes = append(allInternalRoutes, ir)
-			_ = matchingParentRef // keep for now
 		}
 		iListener.Routes = listenerRoutes
 		internalListeners = append(internalListeners, iListener)
@@ -766,7 +764,7 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 			}
 
 			iListener := InternalListener{
-				Name:        string(listener.Name),
+				Name:        fmt.Sprintf("%s/%s/%s", lsState.Namespace, lsState.Name, listener.Name),
 				Protocol:    listener.Protocol,
 				Port:        listener.Port,
 				Hostname:    string(ValueOf(listener.Hostname)),
@@ -781,7 +779,6 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 				}
 
 				bound := false
-				var matchingParentRef *gatewayv1.ParentReference
 				for i := range route.Spec.ParentRefs {
 					parentRef := &route.Spec.ParentRefs[i]
 					pKind := ValueOf(parentRef.Kind)
@@ -812,7 +809,6 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 
 					if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}, nsMap, listenerSets); cond.Status == metav1.ConditionTrue {
 						bound = true
-						matchingParentRef = parentRef
 						break
 					}
 				}
@@ -834,7 +830,6 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 				}
 				listenerRoutes = append(listenerRoutes, ir)
 				allInternalRoutes = append(allInternalRoutes, ir)
-				_ = matchingParentRef
 			}
 			iListener.Routes = listenerRoutes
 			internalListeners = append(internalListeners, iListener)

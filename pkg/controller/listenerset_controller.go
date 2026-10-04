@@ -112,6 +112,7 @@ func (r *ListenerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				}
 			}
 
+			// TODO: In Part 2, compute dynamic conditions for each listener (e.g. conflicts, invalid secret/ReferenceGrant refs, protocol support, etc.) instead of hard-coding them to True.
 			conds := []metav1.Condition{
 				{
 					Type:               string(gatewayv1.ListenerConditionResolvedRefs),
