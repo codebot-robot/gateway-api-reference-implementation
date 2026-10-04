@@ -29,6 +29,7 @@ type State struct {
 	mu sync.RWMutex
 
 	gateways           map[types.NamespacedName]*GatewayState
+	listenerSets       map[types.NamespacedName]*ListenerSetState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services           map[types.NamespacedName]*corev1.Service
@@ -41,6 +42,7 @@ type State struct {
 func NewState() *State {
 	return &State{
 		gateways:           make(map[types.NamespacedName]*GatewayState),
+		listenerSets:       make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:         make(map[types.NamespacedName]*HTTPRouteState),
 		backendTLSPolicies: make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:           make(map[types.NamespacedName]*corev1.Service),
@@ -279,6 +281,54 @@ func (s *State) GetBackendTLSPolicies() []*gatewayv1.BackendTLSPolicy {
 		policies = append(policies, policy)
 	}
 	return policies
+}
+
+func (s *State) UpsertListenerSet(ls *gatewayv1.ListenerSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.listenerSets[types.NamespacedName{Namespace: ls.Namespace, Name: ls.Name}] = &ListenerSetState{
+		ListenerSet: ls,
+	}
+}
+
+func (s *State) DeleteListenerSet(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.listenerSets, name)
+}
+
+func (s *State) GetListenerSet(name types.NamespacedName) *ListenerSetState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.listenerSets[name]
+}
+
+func (s *State) GetListenerSets() []*ListenerSetState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var sets []*ListenerSetState
+	for _, ls := range s.listenerSets {
+		sets = append(sets, ls)
+	}
+
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(sets, func(i, j int) bool {
+		if !sets[i].CreationTimestamp.Equal(&sets[j].CreationTimestamp) {
+			return sets[i].CreationTimestamp.Before(&sets[j].CreationTimestamp)
+		}
+		if sets[i].Namespace != sets[j].Namespace {
+			return sets[i].Namespace < sets[j].Namespace
+		}
+		return sets[i].Name < sets[j].Name
+	})
+
+	return sets
 }
 
 func (s *State) GetServices() map[types.NamespacedName]*corev1.Service {

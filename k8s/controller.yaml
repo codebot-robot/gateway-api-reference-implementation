@@ -10,13 +10,13 @@ metadata:
   name: gari-controller
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants"]
+  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
   resources: ["services", "configmaps", "secrets", "namespaces"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status"]
+  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status"]
   verbs: ["update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
