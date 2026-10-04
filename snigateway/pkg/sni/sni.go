@@ -41,7 +41,8 @@ var ErrNoSNI = errors.New("no SNI extension found in ClientHello")
 // PeekedConn wraps a net.Conn and replays peeked bytes before reading from the underlying connection.
 type PeekedConn struct {
 	net.Conn
-	r io.Reader
+	r      io.Reader
+	peeked []byte
 }
 
 // Read reads from the peeked buffer first, then the underlying connection.
@@ -49,11 +50,24 @@ func (c *PeekedConn) Read(b []byte) (int, error) {
 	return c.r.Read(b)
 }
 
+// PeekedBytes returns a copy of the peeked bytes.
+func (c *PeekedConn) PeekedBytes() []byte {
+	res := make([]byte, len(c.peeked))
+	copy(res, c.peeked)
+	return res
+}
+
+// RawConn returns the underlying unwrapped connection.
+func (c *PeekedConn) RawConn() net.Conn {
+	return c.Conn
+}
+
 // NewPeekedConn returns a net.Conn that replays the given peeked bytes on subsequent reads.
 func NewPeekedConn(conn net.Conn, peeked []byte) *PeekedConn {
 	return &PeekedConn{
-		Conn: conn,
-		r:    io.MultiReader(bytes.NewReader(peeked), conn),
+		Conn:   conn,
+		r:      io.MultiReader(bytes.NewReader(peeked), conn),
+		peeked: peeked,
 	}
 }
 

@@ -17,11 +17,9 @@ package frontend
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,17 +32,20 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/sni"
 )
 
 // ServerConfig holds configuration options for the frontend server.
 type ServerConfig struct {
-	ListenAddrs      []string
-	InternalHostname string
-	ServerTLSConfig  *tls.Config
-	ConnectTimeout   time.Duration
-	ReadSNITimeout   time.Duration
-	Authorizer       Authorizer
+	ListenAddrs       []string
+	InternalHostname  string
+	ServerTLSConfig   *tls.Config
+	ConnectTimeout    time.Duration
+	PerAttemptTimeout time.Duration
+	ReadSNITimeout    time.Duration
+	Authorizer        Authorizer
+	Transport         *PoolTransport
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -52,11 +53,7 @@ type Server struct {
 	config     ServerConfig
 	authorizer Authorizer
 	table      *RegistrationTable
-
-	mu        sync.RWMutex
-	clients   map[string][]chan *api.ConnectionEvent // clientID -> slice of active event stream channels
-	clientsRR map[string]int                         // clientID -> round-robin counter for event stream selection
-	pending   map[string]chan net.Conn               // connectionID -> dialback tunnel channel
+	pool       *PoolTransport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -78,6 +75,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 10 * time.Second
 	}
+	if cfg.PerAttemptTimeout <= 0 {
+		cfg.PerAttemptTimeout = 2 * time.Second
+	}
 	if cfg.ReadSNITimeout <= 0 {
 		cfg.ReadSNITimeout = 5 * time.Second
 	}
@@ -90,21 +90,26 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		auth = &AllowAllAuthorizer{}
 	}
 
+	pool := cfg.Transport
+	if pool == nil {
+		pool = NewPoolTransport()
+	}
+
 	s := &Server{
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		clients:          make(map[string][]chan *api.ConnectionEvent),
-		clientsRR:        make(map[string]int),
-		pending:          make(map[string]chan net.Conn),
+		pool:             pool,
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/session", s.handleSession)
 	mux.HandleFunc("/v1/registration", s.handleRegistration)
-	mux.HandleFunc("/v1/connections", s.handleConnectionsStream)
+	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
+	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -116,6 +121,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 // RegistrationTable returns the server's registration table.
 func (s *Server) RegistrationTable() *RegistrationTable {
 	return s.table
+}
+
+// Transport returns the server's data-plane transport.
+func (s *Server) Transport() *PoolTransport {
+	return s.pool
 }
 
 // ListenAndServe starts listening on all configured addresses and serves traffic.
@@ -191,12 +201,22 @@ func (s *Server) Close() error {
 	s.listenersMu.Unlock()
 
 	_ = s.internalListener.Close()
+	_ = s.pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
 }
 
+func setTCPKeepAlive(conn net.Conn) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+	}
+}
+
 func (s *Server) handleConnection(conn net.Conn) {
+	setTCPKeepAlive(conn)
+
 	sniHostname, peekedConn, err := sni.SniffSNI(conn, s.config.ReadSNITimeout)
 	if err != nil {
 		_ = peekedConn.Close()
@@ -215,72 +235,94 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 2. Otherwise look up in registration table
-	clientID, found := s.table.Match(cleanSNI)
-	if !found {
-		log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
-		// No client registered for this hostname; close connection
-		_ = peekedConn.Close()
-		return
+	// 2. Otherwise route to backend with failover/replay loop
+	var rawClientConn net.Conn = peekedConn
+	var peekedBytes []byte
+	if pc, ok := peekedConn.(*sni.PeekedConn); ok {
+		peekedBytes = pc.PeekedBytes()
+		rawClientConn = pc.RawConn()
 	}
 
-	// Find active event channel for client (round-robin across active streams for this client)
-	s.mu.Lock()
-	var eventCh chan *api.ConnectionEvent
-	if streams, ok := s.clients[clientID]; ok && len(streams) > 0 {
-		idx := s.clientsRR[clientID] % len(streams)
-		s.clientsRR[clientID]++
-		eventCh = streams[idx]
+	proxyHdr := &proxyproto.Header{
+		Command:   proxyproto.CommandProxy,
+		SrcAddr:   peekedConn.RemoteAddr(),
+		DstAddr:   peekedConn.LocalAddr(),
+		Authority: sniHostname,
 	}
-	s.mu.Unlock()
+	proxyBytes := proxyHdr.Format()
 
-	if eventCh == nil {
-		log.Printf("Frontend: rejecting connection with SNI %q: client %q has no active event stream", sniHostname, clientID)
-		_ = peekedConn.Close()
-		return
-	}
+	deadline := time.Now().Add(s.config.ConnectTimeout)
+	var committedTunnel net.Conn
+	var initialBackendBytes []byte
 
-	// Generate connection ID and pending tunnel channel
-	connID := generateConnID()
-	tunnelCh := make(chan net.Conn, 1)
-
-	s.mu.Lock()
-	s.pending[connID] = tunnelCh
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		delete(s.pending, connID)
-		s.mu.Unlock()
-	}()
-
-	// Send event to client
-	event := &api.ConnectionEvent{
-		ID:         connID,
-		Hostname:   sniHostname,
-		RemoteAddr: peekedConn.RemoteAddr().String(),
-	}
-
-	select {
-	case eventCh <- event:
-	case <-time.After(s.config.ConnectTimeout):
-		log.Printf("Frontend: timed out sending event for conn %s (SNI: %q) to client %s", connID, sniHostname, clientID)
-		_ = peekedConn.Close()
-		return
-	}
-
-	// Wait for client to dial back and upgrade
-	select {
-	case dialedConn := <-tunnelCh:
-		if dialedConn == nil {
+	for {
+		now := time.Now()
+		if now.After(deadline) {
+			log.Printf("Frontend: connect timeout reached for SNI %q", sniHostname)
 			_ = peekedConn.Close()
 			return
 		}
-		spliceConnections(peekedConn, dialedConn)
-	case <-time.After(s.config.ConnectTimeout):
-		log.Printf("Frontend: timed out waiting for dialback for conn %s (SNI: %q) from client %s", connID, sniHostname, clientID)
-		_ = peekedConn.Close()
+
+		remaining := time.Until(deadline)
+		attemptTimeout := s.config.PerAttemptTimeout
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+
+		sessions := s.table.MatchSessions(cleanSNI)
+		if len(sessions) == 0 {
+			log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
+			_ = peekedConn.Close()
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), attemptTimeout)
+		tunnelConn, _, err := s.pool.GetConnForSessions(ctx, sessions)
+		cancel()
+
+		if err != nil {
+			// Pool timeout on this attempt, continue until total deadline
+			continue
+		}
+
+		setTCPKeepAlive(tunnelConn)
+
+		// Set write deadline for PROXY header + peeked ClientHello
+		_ = tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout))
+		if _, err := tunnelConn.Write(proxyBytes); err != nil {
+			_ = tunnelConn.Close()
+			continue
+		}
+		if _, err := tunnelConn.Write(peekedBytes); err != nil {
+			_ = tunnelConn.Close()
+			continue
+		}
+
+		// Set read deadline to wait for the first byte from the backend
+		_ = tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout))
+		buf := make([]byte, 4096)
+		n, err := tunnelConn.Read(buf)
+		if err != nil || n == 0 {
+			// Failed or unresponsive backend/tunnel connection; drop and replay on next attempt
+			_ = tunnelConn.Close()
+			continue
+		}
+
+		// First byte received from backend! Clear deadlines and commit splice
+		_ = tunnelConn.SetDeadline(time.Time{})
+		committedTunnel = tunnelConn
+		initialBackendBytes = buf[:n]
+		break
 	}
+
+	// Write initial backend byte(s) to client
+	if _, err := rawClientConn.Write(initialBackendBytes); err != nil {
+		_ = committedTunnel.Close()
+		_ = rawClientConn.Close()
+		return
+	}
+
+	spliceConnections(rawClientConn, committedTunnel)
 }
 
 func spliceConnections(c1, c2 net.Conn) {
@@ -332,42 +374,8 @@ func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
 	}, nil
 }
 
-func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	clientIdentity, err := extractClientIdentity(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	var req api.RegistrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := s.authorizer.Authorize(r.Context(), clientIdentity, req.Hostnames); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	s.table.Register(clientIdentity.ID, req.Hostnames)
-	registered := s.table.GetRegisteredHostnames(clientIdentity.ID)
-	log.Printf("Frontend: client %q registered hostnames: %v", clientIdentity.ID, registered)
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
-		Status:    "registered",
-		Hostnames: registered,
-	})
-}
-
-func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -384,56 +392,83 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	eventCh := make(chan *api.ConnectionEvent, 64)
-
-	s.mu.Lock()
-	s.clients[clientIdentity.ID] = append(s.clients[clientIdentity.ID], eventCh)
-	activeStreamCount := len(s.clients[clientIdentity.ID])
-	s.mu.Unlock()
-	log.Printf("Frontend: client %q connected to event stream (active streams: %d)", clientIdentity.ID, activeStreamCount)
+	sessionID := generateConnID()
+	s.table.RegisterSession(sessionID, clientIdentity)
+	s.pool.RegisterSession(sessionID)
+	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
-		s.mu.Lock()
-		var remaining []chan *api.ConnectionEvent
-		for _, ch := range s.clients[clientIdentity.ID] {
-			if ch != eventCh {
-				remaining = append(remaining, ch)
-			}
-		}
-		if len(remaining) == 0 {
-			delete(s.clients, clientIdentity.ID)
-			delete(s.clientsRR, clientIdentity.ID)
-			s.table.Unregister(clientIdentity.ID)
-			log.Printf("Frontend: client %q all event streams closed and unregistered", clientIdentity.ID)
-		} else {
-			s.clients[clientIdentity.ID] = remaining
-			log.Printf("Frontend: client %q event stream closed (remaining active streams: %d)", clientIdentity.ID, len(remaining))
-		}
-		s.mu.Unlock()
+		s.table.Unregister(sessionID)
+		s.pool.UnregisterSession(sessionID)
+		log.Printf("Frontend: session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
+
+	_ = json.NewEncoder(w).Encode(api.SessionResponse{
+		SessionID: sessionID,
+		Status:    "connected",
+	})
 	flusher.Flush()
 
-	enc := json.NewEncoder(w)
+	<-r.Context().Done()
+}
 
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case event, ok := <-eventCh:
-			if !ok {
-				return
-			}
-			if err := enc.Encode(event); err != nil {
-				return
-			}
-			flusher.Flush()
-		}
+func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+
+	clientIdentity, err := extractClientIdentity(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	sessionID := r.Header.Get(api.HeaderSessionID)
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionId")
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session ID header or query parameter", http.StatusBadRequest)
+		return
+	}
+
+	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
+	if !ok {
+		http.Error(w, "session not found or expired", http.StatusNotFound)
+		return
+	}
+
+	if sessIdentity.ID != clientIdentity.ID {
+		http.Error(w, "session identity mismatch", http.StatusForbidden)
+		return
+	}
+
+	var req api.RegistrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.authorizer.Authorize(r.Context(), clientIdentity, req.Hostnames); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	s.table.Register(sessionID, req.Hostnames)
+	registered := s.table.GetRegisteredHostnames(sessionID)
+	log.Printf("Frontend: session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
+		Status:    "registered",
+		Hostnames: registered,
+	})
 }
 
 func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request) {
@@ -442,24 +477,32 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_, err := extractClientIdentity(r)
+	clientIdentity, err := extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	connID := strings.TrimPrefix(r.URL.Path, "/v1/connections/")
-	if connID == "" {
-		http.Error(w, "missing connection id", http.StatusBadRequest)
+	sessionID := r.Header.Get(api.HeaderSessionID)
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionId")
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimPrefix(r.URL.Path, "/v1/connections/")
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session ID", http.StatusBadRequest)
 		return
 	}
 
-	s.mu.Lock()
-	tunnelCh, ok := s.pending[connID]
-	s.mu.Unlock()
+	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
+	if !ok {
+		http.Error(w, "session not found or expired", http.StatusNotFound)
+		return
+	}
 
-	if !ok || tunnelCh == nil {
-		http.Error(w, "connection not found or expired", http.StatusNotFound)
+	if sessIdentity.ID != clientIdentity.ID {
+		http.Error(w, "session identity mismatch", http.StatusForbidden)
 		return
 	}
 
@@ -496,17 +539,10 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	select {
-	case tunnelCh <- dialedConn:
-	default:
+	if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
 		_ = dialedConn.Close()
+		return
 	}
-}
-
-func generateConnID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 type bufferedConn struct {

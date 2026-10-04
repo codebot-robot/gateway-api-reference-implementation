@@ -20,20 +20,23 @@ certificates. It only needs to:
 ## How it works
 
 ```
-client ──TLS──► front-end node (snigateway-frontend) ══reverse tunnel══► GARI in cluster ──► backends
-                 reads SNI only                                           terminates TLS,
-                 manages mTLS API & dialback tunnels                      does all routing
+client ──TLS──► front-end node (snigateway-frontend) ══warm pooled tunnels (PROXY v2)══► GARI in cluster ──► backends
+                 reads SNI only                                                           terminates TLS,
+                 manages sessions, pool & failover                                        does all routing
 ```
 
 1. **Announce.** GARI looks at the Gateway listeners it serves (HTTPS/TLS
    listeners with hostnames, and attached routes) and works out the set of
    SNI hostnames the cluster wants to receive.
-2. **Tunnel & Registration.** The in-cluster controller connects to `snigateway-frontend` at `snigateway.internal` using mTLS (authenticated via a shared CA). It opens `GET /v1/connections` to maintain a long-lived connection event stream and calls `PUT /v1/registration` to register its hostnames (supporting exact hostnames and `*.example.com` wildcards). Because the connection is outbound from the cluster, there are no inbound firewall rules and no public IP needed on the cluster side.
-3. **Route by SNI.** When a client connects to the front-end node, the SNI
-   proxy peeks at the TLS ClientHello without consuming stream bytes, looks up the hostname in the registration table (exact match wins over wildcards), and notifies the client over `GET /v1/connections`.
-4. **Dial-back & Splicing.** The cluster controller receives a `ConnectionEvent` with a unique connection ID and immediately dials back with a new mTLS connection to `POST /v1/connections/<id>` with `Upgrade: snigateway-tunnel`. The frontend upgrades the connection with `101 Switching Protocols` and splices the waiting client connection (including peeked ClientHello bytes) and the dialback tunnel.
-5. **Terminate in the cluster.** GARI terminates TLS using the certificates
-   from the Gateway listener, and then applies normal Gateway API routing.
+2. **Backend Sessions & Registration.** The in-cluster controller connects to `snigateway-frontend` at `snigateway.internal` using mTLS (authenticated via a trusted CA). It establishes a long-lived control session (`GET /v1/session`) and registers its hostnames (`PUT /v1/registration` with `X-Session-ID`). Registrations are scoped to sessions rather than client certificate identities, allowing multiple replicas to serve the same hostnames without overwriting each other.
+3. **Warm Pre-Dialed Tunnel Pool.** Each backend maintains a warm pool of $N$ idle pre-dialed mTLS reverse tunnel connections (`POST /v1/tunnel` with `Upgrade: snigateway-tunnel` and `X-Session-ID`). Because connections are pre-dialed, there is no dial-back handshake overhead on the hot path.
+4. **Route by SNI & Activation with PROXY Protocol v2.** When a client connects to the front-end node on `:443`, the SNI proxy peeks at the TLS ClientHello without consuming stream bytes and looks up matching sessions in the registration table (exact matches win over wildcards). The frontend takes an idle pooled connection for a matching session, writes a PROXY protocol v2 header carrying the real client IP, destination IP, and `PP2_TYPE_AUTHORITY` SNI TLV, writes the peeked ClientHello bytes, and waits for the backend's first response byte.
+5. **Health Checking & Failover.** The PROXY header write and response check provide zero-overhead health checking:
+   - **Replay until first byte:** If a pooled connection is closed or unresponsive, the frontend drops it and replays the PROXY header and buffered ClientHello to another pooled connection (on the same or another healthy replica).
+   - **Load balancing:** Connections are distributed across active sessions registered for the hostname.
+   - **Pool Refill:** As soon as an idle connection receives the PROXY header, the backend signals its pool worker to immediately dial a replacement, keeping $N$ warm connections available.
+6. **Terminate in the cluster.** GARI terminates TLS using the certificates
+   from the Gateway listener, and then applies normal Gateway API routing. The backend tunnel listener exposes real client IP addresses via `RemoteAddr()`, ensuring correct `X-Forwarded-For` header population.
 
 As the Gateway configuration changes, GARI updates its announcements.
 
@@ -41,7 +44,7 @@ As the Gateway configuration changes, GARI updates its announcements.
 
 The client's TLS session goes end-to-end to GARI in the cluster, so the front-end node and the reverse tunnel only ever see ciphertext. The only plaintext they see is the SNI hostname, which is already visible to any on-path observer (absent Encrypted Client Hello). The front-end node never holds private keys for routed domains.
 
-Management operations (`snigateway.internal`) require **mutual TLS (mTLS)**: the front-end verifies client certificates signed by our private CA, ensuring only authorized clusters can register hostnames and claim tunnels.
+Management operations (`snigateway.internal`) require **mutual TLS (mTLS)**: the front-end verifies client certificates signed by our trusted CAs, ensuring only authorized clusters can register hostnames and claim tunnels. Authorization rules can restrict specific CA fingerprints to designated domain patterns (e.g. `*.team-a.example.com`).
 
 ## Relationship to acceleration
 
@@ -63,10 +66,11 @@ stays a simple, separate SNI proxy.
 
 The `snigateway` module contains the frontend and supporting packages:
 - `snigateway/cmd/snigateway-frontend`: The frontend server binary with `generate-certs` subcommand.
-- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client.
+- `snigateway/cmd/snigateway`: In-cluster controller binary embedding GARI and reverse-tunnel client with `--tunnel-pool-size`.
+- `snigateway/pkg/proxyproto`: PROXY protocol v2 header encoding/decoding and `PP2_TYPE_AUTHORITY` TLV support.
 - `snigateway/pkg/sni`: TLS ClientHello sniffing and parsing.
-- `snigateway/pkg/frontend`: Registration table, mTLS API server, and reverse-tunnel splicing.
+- `snigateway/pkg/frontend`: Registration table, session management, warm pool transport, and failover splicing.
 - `snigateway/pkg/certs`: In-memory and on-disk CA/server/client certificate generation.
 - `snigateway/pkg/client`: Reusable client library for in-cluster controllers.
-- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction, and connection manager.
+- `snigateway/pkg/tunnel`: Tunnel listener, hostname extraction from Gateways, and pool connection manager.
 - `snigateway/k8s/`: Kubernetes manifests (RBAC, GatewayClass, Deployment, example Gateway/Route).

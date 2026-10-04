@@ -68,6 +68,9 @@ func NewClient(serverAddr string, tlsConfig *tls.Config, opts ...ClientOption) *
 		TLSClientConfig: c.tlsConfig,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialer := &tls.Dialer{
+				NetDialer: &net.Dialer{
+					KeepAlive: 15 * time.Second,
+				},
 				Config: c.tlsConfig,
 			}
 			return dialer.DialContext(ctx, "tcp", c.serverAddr)
@@ -81,8 +84,66 @@ func NewClient(serverAddr string, tlsConfig *tls.Config, opts ...ClientOption) *
 	return c
 }
 
-// Register registers the given hostnames with the frontend server.
-func (c *Client) Register(ctx context.Context, hostnames []string) (*api.RegistrationResponse, error) {
+// StartSession opens a long-lived backend session with the frontend.
+// It returns the assigned sessionID, a channel that receives an error if the session drops, and any startup error.
+func (c *Client) StartSession(ctx context.Context) (string, <-chan error, error) {
+	url := fmt.Sprintf("https://%s/v1/session", c.internalHostname)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("creating session request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("opening session: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return "", nil, fmt.Errorf("session failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		_ = resp.Body.Close()
+		return "", nil, fmt.Errorf("reading session response: %w", err)
+	}
+
+	var sessResp api.SessionResponse
+	if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
+		_ = resp.Body.Close()
+		return "", nil, fmt.Errorf("decoding session response: %w", err)
+	}
+
+	if sessResp.SessionID == "" {
+		_ = resp.Body.Close()
+		return "", nil, errors.New("empty session ID received from frontend")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer resp.Body.Close()
+		buf := make([]byte, 1024)
+		for {
+			_, err := resp.Body.Read(buf)
+			if err != nil {
+				if errors.Is(err, io.EOF) || ctx.Err() != nil {
+					errCh <- ctx.Err()
+				} else {
+					errCh <- err
+				}
+				return
+			}
+		}
+	}()
+
+	return sessResp.SessionID, errCh, nil
+}
+
+// Register registers the given hostnames with the frontend server for the specified session.
+func (c *Client) Register(ctx context.Context, sessionID string, hostnames []string) (*api.RegistrationResponse, error) {
 	reqBody, err := json.Marshal(api.RegistrationRequest{
 		Hostnames: hostnames,
 	})
@@ -96,6 +157,7 @@ func (c *Client) Register(ctx context.Context, hostnames []string) (*api.Registr
 		return nil, fmt.Errorf("creating registration request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(api.HeaderSessionID, sessionID)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -116,64 +178,12 @@ func (c *Client) Register(ctx context.Context, hostnames []string) (*api.Registr
 	return &regResp, nil
 }
 
-// StreamConnections opens a long-lived connections stream from the frontend and invokes onEvent for each incoming connection.
-func (c *Client) StreamConnections(ctx context.Context, onEvent func(ctx context.Context, event *api.ConnectionEvent) error) error {
-	return c.StreamConnectionsWithReady(ctx, nil, onEvent)
-}
-
-// StreamConnectionsWithReady opens a connections stream, signals ready when connected, and invokes onEvent for each incoming connection.
-func (c *Client) StreamConnectionsWithReady(ctx context.Context, ready chan<- struct{}, onEvent func(ctx context.Context, event *api.ConnectionEvent) error) error {
-	url := fmt.Sprintf("https://%s/v1/connections", c.internalHostname)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("creating connections stream request: %w", err)
-	}
-
-	// Use custom client without timeout for long-lived stream
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("connecting to connections stream: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("connections stream failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	if ready != nil {
-		close(ready)
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) || ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("reading connections stream: %w", err)
-		}
-
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 {
-			continue
-		}
-
-		var event api.ConnectionEvent
-		if err := json.Unmarshal(trimmed, &event); err != nil {
-			continue
-		}
-
-		if err := onEvent(ctx, &event); err != nil {
-			return err
-		}
-	}
-}
-
-// DialTunnel dials back to the frontend with an mTLS connection and performs an HTTP/1.1 Upgrade for the given connID.
-func (c *Client) DialTunnel(ctx context.Context, connID string) (net.Conn, error) {
+// DialTunnel dials an mTLS pooled tunnel connection to the frontend for the given sessionID.
+func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, error) {
 	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{
+			KeepAlive: 15 * time.Second,
+		},
 		Config: c.tlsConfig,
 	}
 
@@ -182,7 +192,7 @@ func (c *Client) DialTunnel(ctx context.Context, connID string) (net.Conn, error
 		return nil, fmt.Errorf("dialing frontend mTLS: %w", err)
 	}
 
-	urlPath := "/v1/connections/" + connID
+	urlPath := "/v1/tunnel"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlPath, nil)
 	if err != nil {
 		_ = tlsConn.Close()
@@ -191,6 +201,7 @@ func (c *Client) DialTunnel(ctx context.Context, connID string) (net.Conn, error
 	req.Host = c.internalHostname
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", api.UpgradeProtocol)
+	req.Header.Set(api.HeaderSessionID, sessionID)
 
 	if err := req.Write(tlsConn); err != nil {
 		_ = tlsConn.Close()
@@ -223,65 +234,6 @@ func (c *Client) DialTunnel(ctx context.Context, connID string) (net.Conn, error
 	}
 
 	return tlsConn, nil
-}
-
-// Serve registers hostnames and handles incoming connections using handler.
-func (c *Client) Serve(ctx context.Context, hostnames []string, handler func(ctx context.Context, connID string, hostname string, tunnel net.Conn)) error {
-	return c.StreamConnections(ctx, func(ctx context.Context, event *api.ConnectionEvent) error {
-		go func(ev *api.ConnectionEvent) {
-			dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-
-			tunnel, err := c.DialTunnel(dialCtx, ev.ID)
-			if err != nil {
-				return
-			}
-			handler(ctx, ev.ID, ev.Hostname, tunnel)
-		}(event)
-		return nil
-	})
-}
-
-// Run opens connections stream, registers hostnames, and for each event dials back and passes tunnel to handler.
-func (c *Client) Run(ctx context.Context, hostnames []string, handler func(ctx context.Context, connID string, hostname string, tunnel net.Conn)) error {
-	errCh := make(chan error, 1)
-	readyCh := make(chan struct{})
-
-	go func() {
-		err := c.StreamConnectionsWithReady(ctx, readyCh, func(ctx context.Context, event *api.ConnectionEvent) error {
-			go func(ev *api.ConnectionEvent) {
-				dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				defer cancel()
-
-				tunnel, err := c.DialTunnel(dialCtx, ev.ID)
-				if err != nil {
-					return
-				}
-				handler(ctx, ev.ID, ev.Hostname, tunnel)
-			}(event)
-			return nil
-		})
-		errCh <- err
-	}()
-
-	select {
-	case <-readyCh:
-	case err := <-errCh:
-		return fmt.Errorf("establishing connections stream: %w", err)
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	if _, err := c.Register(ctx, hostnames); err != nil {
-		return fmt.Errorf("registering hostnames: %w", err)
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errCh:
-		return err
-	}
 }
 
 type bufferedClientConn struct {

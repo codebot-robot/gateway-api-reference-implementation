@@ -34,6 +34,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 )
 
 func generateBackendCert(hosts ...string) (tls.Certificate, error) {
@@ -126,13 +127,14 @@ func TestE2ESmoke(t *testing.T) {
 		_ = srv.Serve(ln)
 	}()
 
-	// 3. Initialize client and reverse-tunnel handler
+	// 3. Initialize client and tunnel Manager
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
 	if err != nil {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
 
 	c := client.NewClient(serverAddr, clientTLS)
+	mgr := tunnel.NewManager(c)
 
 	backendCert, err := generateBackendCert("app.example.com", "*.wildcard.org")
 	if err != nil {
@@ -142,30 +144,41 @@ func TestE2ESmoke(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	serveTunnel := func(ctx context.Context, connID string, hostname string, tunnel net.Conn) {
-		defer tunnel.Close()
-
-		tlsServer := tls.Server(tunnel, &tls.Config{
-			Certificates: []tls.Certificate{backendCert},
-		})
-		defer tlsServer.Close()
-
-		buf := make([]byte, 1024)
-		n, err := tlsServer.Read(buf)
-		if err != nil {
-			return
-		}
-		reqStr := string(buf[:n])
-		respStr := fmt.Sprintf("ECHO:%s:%s", hostname, reqStr)
-		_, _ = tlsServer.Write([]byte(respStr))
-	}
-
 	go func() {
-		_ = c.Run(ctx, []string{"app.example.com", "*.wildcard.org"}, serveTunnel)
+		_ = mgr.Run(ctx)
+	}()
+
+	mgr.UpdateHostnames([]string{"app.example.com", "*.wildcard.org"})
+
+	// Accept connections on tunnel listener
+	go func() {
+		lis := mgr.Listener()
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				tlsServer := tls.Server(c, &tls.Config{
+					Certificates: []tls.Certificate{backendCert},
+				})
+				defer tlsServer.Close()
+
+				buf := make([]byte, 1024)
+				n, err := tlsServer.Read(buf)
+				if err != nil {
+					return
+				}
+				reqStr := string(buf[:n])
+				respStr := fmt.Sprintf("ECHO:%s", reqStr)
+				_, _ = tlsServer.Write([]byte(respStr))
+			}(conn)
+		}
 	}()
 
 	// Wait for client to connect and register
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	// 4. Dial frontend as external TLS client with SNI app.example.com
 	t.Run("Exact SNI routing over reverse tunnel", func(t *testing.T) {
@@ -190,7 +203,7 @@ func TestE2ESmoke(t *testing.T) {
 		}
 
 		got := string(reply[:n])
-		want := "ECHO:app.example.com:ping-exact"
+		want := "ECHO:ping-exact"
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -219,7 +232,7 @@ func TestE2ESmoke(t *testing.T) {
 		}
 
 		got := string(reply[:n])
-		want := "ECHO:sub.wildcard.org:ping-wildcard"
+		want := "ECHO:ping-wildcard"
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
