@@ -304,7 +304,7 @@ metadata:
 func (h *Harness) DeployBackend() {
 	h.t.Log("Deploying Backend")
 	gitRoot := h.GetGitRoot()
-	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
+	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), gitRoot)
 	h.KindLoad("toolbox:e2e")
 
 	h.KubectlApplyContent(h.BackendManifest())

@@ -44,11 +44,17 @@ func TestGatewayAPI(t *testing.T) {
 	h.DeployBackend()
 
 	// 4. Create Gateway API Resources
+	certPEM, keyPEM, err := GenerateTestCertificate("example.com", "example.com")
+	if err != nil {
+		t.Fatalf("Failed to generate test certificate: %v", err)
+	}
+	h.CreateTLSSecret("gateway-tls-cert", "default", certPEM, keyPEM)
+
 	h.KubectlApplyContent(h.ExampleGatewayManifest())
 	// Give the controller some time to reconcile
 	time.Sleep(5 * time.Second)
 
-	// 5. Run Client Pod
+	// 5. Run Client Pod (HTTP)
 	clientPodName := "test-client"
 	h.DeletePod(clientPodName)
 
@@ -56,9 +62,9 @@ func TestGatewayAPI(t *testing.T) {
 	h.WaitForPodSuccess(clientPodName, 1*time.Minute)
 
 	logs := h.GetPodLogs(clientPodName)
-	t.Logf("Client logs: %s", logs)
+	t.Logf("Client logs (HTTP): %s", logs)
 
-	// 6. Verify
+	// 6. Verify HTTP
 	if !strings.Contains(logs, "Status: 200 OK") || (!strings.Contains(logs, "\"hostname\":\"example.com\"") && !strings.Contains(logs, "\"host\": \"example.com\"")) {
 		controllerLogs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
 		t.Logf("Controller logs: %s", controllerLogs)
@@ -68,5 +74,37 @@ func TestGatewayAPI(t *testing.T) {
 		if !strings.Contains(logs, "\"hostname\":\"example.com\"") && !strings.Contains(logs, "\"host\": \"example.com\"") {
 			t.Errorf("Expected hostname example.com in response body, got: %s", logs)
 		}
+	}
+
+	// 7. Run Client Pod (HTTPS - verify Alt-Svc header and certificate)
+	httpsClientPodName := "test-client-https"
+	h.DeletePod(httpsClientPodName)
+
+	h.KubectlApplyContent(h.ClientManifestWithArgs(httpsClientPodName, "--insecure", "--sni", "example.com", "https://gari-proxy:443", "example.com"))
+	h.WaitForPodSuccess(httpsClientPodName, 1*time.Minute)
+
+	httpsLogs := h.GetPodLogs(httpsClientPodName)
+	t.Logf("Client logs (HTTPS): %s", httpsLogs)
+	if !strings.Contains(httpsLogs, "Status: 200 OK") {
+		t.Errorf("Expected HTTPS 200 OK, got: %s", httpsLogs)
+	}
+	if !strings.Contains(httpsLogs, "Header-Alt-Svc: h3=\":443\"; ma=86400") {
+		t.Errorf("Expected Alt-Svc header advertising h3=\":443\"; ma=86400, got: %s", httpsLogs)
+	}
+	if !strings.Contains(httpsLogs, "PeerCertDNSNames: example.com") {
+		t.Errorf("Expected PeerCertDNSNames example.com, got: %s", httpsLogs)
+	}
+
+	// 8. Run Client Pod (HTTP/3 over QUIC)
+	h3ClientPodName := "test-client-http3"
+	h.DeletePod(h3ClientPodName)
+
+	h.KubectlApplyContent(h.ClientManifestWithArgs(h3ClientPodName, "--http3", "--insecure", "--sni", "example.com", "https://gari-proxy:443", "example.com"))
+	h.WaitForPodSuccess(h3ClientPodName, 1*time.Minute)
+
+	h3Logs := h.GetPodLogs(h3ClientPodName)
+	t.Logf("Client logs (HTTP/3): %s", h3Logs)
+	if !strings.Contains(h3Logs, "Status: 200 OK") || (!strings.Contains(h3Logs, "\"hostname\":\"example.com\"") && !strings.Contains(h3Logs, "\"host\": \"example.com\"")) {
+		t.Errorf("Expected HTTP/3 200 OK with hostname example.com, got: %s", h3Logs)
 	}
 }
