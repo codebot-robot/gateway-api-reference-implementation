@@ -17,11 +17,9 @@ package frontend
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +43,7 @@ type ServerConfig struct {
 	ConnectTimeout   time.Duration
 	ReadSNITimeout   time.Duration
 	Authorizer       Authorizer
+	Transport        Transport
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -52,11 +51,7 @@ type Server struct {
 	config     ServerConfig
 	authorizer Authorizer
 	table      *RegistrationTable
-
-	mu        sync.RWMutex
-	clients   map[string][]chan *api.ConnectionEvent // clientID -> slice of active event stream channels
-	clientsRR map[string]int                         // clientID -> round-robin counter for event stream selection
-	pending   map[string]chan net.Conn               // connectionID -> dialback tunnel channel
+	transport  Transport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -90,13 +85,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		auth = &AllowAllAuthorizer{}
 	}
 
+	tr := cfg.Transport
+	if tr == nil {
+		tr = NewDialbackTransport(cfg.ConnectTimeout)
+	}
+
 	s := &Server{
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		clients:          make(map[string][]chan *api.ConnectionEvent),
-		clientsRR:        make(map[string]int),
-		pending:          make(map[string]chan net.Conn),
+		transport:        tr,
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 	}
@@ -116,6 +114,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 // RegistrationTable returns the server's registration table.
 func (s *Server) RegistrationTable() *RegistrationTable {
 	return s.table
+}
+
+// Transport returns the server's data-plane transport.
+func (s *Server) Transport() Transport {
+	return s.transport
 }
 
 // ListenAndServe starts listening on all configured addresses and serves traffic.
@@ -191,6 +194,7 @@ func (s *Server) Close() error {
 	s.listenersMu.Unlock()
 
 	_ = s.internalListener.Close()
+	_ = s.transport.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
@@ -219,68 +223,21 @@ func (s *Server) handleConnection(conn net.Conn) {
 	clientID, found := s.table.Match(cleanSNI)
 	if !found {
 		log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
-		// No client registered for this hostname; close connection
 		_ = peekedConn.Close()
 		return
 	}
 
-	// Find active event channel for client (round-robin across active streams for this client)
-	s.mu.Lock()
-	var eventCh chan *api.ConnectionEvent
-	if streams, ok := s.clients[clientID]; ok && len(streams) > 0 {
-		idx := s.clientsRR[clientID] % len(streams)
-		s.clientsRR[clientID]++
-		eventCh = streams[idx]
-	}
-	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.ConnectTimeout)
+	defer cancel()
 
-	if eventCh == nil {
-		log.Printf("Frontend: rejecting connection with SNI %q: client %q has no active event stream", sniHostname, clientID)
+	dialedConn, err := s.transport.GetConn(ctx, clientID, sniHostname, peekedConn.RemoteAddr())
+	if err != nil {
+		log.Printf("Frontend: failed to get tunnel connection for SNI %q (client %s): %v", sniHostname, clientID, err)
 		_ = peekedConn.Close()
 		return
 	}
 
-	// Generate connection ID and pending tunnel channel
-	connID := generateConnID()
-	tunnelCh := make(chan net.Conn, 1)
-
-	s.mu.Lock()
-	s.pending[connID] = tunnelCh
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		delete(s.pending, connID)
-		s.mu.Unlock()
-	}()
-
-	// Send event to client
-	event := &api.ConnectionEvent{
-		ID:         connID,
-		Hostname:   sniHostname,
-		RemoteAddr: peekedConn.RemoteAddr().String(),
-	}
-
-	select {
-	case eventCh <- event:
-	case <-time.After(s.config.ConnectTimeout):
-		log.Printf("Frontend: timed out sending event for conn %s (SNI: %q) to client %s", connID, sniHostname, clientID)
-		_ = peekedConn.Close()
-		return
-	}
-
-	// Wait for client to dial back and upgrade
-	select {
-	case dialedConn := <-tunnelCh:
-		if dialedConn == nil {
-			_ = peekedConn.Close()
-			return
-		}
-		spliceConnections(peekedConn, dialedConn)
-	case <-time.After(s.config.ConnectTimeout):
-		log.Printf("Frontend: timed out waiting for dialback for conn %s (SNI: %q) from client %s", connID, sniHostname, clientID)
-		_ = peekedConn.Close()
-	}
+	spliceConnections(peekedConn, dialedConn)
 }
 
 func spliceConnections(c1, c2 net.Conn) {
@@ -384,32 +341,24 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	eventCh := make(chan *api.ConnectionEvent, 64)
+	dialback, ok := s.transport.(*DialbackTransport)
+	if !ok {
+		http.Error(w, "event streaming not supported by current transport", http.StatusNotImplemented)
+		return
+	}
 
-	s.mu.Lock()
-	s.clients[clientIdentity.ID] = append(s.clients[clientIdentity.ID], eventCh)
-	activeStreamCount := len(s.clients[clientIdentity.ID])
-	s.mu.Unlock()
+	eventCh := make(chan *api.ConnectionEvent, 64)
+	activeStreamCount := dialback.AddClientStream(clientIdentity.ID, eventCh)
 	log.Printf("Frontend: client %q connected to event stream (active streams: %d)", clientIdentity.ID, activeStreamCount)
 
 	defer func() {
-		s.mu.Lock()
-		var remaining []chan *api.ConnectionEvent
-		for _, ch := range s.clients[clientIdentity.ID] {
-			if ch != eventCh {
-				remaining = append(remaining, ch)
-			}
-		}
-		if len(remaining) == 0 {
-			delete(s.clients, clientIdentity.ID)
-			delete(s.clientsRR, clientIdentity.ID)
+		remaining := dialback.RemoveClientStream(clientIdentity.ID, eventCh)
+		if remaining == 0 {
 			s.table.Unregister(clientIdentity.ID)
 			log.Printf("Frontend: client %q all event streams closed and unregistered", clientIdentity.ID)
 		} else {
-			s.clients[clientIdentity.ID] = remaining
-			log.Printf("Frontend: client %q event stream closed (remaining active streams: %d)", clientIdentity.ID, len(remaining))
+			log.Printf("Frontend: client %q event stream closed (remaining active streams: %d)", clientIdentity.ID, remaining)
 		}
-		s.mu.Unlock()
 	}()
 
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -454,10 +403,13 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s.mu.Lock()
-	tunnelCh, ok := s.pending[connID]
-	s.mu.Unlock()
+	dialback, ok := s.transport.(*DialbackTransport)
+	if !ok {
+		http.Error(w, "connection dialback not supported by current transport", http.StatusNotImplemented)
+		return
+	}
 
+	tunnelCh, ok := dialback.ClaimPending(connID)
 	if !ok || tunnelCh == nil {
 		http.Error(w, "connection not found or expired", http.StatusNotFound)
 		return
@@ -501,12 +453,6 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 	default:
 		_ = dialedConn.Close()
 	}
-}
-
-func generateConnID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 type bufferedConn struct {
