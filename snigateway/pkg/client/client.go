@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 )
@@ -67,6 +68,9 @@ func NewClient(serverAddr string, tlsConfig *tls.Config, opts ...ClientOption) *
 		TLSClientConfig: c.tlsConfig,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialer := &tls.Dialer{
+				NetDialer: &net.Dialer{
+					KeepAlive: 15 * time.Second,
+				},
 				Config: c.tlsConfig,
 			}
 			return dialer.DialContext(ctx, "tcp", c.serverAddr)
@@ -177,6 +181,9 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 // DialTunnel dials an mTLS pooled tunnel connection to the frontend for the given sessionID.
 func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, error) {
 	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{
+			KeepAlive: 15 * time.Second,
+		},
 		Config: c.tlsConfig,
 	}
 

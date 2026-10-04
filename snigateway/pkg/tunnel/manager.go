@@ -309,7 +309,9 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 				return
 			}
 
-			// Watch connection for activation via PROXY protocol header or drop
+			// Watch connection for activation via PROXY protocol header or drop.
+			// Note: If the frontend becomes unreachable or drops, idle pooled connections
+			// waiting in this read call are detected and reclaimed via TCP keepalive.
 			bufReader := bufio.NewReader(conn)
 			hdr, err := proxyproto.Decode(bufReader)
 

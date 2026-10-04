@@ -33,20 +33,23 @@ type Transport interface {
 
 // PoolTransport implements Transport using a warm pool of pre-dialed reverse tunnel connections.
 type PoolTransport struct {
-	mu         sync.Mutex
-	pools      map[string][]net.Conn
-	notifyCh   chan struct{}
-	closed     bool
-	closedChan chan struct{}
+	mu       sync.Mutex
+	pools    map[string][]net.Conn
+	notifyCh chan struct{}
+	closed   bool
 }
 
 // NewPoolTransport creates a new PoolTransport.
 func NewPoolTransport() *PoolTransport {
 	return &PoolTransport{
-		pools:      make(map[string][]net.Conn),
-		notifyCh:   make(chan struct{}, 1),
-		closedChan: make(chan struct{}),
+		pools:    make(map[string][]net.Conn),
+		notifyCh: make(chan struct{}),
 	}
+}
+
+func (p *PoolTransport) broadcastLocked() {
+	close(p.notifyCh)
+	p.notifyCh = make(chan struct{})
 }
 
 // RegisterSession registers a new backend session in the transport.
@@ -55,6 +58,7 @@ func (p *PoolTransport) RegisterSession(sessionID string) {
 	defer p.mu.Unlock()
 	if _, exists := p.pools[sessionID]; !exists {
 		p.pools[sessionID] = make([]net.Conn, 0, 8)
+		p.broadcastLocked()
 	}
 }
 
@@ -63,12 +67,12 @@ func (p *PoolTransport) UnregisterSession(sessionID string) {
 	p.mu.Lock()
 	conns := p.pools[sessionID]
 	delete(p.pools, sessionID)
+	p.broadcastLocked()
 	p.mu.Unlock()
 
 	for _, c := range conns {
 		_ = c.Close()
 	}
-	p.notify()
 }
 
 // AddConn adds a newly dialed tunnel connection to the idle pool of sessionID.
@@ -85,17 +89,9 @@ func (p *PoolTransport) AddConn(sessionID string, conn net.Conn) error {
 		return fmt.Errorf("unknown or closed session: %s", sessionID)
 	}
 	p.pools[sessionID] = append(p.pools[sessionID], conn)
+	p.broadcastLocked()
 	p.mu.Unlock()
-
-	p.notify()
 	return nil
-}
-
-func (p *PoolTransport) notify() {
-	select {
-	case p.notifyCh <- struct{}{}:
-	default:
-	}
 }
 
 // GetConn takes an idle connection for sessionID. If the pool is empty, it waits until a connection arrives or ctx is done.
@@ -107,6 +103,8 @@ func (p *PoolTransport) GetConn(ctx context.Context, sessionID string) (net.Conn
 // GetConnForSessions takes an idle connection from one of the candidate sessions in order.
 // Sessions with no idle connections are skipped. If none currently have an idle connection,
 // it waits until any candidate session receives an idle connection or ctx is done.
+// A broadcast channel ensures no wakeups are lost even when multiple concurrent waiters
+// compete across different sessions or when connections are added in rapid bursts.
 func (p *PoolTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
 	for {
 		p.mu.Lock()
@@ -125,15 +123,15 @@ func (p *PoolTransport) GetConnForSessions(ctx context.Context, sessionIDs []str
 				return conn, sid, nil
 			}
 		}
+
+		ch := p.notifyCh
 		p.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
 			return nil, "", ctx.Err()
-		case <-p.closedChan:
-			return nil, "", net.ErrClosed
-		case <-p.notifyCh:
-			// A connection was added or session updated, retry
+		case <-ch:
+			// A connection was added or session state changed; retry under lock
 		}
 	}
 }
@@ -146,7 +144,7 @@ func (p *PoolTransport) Close() error {
 		return nil
 	}
 	p.closed = true
-	close(p.closedChan)
+	p.broadcastLocked()
 
 	var allConns []net.Conn
 	for sid, conns := range p.pools {
@@ -158,7 +156,6 @@ func (p *PoolTransport) Close() error {
 	for _, c := range allConns {
 		_ = c.Close()
 	}
-	p.notify()
 	return nil
 }
 
