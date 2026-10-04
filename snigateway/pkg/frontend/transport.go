@@ -18,162 +18,147 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
-	"time"
-
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 )
 
 // Transport represents the data-plane connection provider between the frontend and backends.
 type Transport interface {
-	// GetConn retrieves or establishes a tunnel connection to the specified backend.
-	GetConn(ctx context.Context, backendID string, hostname string, clientAddr net.Addr) (net.Conn, error)
+	// GetConn retrieves or establishes a tunnel connection to the specified backend session.
+	GetConn(ctx context.Context, sessionID string) (net.Conn, error)
 	// Close closes the transport and any resources associated with it.
 	Close() error
 }
 
-// DialbackTransport implements Transport using on-demand dialback over the connection event stream.
-type DialbackTransport struct {
-	mu        sync.RWMutex
-	clients   map[string][]chan *api.ConnectionEvent
-	clientsRR map[string]int
-	pending   map[string]chan net.Conn
-	timeout   time.Duration
-	closed    bool
+// PoolTransport implements Transport using a warm pool of pre-dialed reverse tunnel connections.
+type PoolTransport struct {
+	mu         sync.Mutex
+	pools      map[string][]net.Conn
+	notifyCh   chan struct{}
+	closed     bool
+	closedChan chan struct{}
 }
 
-// NewDialbackTransport creates a new DialbackTransport.
-func NewDialbackTransport(connectTimeout time.Duration) *DialbackTransport {
-	if connectTimeout <= 0 {
-		connectTimeout = 10 * time.Second
-	}
-	return &DialbackTransport{
-		clients:   make(map[string][]chan *api.ConnectionEvent),
-		clientsRR: make(map[string]int),
-		pending:   make(map[string]chan net.Conn),
-		timeout:   connectTimeout,
+// NewPoolTransport creates a new PoolTransport.
+func NewPoolTransport() *PoolTransport {
+	return &PoolTransport{
+		pools:      make(map[string][]net.Conn),
+		notifyCh:   make(chan struct{}, 1),
+		closedChan: make(chan struct{}),
 	}
 }
 
-// AddClientStream registers an event stream channel for a client.
-func (t *DialbackTransport) AddClientStream(clientID string, ch chan *api.ConnectionEvent) int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.clients[clientID] = append(t.clients[clientID], ch)
-	return len(t.clients[clientID])
+// RegisterSession registers a new backend session in the transport.
+func (p *PoolTransport) RegisterSession(sessionID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.pools[sessionID]; !exists {
+		p.pools[sessionID] = make([]net.Conn, 0, 8)
+	}
 }
 
-// RemoveClientStream removes an event stream channel for a client.
-func (t *DialbackTransport) RemoveClientStream(clientID string, ch chan *api.ConnectionEvent) (remaining int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// UnregisterSession removes a session and closes any idle pooled connections for it.
+func (p *PoolTransport) UnregisterSession(sessionID string) {
+	p.mu.Lock()
+	conns := p.pools[sessionID]
+	delete(p.pools, sessionID)
+	p.mu.Unlock()
 
-	var kept []chan *api.ConnectionEvent
-	for _, c := range t.clients[clientID] {
-		if c != ch {
-			kept = append(kept, c)
-		}
+	for _, c := range conns {
+		_ = c.Close()
 	}
-	if len(kept) == 0 {
-		delete(t.clients, clientID)
-		delete(t.clientsRR, clientID)
-		return 0
-	}
-	t.clients[clientID] = kept
-	return len(kept)
+	p.notify()
 }
 
-// RegisterPending registers a pending connection ID for dialback.
-func (t *DialbackTransport) RegisterPending(connID string, ch chan net.Conn) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.pending[connID] = ch
+// AddConn adds a newly dialed tunnel connection to the idle pool of sessionID.
+func (p *PoolTransport) AddConn(sessionID string, conn net.Conn) error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		_ = conn.Close()
+		return net.ErrClosed
+	}
+	if _, exists := p.pools[sessionID]; !exists {
+		p.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("unknown or closed session: %s", sessionID)
+	}
+	p.pools[sessionID] = append(p.pools[sessionID], conn)
+	p.mu.Unlock()
+
+	p.notify()
+	return nil
 }
 
-// ClaimPending claims a pending connection channel by ID.
-func (t *DialbackTransport) ClaimPending(connID string) (chan net.Conn, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	ch, ok := t.pending[connID]
-	return ch, ok
-}
-
-// RemovePending removes a pending connection channel.
-func (t *DialbackTransport) RemovePending(connID string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.pending, connID)
-}
-
-// GetConn implements Transport.
-func (t *DialbackTransport) GetConn(ctx context.Context, backendID string, hostname string, clientAddr net.Addr) (net.Conn, error) {
-	t.mu.Lock()
-	if t.closed {
-		t.mu.Unlock()
-		return nil, net.ErrClosed
-	}
-
-	var eventCh chan *api.ConnectionEvent
-	if streams, ok := t.clients[backendID]; ok && len(streams) > 0 {
-		idx := t.clientsRR[backendID] % len(streams)
-		t.clientsRR[backendID]++
-		eventCh = streams[idx]
-	}
-	t.mu.Unlock()
-
-	if eventCh == nil {
-		return nil, fmt.Errorf("client %q has no active event stream", backendID)
-	}
-
-	connID := generateConnID()
-	tunnelCh := make(chan net.Conn, 1)
-
-	t.RegisterPending(connID, tunnelCh)
-	defer t.RemovePending(connID)
-
-	event := &api.ConnectionEvent{
-		ID:         connID,
-		Hostname:   hostname,
-		RemoteAddr: clientAddr.String(),
-	}
-
-	timeout := t.timeout
-	if d, ok := ctx.Deadline(); ok {
-		remaining := time.Until(d)
-		if remaining < timeout {
-			timeout = remaining
-		}
-	}
-
+func (p *PoolTransport) notify() {
 	select {
-	case eventCh <- event:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("timeout sending event for conn %s to %s", connID, backendID)
-	}
-
-	select {
-	case dialedConn := <-tunnelCh:
-		if dialedConn == nil {
-			return nil, errors.New("dialed connection closed")
-		}
-		return dialedConn, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("timeout waiting for dialback for conn %s from %s", connID, backendID)
+	case p.notifyCh <- struct{}{}:
+	default:
 	}
 }
 
-// Close implements Transport.
-func (t *DialbackTransport) Close() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.closed = true
+// GetConn takes an idle connection for sessionID. If the pool is empty, it waits until a connection arrives or ctx is done.
+func (p *PoolTransport) GetConn(ctx context.Context, sessionID string) (net.Conn, error) {
+	conn, _, err := p.GetConnForSessions(ctx, []string{sessionID})
+	return conn, err
+}
+
+// GetConnForSessions takes an idle connection from one of the candidate sessions in order.
+// Sessions with no idle connections are skipped. If none currently have an idle connection,
+// it waits until any candidate session receives an idle connection or ctx is done.
+func (p *PoolTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, "", net.ErrClosed
+		}
+
+		// Try to pop an idle connection from the candidate sessions in order
+		for _, sid := range sessionIDs {
+			conns := p.pools[sid]
+			if len(conns) > 0 {
+				conn := conns[0]
+				p.pools[sid] = conns[1:]
+				p.mu.Unlock()
+				return conn, sid, nil
+			}
+		}
+		p.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		case <-p.closedChan:
+			return nil, "", net.ErrClosed
+		case <-p.notifyCh:
+			// A connection was added or session updated, retry
+		}
+	}
+}
+
+// Close closes all pooled connections across all sessions.
+func (p *PoolTransport) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	close(p.closedChan)
+
+	var allConns []net.Conn
+	for sid, conns := range p.pools {
+		allConns = append(allConns, conns...)
+		delete(p.pools, sid)
+	}
+	p.mu.Unlock()
+
+	for _, c := range allConns {
+		_ = c.Close()
+	}
+	p.notify()
 	return nil
 }
 

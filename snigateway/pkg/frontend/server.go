@@ -43,7 +43,7 @@ type ServerConfig struct {
 	ConnectTimeout   time.Duration
 	ReadSNITimeout   time.Duration
 	Authorizer       Authorizer
-	Transport        Transport
+	Transport        *PoolTransport
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -51,7 +51,7 @@ type Server struct {
 	config     ServerConfig
 	authorizer Authorizer
 	table      *RegistrationTable
-	transport  Transport
+	pool       *PoolTransport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -85,24 +85,26 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		auth = &AllowAllAuthorizer{}
 	}
 
-	tr := cfg.Transport
-	if tr == nil {
-		tr = NewDialbackTransport(cfg.ConnectTimeout)
+	pool := cfg.Transport
+	if pool == nil {
+		pool = NewPoolTransport()
 	}
 
 	s := &Server{
 		config:           cfg,
 		authorizer:       auth,
 		table:            NewRegistrationTable(),
-		transport:        tr,
+		pool:             pool,
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/session", s.handleSession)
 	mux.HandleFunc("/v1/registration", s.handleRegistration)
-	mux.HandleFunc("/v1/connections", s.handleConnectionsStream)
+	mux.HandleFunc("/v1/connections", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
+	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -117,8 +119,8 @@ func (s *Server) RegistrationTable() *RegistrationTable {
 }
 
 // Transport returns the server's data-plane transport.
-func (s *Server) Transport() Transport {
-	return s.transport
+func (s *Server) Transport() *PoolTransport {
+	return s.pool
 }
 
 // ListenAndServe starts listening on all configured addresses and serves traffic.
@@ -194,7 +196,7 @@ func (s *Server) Close() error {
 	s.listenersMu.Unlock()
 
 	_ = s.internalListener.Close()
-	_ = s.transport.Close()
+	_ = s.pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
@@ -219,9 +221,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 2. Otherwise look up in registration table
-	clientID, found := s.table.Match(cleanSNI)
-	if !found {
+	// 2. Otherwise look up matching sessions in registration table
+	sessions := s.table.MatchSessions(cleanSNI)
+	if len(sessions) == 0 {
 		log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
 		_ = peekedConn.Close()
 		return
@@ -230,14 +232,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.config.ConnectTimeout)
 	defer cancel()
 
-	dialedConn, err := s.transport.GetConn(ctx, clientID, sniHostname, peekedConn.RemoteAddr())
+	tunnelConn, chosenSession, err := s.pool.GetConnForSessions(ctx, sessions)
 	if err != nil {
-		log.Printf("Frontend: failed to get tunnel connection for SNI %q (client %s): %v", sniHostname, clientID, err)
+		log.Printf("Frontend: failed to get tunnel connection for SNI %q: %v", sniHostname, err)
 		_ = peekedConn.Close()
 		return
 	}
+	_ = chosenSession
 
-	spliceConnections(peekedConn, dialedConn)
+	spliceConnections(peekedConn, tunnelConn)
 }
 
 func spliceConnections(c1, c2 net.Conn) {
@@ -289,42 +292,8 @@ func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
 	}, nil
 }
 
-func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	clientIdentity, err := extractClientIdentity(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return
-	}
-
-	var req api.RegistrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := s.authorizer.Authorize(r.Context(), clientIdentity, req.Hostnames); err != nil {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	s.table.Register(clientIdentity.ID, req.Hostnames)
-	registered := s.table.GetRegisteredHostnames(clientIdentity.ID)
-	log.Printf("Frontend: client %q registered hostnames: %v", clientIdentity.ID, registered)
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
-		Status:    "registered",
-		Hostnames: registered,
-	})
-}
-
-func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -341,48 +310,83 @@ func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	dialback, ok := s.transport.(*DialbackTransport)
-	if !ok {
-		http.Error(w, "event streaming not supported by current transport", http.StatusNotImplemented)
-		return
-	}
-
-	eventCh := make(chan *api.ConnectionEvent, 64)
-	activeStreamCount := dialback.AddClientStream(clientIdentity.ID, eventCh)
-	log.Printf("Frontend: client %q connected to event stream (active streams: %d)", clientIdentity.ID, activeStreamCount)
+	sessionID := generateConnID()
+	s.table.RegisterSession(sessionID, clientIdentity)
+	s.pool.RegisterSession(sessionID)
+	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
-		remaining := dialback.RemoveClientStream(clientIdentity.ID, eventCh)
-		if remaining == 0 {
-			s.table.Unregister(clientIdentity.ID)
-			log.Printf("Frontend: client %q all event streams closed and unregistered", clientIdentity.ID)
-		} else {
-			log.Printf("Frontend: client %q event stream closed (remaining active streams: %d)", clientIdentity.ID, remaining)
-		}
+		s.table.Unregister(sessionID)
+		s.pool.UnregisterSession(sessionID)
+		log.Printf("Frontend: session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
+
+	_ = json.NewEncoder(w).Encode(api.SessionResponse{
+		SessionID: sessionID,
+		Status:    "connected",
+	})
 	flusher.Flush()
 
-	enc := json.NewEncoder(w)
+	<-r.Context().Done()
+}
 
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case event, ok := <-eventCh:
-			if !ok {
-				return
-			}
-			if err := enc.Encode(event); err != nil {
-				return
-			}
-			flusher.Flush()
-		}
+func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+
+	clientIdentity, err := extractClientIdentity(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	sessionID := r.Header.Get(api.HeaderSessionID)
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionId")
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session ID header or query parameter", http.StatusBadRequest)
+		return
+	}
+
+	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
+	if !ok {
+		http.Error(w, "session not found or expired", http.StatusNotFound)
+		return
+	}
+
+	if sessIdentity.ID != clientIdentity.ID {
+		http.Error(w, "session identity mismatch", http.StatusForbidden)
+		return
+	}
+
+	var req api.RegistrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := s.authorizer.Authorize(r.Context(), clientIdentity, req.Hostnames); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	s.table.Register(sessionID, req.Hostnames)
+	registered := s.table.GetRegisteredHostnames(sessionID)
+	log.Printf("Frontend: session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
+		Status:    "registered",
+		Hostnames: registered,
+	})
 }
 
 func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request) {
@@ -391,27 +395,32 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_, err := extractClientIdentity(r)
+	clientIdentity, err := extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	connID := strings.TrimPrefix(r.URL.Path, "/v1/connections/")
-	if connID == "" {
-		http.Error(w, "missing connection id", http.StatusBadRequest)
+	sessionID := r.Header.Get(api.HeaderSessionID)
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionId")
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimPrefix(r.URL.Path, "/v1/connections/")
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session ID", http.StatusBadRequest)
 		return
 	}
 
-	dialback, ok := s.transport.(*DialbackTransport)
+	sessIdentity, ok := s.table.GetSessionIdentity(sessionID)
 	if !ok {
-		http.Error(w, "connection dialback not supported by current transport", http.StatusNotImplemented)
+		http.Error(w, "session not found or expired", http.StatusNotFound)
 		return
 	}
 
-	tunnelCh, ok := dialback.ClaimPending(connID)
-	if !ok || tunnelCh == nil {
-		http.Error(w, "connection not found or expired", http.StatusNotFound)
+	if sessIdentity.ID != clientIdentity.ID {
+		http.Error(w, "session identity mismatch", http.StatusForbidden)
 		return
 	}
 
@@ -448,10 +457,9 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	select {
-	case tunnelCh <- dialedConn:
-	default:
+	if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
 		_ = dialedConn.Close()
+		return
 	}
 }
 

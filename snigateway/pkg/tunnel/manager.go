@@ -15,18 +15,23 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"net"
 	"slices"
 	"sync"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+// DefaultPoolSize is the default number of idle pooled reverse tunnel connections.
+const DefaultPoolSize = 4
 
 // ManagerOption configures a Manager.
 type ManagerOption func(*Manager)
@@ -35,6 +40,15 @@ type ManagerOption func(*Manager)
 func WithListener(lis *Listener) ManagerOption {
 	return func(m *Manager) {
 		m.listener = lis
+	}
+}
+
+// WithPoolSize sets the number of idle pooled reverse tunnel connections to maintain.
+func WithPoolSize(size int) ManagerOption {
+	return func(m *Manager) {
+		if size > 0 {
+			m.poolSize = size
+		}
 	}
 }
 
@@ -60,11 +74,12 @@ func WithBackoff(min, max time.Duration) ManagerOption {
 	}
 }
 
-// Manager manages communication with the snigateway frontend, announcing SNI hostnames
-// and feeding reverse-tunnelled connections into a tunnel Listener.
+// Manager manages communication with the snigateway frontend, maintaining a warm pool
+// of pre-dialed reverse tunnel connections and announcing SNI hostnames.
 type Manager struct {
 	client          *client.Client
 	listener        *Listener
+	poolSize        int
 	dialTimeout     time.Duration
 	registerTimeout time.Duration
 	backoffMin      time.Duration
@@ -72,6 +87,7 @@ type Manager struct {
 
 	mu         sync.Mutex
 	hostnames  []string
+	sessionID  string
 	connected  bool
 	generation uint64
 	updateCh   chan struct{}
@@ -82,6 +98,7 @@ func NewManager(c *client.Client, opts ...ManagerOption) *Manager {
 	m := &Manager{
 		client:          c,
 		listener:        NewListener(),
+		poolSize:        DefaultPoolSize,
 		dialTimeout:     10 * time.Second,
 		registerTimeout: 5 * time.Second,
 		backoffMin:      200 * time.Millisecond,
@@ -126,7 +143,7 @@ func (m *Manager) triggerRegistration() {
 	}
 }
 
-// Run starts the connection and registration loops, maintaining connectivity to the frontend
+// Run starts the session, pool, and registration loops, maintaining connectivity to the frontend
 // and feeding connections into the tunnel Listener until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
 	defer m.listener.Close()
@@ -138,6 +155,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		var lastRegistered []string
 		var lastGen uint64
 		var hasRegistered bool
+		var lastSession string
 
 		for {
 			select {
@@ -146,25 +164,26 @@ func (m *Manager) Run(ctx context.Context) error {
 			case <-m.updateCh:
 				m.mu.Lock()
 				connected := m.connected
+				sessID := m.sessionID
 				gen := m.generation
 				curr := slices.Clone(m.hostnames)
 				m.mu.Unlock()
 
-				if !connected {
+				if !connected || sessID == "" {
 					continue
 				}
 
-				if hasRegistered && lastGen == gen && slices.Equal(lastRegistered, curr) {
+				if hasRegistered && lastGen == gen && lastSession == sessID && slices.Equal(lastRegistered, curr) {
 					continue
 				}
 
 				regCtx, cancel := context.WithTimeout(ctx, m.registerTimeout)
-				resp, err := m.client.Register(regCtx, curr)
+				resp, err := m.client.Register(regCtx, sessID, curr)
 				cancel()
 
 				if err != nil {
 					if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-						klog.Errorf("Failed to register hostnames %v with frontend: %v", curr, err)
+						klog.Errorf("Failed to register hostnames %v with frontend (session %s): %v", curr, sessID, err)
 						go func() {
 							select {
 							case <-ctx.Done():
@@ -174,16 +193,17 @@ func (m *Manager) Run(ctx context.Context) error {
 						}()
 					}
 				} else {
-					klog.Infof("Successfully registered hostnames with frontend: %v", resp.Hostnames)
+					klog.Infof("Successfully registered hostnames with frontend: %v (session: %s)", resp.Hostnames, sessID)
 					lastRegistered = curr
 					lastGen = gen
+					lastSession = sessID
 					hasRegistered = true
 				}
 			}
 		}
 	})
 
-	// Connection streaming loop with reconnect and exponential backoff
+	// Session & Pool loop with reconnect and exponential backoff
 	g.Go(func() error {
 		backoff := m.backoffMin
 
@@ -192,67 +212,165 @@ func (m *Manager) Run(ctx context.Context) error {
 				return nil
 			}
 
-			readyCh := make(chan struct{})
-			readyDone := make(chan struct{})
-
-			// Handle ready state as soon as connection stream is established
-			go func() {
-				select {
-				case <-readyCh:
-					m.mu.Lock()
-					m.connected = true
-					m.generation++
-					m.mu.Unlock()
-					m.triggerRegistration()
-				case <-readyDone:
-				case <-ctx.Done():
+			sessCtx, sessCancel := context.WithCancel(ctx)
+			sessID, sessErrCh, err := m.client.StartSession(sessCtx)
+			if err != nil {
+				sessCancel()
+				if ctx.Err() != nil {
+					return nil
 				}
-			}()
+				klog.Warningf("Failed to start session with frontend: %v. Reconnecting in %v...", err, backoff)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				if backoff > m.backoffMax {
+					backoff = m.backoffMax
+				}
+				continue
+			}
 
-			// Open connection event stream (blocks until error/disconnect)
-			streamErr := m.client.StreamConnectionsWithReady(ctx, readyCh, func(streamCtx context.Context, event *api.ConnectionEvent) error {
-				go func(ev *api.ConnectionEvent) {
-					dialCtx, cancel := context.WithTimeout(ctx, m.dialTimeout)
-					defer cancel()
+			// Reset backoff on successful session creation
+			backoff = m.backoffMin
 
-					tunnelConn, err := m.client.DialTunnel(dialCtx, ev.ID)
-					if err != nil {
-						klog.Errorf("Failed to dial reverse tunnel for connection %s: %v", ev.ID, err)
-						return
-					}
+			m.mu.Lock()
+			m.connected = true
+			m.sessionID = sessID
+			m.generation++
+			m.mu.Unlock()
 
-					if err := m.listener.Enqueue(tunnelConn); err != nil {
-						klog.Errorf("Failed to enqueue reverse tunnel connection %s: %v", ev.ID, err)
-					}
-				}(event)
-				return nil
-			})
-			close(readyDone)
+			klog.Infof("Established session %s with frontend", sessID)
+			m.triggerRegistration()
+
+			// Run pool worker for this session
+			m.runPool(sessCtx, sessID, sessErrCh)
+
+			sessCancel()
 
 			m.mu.Lock()
 			m.connected = false
+			m.sessionID = ""
 			m.mu.Unlock()
 
 			if ctx.Err() != nil {
 				return nil
 			}
 
-			if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
-				klog.Warningf("Connection stream to frontend failed: %v. Reconnecting in %v...", streamErr, backoff)
-			}
-
+			klog.Warningf("Session %s ended. Reconnecting in %v...", sessID, backoff)
 			select {
 			case <-ctx.Done():
 				return nil
 			case <-time.After(backoff):
 			}
-
-			backoff *= 2
-			if backoff > m.backoffMax {
-				backoff = m.backoffMax
-			}
 		}
 	})
 
 	return g.Wait()
+}
+
+func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-chan error) {
+	refillCh := make(chan struct{}, m.poolSize*2)
+	activeIdleMu := sync.Mutex{}
+	activeIdle := 0
+
+	triggerRefill := func() {
+		select {
+		case refillCh <- struct{}{}:
+		default:
+		}
+	}
+
+	dialOne := func() {
+		activeIdleMu.Lock()
+		if activeIdle >= m.poolSize {
+			activeIdleMu.Unlock()
+			return
+		}
+		activeIdle++
+		activeIdleMu.Unlock()
+
+		go func() {
+			dialCtx, cancel := context.WithTimeout(ctx, m.dialTimeout)
+			conn, err := m.client.DialTunnel(dialCtx, sessionID)
+			cancel()
+
+			if err != nil {
+				activeIdleMu.Lock()
+				activeIdle--
+				activeIdleMu.Unlock()
+
+				if ctx.Err() == nil {
+					klog.Errorf("Failed to dial pooled tunnel connection for session %s: %v", sessionID, err)
+					time.Sleep(200 * time.Millisecond)
+					triggerRefill()
+				}
+				return
+			}
+
+			// Watch connection for activation or drop
+			buf := make([]byte, 4096)
+			n, err := conn.Read(buf)
+
+			// Decrement idle count immediately upon read (either activated or closed)
+			activeIdleMu.Lock()
+			activeIdle--
+			activeIdleMu.Unlock()
+
+			if err != nil && n == 0 {
+				_ = conn.Close()
+				if ctx.Err() == nil {
+					triggerRefill()
+				}
+				return
+			}
+
+			// Connection is activated! Trigger pool refill immediately
+			triggerRefill()
+
+			wrappedConn := newPrefixedConn(conn, buf[:n])
+			if err := m.listener.Enqueue(wrappedConn); err != nil {
+				_ = conn.Close()
+			}
+		}()
+	}
+
+	// Initial fill of the pool
+	for i := 0; i < m.poolSize; i++ {
+		dialOne()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-sessErrCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				klog.Warningf("Session error from frontend: %v", err)
+			}
+			return
+		case <-refillCh:
+			dialOne()
+		}
+	}
+}
+
+type prefixedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func newPrefixedConn(conn net.Conn, prefix []byte) net.Conn {
+	if len(prefix) == 0 {
+		return conn
+	}
+	return &prefixedConn{
+		Conn: conn,
+		r:    io.MultiReader(bytes.NewReader(prefix), conn),
+	}
+}
+
+func (c *prefixedConn) Read(b []byte) (int, error) {
+	return c.r.Read(b)
 }

@@ -20,26 +20,28 @@ import (
 	"sync"
 )
 
-// RegistrationTable maps registered hostnames to client identifiers.
-// It supports multiple clients registering the same hostname, and supports exact hostnames
+// RegistrationTable maps registered hostnames to backend session identifiers.
+// It supports multiple sessions registering the same hostname, and supports exact hostnames
 // as well as wildcard hostnames (*.example.com), with exact match taking precedence.
 type RegistrationTable struct {
-	mu          sync.RWMutex
-	clientHosts map[string][]string // clientID -> registered host patterns
-	exact       map[string][]string // normalized exact hostname -> slice of clientIDs
-	wildcard    map[string][]string // normalized wildcard pattern (*.example.com) -> slice of clientIDs
-	exactRR     map[string]int      // round-robin counter per exact hostname
-	wildcardRR  map[string]int      // round-robin counter per wildcard pattern
+	mu              sync.RWMutex
+	sessionHosts    map[string][]string        // sessionID -> registered host patterns
+	sessionIdentity map[string]ClientIdentity // sessionID -> client identity
+	exact           map[string][]string        // normalized exact hostname -> slice of sessionIDs
+	wildcard        map[string][]string        // normalized wildcard pattern (*.example.com) -> slice of sessionIDs
+	exactRR         map[string]int             // round-robin counter per exact hostname
+	wildcardRR      map[string]int             // round-robin counter per wildcard pattern
 }
 
 // NewRegistrationTable creates a new empty RegistrationTable.
 func NewRegistrationTable() *RegistrationTable {
 	return &RegistrationTable{
-		clientHosts: make(map[string][]string),
-		exact:       make(map[string][]string),
-		wildcard:    make(map[string][]string),
-		exactRR:     make(map[string]int),
-		wildcardRR:  make(map[string]int),
+		sessionHosts:    make(map[string][]string),
+		sessionIdentity: make(map[string]ClientIdentity),
+		exact:           make(map[string][]string),
+		wildcard:        make(map[string][]string),
+		exactRR:         make(map[string]int),
+		wildcardRR:      make(map[string]int),
 	}
 }
 
@@ -51,13 +53,28 @@ func CleanHostname(host string) string {
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
-// Register sets the full list of hostnames served by clientID, replacing any previous list for that client.
-func (t *RegistrationTable) Register(clientID string, hostnames []string) {
+// RegisterSession records a backend session with its verified client identity.
+func (t *RegistrationTable) RegisterSession(sessionID string, identity ClientIdentity) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sessionIdentity[sessionID] = identity
+}
+
+// GetSessionIdentity retrieves the client identity for a session.
+func (t *RegistrationTable) GetSessionIdentity(sessionID string) (ClientIdentity, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	id, ok := t.sessionIdentity[sessionID]
+	return id, ok
+}
+
+// Register sets the full list of hostnames served by sessionID, replacing any previous list for that session.
+func (t *RegistrationTable) Register(sessionID string, hostnames []string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Clear previous registrations for this client
-	t.unregisterLocked(clientID)
+	// Clear previous registrations for this session
+	t.unregisterLocked(sessionID)
 
 	var registered []string
 	for _, rawHost := range hostnames {
@@ -67,19 +84,20 @@ func (t *RegistrationTable) Register(clientID string, hostnames []string) {
 		}
 		registered = append(registered, h)
 		if strings.HasPrefix(h, "*.") {
-			t.wildcard[h] = append(t.wildcard[h], clientID)
+			t.wildcard[h] = append(t.wildcard[h], sessionID)
 		} else {
-			t.exact[h] = append(t.exact[h], clientID)
+			t.exact[h] = append(t.exact[h], sessionID)
 		}
 	}
-	t.clientHosts[clientID] = registered
+	t.sessionHosts[sessionID] = registered
 }
 
-// Unregister removes all hostname registrations for clientID.
-func (t *RegistrationTable) Unregister(clientID string) {
+// Unregister removes all hostname registrations and identity for sessionID.
+func (t *RegistrationTable) Unregister(sessionID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.unregisterLocked(clientID)
+	t.unregisterLocked(sessionID)
+	delete(t.sessionIdentity, sessionID)
 }
 
 func removeFromSlice(slice []string, val string) []string {
@@ -92,11 +110,11 @@ func removeFromSlice(slice []string, val string) []string {
 	return res
 }
 
-func (t *RegistrationTable) unregisterLocked(clientID string) {
-	if previous, exists := t.clientHosts[clientID]; exists {
+func (t *RegistrationTable) unregisterLocked(sessionID string) {
+	if previous, exists := t.sessionHosts[sessionID]; exists {
 		for _, h := range previous {
 			if strings.HasPrefix(h, "*.") {
-				newSlice := removeFromSlice(t.wildcard[h], clientID)
+				newSlice := removeFromSlice(t.wildcard[h], sessionID)
 				if len(newSlice) == 0 {
 					delete(t.wildcard, h)
 					delete(t.wildcardRR, h)
@@ -104,7 +122,7 @@ func (t *RegistrationTable) unregisterLocked(clientID string) {
 					t.wildcard[h] = newSlice
 				}
 			} else {
-				newSlice := removeFromSlice(t.exact[h], clientID)
+				newSlice := removeFromSlice(t.exact[h], sessionID)
 				if len(newSlice) == 0 {
 					delete(t.exact, h)
 					delete(t.exactRR, h)
@@ -113,35 +131,45 @@ func (t *RegistrationTable) unregisterLocked(clientID string) {
 				}
 			}
 		}
-		delete(t.clientHosts, clientID)
+		delete(t.sessionHosts, sessionID)
 	}
 }
 
-// Match looks up the best matching clientID for a given incoming SNI hostname.
+// Match looks up the best matching sessionID for a given incoming SNI hostname.
 // Exact match wins. If no exact match, longest matching wildcard pattern wins.
-// If multiple clients are registered for the matched pattern, selection is round-robined.
+// If multiple sessions are registered for the matched pattern, selection is round-robined.
 func (t *RegistrationTable) Match(hostname string) (string, bool) {
+	sessions := t.MatchSessions(hostname)
+	if len(sessions) == 0 {
+		return "", false
+	}
+	return sessions[0], true
+}
+
+// MatchSessions returns all sessions registered for the matching hostname pattern,
+// ordered starting from the round-robin selection.
+func (t *RegistrationTable) MatchSessions(hostname string) []string {
 	cleanHost := CleanHostname(hostname)
 	if cleanHost == "" {
-		return "", false
+		return nil
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	// 1. Exact match
-	if clients, ok := t.exact[cleanHost]; ok && len(clients) > 0 {
-		idx := t.exactRR[cleanHost] % len(clients)
+	if sessions, ok := t.exact[cleanHost]; ok && len(sessions) > 0 {
+		idx := t.exactRR[cleanHost] % len(sessions)
 		t.exactRR[cleanHost]++
-		return clients[idx], true
+		return rotateSessions(sessions, idx)
 	}
 
 	// 2. Wildcard match (longest matching wildcard suffix wins)
 	var bestPattern string
 	bestPatternLen := -1
 
-	for pattern, clients := range t.wildcard {
-		if len(clients) == 0 {
+	for pattern, sessions := range t.wildcard {
+		if len(sessions) == 0 {
 			continue
 		}
 		suffix := pattern[1:] // e.g. .example.com
@@ -154,25 +182,58 @@ func (t *RegistrationTable) Match(hostname string) (string, bool) {
 	}
 
 	if bestPatternLen >= 0 {
-		clients := t.wildcard[bestPattern]
-		idx := t.wildcardRR[bestPattern] % len(clients)
+		sessions := t.wildcard[bestPattern]
+		idx := t.wildcardRR[bestPattern] % len(sessions)
 		t.wildcardRR[bestPattern]++
-		return clients[idx], true
+		return rotateSessions(sessions, idx)
 	}
 
-	return "", false
+	return nil
 }
 
-// GetRegisteredHostnames returns the hostnames registered for a given clientID.
-func (t *RegistrationTable) GetRegisteredHostnames(clientID string) []string {
+func rotateSessions(sessions []string, start int) []string {
+	n := len(sessions)
+	if n == 0 {
+		return nil
+	}
+	start = start % n
+	res := make([]string, n)
+	for i := 0; i < n; i++ {
+		res[i] = sessions[(start+i)%n]
+	}
+	return res
+}
+
+// GetRegisteredHostnames returns the hostnames registered for a given sessionID.
+func (t *RegistrationTable) GetRegisteredHostnames(sessionID string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	hosts, ok := t.clientHosts[clientID]
+	hosts, ok := t.sessionHosts[sessionID]
 	if !ok {
 		return nil
 	}
 	res := make([]string, len(hosts))
 	copy(res, hosts)
+	return res
+}
+
+// GetRegisteredHostnamesForClient returns all hostnames registered by any active session of clientID.
+func (t *RegistrationTable) GetRegisteredHostnamesForClient(clientID string) []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var res []string
+	seen := make(map[string]bool)
+	for sid, ident := range t.sessionIdentity {
+		if ident.ID == clientID {
+			for _, h := range t.sessionHosts[sid] {
+				if !seen[h] {
+					seen[h] = true
+					res = append(res, h)
+				}
+			}
+		}
+	}
 	return res
 }

@@ -47,6 +47,7 @@ func main() {
 		metricsAddr      string
 		healthProbeAddr  string
 		proxyAddr        string
+		tunnelPoolSize   int
 		leaderElection   bool
 		leaderElectionID string
 	)
@@ -57,6 +58,7 @@ func main() {
 	flag.StringVar(&clientKeyPath, "client-key", "", "Path to the client private key PEM file for mTLS authentication.")
 	flag.StringVar(&internalHostname, "internal-hostname", "snigateway.internal", "TLS ServerName for the snigateway-frontend mTLS management API.")
 	flag.StringVar(&controllerName, "controller-name", DefaultControllerName, "The GatewayClass controller name managed by this instance.")
+	flag.IntVar(&tunnelPoolSize, "tunnel-pool-size", tunnel.DefaultPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&healthProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&proxyAddr, "proxy-bind-address", "", "Optional HTTP proxy bind address. Disabled by default.")
@@ -107,7 +109,7 @@ func main() {
 	}
 
 	snigatewayClient := client.NewClient(frontendAddr, clientTLS, client.WithInternalHostname(internalHostname))
-	tunnelMgr := tunnel.NewManager(snigatewayClient)
+	tunnelMgr := tunnel.NewManager(snigatewayClient, tunnel.WithPoolSize(tunnelPoolSize))
 
 	gariOpts := gari.DefaultOptions()
 	gariOpts.ControllerName = controllerName

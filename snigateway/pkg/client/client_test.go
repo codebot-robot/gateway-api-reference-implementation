@@ -63,7 +63,12 @@ func TestClient_Registration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	resp, err := c.Register(ctx, []string{"foo.example.com", "*.bar.com"})
+	sessID, _, err := c.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("c.StartSession failed: %v", err)
+	}
+
+	resp, err := c.Register(ctx, sessID, []string{"foo.example.com", "*.bar.com"})
 	if err != nil {
 		t.Fatalf("c.Register failed: %v", err)
 	}

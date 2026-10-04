@@ -27,7 +27,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
@@ -120,7 +119,7 @@ func TestManager_EndToEnd(t *testing.T) {
 	var regHosts []string
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		regHosts = srv.RegistrationTable().GetRegisteredHostnames(clientID)
+		regHosts = srv.RegistrationTable().GetRegisteredHostnamesForClient(clientID)
 		slices.Sort(regHosts)
 		if slices.Equal(regHosts, []string{"*.wildcard.org", "app1.example.com"}) {
 			break
@@ -185,7 +184,7 @@ func TestManager_EndToEnd(t *testing.T) {
 
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		regHosts = srv.RegistrationTable().GetRegisteredHostnames(clientID)
+		regHosts = srv.RegistrationTable().GetRegisteredHostnamesForClient(clientID)
 		if slices.Equal(regHosts, []string{"app2.example.com"}) {
 			break
 		}
@@ -229,7 +228,7 @@ func TestManager_EndToEnd(t *testing.T) {
 	}
 }
 
-func TestManager_StreamReconnect(t *testing.T) {
+func TestManager_SessionReconnect(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "snigateway-mgr-reconn-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -334,7 +333,7 @@ func TestManager_StreamReconnect(t *testing.T) {
 	// Wait for initial registration
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		regHosts := srv.RegistrationTable().GetRegisteredHostnames(clientID)
+		regHosts := srv.RegistrationTable().GetRegisteredHostnamesForClient(clientID)
 		if slices.Equal(regHosts, []string{"echo.snigateway.test"}) {
 			break
 		}
@@ -364,49 +363,5 @@ func TestManager_StreamReconnect(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
-	}
-
-	// Connect an overlapping second stream with the same client certificate to simulate reconnect / old stream displacement
-	ctxOverlap, cancelOverlap := context.WithCancel(t.Context())
-	overlapReady := make(chan struct{})
-	overlapClient := client.NewClient(serverAddr, clientTLS)
-	go func() {
-		_ = overlapClient.StreamConnectionsWithReady(ctxOverlap, overlapReady, func(ctx context.Context, event *api.ConnectionEvent) error {
-			return nil
-		})
-	}()
-
-	select {
-	case <-overlapReady:
-	case <-time.After(3 * time.Second):
-		t.Fatal("overlap stream timed out connecting")
-	}
-
-	// Close the overlapping stream; Manager should recover and re-register
-	cancelOverlap()
-
-	// Wait for Manager to reconnect and re-register
-	deadline = time.Now().Add(5 * time.Second)
-	var regHosts []string
-	for time.Now().Before(deadline) {
-		regHosts = srv.RegistrationTable().GetRegisteredHostnames(clientID)
-		if slices.Equal(regHosts, []string{"echo.snigateway.test"}) {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	if !slices.Equal(regHosts, []string{"echo.snigateway.test"}) {
-		t.Fatalf("hostnames not re-registered after stream reconnect, got: %v", regHosts)
-	}
-
-	// Verify traffic still works
-	resp2, err := httpClient.Get("https://echo.snigateway.test/test")
-	if err != nil {
-		t.Fatalf("HTTP GET after reconnect failed: %v", err)
-	}
-	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("expected status 200 after reconnect, got %d", resp2.StatusCode)
 	}
 }

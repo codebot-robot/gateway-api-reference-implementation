@@ -33,7 +33,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 )
@@ -110,6 +109,81 @@ func setupTestServerAndClient(t *testing.T) (*Server, string, *certs.GeneratedCe
 	return srv, serverAddr, generated, cleanup
 }
 
+func startBackendWorker(ctx context.Context, t *testing.T, c *client.Client, hostnames []string, cert tls.Certificate, onConn func(net.Conn)) string {
+	sessID, sessErrCh, err := c.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	if len(hostnames) > 0 {
+		if _, err := c.Register(ctx, sessID, hostnames); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+	}
+
+	// Maintain pool of 4 idle connections
+	for i := 0; i < 4; i++ {
+		go func() {
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				conn, err := c.DialTunnel(dialCtx, sessID)
+				cancel()
+				if err != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(50 * time.Millisecond):
+						continue
+					}
+				}
+
+				buf := make([]byte, 4096)
+				n, err := conn.Read(buf)
+				if err != nil && n == 0 {
+					_ = conn.Close()
+					continue
+				}
+
+				wrapped := &prefixedConn{
+					Conn:   conn,
+					prefix: buf[:n],
+				}
+
+				if onConn != nil {
+					go onConn(wrapped)
+				}
+			}
+		}()
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-sessErrCh:
+		}
+	}()
+
+	return sessID
+}
+
+type prefixedConn struct {
+	net.Conn
+	prefix []byte
+	pos    int
+}
+
+func (c *prefixedConn) Read(b []byte) (int, error) {
+	if c.pos < len(c.prefix) {
+		n := copy(b, c.prefix[c.pos:])
+		c.pos += n
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
 func TestEndToEndReverseTunnel(t *testing.T) {
 	_, serverAddr, generated, cleanup := setupTestServerAndClient(t)
 	defer cleanup()
@@ -130,11 +204,9 @@ func TestEndToEndReverseTunnel(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	// Backend handler for incoming tunnels
-	serveConn := func(ctx context.Context, connID string, hostname string, tunnel net.Conn) {
-		defer tunnel.Close()
-
-		tlsServer := tls.Server(tunnel, &tls.Config{
+	handleConn := func(conn net.Conn) {
+		defer conn.Close()
+		tlsServer := tls.Server(conn, &tls.Config{
 			Certificates: []tls.Certificate{backendCert},
 		})
 		defer tlsServer.Close()
@@ -145,16 +217,13 @@ func TestEndToEndReverseTunnel(t *testing.T) {
 			return
 		}
 		reqStr := string(buf[:n])
-		respStr := fmt.Sprintf("ECHO from backend for host %s: %s", hostname, reqStr)
+		respStr := fmt.Sprintf("ECHO: %s", reqStr)
 		_, _ = tlsServer.Write([]byte(respStr))
 	}
 
-	// Start client loop serving hostnames
-	go func() {
-		_ = c.Run(ctx, []string{"app.example.com", "*.wildcard.org"}, serveConn)
-	}()
+	startBackendWorker(ctx, t, c, []string{"app.example.com", "*.wildcard.org"}, backendCert, handleConn)
 
-	// Wait for registration to complete
+	// Wait for registration and pool
 	time.Sleep(100 * time.Millisecond)
 
 	// 1. Test Exact Match End-to-End
@@ -180,7 +249,7 @@ func TestEndToEndReverseTunnel(t *testing.T) {
 		}
 
 		got := string(reply[:n])
-		want := "ECHO from backend for host app.example.com: " + payload
+		want := "ECHO: " + payload
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -209,7 +278,7 @@ func TestEndToEndReverseTunnel(t *testing.T) {
 		}
 
 		got := string(reply[:n])
-		want := "ECHO from backend for host service-1.wildcard.org: " + payload
+		want := "ECHO: " + payload
 		if got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
@@ -222,7 +291,6 @@ func TestEndToEndReverseTunnel(t *testing.T) {
 			InsecureSkipVerify: true,
 		})
 		if err == nil {
-			// If handshake initiated, read should return EOF immediately
 			buf := make([]byte, 10)
 			_, readErr := conn.Read(buf)
 			_ = conn.Close()
@@ -257,7 +325,7 @@ func TestRejectionWithoutValidClientCertificate(t *testing.T) {
 			},
 		}
 
-		_, err := client.Get("https://snigateway.internal/v1/connections")
+		_, err := client.Get("https://snigateway.internal/v1/session")
 		if err == nil {
 			t.Fatal("expected request without client cert to fail, got nil err")
 		}
@@ -294,7 +362,7 @@ func TestRejectionWithoutValidClientCertificate(t *testing.T) {
 			},
 		}
 
-		_, err = client.Get("https://snigateway.internal/v1/connections")
+		_, err = client.Get("https://snigateway.internal/v1/session")
 		if err == nil {
 			t.Fatal("expected request with untrusted client cert to fail, got nil err")
 		}
@@ -302,7 +370,6 @@ func TestRejectionWithoutValidClientCertificate(t *testing.T) {
 }
 
 func TestCAAllowlistAuthorization(t *testing.T) {
-	// Generate two separate sets of client/CA credentials
 	certsA, err := certs.GenerateAll("snigateway.internal", "team-a-client")
 	if err != nil {
 		t.Fatalf("GenerateAll certsA: %v", err)
@@ -374,9 +441,19 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 
 	ctx := t.Context()
 
+	sessIDA, _, err := clientA.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession A failed: %v", err)
+	}
+
+	sessIDB, _, err := clientB.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession B failed: %v", err)
+	}
+
 	// 1. Team A attempts to register disallowed hostnames -> rejected with 403 Forbidden
 	t.Run("Team A rejected for hostnames outside allowlist", func(t *testing.T) {
-		_, err := clientA.Register(ctx, []string{"app.b.example.com"})
+		_, err := clientA.Register(ctx, sessIDA, []string{"app.b.example.com"})
 		if err == nil {
 			t.Fatal("expected registration of app.b.example.com by Team A to fail")
 		}
@@ -385,9 +462,9 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 		}
 	})
 
-	// 2. Team A attempts to register partially allowed hostnames -> rejected completely (not partially registered)
+	// 2. Team A attempts to register partially allowed hostnames -> rejected completely
 	t.Run("Team A rejected for mixed allowed and disallowed hostnames", func(t *testing.T) {
-		_, err := clientA.Register(ctx, []string{"app.a.example.com", "other.example.com"})
+		_, err := clientA.Register(ctx, sessIDA, []string{"app.a.example.com", "other.example.com"})
 		if err == nil {
 			t.Fatal("expected registration of mixed hostnames by Team A to fail")
 		}
@@ -395,9 +472,7 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 			t.Fatalf("unexpected error response: %v", err)
 		}
 
-		// Verify app.a.example.com was NOT partially registered
-		clientID := fmt.Sprintf("%s/team-a-client", fpA)
-		hosts := srv.RegistrationTable().GetRegisteredHostnames(clientID)
+		hosts := srv.RegistrationTable().GetRegisteredHostnames(sessIDA)
 		if len(hosts) != 0 {
 			t.Fatalf("expected 0 registered hostnames for Team A, got %v", hosts)
 		}
@@ -405,7 +480,7 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 
 	// 3. Team A registers allowed hostnames -> succeeds
 	t.Run("Team A succeeds for allowed hostnames", func(t *testing.T) {
-		resp, err := clientA.Register(ctx, []string{"app.a.example.com", "a.example.org"})
+		resp, err := clientA.Register(ctx, sessIDA, []string{"app.a.example.com", "a.example.org"})
 		if err != nil {
 			t.Fatalf("unexpected registration failure for Team A: %v", err)
 		}
@@ -416,7 +491,7 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 
 	// 4. Team B registers allowed hostnames -> succeeds
 	t.Run("Team B succeeds for allowed hostnames", func(t *testing.T) {
-		resp, err := clientB.Register(ctx, []string{"service.b.example.com"})
+		resp, err := clientB.Register(ctx, sessIDB, []string{"service.b.example.com"})
 		if err != nil {
 			t.Fatalf("unexpected registration failure for Team B: %v", err)
 		}
@@ -427,7 +502,7 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 
 	// 5. Team B attempts to register Team A's hostname -> rejected with 403 Forbidden
 	t.Run("Team B cannot hijack Team A hostname", func(t *testing.T) {
-		_, err := clientB.Register(ctx, []string{"app.a.example.com"})
+		_, err := clientB.Register(ctx, sessIDB, []string{"app.a.example.com"})
 		if err == nil {
 			t.Fatal("expected registration of app.a.example.com by Team B to fail")
 		}
@@ -437,84 +512,7 @@ func TestCAAllowlistAuthorization(t *testing.T) {
 	})
 }
 
-func TestStreamReconnectKeepsRegistration(t *testing.T) {
-	srv, serverAddr, generated, cleanup := setupTestServerAndClient(t)
-	defer cleanup()
-
-	parsedCA, err := certs.ParseCertificatesFromPEM(generated.CA.CertPEM)
-	if err != nil {
-		t.Fatalf("ParseCertificatesFromPEM: %v", err)
-	}
-	fp := fmt.Sprintf("%x", sha256.Sum256(parsedCA[0].Raw))
-	clientID := fmt.Sprintf("%s/test-cluster-client", fp)
-
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
-	if err != nil {
-		t.Fatalf("NewClientTLSConfig failed: %v", err)
-	}
-
-	c := client.NewClient(serverAddr, clientTLS)
-
-	ctx1, cancel1 := context.WithCancel(t.Context())
-	ready1 := make(chan struct{})
-
-	go func() {
-		_ = c.StreamConnectionsWithReady(ctx1, ready1, func(ctx context.Context, event *api.ConnectionEvent) error {
-			return nil
-		})
-	}()
-
-	select {
-	case <-ready1:
-	case <-time.After(3 * time.Second):
-		t.Fatal("stream 1 timed out connecting")
-	}
-
-	// Register hostnames with frontend
-	if _, err := c.Register(ctx1, []string{"app.example.com"}); err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
-
-	if registered := srv.RegistrationTable().GetRegisteredHostnames(clientID); len(registered) != 1 || registered[0] != "app.example.com" {
-		t.Fatalf("expected [app.example.com] registered, got %v", registered)
-	}
-
-	// Connect stream 2 (reconnect) before stream 1 completes
-	ctx2, cancel2 := context.WithCancel(t.Context())
-	ready2 := make(chan struct{})
-
-	go func() {
-		_ = c.StreamConnectionsWithReady(ctx2, ready2, func(ctx context.Context, event *api.ConnectionEvent) error {
-			return nil
-		})
-	}()
-
-	select {
-	case <-ready2:
-	case <-time.After(3 * time.Second):
-		t.Fatal("stream 2 timed out connecting")
-	}
-
-	// Now close stream 1
-	cancel1()
-	time.Sleep(100 * time.Millisecond)
-
-	// Stream 1 exiting must NOT unregister the hostnames because stream 2 is active
-	if registered := srv.RegistrationTable().GetRegisteredHostnames(clientID); len(registered) != 1 || registered[0] != "app.example.com" {
-		t.Fatalf("expected hostnames to remain registered after stream 1 closed, got %v", registered)
-	}
-
-	// Now close stream 2 (the active stream)
-	cancel2()
-	time.Sleep(100 * time.Millisecond)
-
-	// Active stream 2 closing with no replacement must unregister
-	if registered := srv.RegistrationTable().GetRegisteredHostnames(clientID); len(registered) != 0 {
-		t.Fatalf("expected hostnames to be unregistered after active stream 2 closed, got %v", registered)
-	}
-}
-
-func TestMultipleServingStreamsLoadBalancing(t *testing.T) {
+func TestMultipleSessionsLoadBalancing(t *testing.T) {
 	_, serverAddr, generated, cleanup := setupTestServerAndClient(t)
 	defer cleanup()
 
@@ -528,71 +526,40 @@ func TestMultipleServingStreamsLoadBalancing(t *testing.T) {
 		t.Fatalf("NewClientTLSConfig failed: %v", err)
 	}
 
-	c := client.NewClient(serverAddr, clientTLS)
+	c1 := client.NewClient(serverAddr, clientTLS)
+	c2 := client.NewClient(serverAddr, clientTLS)
 
-	handleBackendTLS := func(streamCtx context.Context, event *api.ConnectionEvent, streamName string) {
-		dialCtx, cancel := context.WithTimeout(streamCtx, 3*time.Second)
-		defer cancel()
-		conn, err := c.DialTunnel(dialCtx, event.ID)
-		if err != nil {
-			return
-		}
+	var session1Events, session2Events atomic.Int32
+
+	handleSession1 := func(conn net.Conn) {
+		session1Events.Add(1)
 		defer conn.Close()
-
-		tlsConn := tls.Server(conn, &tls.Config{
-			Certificates: []tls.Certificate{backendCert},
-		})
+		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
 		defer tlsConn.Close()
-
 		buf := make([]byte, 1024)
 		_, _ = tlsConn.Read(buf)
-		_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: " + fmt.Sprintf("%d", len(streamName)) + "\r\n\r\n" + streamName))
+		_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 9\r\n\r\nsession-1"))
 	}
 
-	// Stream 1
+	handleSession2 := func(conn net.Conn) {
+		session2Events.Add(1)
+		defer conn.Close()
+		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
+		defer tlsConn.Close()
+		buf := make([]byte, 1024)
+		_, _ = tlsConn.Read(buf)
+		_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 9\r\n\r\nsession-2"))
+	}
+
 	ctx1, cancel1 := context.WithCancel(t.Context())
 	defer cancel1()
-	ready1 := make(chan struct{})
-	var stream1Events atomic.Int32
+	startBackendWorker(ctx1, t, c1, []string{"multi.example.com"}, backendCert, handleSession1)
 
-	go func() {
-		_ = c.StreamConnectionsWithReady(ctx1, ready1, func(streamCtx context.Context, event *api.ConnectionEvent) error {
-			stream1Events.Add(1)
-			go handleBackendTLS(streamCtx, event, "stream-1")
-			return nil
-		})
-	}()
-
-	// Stream 2
 	ctx2, cancel2 := context.WithCancel(t.Context())
 	defer cancel2()
-	ready2 := make(chan struct{})
-	var stream2Events atomic.Int32
+	startBackendWorker(ctx2, t, c2, []string{"multi.example.com"}, backendCert, handleSession2)
 
-	go func() {
-		_ = c.StreamConnectionsWithReady(ctx2, ready2, func(streamCtx context.Context, event *api.ConnectionEvent) error {
-			stream2Events.Add(1)
-			go handleBackendTLS(streamCtx, event, "stream-2")
-			return nil
-		})
-	}()
-
-	select {
-	case <-ready1:
-	case <-time.After(3 * time.Second):
-		t.Fatal("stream 1 timed out connecting")
-	}
-
-	select {
-	case <-ready2:
-	case <-time.After(3 * time.Second):
-		t.Fatal("stream 2 timed out connecting")
-	}
-
-	// Register hostname
-	if _, err := c.Register(ctx1, []string{"multi.example.com"}); err != nil {
-		t.Fatalf("Register failed: %v", err)
-	}
+	time.Sleep(100 * time.Millisecond)
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
@@ -622,24 +589,23 @@ func TestMultipleServingStreamsLoadBalancing(t *testing.T) {
 		}
 	}
 
-	// Both streams should have received events
-	s1 := stream1Events.Load()
-	s2 := stream2Events.Load()
-	t.Logf("stream1 events: %d, stream2 events: %d", s1, s2)
+	s1 := session1Events.Load()
+	s2 := session2Events.Load()
+	t.Logf("session1 events: %d, session2 events: %d", s1, s2)
 	if s1 == 0 || s2 == 0 || s1+s2 != 4 {
-		t.Fatalf("expected load balancing across both streams (sum=4), got s1=%d, s2=%d", s1, s2)
+		t.Fatalf("expected load balancing across both sessions (sum=4), got s1=%d, s2=%d", s1, s2)
 	}
 
-	// Close stream 1; stream 2 should still serve traffic
+	// Close session 1; session 2 should still serve traffic
 	cancel1()
 	time.Sleep(100 * time.Millisecond)
 
 	resp, err := httpClient.Get("https://multi.example.com/test")
 	if err != nil {
-		t.Fatalf("request after stream 1 closed failed: %v", err)
+		t.Fatalf("request after session 1 closed failed: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected status 200 after stream 1 closed, got: %d", resp.StatusCode)
+		t.Fatalf("expected status 200 after session 1 closed, got: %d", resp.StatusCode)
 	}
 }

@@ -20,9 +20,18 @@ const (
 
 	// UpgradeProtocol is the protocol value used in HTTP Upgrade for reverse tunnels.
 	UpgradeProtocol = "snigateway-tunnel"
+
+	// HeaderSessionID is the HTTP header used to identify the backend session.
+	HeaderSessionID = "X-Session-ID"
 )
 
-// RegistrationRequest contains hostnames to be served by the client.
+// SessionResponse is returned upon establishing a backend session.
+type SessionResponse struct {
+	SessionID string `json:"sessionId"`
+	Status    string `json:"status"`
+}
+
+// RegistrationRequest contains hostnames to be served by the session.
 type RegistrationRequest struct {
 	Hostnames []string `json:"hostnames"`
 }
@@ -31,11 +40,4 @@ type RegistrationRequest struct {
 type RegistrationResponse struct {
 	Status    string   `json:"status"`
 	Hostnames []string `json:"hostnames"`
-}
-
-// ConnectionEvent is streamed to the client over GET /v1/connections.
-type ConnectionEvent struct {
-	ID         string `json:"id"`
-	Hostname   string `json:"hostname,omitempty"`
-	RemoteAddr string `json:"remoteAddr,omitempty"`
 }
