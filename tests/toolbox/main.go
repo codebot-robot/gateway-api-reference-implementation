@@ -29,6 +29,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 func main() {
@@ -91,6 +94,7 @@ func runClientCLI(args []string) {
 	caCertPath := fs.String("ca-cert", "", "Path to CA cert PEM file to trust")
 	insecure := fs.Bool("insecure", false, "Skip TLS verification")
 	expectFail := fs.Bool("expect-fail", false, "Expect request / TLS connection to fail/be closed")
+	http3Flag := fs.Bool("http3", false, "Use HTTP/3 (QUIC) protocol")
 	timeout := fs.Duration("timeout", 10*time.Second, "Request timeout")
 	retries := fs.Int("retries", 30, "Number of retries for request on failure")
 	retryInterval := fs.Duration("retry-interval", 1*time.Second, "Interval between retries")
@@ -122,42 +126,67 @@ func runClientCLI(args []string) {
 	}
 
 	var capturedPeerCerts []*x509.Certificate
+	var transport http.RoundTripper
 
-	transport := &http.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialAddr := addr
-			if *connectTo != "" {
-				dialAddr = *connectTo
+	if *http3Flag {
+		serverName := *sni
+		if serverName == "" {
+			u, err := url.Parse(targetURL)
+			if err == nil {
+				serverName = u.Hostname()
 			}
-			serverName := *sni
-			if serverName == "" {
-				u, err := url.Parse(targetURL)
-				if err == nil {
-					serverName = u.Hostname()
+		}
+		tlsConfig := &tls.Config{
+			ServerName:         serverName,
+			RootCAs:            rootCAs,
+			InsecureSkipVerify: *insecure,
+		}
+		h3Transport := &http3.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+		if *connectTo != "" {
+			h3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				return quic.DialAddrEarly(ctx, *connectTo, tlsCfg, cfg)
+			}
+		}
+		transport = h3Transport
+	} else {
+		transport = &http.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialAddr := addr
+				if *connectTo != "" {
+					dialAddr = *connectTo
 				}
-			}
-			tlsConfig := &tls.Config{
-				ServerName:         serverName,
-				RootCAs:            rootCAs,
-				InsecureSkipVerify: *insecure,
-			}
-			dialer := &net.Dialer{Timeout: *timeout}
-			conn, err := tls.DialWithDialer(dialer, network, dialAddr, tlsConfig)
-			if err != nil {
-				return nil, err
-			}
-			cs := conn.ConnectionState()
-			capturedPeerCerts = cs.PeerCertificates
-			return conn, nil
-		},
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialAddr := addr
-			if *connectTo != "" {
-				dialAddr = *connectTo
-			}
-			dialer := &net.Dialer{Timeout: *timeout}
-			return dialer.DialContext(ctx, network, dialAddr)
-		},
+				serverName := *sni
+				if serverName == "" {
+					u, err := url.Parse(targetURL)
+					if err == nil {
+						serverName = u.Hostname()
+					}
+				}
+				tlsConfig := &tls.Config{
+					ServerName:         serverName,
+					RootCAs:            rootCAs,
+					InsecureSkipVerify: *insecure,
+				}
+				dialer := &net.Dialer{Timeout: *timeout}
+				conn, err := tls.DialWithDialer(dialer, network, dialAddr, tlsConfig)
+				if err != nil {
+					return nil, err
+				}
+				cs := conn.ConnectionState()
+				capturedPeerCerts = cs.PeerCertificates
+				return conn, nil
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialAddr := addr
+				if *connectTo != "" {
+					dialAddr = *connectTo
+				}
+				dialer := &net.Dialer{Timeout: *timeout}
+				return dialer.DialContext(ctx, network, dialAddr)
+			},
+		}
 	}
 
 	client := &http.Client{
@@ -165,7 +194,7 @@ func runClientCLI(args []string) {
 		Timeout:   *timeout,
 	}
 
-	log.Printf("Sending request to %s (Host: %s, ConnectTo: %s, SNI: %s)", targetURL, *hostHeader, *connectTo, *sni)
+	log.Printf("Sending request to %s (Host: %s, ConnectTo: %s, SNI: %s, HTTP3: %v)", targetURL, *hostHeader, *connectTo, *sni, *http3Flag)
 
 	var resp *http.Response
 	var lastErr error
@@ -240,5 +269,10 @@ func runClientCLI(args []string) {
 	}
 
 	fmt.Printf("Status: %s\n", resp.Status)
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			fmt.Printf("Header-%s: %s\n", k, v)
+		}
+	}
 	fmt.Printf("Body: %s\n", string(body))
 }

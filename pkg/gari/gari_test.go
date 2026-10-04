@@ -29,6 +29,8 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,6 +52,12 @@ func TestDefaultOptions(t *testing.T) {
 	}
 	if opts.ProxyHTTPSAddr != ":8443" {
 		t.Errorf("expected proxy https addr :8443, got %q", opts.ProxyHTTPSAddr)
+	}
+	if opts.ProxyHTTP3Addr != "" {
+		t.Errorf("expected proxy http3 addr to be empty by default, got %q", opts.ProxyHTTP3Addr)
+	}
+	if opts.ProxyHTTP3AdvertisedPort != 0 {
+		t.Errorf("expected proxy http3 advertised port to be 0 by default, got %d", opts.ProxyHTTP3AdvertisedPort)
 	}
 	if opts.MetricsAddr != ":8080" {
 		t.Errorf("expected metrics addr :8080, got %q", opts.MetricsAddr)
@@ -377,5 +385,427 @@ func TestNewWithManager(t *testing.T) {
 	}
 	if opts.Scheme == nil {
 		t.Errorf("expected scheme to be initialized")
+	}
+}
+
+func TestHTTP3_DisabledByDefault(t *testing.T) {
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create HTTPS listener: %v", err)
+	}
+	defer httpsLis.Close()
+
+	opts := Options{
+		HTTPSListener: httpsLis,
+		ProxyAddr:     "",
+		// HTTP/3 is disabled (ProxyHTTP3Addr is empty, HTTP3PacketConn is nil)
+		Scheme: DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr, Timeout: 2 * time.Second}
+	reqURL := "https://" + httpsLis.Addr().String() + "/test"
+
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		resp, err = client.Get(reqURL)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to HTTPS listener: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if altSvc := resp.Header.Get("Alt-Svc"); altSvc != "" {
+		t.Errorf("expected no Alt-Svc header when HTTP/3 is disabled, got %q", altSvc)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for proxy shutdown")
+	}
+}
+
+func TestHTTP3_Enabled_AltSvcAndQUICRouting(t *testing.T) {
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create HTTPS listener: %v", err)
+	}
+	defer httpsLis.Close()
+
+	h3Conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP packet conn: %v", err)
+	}
+	defer h3Conn.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend-Host", r.Host)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend:" + r.URL.Path))
+	}))
+	defer backend.Close()
+
+	host, portStr, _ := net.SplitHostPort(backend.Listener.Addr().String())
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	advertisedPort := 9443
+
+	opts := Options{
+		HTTPSListener:            httpsLis,
+		HTTP3PacketConn:          h3Conn,
+		ProxyHTTP3AdvertisedPort: advertisedPort,
+		ProxyAddr:                "",
+		Scheme:                   DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	// Configure listeners and routes on proxy
+	p.UpdateListeners([]state.InternalListener{
+		{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "example.com",
+			Port:     443,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/foo",
+									},
+								},
+							},
+							Backends: []state.InternalBackend{
+								{
+									Host:   host,
+									Port:   int32(port),
+									Weight: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "https-wildcard",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "*.other.com",
+			Port:     443,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"*.other.com"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/bar",
+									},
+								},
+							},
+							Backends: []state.InternalBackend{
+								{
+									Host:   host,
+									Port:   int32(port),
+									Weight: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	// 1. Verify Alt-Svc on HTTPS TCP responses
+	tcpTr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	tcpClient := &http.Client{Transport: tcpTr, Timeout: 2 * time.Second}
+	reqURL := "https://" + httpsLis.Addr().String() + "/foo"
+
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		req, _ := http.NewRequest("GET", reqURL, nil)
+		req.Host = "example.com"
+		resp, err = tcpClient.Do(req)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to HTTPS listener: %v", err)
+	}
+	defer resp.Body.Close()
+
+	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=2592000`, advertisedPort)
+	if altSvc := resp.Header.Get("Alt-Svc"); altSvc != expectedAltSvc {
+		t.Errorf("expected Alt-Svc %q, got %q", expectedAltSvc, altSvc)
+	}
+
+	// 2. Test HTTP/3 (QUIC) requests
+	h3Addr := h3Conn.LocalAddr().String()
+	h3Transport := &http3.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			return quic.DialAddrEarly(ctx, h3Addr, tlsCfg, cfg)
+		},
+	}
+	defer h3Transport.Close()
+
+	h3Client := &http.Client{
+		Transport: h3Transport,
+		Timeout:   3 * time.Second,
+	}
+
+	// Request to example.com/foo
+	h3Resp1, err := h3Client.Get("https://example.com/foo")
+	if err != nil {
+		t.Fatalf("HTTP/3 request to example.com/foo failed: %v", err)
+	}
+	defer h3Resp1.Body.Close()
+
+	if h3Resp1.StatusCode != http.StatusOK {
+		t.Errorf("expected HTTP/3 status 200, got %d", h3Resp1.StatusCode)
+	}
+	body1, _ := io.ReadAll(h3Resp1.Body)
+	if string(body1) != "backend:/foo" {
+		t.Errorf("expected body 'backend:/foo', got %q", string(body1))
+	}
+
+	// Request to app.other.com/bar (wildcard listener match)
+	h3Resp2, err := h3Client.Get("https://app.other.com/bar")
+	if err != nil {
+		t.Fatalf("HTTP/3 request to app.other.com/bar failed: %v", err)
+	}
+	defer h3Resp2.Body.Close()
+
+	if h3Resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected HTTP/3 status 200, got %d", h3Resp2.StatusCode)
+	}
+	body2, _ := io.ReadAll(h3Resp2.Body)
+	if string(body2) != "backend:/bar" {
+		t.Errorf("expected body 'backend:/bar', got %q", string(body2))
+	}
+
+	// Request to unmatched path
+	h3Resp3, err := h3Client.Get("https://example.com/unknown")
+	if err != nil {
+		t.Fatalf("HTTP/3 request to example.com/unknown failed: %v", err)
+	}
+	defer h3Resp3.Body.Close()
+
+	if h3Resp3.StatusCode != http.StatusNotFound {
+		t.Errorf("expected HTTP/3 status 404, got %d", h3Resp3.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for proxy shutdown")
+	}
+}
+
+func TestHTTP3_AutomaticAdvertisedPort(t *testing.T) {
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create HTTPS listener: %v", err)
+	}
+	defer httpsLis.Close()
+
+	h3Conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP packet conn: %v", err)
+	}
+	defer h3Conn.Close()
+
+	h3Port := h3Conn.LocalAddr().(*net.UDPAddr).Port
+
+	opts := Options{
+		HTTPSListener:            httpsLis,
+		HTTP3PacketConn:          h3Conn,
+		ProxyHTTP3AdvertisedPort: 0, // Inferred automatically from HTTP3 listener
+		ProxyAddr:                "",
+		Scheme:                   DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	tcpTr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	tcpClient := &http.Client{Transport: tcpTr, Timeout: 2 * time.Second}
+	reqURL := "https://" + httpsLis.Addr().String() + "/test"
+
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		resp, err = tcpClient.Get(reqURL)
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to HTTPS listener: %v", err)
+	}
+	defer resp.Body.Close()
+
+	expectedAltSvc := fmt.Sprintf(`h3=":%d"; ma=2592000`, h3Port)
+	if altSvc := resp.Header.Get("Alt-Svc"); altSvc != expectedAltSvc {
+		t.Errorf("expected Alt-Svc %q, got %q", expectedAltSvc, altSvc)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for proxy shutdown")
+	}
+}
+
+func TestHTTP3_CustomQUICConfig(t *testing.T) {
+	h3Conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP packet conn: %v", err)
+	}
+	defer h3Conn.Close()
+
+	opts := Options{
+		HTTP3PacketConn: h3Conn,
+		HTTP3QUICConfig: &quic.Config{
+			InitialPacketSize: 1200,
+		},
+		ProxyAddr:      "",
+		ProxyHTTPSAddr: "",
+		Scheme:         DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	h3Addr := h3Conn.LocalAddr().String()
+	h3Transport := &http3.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			return quic.DialAddrEarly(ctx, h3Addr, tlsCfg, cfg)
+		},
+	}
+	defer h3Transport.Close()
+
+	h3Client := &http.Client{
+		Transport: h3Transport,
+		Timeout:   3 * time.Second,
+	}
+
+	h3Resp, err := h3Client.Get("https://example.com/test")
+	if err != nil {
+		t.Fatalf("HTTP/3 request with custom QUICConfig failed: %v", err)
+	}
+	defer h3Resp.Body.Close()
+
+	if h3Resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", h3Resp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for proxy shutdown")
 	}
 }

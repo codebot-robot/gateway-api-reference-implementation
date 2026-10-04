@@ -596,6 +596,7 @@ func TestMultipleServingStreamsLoadBalancing(t *testing.T) {
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
+			DisableKeepAlives: true,
 			TLSClientConfig: &tls.Config{
 				ServerName:         "multi.example.com",
 				InsecureSkipVerify: true,

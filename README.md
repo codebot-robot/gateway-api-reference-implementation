@@ -11,6 +11,28 @@ The goal of this project is to create a simple, pure Go implementation of the [G
 - **Fallback Model**: We are exploring a model where this reference implementation can serve as a fallback for specialized implementations for configurations they cannot accelerate. See [docs/accelerated-operations.md](docs/accelerated-operations.md).
 - **Pure Go**: The implementation should be written in pure Go.
 
+## Features
+
+### HTTP/3 (QUIC) Support
+
+GARI supports serving HTTP/3 over QUIC on HTTPS listeners. Gateway API models HTTPS listeners, and GARI can serve the same hostnames, TLS certificates, and HTTPRoutes over both TCP (HTTP/1.1 and HTTP/2) and QUIC (HTTP/3).
+
+HTTP/3 is opt-in and disabled by default.
+
+#### Configuration Options
+
+- **CLI Flags**:
+  - `--proxy-http3-bind-address`: UDP address to bind for HTTP/3 (e.g. `:8443`). If empty, HTTP/3 is disabled.
+  - `--proxy-http3-advertised-port`: Port advertised in the `Alt-Svc` header on HTTPS (TCP) responses (e.g. `443`). If `0`, the port is inferred from the bind address.
+
+- **Programmatic Options (`pkg/gari.Options`)**:
+  - `ProxyHTTP3Addr`: The UDP address string to bind for HTTP/3.
+  - `ProxyHTTP3AdvertisedPort`: The port number advertised in `Alt-Svc` headers.
+  - `HTTP3PacketConn`: A custom `net.PacketConn` to use for the HTTP/3 server (overriding `ProxyHTTP3Addr`).
+  - `HTTP3QUICConfig`: An optional `*quic.Config` for fine-grained QUIC tuning (e.g., MTU / initial packet size).
+
+When HTTP/3 is enabled, HTTPS (TCP) responses automatically include an `Alt-Svc: h3=":<advertised-port>"` header so compatible clients can discover and upgrade to HTTP/3.
+
 ## Contributing
 
 This project is licensed under the [Apache 2.0 License](LICENSE).

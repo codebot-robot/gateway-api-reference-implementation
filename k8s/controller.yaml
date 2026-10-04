@@ -58,12 +58,15 @@ spec:
       containers:
       - name: controller
         image: gari-controller:latest
-        args: ["--proxy-bind-address", ":8000"]
+        args: ["--proxy-bind-address", ":8000", "--proxy-https-bind-address", ":8443", "--proxy-http3-bind-address", ":8443", "--proxy-http3-advertised-port", "443"]
         ports:
         - containerPort: 8000
           name: proxy
         - containerPort: 8443
           name: proxy-https
+        - containerPort: 8443
+          protocol: UDP
+          name: proxy-http3
 ---
 apiVersion: v1
 kind: Service
@@ -81,6 +84,10 @@ spec:
   - port: 443
     targetPort: 8443
     name: https
+  - port: 443
+    targetPort: 8443
+    protocol: UDP
+    name: http3
   - port: 8080
     targetPort: 8000
     name: http-8080

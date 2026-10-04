@@ -17,14 +17,18 @@ package gari
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/errgroup"
@@ -88,6 +92,21 @@ type Options struct {
 	// ProxyHTTPSAddr is the address the HTTPS proxy server binds to.
 	// Defaults to ":8443". Ignored if HTTPSListener is provided.
 	ProxyHTTPSAddr string
+
+	// ProxyHTTP3Addr is the UDP address the HTTP/3 proxy server binds to.
+	// Defaults to "" (disabled). Ignored if HTTP3PacketConn is provided.
+	ProxyHTTP3Addr string
+
+	// ProxyHTTP3AdvertisedPort is the port advertised in Alt-Svc headers on HTTPS responses.
+	// If 0, the port is inferred from the HTTP/3 listener address.
+	ProxyHTTP3AdvertisedPort int
+
+	// HTTP3PacketConn is an optional custom net.PacketConn for the HTTP/3 proxy server.
+	// If set, ProxyHTTP3Addr is ignored.
+	HTTP3PacketConn net.PacketConn
+
+	// HTTP3QUICConfig is an optional custom QUIC configuration for the HTTP/3 proxy server.
+	HTTP3QUICConfig *quic.Config
 
 	// EnableH2C enables HTTP/2 Cleartext (H2C) support on the HTTP proxy server.
 	EnableH2C bool
@@ -250,9 +269,30 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 	})
 }
 
+func (s *Server) initDefaultCertificate() error {
+	if s.opts.DefaultCertificate != nil {
+		s.proxy.SetDefaultCertificate(s.opts.DefaultCertificate)
+		return nil
+	}
+	cert, err := GenerateSelfSignedCert()
+	if err != nil {
+		return fmt.Errorf("failed to generate self-signed cert: %w", err)
+	}
+	s.proxy.SetDefaultCertificate(&cert)
+	return nil
+}
+
 // StartProxyServers starts the HTTP and HTTPS proxy servers and blocks until ctx is canceled.
 func (s *Server) StartProxyServers(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
+
+	hasHTTPS := s.opts.HTTPSListener != nil || s.opts.ProxyHTTPSAddr != ""
+	hasHTTP3 := s.opts.HTTP3PacketConn != nil || s.opts.ProxyHTTP3Addr != ""
+	if hasHTTPS || hasHTTP3 {
+		if err := s.initDefaultCertificate(); err != nil {
+			return err
+		}
+	}
 
 	// HTTP Proxy Server
 	if s.opts.HTTPListener != nil || s.opts.ProxyAddr != "" {
@@ -291,8 +331,41 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 		})
 	}
 
+	var h3Conn net.PacketConn
+	var advertisedH3Port int
+
+	if hasHTTP3 {
+		if s.opts.HTTP3PacketConn != nil {
+			h3Conn = s.opts.HTTP3PacketConn
+		} else {
+			var err error
+			h3Conn, err = net.ListenPacket("udp", s.opts.ProxyHTTP3Addr)
+			if err != nil {
+				return fmt.Errorf("failed to listen on HTTP/3 proxy address %q: %w", s.opts.ProxyHTTP3Addr, err)
+			}
+		}
+
+		advertisedH3Port = s.opts.ProxyHTTP3AdvertisedPort
+		if advertisedH3Port == 0 && h3Conn != nil {
+			if udpAddr, ok := h3Conn.LocalAddr().(*net.UDPAddr); ok {
+				advertisedH3Port = udpAddr.Port
+			} else {
+				_, portStr, err := net.SplitHostPort(h3Conn.LocalAddr().String())
+				if err == nil {
+					if p, err := strconv.Atoi(portStr); err == nil {
+						advertisedH3Port = p
+					}
+				}
+			}
+		}
+	}
+
+	tlsConfig := &tls.Config{
+		GetCertificate: s.proxy.GetCertificate,
+	}
+
 	// HTTPS Proxy Server
-	if s.opts.HTTPSListener != nil || s.opts.ProxyHTTPSAddr != "" {
+	if hasHTTPS {
 		g.Go(func() error {
 			var lis net.Listener
 			if s.opts.HTTPSListener != nil {
@@ -307,21 +380,17 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 
 			setupLog.Info("starting proxy HTTPS server", "addr", lis.Addr().String())
 
-			if s.opts.DefaultCertificate != nil {
-				s.proxy.SetDefaultCertificate(s.opts.DefaultCertificate)
-			} else {
-				cert, err := GenerateSelfSignedCert()
-				if err != nil {
-					return fmt.Errorf("failed to generate self-signed cert: %w", err)
-				}
-				s.proxy.SetDefaultCertificate(&cert)
+			var handler http.Handler = s.proxy
+			if hasHTTP3 && advertisedH3Port > 0 {
+				altSvcVal := fmt.Sprintf(`h3=":%d"; ma=2592000`, advertisedH3Port)
+				handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Alt-Svc", altSvcVal)
+					s.proxy.ServeHTTP(w, r)
+				})
 			}
 
-			tlsConfig := &tls.Config{
-				GetCertificate: s.proxy.GetCertificate,
-			}
 			srv := &http.Server{
-				Handler:   s.proxy,
+				Handler:   handler,
 				TLSConfig: tlsConfig,
 			}
 			if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
@@ -337,6 +406,34 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			}()
 			if err := srv.Serve(tlsLis); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy HTTPS server failed: %w", err)
+			}
+			return nil
+		})
+	}
+
+	// HTTP/3 Proxy Server
+	if hasHTTP3 && h3Conn != nil {
+		g.Go(func() error {
+			setupLog.Info("starting proxy HTTP/3 server", "addr", h3Conn.LocalAddr().String())
+
+			h3Server := &http3.Server{
+				Handler:    s.proxy,
+				TLSConfig:  tlsConfig,
+				Port:       advertisedH3Port,
+				QUICConfig: s.opts.HTTP3QUICConfig,
+			}
+
+			go func() {
+				<-ctx.Done()
+				setupLog.Info("shutting down proxy HTTP/3 server")
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = h3Server.Shutdown(shutdownCtx)
+				_ = h3Conn.Close()
+			}()
+
+			if err := h3Server.Serve(h3Conn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, quic.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				return fmt.Errorf("proxy HTTP/3 server failed: %w", err)
 			}
 			return nil
 		})

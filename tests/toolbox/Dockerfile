@@ -14,8 +14,10 @@
 
 FROM golang:1.27.1 AS builder
 WORKDIR /app
-COPY main.go .
-RUN CGO_ENABLED=0 go build -o toolbox main.go
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o toolbox tests/toolbox/main.go
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /app

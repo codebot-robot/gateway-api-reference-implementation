@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -304,6 +305,9 @@ spec:
   - name: http
     protocol: HTTP
     port: 80
+  - name: https
+    protocol: HTTPS
+    port: 443
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -322,25 +326,31 @@ spec:
 }
 
 func (h *Harness) ClientManifest(url string, host string) string {
+	return h.ClientManifestWithArgs("test-client", url, host)
+}
+
+func (h *Harness) ClientManifestWithArgs(name string, args ...string) string {
+	argsJSON, _ := json.Marshal(args)
 	return fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
 metadata:
-  name: test-client
+  name: %s
 spec:
   containers:
   - name: toolbox
     image: toolbox:e2e
     imagePullPolicy: Never
-    command: ["/app/toolbox", "client", "%s", "%s"]
+    command: ["/app/toolbox", "client"]
+    args: %s
   restartPolicy: Never
-`, url, host)
+`, name, string(argsJSON))
 }
 
 func (h *Harness) DeployBackend() {
 	h.t.Log("Deploying Backend")
 	gitRoot := h.GetGitRoot()
-	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), filepath.Join(gitRoot, "tests/toolbox"))
+	h.DockerBuild("toolbox:e2e", filepath.Join(gitRoot, "tests/toolbox/Dockerfile"), gitRoot)
 	h.KindLoad("toolbox:e2e")
 
 	h.KubectlApplyContent(h.BackendManifest())
