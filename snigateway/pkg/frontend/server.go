@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/sni"
 )
 
@@ -239,6 +240,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 	_ = chosenSession
+
+	proxyHdr := &proxyproto.Header{
+		Command:   proxyproto.CommandProxy,
+		SrcAddr:   peekedConn.RemoteAddr(),
+		DstAddr:   peekedConn.LocalAddr(),
+		Authority: sniHostname,
+	}
+	if _, err := tunnelConn.Write(proxyHdr.Format()); err != nil {
+		log.Printf("Frontend: failed to write PROXY header on tunnel connection: %v", err)
+		_ = tunnelConn.Close()
+		_ = peekedConn.Close()
+		return
+	}
 
 	spliceConnections(peekedConn, tunnelConn)
 }

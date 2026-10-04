@@ -121,6 +121,8 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Custom-Header", "ReverseTunnel")
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+		w.Header().Set("X-Real-Client-IP", clientIP)
 		_, _ = fmt.Fprintf(w, "Hello from backend for host: %s, path: %s", r.Host, r.URL.Path)
 	})
 
@@ -200,6 +202,9 @@ func TestTunnelListenerHTTPSIntegration(t *testing.T) {
 		}
 		if gotHeader := resp.Header.Get("X-Custom-Header"); gotHeader != "ReverseTunnel" {
 			t.Fatalf("expected header 'ReverseTunnel', got %q", gotHeader)
+		}
+		if clientIP := resp.Header.Get("X-Real-Client-IP"); clientIP != "127.0.0.1" {
+			t.Fatalf("expected real client IP 127.0.0.1 via PROXY protocol, got %q", clientIP)
 		}
 		expectedBody := "Hello from backend for host: service.example.com, path: /hello"
 		if body != expectedBody {

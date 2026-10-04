@@ -15,6 +15,7 @@
 package tunnel
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -309,16 +311,16 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 				return
 			}
 
-			// Watch connection for activation or drop
-			buf := make([]byte, 4096)
-			n, err := conn.Read(buf)
+			// Watch connection for activation via PROXY protocol header or drop
+			bufReader := bufio.NewReader(conn)
+			hdr, err := proxyproto.Decode(bufReader)
 
 			// Decrement idle count immediately upon read (either activated or closed)
 			activeIdleMu.Lock()
 			activeIdle--
 			activeIdleMu.Unlock()
 
-			if err != nil && n == 0 {
+			if err != nil {
 				_ = conn.Close()
 				if ctx.Err() == nil {
 					triggerRefill()
@@ -329,8 +331,14 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 			// Connection is activated! Trigger pool refill immediately
 			triggerRefill()
 
-			wrappedConn := newPrefixedConn(conn, buf[:n])
-			if err := m.listener.Enqueue(wrappedConn); err != nil {
+			var remaining []byte
+			if bufReader.Buffered() > 0 {
+				remaining = make([]byte, bufReader.Buffered())
+				_, _ = io.ReadFull(bufReader, remaining)
+			}
+
+			proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
+			if err := m.listener.Enqueue(proxyConn); err != nil {
 				_ = conn.Close()
 			}
 		}()

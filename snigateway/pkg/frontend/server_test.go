@@ -15,6 +15,7 @@
 package frontend
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -25,6 +26,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -35,6 +37,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 )
 
 // generateTestBackendCert creates a self-signed cert for the fake backend application served over reverse tunnel.
@@ -140,20 +143,23 @@ func startBackendWorker(ctx context.Context, t *testing.T, c *client.Client, hos
 					}
 				}
 
-				buf := make([]byte, 4096)
-				n, err := conn.Read(buf)
-				if err != nil && n == 0 {
+				bufReader := bufio.NewReader(conn)
+				hdr, err := proxyproto.Decode(bufReader)
+				if err != nil {
 					_ = conn.Close()
 					continue
 				}
 
-				wrapped := &prefixedConn{
-					Conn:   conn,
-					prefix: buf[:n],
+				var remaining []byte
+				if bufReader.Buffered() > 0 {
+					remaining = make([]byte, bufReader.Buffered())
+					_, _ = io.ReadFull(bufReader, remaining)
 				}
 
+				proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
+
 				if onConn != nil {
-					go onConn(wrapped)
+					go onConn(proxyConn)
 				}
 			}
 		}()
