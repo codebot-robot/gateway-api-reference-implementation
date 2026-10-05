@@ -118,11 +118,6 @@ func (el *EffectiveListener) IsConflicted() bool {
 	return false
 }
 
-// IsValid returns true if the listener is accepted, programmed, and not conflicted.
-func (el *EffectiveListener) IsValid() bool {
-	return el.IsAccepted() && el.IsProgrammed() && !el.IsConflicted()
-}
-
 // QualifiedName returns the listener name, qualified with owner namespace and name for ListenerSets.
 func (el *EffectiveListener) QualifiedName() string {
 	if el.Owner.Kind == "Gateway" {
@@ -499,7 +494,7 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 
 	for _, el := range effectiveListeners {
 		if el.Owner.Kind == "Gateway" {
-			if el.IsValid() {
+			if el.IsAccepted() {
 				acceptedListenersCount++
 			}
 		}
@@ -559,6 +554,10 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 	}
 }
 
+// areProtocolsCompatible returns true if two listeners on the same port can co-exist.
+// HTTP listeners can share a port with other HTTP listeners (differentiated by hostname).
+// HTTPS listeners can share a port with other HTTPS listeners (differentiated by SNI/hostname).
+// TODO: HTTPS and TLS listeners can also share a port (both routed by SNI); enable when TLSRoute is supported.
 func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 	if p1 == p2 {
 		if p1 == gatewayv1.HTTPProtocolType || p1 == gatewayv1.HTTPSProtocolType || p1 == gatewayv1.TLSProtocolType {
@@ -566,6 +565,7 @@ func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 		}
 		return false
 	}
+	// TODO: Support HTTPS and TLS protocol sharing on the same port once TLSRoute is implemented.
 	return false
 }
 
@@ -681,7 +681,12 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 
 				// Check protocol compatibility
 				if !areProtocolsCompatible(elPrev.Protocol, elCur.Protocol) {
-					msg := fmt.Sprintf("Protocol %q conflicts with higher-precedence listener %q protocol %q on port %d", elCur.Protocol, elPrev.QualifiedName(), elPrev.Protocol, elCur.Port)
+					var msg string
+					if elPrev.Protocol == elCur.Protocol {
+						msg = fmt.Sprintf("Multiple %q listeners cannot share port %d without hostname/SNI routing (conflicts with %q)", elCur.Protocol, elCur.Port, elPrev.QualifiedName())
+					} else {
+						msg = fmt.Sprintf("Protocol %q conflicts with higher-precedence listener %q protocol %q on port %d", elCur.Protocol, elPrev.QualifiedName(), elPrev.Protocol, elCur.Port)
+					}
 					markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
 					break
 				}
@@ -697,13 +702,13 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			}
 		}
 
-		// Count only accepted ListenerSets (where at least one listener is valid)
+		// Count only accepted ListenerSets (where at least one listener is valid/programmed and unconflicted)
 		acceptedLSCount := int32(0)
 		for _, ls := range allowedListenerSets {
 			validCount := 0
 			for _, el := range cg.EffectiveListeners {
 				if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == ls.Namespace && el.Owner.Name == ls.Name {
-					if el.IsValid() {
+					if el.IsAccepted() && el.IsProgrammed() && !el.IsConflicted() {
 						validCount++
 					}
 				}
@@ -808,7 +813,7 @@ func bindRouteParentRef(
 			)
 		}
 		for _, el := range cg.EffectiveListeners {
-			if el.Owner.Kind == "Gateway" && el.IsValid() {
+			if el.Owner.Kind == "Gateway" && el.IsAccepted() {
 				candidateListeners = append(candidateListeners, el)
 			}
 		}
@@ -840,7 +845,7 @@ func bindRouteParentRef(
 		}
 
 		for _, el := range cg.EffectiveListeners {
-			if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == targetLS.Namespace && el.Owner.Name == targetLS.Name && el.IsValid() {
+			if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == targetLS.Namespace && el.Owner.Name == targetLS.Name && el.IsAccepted() {
 				candidateListeners = append(candidateListeners, el)
 			}
 		}
@@ -981,7 +986,7 @@ func ExtractCertificates(
 			continue
 		}
 		for _, el := range cg.EffectiveListeners {
-			if !el.IsValid() {
+			if !el.IsAccepted() {
 				continue
 			}
 			if (el.Protocol != gatewayv1.HTTPSProtocolType && el.Protocol != gatewayv1.TLSProtocolType) || el.TLS == nil {
@@ -1074,7 +1079,7 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 			continue
 		}
 		for _, el := range cg.EffectiveListeners {
-			if !el.IsValid() {
+			if !el.IsAccepted() {
 				continue
 			}
 			iListener := el.ToInternalListener()

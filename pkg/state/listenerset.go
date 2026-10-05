@@ -129,7 +129,7 @@ func ComputeListenerSetConditions(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gatew
 		validCount := 0
 		for _, el := range effectiveListeners {
 			if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == ls.Namespace && el.Owner.Name == ls.Name {
-				if el.IsValid() {
+				if el.IsAccepted() && el.IsProgrammed() && !el.IsConflicted() {
 					validCount++
 				}
 			}
@@ -167,9 +167,4 @@ func ComputeListenerSetConditions(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gatew
 			"ListenerSet programmed by reference implementation",
 			ls.Generation,
 		)
-}
-
-// ComputeListenerSetAcceptedCondition computes the Accepted and Programmed conditions for a ListenerSet without listener aggregation.
-func ComputeListenerSetAcceptedCondition(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gateway, namespaces map[string]*corev1.Namespace) (metav1.Condition, metav1.Condition) {
-	return ComputeListenerSetConditions(ls, gw, namespaces, nil)
 }

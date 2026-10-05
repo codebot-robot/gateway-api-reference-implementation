@@ -95,10 +95,29 @@ func (r *ListenerSetReconciler) updateProxy() {
 	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
+const listenerSetSecretIndex = ".spec.listeners.tls.certificateRefs"
+
 func (r *ListenerSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ControllerName == "" {
 		return fmt.Errorf("ControllerName is required")
 	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.ListenerSet{}, listenerSetSecretIndex, func(obj client.Object) []string {
+		ls := obj.(*gatewayv1.ListenerSet)
+		var secretKeys []string
+		for _, l := range ls.Spec.Listeners {
+			if l.TLS != nil {
+				for _, ref := range l.TLS.CertificateRefs {
+					secKey := ResolveNamespacedName(ref.Namespace, ref.Name, ls)
+					secretKeys = append(secretKeys, secKey.String())
+				}
+			}
+		}
+		return secretKeys
+	}); err != nil {
+		return fmt.Errorf("failed to create field indexer for ListenerSet secrets: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.ListenerSet{}).
 		Watches(&gatewayv1.ListenerSet{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
@@ -194,35 +213,19 @@ func (r *ListenerSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			secret := obj.(*corev1.Secret)
+			secretKey := types.NamespacedName{Namespace: secret.Namespace, Name: secret.Name}.String()
 			var lsList gatewayv1.ListenerSetList
-			if err := r.List(ctx, &lsList); err != nil {
+			if err := r.List(ctx, &lsList, client.MatchingFields{listenerSetSecretIndex: secretKey}); err != nil {
 				return nil
 			}
 			var requests []ctrl.Request
 			for _, ls := range lsList.Items {
-				matched := false
-				for _, l := range ls.Spec.Listeners {
-					if l.TLS != nil {
-						for _, ref := range l.TLS.CertificateRefs {
-							secKey := ResolveNamespacedName(ref.Namespace, ref.Name, &ls)
-							if secKey.Namespace == secret.Namespace && secKey.Name == secret.Name {
-								matched = true
-								break
-							}
-						}
-					}
-					if matched {
-						break
-					}
-				}
-				if matched {
-					requests = append(requests, ctrl.Request{
-						NamespacedName: types.NamespacedName{
-							Namespace: ls.Namespace,
-							Name:      ls.Name,
-						},
-					})
-				}
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: ls.Namespace,
+						Name:      ls.Name,
+					},
+				})
 			}
 			return requests
 		})).

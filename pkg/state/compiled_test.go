@@ -1225,8 +1225,8 @@ func TestCompileModel_PrecedenceAndConflicts(t *testing.T) {
 				if found.IsConflicted() {
 					t.Errorf("listener %s expected to NOT be conflicted, but is", unconf)
 				}
-				if !found.IsValid() {
-					t.Errorf("listener %s expected to be valid, but is not", unconf)
+				if !found.IsAccepted() {
+					t.Errorf("listener %s expected to be accepted, but is not", unconf)
 				}
 			}
 
@@ -1427,4 +1427,116 @@ func TestCompileModel_ListenerSetReferenceGrant(t *testing.T) {
 			t.Errorf("expected listener ResolvedRefs=True (ResolvedRefs), got %v", resCond)
 		}
 	})
+}
+
+func TestCompileModel_GatewayUnresolvedCertRouteAttachment(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{
+								Name: "nonexistent-secret",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "gw",
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "svc",
+									Port: Ptr(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gw},
+		HTTPRoutes: []*gatewayv1.HTTPRoute{route},
+		Services: map[types.NamespacedName]*corev1.Service{
+			{Namespace: "default", Name: "svc"}: {ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "svc"}},
+		},
+		Secrets: map[types.NamespacedName]*corev1.Secret{}, // secret is missing
+	})
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw"}
+	cg := compiled.Gateways[gwKey]
+	if cg == nil {
+		t.Fatalf("compiled gateway not found")
+	}
+
+	// Gateway should remain Accepted=True
+	var gwAccCond *metav1.Condition
+	for i := range cg.Conditions {
+		if cg.Conditions[i].Type == string(gatewayv1.GatewayConditionAccepted) {
+			gwAccCond = &cg.Conditions[i]
+		}
+	}
+	if gwAccCond == nil || gwAccCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Gateway Accepted=True, got %v", gwAccCond)
+	}
+
+	// Listener should have ResolvedRefs=False, but AttachedRoutes=1
+	if len(cg.EffectiveListeners) != 1 {
+		t.Fatalf("expected 1 effective listener, got %d", len(cg.EffectiveListeners))
+	}
+	el := cg.EffectiveListeners[0]
+	if el.AttachedRoutes != 1 {
+		t.Errorf("expected listener AttachedRoutes=1, got %d", el.AttachedRoutes)
+	}
+	if !el.IsAccepted() {
+		t.Errorf("expected listener IsAccepted()=true")
+	}
+	if el.IsProgrammed() {
+		t.Errorf("expected listener IsProgrammed()=false (due to unresolved ref)")
+	}
+
+	// Route should be Accepted=True
+	routeKey := types.NamespacedName{Namespace: "default", Name: "route"}
+	cr := compiled.HTTPRoutes[routeKey]
+	if cr == nil {
+		t.Fatalf("compiled route not found")
+	}
+	routeStatus, _ := ComputeDesiredHTTPRouteStatus(route, cr, "example.net/gateway-controller")
+	if len(routeStatus.Parents) != 1 {
+		t.Fatalf("expected 1 parent in route status, got %d", len(routeStatus.Parents))
+	}
+	var routeAccCond *metav1.Condition
+	for i := range routeStatus.Parents[0].Conditions {
+		if routeStatus.Parents[0].Conditions[i].Type == string(gatewayv1.RouteConditionAccepted) {
+			routeAccCond = &routeStatus.Parents[0].Conditions[i]
+		}
+	}
+	if routeAccCond == nil || routeAccCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Route Accepted=True, got %v", routeAccCond)
+	}
 }
