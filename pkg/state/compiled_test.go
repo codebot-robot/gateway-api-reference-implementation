@@ -985,3 +985,446 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 		})
 	}
 }
+
+func TestCompileModel_PrecedenceAndConflicts(t *testing.T) {
+	sameFrom := gatewayv1.NamespacesFromSame
+	allFrom := gatewayv1.NamespacesFromAll
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(10 * time.Minute)
+	t2 := t0.Add(20 * time.Minute)
+
+	tests := []struct {
+		name                 string
+		gateway              *gatewayv1.Gateway
+		listenerSets         []*gatewayv1.ListenerSet
+		expectedAttachedLS   int32
+		expectedConflicted   map[string]gatewayv1.ListenerConditionReason
+		expectedUnconflicted []string
+		expectedLSStatus     map[string]metav1.ConditionStatus
+		expectedLSReason     map[string]string
+	}{
+		{
+			name: "Hostname conflict: Gateway listener wins over ListenerSet listener",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{From: &sameFrom},
+					},
+					Listeners: []gatewayv1.Listener{
+						{Name: "gw-http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("example.com"))},
+					},
+				},
+			},
+			listenerSets: []*gatewayv1.ListenerSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "ls1", Namespace: "default", CreationTimestamp: metav1.NewTime(t0)},
+					Spec: gatewayv1.ListenerSetSpec{
+						ParentRef: gatewayv1.ParentGatewayReference{Name: "gw"},
+						Listeners: []gatewayv1.ListenerEntry{
+							{Name: "ls-conflict", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("example.com"))},
+						},
+					},
+				},
+			},
+			expectedAttachedLS: 0,
+			expectedConflicted: map[string]gatewayv1.ListenerConditionReason{
+				"default/ls1/ls-conflict": gatewayv1.ListenerReasonHostnameConflict,
+			},
+			expectedUnconflicted: []string{"gw-http"},
+			expectedLSStatus: map[string]metav1.ConditionStatus{
+				"ls1": metav1.ConditionFalse,
+			},
+			expectedLSReason: map[string]string{
+				"ls1": string(gatewayv1.ListenerSetReasonListenersNotValid),
+			},
+		},
+		{
+			name: "Protocol conflict: Gateway HTTP wins over ListenerSet TCP on port 80",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{From: &sameFrom},
+					},
+					Listeners: []gatewayv1.Listener{
+						{Name: "gw-http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+					},
+				},
+			},
+			listenerSets: []*gatewayv1.ListenerSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "ls1", Namespace: "default", CreationTimestamp: metav1.NewTime(t0)},
+					Spec: gatewayv1.ListenerSetSpec{
+						ParentRef: gatewayv1.ParentGatewayReference{Name: "gw"},
+						Listeners: []gatewayv1.ListenerEntry{
+							{Name: "ls-tcp", Port: 80, Protocol: gatewayv1.TCPProtocolType},
+						},
+					},
+				},
+			},
+			expectedAttachedLS: 0,
+			expectedConflicted: map[string]gatewayv1.ListenerConditionReason{
+				"default/ls1/ls-tcp": gatewayv1.ListenerReasonProtocolConflict,
+			},
+			expectedUnconflicted: []string{"gw-http"},
+			expectedLSStatus: map[string]metav1.ConditionStatus{
+				"ls1": metav1.ConditionFalse,
+			},
+			expectedLSReason: map[string]string{
+				"ls1": string(gatewayv1.ListenerSetReasonListenersNotValid),
+			},
+		},
+		{
+			name: "Precedence by CreationTimestamp: older ListenerSet wins hostname conflict over younger",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{From: &allFrom},
+					},
+					Listeners: []gatewayv1.Listener{
+						{Name: "gw-other", Port: 8080, Protocol: gatewayv1.HTTPProtocolType},
+					},
+				},
+			},
+			listenerSets: []*gatewayv1.ListenerSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "ls-younger", Namespace: "default", CreationTimestamp: metav1.NewTime(t2)},
+					Spec: gatewayv1.ListenerSetSpec{
+						ParentRef: gatewayv1.ParentGatewayReference{Name: "gw"},
+						Listeners: []gatewayv1.ListenerEntry{
+							{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("app.io"))},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "ls-older", Namespace: "default", CreationTimestamp: metav1.NewTime(t1)},
+					Spec: gatewayv1.ListenerSetSpec{
+						ParentRef: gatewayv1.ParentGatewayReference{Name: "gw"},
+						Listeners: []gatewayv1.ListenerEntry{
+							{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("app.io"))},
+						},
+					},
+				},
+			},
+			expectedAttachedLS: 1,
+			expectedConflicted: map[string]gatewayv1.ListenerConditionReason{
+				"default/ls-younger/http": gatewayv1.ListenerReasonHostnameConflict,
+			},
+			expectedUnconflicted: []string{"gw-other", "default/ls-older/http"},
+			expectedLSStatus: map[string]metav1.ConditionStatus{
+				"ls-older":   metav1.ConditionTrue,
+				"ls-younger": metav1.ConditionFalse,
+			},
+			expectedLSReason: map[string]string{
+				"ls-older":   string(gatewayv1.ListenerSetReasonAccepted),
+				"ls-younger": string(gatewayv1.ListenerSetReasonListenersNotValid),
+			},
+		},
+		{
+			name: "Partial vs full conflict: ListenerSet with one valid listener stays Accepted=True",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{From: &sameFrom},
+					},
+					Listeners: []gatewayv1.Listener{
+						{Name: "gw-http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("gw.io"))},
+					},
+				},
+			},
+			listenerSets: []*gatewayv1.ListenerSet{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "ls-mixed", Namespace: "default", CreationTimestamp: metav1.NewTime(t0)},
+					Spec: gatewayv1.ListenerSetSpec{
+						ParentRef: gatewayv1.ParentGatewayReference{Name: "gw"},
+						Listeners: []gatewayv1.ListenerEntry{
+							{Name: "conflicted-http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("gw.io"))},
+							{Name: "valid-http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Hostname: Ptr(gatewayv1.Hostname("valid.io"))},
+						},
+					},
+				},
+			},
+			expectedAttachedLS: 1,
+			expectedConflicted: map[string]gatewayv1.ListenerConditionReason{
+				"default/ls-mixed/conflicted-http": gatewayv1.ListenerReasonHostnameConflict,
+			},
+			expectedUnconflicted: []string{"gw-http", "default/ls-mixed/valid-http"},
+			expectedLSStatus: map[string]metav1.ConditionStatus{
+				"ls-mixed": metav1.ConditionTrue,
+			},
+			expectedLSReason: map[string]string{
+				"ls-mixed": string(gatewayv1.ListenerSetReasonAccepted),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			compiled := CompileModel(ModelInputs{
+				Gateways:     []*gatewayv1.Gateway{tc.gateway},
+				ListenerSets: tc.listenerSets,
+				Namespaces:   map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+			})
+
+			gwKey := types.NamespacedName{Namespace: tc.gateway.Namespace, Name: tc.gateway.Name}
+			cg := compiled.Gateways[gwKey]
+			if cg == nil {
+				t.Fatalf("compiled gateway not found")
+			}
+
+			if cg.AttachedListenerSets != tc.expectedAttachedLS {
+				t.Errorf("expected AttachedListenerSets = %d, got %d", tc.expectedAttachedLS, cg.AttachedListenerSets)
+			}
+
+			// Check listeners
+			for _, el := range cg.EffectiveListeners {
+				qName := el.QualifiedName()
+				expectedReason, shouldBeConflicted := tc.expectedConflicted[qName]
+				if shouldBeConflicted {
+					if !el.IsConflicted() {
+						t.Errorf("listener %s expected to be conflicted", qName)
+					}
+					var confCond, accCond, progCond *metav1.Condition
+					for i := range el.Conditions {
+						if el.Conditions[i].Type == string(gatewayv1.ListenerConditionConflicted) {
+							confCond = &el.Conditions[i]
+						}
+						if el.Conditions[i].Type == string(gatewayv1.ListenerConditionAccepted) {
+							accCond = &el.Conditions[i]
+						}
+						if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+							progCond = &el.Conditions[i]
+						}
+					}
+					if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(expectedReason) {
+						t.Errorf("listener %s expected Conflicted=True reason %s, got %v", qName, expectedReason, confCond)
+					}
+					if accCond == nil || accCond.Status != metav1.ConditionFalse || accCond.Reason != string(expectedReason) {
+						t.Errorf("listener %s expected Accepted=False reason %s, got %v", qName, expectedReason, accCond)
+					}
+					if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(expectedReason) {
+						t.Errorf("listener %s expected Programmed=False reason %s, got %v", qName, expectedReason, progCond)
+					}
+				}
+			}
+
+			for _, unconf := range tc.expectedUnconflicted {
+				var found *EffectiveListener
+				for _, el := range cg.EffectiveListeners {
+					if el.QualifiedName() == unconf {
+						found = el
+						break
+					}
+				}
+				if found == nil {
+					t.Fatalf("unconflicted listener %s not found in effective listeners", unconf)
+				}
+				if found.IsConflicted() {
+					t.Errorf("listener %s expected to NOT be conflicted, but is", unconf)
+				}
+				if !found.IsValid() {
+					t.Errorf("listener %s expected to be valid, but is not", unconf)
+				}
+			}
+
+			// Check ListenerSet desired status
+			for _, ls := range tc.listenerSets {
+				lsStatus, _ := ComputeDesiredListenerSetStatus(ls, tc.gateway, map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}}, cg)
+				expectedStatus, ok := tc.expectedLSStatus[ls.Name]
+				if ok {
+					var accCond *metav1.Condition
+					for i := range lsStatus.Conditions {
+						if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {
+							accCond = &lsStatus.Conditions[i]
+						}
+					}
+					if accCond == nil || accCond.Status != expectedStatus {
+						t.Errorf("ListenerSet %s expected Accepted=%v, got %v", ls.Name, expectedStatus, accCond)
+					}
+					if expectedReason, ok := tc.expectedLSReason[ls.Name]; ok {
+						if accCond != nil && accCond.Reason != expectedReason {
+							t.Errorf("ListenerSet %s expected Reason=%s, got %s", ls.Name, expectedReason, accCond.Reason)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCompileModel_ListenerSetReferenceGrant(t *testing.T) {
+	certPEM, keyPEM := generateTestCertPEM(t, "cross-ns.example.com")
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "secret-ns", Name: "my-secret"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "secret-ns", Name: "my-secret"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       certPEM,
+				corev1.TLSPrivateKeyKey: keyPEM,
+			},
+		},
+	}
+
+	stWithGrant := NewState()
+	stWithGrant.UpsertReferenceGrant(&gatewayv1beta1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Name: "grant", Namespace: "secret-ns"},
+		Spec: gatewayv1beta1.ReferenceGrantSpec{
+			From: []gatewayv1beta1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      "ListenerSet",
+					Namespace: "ls-ns",
+				},
+			},
+			To: []gatewayv1beta1.ReferenceGrantTo{
+				{
+					Group: "",
+					Kind:  "Secret",
+					Name:  Ptr(gatewayv1.ObjectName("my-secret")),
+				},
+			},
+		},
+	})
+
+	allFrom := gatewayv1.NamespacesFromAll
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "gw-ns"},
+		Spec: gatewayv1.GatewaySpec{
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{From: &allFrom},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	ls := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ls-tls", Namespace: "ls-ns"},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name:      "gw",
+				Namespace: Ptr(gatewayv1.Namespace("gw-ns")),
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{
+								Namespace: Ptr(gatewayv1.Namespace("secret-ns")),
+								Name:      "my-secret",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	namespaces := map[string]*corev1.Namespace{
+		"gw-ns":     {ObjectMeta: metav1.ObjectMeta{Name: "gw-ns"}},
+		"ls-ns":     {ObjectMeta: metav1.ObjectMeta{Name: "ls-ns"}},
+		"secret-ns": {ObjectMeta: metav1.ObjectMeta{Name: "secret-ns"}},
+	}
+
+	t.Run("Without ReferenceGrant", func(t *testing.T) {
+		compiled := CompileModel(ModelInputs{
+			Gateways:     []*gatewayv1.Gateway{gw},
+			ListenerSets: []*gatewayv1.ListenerSet{ls},
+			Secrets:      secrets,
+			Namespaces:   namespaces,
+			RefValidator: NewState(), // empty validator
+		})
+
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "gw-ns", Name: "gw"}]
+		if cg == nil {
+			t.Fatalf("compiled gateway not found")
+		}
+		if cg.AttachedListenerSets != 0 {
+			t.Errorf("expected AttachedListenerSets = 0 without grant, got %d", cg.AttachedListenerSets)
+		}
+
+		lsStatus, _ := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
+		var accCond, progCond *metav1.Condition
+		for i := range lsStatus.Conditions {
+			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {
+				accCond = &lsStatus.Conditions[i]
+			}
+			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionProgrammed) {
+				progCond = &lsStatus.Conditions[i]
+			}
+		}
+		if accCond == nil || accCond.Status != metav1.ConditionFalse || accCond.Reason != string(gatewayv1.ListenerSetReasonListenersNotValid) {
+			t.Errorf("expected ListenerSet Accepted=False (ListenersNotValid), got %v", accCond)
+		}
+		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerSetReasonListenersNotValid) {
+			t.Errorf("expected ListenerSet Programmed=False (ListenersNotValid), got %v", progCond)
+		}
+
+		if len(lsStatus.Listeners) != 1 {
+			t.Fatalf("expected 1 listener in ListenerSet status, got %d", len(lsStatus.Listeners))
+		}
+		var resCond *metav1.Condition
+		for i := range lsStatus.Listeners[0].Conditions {
+			if lsStatus.Listeners[0].Conditions[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
+				resCond = &lsStatus.Listeners[0].Conditions[i]
+			}
+		}
+		if resCond == nil || resCond.Status != metav1.ConditionFalse || resCond.Reason != string(gatewayv1.ListenerReasonRefNotPermitted) {
+			t.Errorf("expected listener ResolvedRefs=False (RefNotPermitted), got %v", resCond)
+		}
+	})
+
+	t.Run("With ReferenceGrant", func(t *testing.T) {
+		compiled := CompileModel(ModelInputs{
+			Gateways:     []*gatewayv1.Gateway{gw},
+			ListenerSets: []*gatewayv1.ListenerSet{ls},
+			Secrets:      secrets,
+			Namespaces:   namespaces,
+			RefValidator: stWithGrant,
+		})
+
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "gw-ns", Name: "gw"}]
+		if cg == nil {
+			t.Fatalf("compiled gateway not found")
+		}
+		if cg.AttachedListenerSets != 1 {
+			t.Errorf("expected AttachedListenerSets = 1 with grant, got %d", cg.AttachedListenerSets)
+		}
+
+		lsStatus, _ := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
+		var accCond, progCond *metav1.Condition
+		for i := range lsStatus.Conditions {
+			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {
+				accCond = &lsStatus.Conditions[i]
+			}
+			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionProgrammed) {
+				progCond = &lsStatus.Conditions[i]
+			}
+		}
+		if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerSetReasonAccepted) {
+			t.Errorf("expected ListenerSet Accepted=True (Accepted), got %v", accCond)
+		}
+		if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerSetReasonProgrammed) {
+			t.Errorf("expected ListenerSet Programmed=True (Programmed), got %v", progCond)
+		}
+
+		if len(lsStatus.Listeners) != 1 {
+			t.Fatalf("expected 1 listener in ListenerSet status, got %d", len(lsStatus.Listeners))
+		}
+		var resCond *metav1.Condition
+		for i := range lsStatus.Listeners[0].Conditions {
+			if lsStatus.Listeners[0].Conditions[i].Type == string(gatewayv1.ListenerConditionResolvedRefs) {
+				resCond = &lsStatus.Listeners[0].Conditions[i]
+			}
+		}
+		if resCond == nil || resCond.Status != metav1.ConditionTrue || resCond.Reason != string(gatewayv1.ListenerReasonResolvedRefs) {
+			t.Errorf("expected listener ResolvedRefs=True (ResolvedRefs), got %v", resCond)
+		}
+	})
+}

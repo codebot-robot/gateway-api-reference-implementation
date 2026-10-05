@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type ListenerSetReconciler struct {
@@ -100,6 +101,30 @@ func (r *ListenerSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.ListenerSet{}).
+		Watches(&gatewayv1.ListenerSet{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			changedLS := obj.(*gatewayv1.ListenerSet)
+			var lsList gatewayv1.ListenerSetList
+			if err := r.List(ctx, &lsList); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			changedGwKey := ResolveNamespacedName(changedLS.Spec.ParentRef.Namespace, changedLS.Spec.ParentRef.Name, changedLS)
+			for _, ls := range lsList.Items {
+				if ls.Namespace == changedLS.Namespace && ls.Name == changedLS.Name {
+					continue
+				}
+				gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, &ls)
+				if gwKey == changedGwKey {
+					requests = append(requests, ctrl.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: ls.Namespace,
+							Name:      ls.Name,
+						},
+					})
+				}
+			}
+			return requests
+		})).
 		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
 			gw := obj.(*gatewayv1.Gateway)
 			var lsList gatewayv1.ListenerSetList
@@ -146,6 +171,56 @@ func (r *ListenerSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					lsKey := ResolveNamespacedName(parentRef.Namespace, parentRef.Name, route)
 					requests = append(requests, ctrl.Request{
 						NamespacedName: lsKey,
+					})
+				}
+			}
+			return requests
+		})).
+		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			var lsList gatewayv1.ListenerSetList
+			if err := r.List(ctx, &lsList); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, ls := range lsList.Items {
+				requests = append(requests, ctrl.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: ls.Namespace,
+						Name:      ls.Name,
+					},
+				})
+			}
+			return requests
+		})).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+			secret := obj.(*corev1.Secret)
+			var lsList gatewayv1.ListenerSetList
+			if err := r.List(ctx, &lsList); err != nil {
+				return nil
+			}
+			var requests []ctrl.Request
+			for _, ls := range lsList.Items {
+				matched := false
+				for _, l := range ls.Spec.Listeners {
+					if l.TLS != nil {
+						for _, ref := range l.TLS.CertificateRefs {
+							secKey := ResolveNamespacedName(ref.Namespace, ref.Name, &ls)
+							if secKey.Namespace == secret.Namespace && secKey.Name == secret.Name {
+								matched = true
+								break
+							}
+						}
+					}
+					if matched {
+						break
+					}
+				}
+				if matched {
+					requests = append(requests, ctrl.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: ls.Namespace,
+							Name:      ls.Name,
+						},
 					})
 				}
 			}

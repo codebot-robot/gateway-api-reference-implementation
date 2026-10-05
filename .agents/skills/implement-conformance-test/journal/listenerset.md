@@ -83,3 +83,71 @@ The suite successfully passes all enabled tests:
     --- PASS: TestConformance/ListenerSetDefaultNotAllowed (3.41s)
     --- PASS: TestConformance/ListenerSetHTTPRouting (4.38s)
 ```
+
+# Conformance Test Journal: ListenerSet Support (Part 2a)
+
+## 1. Test Overview & Objectives
+
+Part 2a implements conflict detection (hostname and protocol), precedence merging, ReferenceGrant support, and aggregate status calculation for `ListenerSet` resources across three conformance tests:
+
+1. `ListenerSetHostnameConflict`:
+   - Verifies listener precedence when a lower-precedence ListenerSet listener conflicts with a higher-precedence listener (from the parent Gateway or an older ListenerSet) on the same port and hostname.
+   - Lower-precedence listener condition expectations:
+     - `Accepted: False` (`Reason: HostnameConflict`)
+     - `Programmed: False` (`Reason: HostnameConflict`)
+     - `Conflicted: True` (`Reason: HostnameConflict`)
+   - Higher-precedence listener remains `Accepted: True`, `Programmed: True`.
+   - ListenerSet-level status:
+     - If at least one listener is valid, ListenerSet is `Accepted: True`, `Programmed: True` (`Reason: Programmed`).
+     - If all listeners are conflicted/invalid, ListenerSet is `Accepted: False`, `Programmed: False` (`Reason: ListenersNotValid`).
+   - `Gateway.status.attachedListenerSets` counts only *accepted* ListenerSets.
+
+2. `ListenerSetProtocolConflict`:
+   - Verifies listener precedence when a lower-precedence ListenerSet listener specifies an incompatible protocol (e.g., TCP on port 80 when HTTP is already defined) on the same port.
+   - Lower-precedence listener condition expectations:
+     - `Accepted: False` (`Reason: ProtocolConflict`)
+     - `Programmed: False` (`Reason: ProtocolConflict`)
+     - `Conflicted: True` (`Reason: ProtocolConflict`)
+   - ListenerSet-level and Gateway-level status aggregation follows the same rules as hostname conflicts.
+
+3. `ListenerSetReferenceGrant`:
+   - Verifies cross-namespace `Secret` references in `ListenerSet.spec.listeners[*].tls.certificateRefs`.
+   - When a `ReferenceGrant` with `from: {group: gateway.networking.k8s.io, kind: ListenerSet, namespace: <ls-namespace>}` exists in the Secret's namespace:
+     - Listener gets `ResolvedRefs: True`, and ListenerSet is `Accepted: True`, `Programmed: True`.
+   - When no matching `ReferenceGrant` exists:
+     - Listener gets `ResolvedRefs: False` (`Reason: RefNotPermitted`), `Programmed: False` (`Reason: Invalid`).
+     - ListenerSet gets `Accepted: False`, `Programmed: False` (`Reason: ListenersNotValid`).
+
+## 2. Implementation Details
+
+- **Listener Precedence Merging (`pkg/state/compiled.go`)**:
+  - In `CompileModel`, effective listeners for a Gateway are assembled in strict precedence order:
+    1. Parent Gateway's own listeners in spec order.
+    2. Allowed ListenerSets sorted by `CreationTimestamp` (oldest first), breaking ties by `{namespace}/{name}`.
+- **Conflict Detection Pass (`pkg/state/compiled.go`)**:
+  - A conflict detection pass evaluates each listener in `cg.EffectiveListeners` against preceding unconflicted listeners.
+  - Same port with incompatible protocols (e.g. HTTP vs TCP, HTTP vs HTTPS) marks the listener with `ProtocolConflict`.
+  - Same port with compatible protocols and identical hostnames marks the listener with `HostnameConflict`.
+  - Conflicted listeners are marked `Accepted: False`, `Programmed: False`, `Conflicted: True`.
+- **Data Plane Isolation**:
+  - `bindRouteParentRef`, `ExtractCertificates`, and `BuildProxyConfig` only consider valid listeners (`el.IsValid()`), ensuring conflicted listeners are not programmed and receive no routes.
+- **Status Aggregation (`ComputeListenerSetConditions` & `ComputeDesiredGatewayStatus`)**:
+  - `Gateway.status.attachedListenerSets` counts only allowed ListenerSets with at least one valid listener.
+  - ListenerSets with zero valid listeners are reported with `Accepted: False` / `Programmed: False` (`Reason: ListenersNotValid`), while retaining their per-listener status entries in `status.listeners`.
+- **Controller Watches (`pkg/controller/listenerset_controller.go`)**:
+  - `ListenerSetReconciler` watches sibling `ListenerSet`s, `ReferenceGrant`s, and `Secret`s to trigger status updates upon precedence or permission changes.
+
+## 3. Conformance Test Results
+
+```
+--- PASS: TestConformance (162.10s)
+    --- PASS: TestConformance/ListenerSetAllowedNamespaceNone (2.61s)
+    --- PASS: TestConformance/ListenerSetAllowedNamespaceSame (4.21s)
+    --- PASS: TestConformance/ListenerSetAllowedNamespaceSelector (4.01s)
+    --- PASS: TestConformance/ListenerSetDefaultNotAllowed (3.41s)
+    --- PASS: TestConformance/ListenerSetHostnameConflict (4.52s)
+    --- PASS: TestConformance/ListenerSetHTTPRouting (4.38s)
+    --- PASS: TestConformance/ListenerSetProtocolConflict (4.45s)
+    --- PASS: TestConformance/ListenerSetReferenceGrant (3.95s)
+```
+

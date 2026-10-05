@@ -1381,6 +1381,13 @@ func TestGatewayReconciler_AttachedListenerSets(t *testing.T) {
 			ParentRef: gatewayv1.ParentGatewayReference{
 				Name: "test-gw",
 			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "ls-http",
+					Port:     8080,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
 		},
 	}
 	ls2 := &gatewayv1.ListenerSet{

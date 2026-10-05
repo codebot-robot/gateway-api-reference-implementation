@@ -88,8 +88,8 @@ func IsListenerSetAllowed(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gateway, name
 	}
 }
 
-// ComputeListenerSetAcceptedCondition computes the Accepted and Programmed conditions for a ListenerSet.
-func ComputeListenerSetAcceptedCondition(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gateway, namespaces map[string]*corev1.Namespace) (metav1.Condition, metav1.Condition) {
+// ComputeListenerSetConditions computes the Accepted and Programmed conditions for a ListenerSet given its compiled effective listeners.
+func ComputeListenerSetConditions(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gateway, namespaces map[string]*corev1.Namespace, effectiveListeners []*EffectiveListener) (metav1.Condition, metav1.Condition) {
 	if gw == nil {
 		return NewCondition(
 				string(gatewayv1.ListenerSetConditionAccepted),
@@ -124,6 +124,35 @@ func ComputeListenerSetAcceptedCondition(ls *gatewayv1.ListenerSet, gw *gatewayv
 			)
 	}
 
+	if effectiveListeners != nil {
+		totalListeners := len(ls.Spec.Listeners)
+		validCount := 0
+		for _, el := range effectiveListeners {
+			if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == ls.Namespace && el.Owner.Name == ls.Name {
+				if el.IsValid() {
+					validCount++
+				}
+			}
+		}
+
+		if totalListeners == 0 || validCount == 0 {
+			return NewCondition(
+					string(gatewayv1.ListenerSetConditionAccepted),
+					metav1.ConditionFalse,
+					string(gatewayv1.ListenerSetReasonListenersNotValid),
+					"All listeners in ListenerSet are invalid or conflicted",
+					ls.Generation,
+				),
+				NewCondition(
+					string(gatewayv1.ListenerSetConditionProgrammed),
+					metav1.ConditionFalse,
+					string(gatewayv1.ListenerSetReasonListenersNotValid),
+					"All listeners in ListenerSet are invalid or conflicted",
+					ls.Generation,
+				)
+		}
+	}
+
 	return NewCondition(
 			string(gatewayv1.ListenerSetConditionAccepted),
 			metav1.ConditionTrue,
@@ -138,4 +167,9 @@ func ComputeListenerSetAcceptedCondition(ls *gatewayv1.ListenerSet, gw *gatewayv
 			"ListenerSet programmed by reference implementation",
 			ls.Generation,
 		)
+}
+
+// ComputeListenerSetAcceptedCondition computes the Accepted and Programmed conditions for a ListenerSet without listener aggregation.
+func ComputeListenerSetAcceptedCondition(ls *gatewayv1.ListenerSet, gw *gatewayv1.Gateway, namespaces map[string]*corev1.Namespace) (metav1.Condition, metav1.Condition) {
+	return ComputeListenerSetConditions(ls, gw, namespaces, nil)
 }
