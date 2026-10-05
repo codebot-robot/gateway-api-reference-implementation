@@ -576,6 +576,9 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 }
 
 // areProtocolsCompatible returns true if two listeners on the same port can co-exist.
+// HTTP listeners can share a port with other HTTP listeners (differentiated by hostname).
+// HTTPS listeners can share a port with other HTTPS listeners (differentiated by SNI/hostname).
+// TODO: HTTPS and TLS listeners can also share a port (both routed by SNI); enable when TLSRoute is supported.
 func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 	if p1 == p2 {
 		if p1 == gatewayv1.HTTPProtocolType || p1 == gatewayv1.HTTPSProtocolType || p1 == gatewayv1.TLSProtocolType {
@@ -629,9 +632,8 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 	}
 
-	var managedGatewayClasses map[string]bool
-	if inputs.ControllerName != "" && len(inputs.GatewayClasses) > 0 {
-		managedGatewayClasses = make(map[string]bool)
+	managedGatewayClasses := make(map[string]bool)
+	if inputs.ControllerName != "" {
 		for _, gc := range inputs.GatewayClasses {
 			if gc != nil && string(gc.Spec.ControllerName) == inputs.ControllerName {
 				managedGatewayClasses[gc.Name] = true
@@ -644,7 +646,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if gw == nil {
 			continue
 		}
-		if managedGatewayClasses != nil && !managedGatewayClasses[string(gw.Spec.GatewayClassName)] {
+		if inputs.ControllerName != "" && !managedGatewayClasses[string(gw.Spec.GatewayClassName)] {
 			continue
 		}
 		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
@@ -1710,11 +1712,10 @@ func MergeListenerSetStatus(current *gatewayv1.ListenerSetStatus, desired gatewa
 }
 
 // MergeHTTPRouteStatus merges desired HTTPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
+// It returns true if semantic changes occurred that require updating status in the API server.
 func MergeHTTPRouteStatus(current *gatewayv1.HTTPRouteStatus, desired gatewayv1.HTTPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
 	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
-	if updated {
-		current.Parents = newParents
-	}
+	current.Parents = newParents
 	return updated
 }
 

@@ -23,22 +23,85 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
-
-const eventChannelBufferSize = 1024
 
 // ProxyConfigUpdater defines the interface needed by State to update the proxy.
 type ProxyConfigUpdater interface {
 	UpdateConfig(listeners []InternalListener, routes []InternalRoute)
 	UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate)
 }
+
+// EventSource implements source.TypedSource[reconcile.Request].
+// It delivers reconcile requests directly to controller workqueues without dropping events.
+type EventSource struct {
+	mu     sync.Mutex
+	queues []workqueue.TypedRateLimitingInterface[reconcile.Request]
+	testCh chan types.NamespacedName
+}
+
+func NewEventSource() *EventSource {
+	return &EventSource{
+		testCh: make(chan types.NamespacedName, 10000),
+	}
+}
+
+// Start is called by controller-runtime when starting a controller.
+func (s *EventSource) Start(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
+	s.mu.Lock()
+	s.queues = append(s.queues, q)
+	s.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for i, existing := range s.queues {
+			if existing == q {
+				s.queues = append(s.queues[:i], s.queues[i+1:]...)
+				break
+			}
+		}
+	}()
+
+	return nil
+}
+
+// Enqueue adds a reconcile.Request to all active controller workqueues.
+func (s *EventSource) Enqueue(req reconcile.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, q := range s.queues {
+		q.Add(req)
+	}
+	select {
+	case s.testCh <- req.NamespacedName:
+	default:
+	}
+}
+
+// DrainEvents drains and returns any events recorded on the test channel.
+func (s *EventSource) DrainEvents() []types.NamespacedName {
+	var res []types.NamespacedName
+	for {
+		select {
+		case k := <-s.testCh:
+			res = append(res, k)
+		default:
+			return res
+		}
+	}
+}
+
+var _ source.TypedSource[reconcile.Request] = (*EventSource)(nil)
 
 type State struct {
 	mu sync.RWMutex
@@ -63,15 +126,16 @@ type State struct {
 
 	previousOutputs *Outputs
 
-	gatewayEvents          chan event.GenericEvent
-	httpRouteEvents        chan event.GenericEvent
-	listenerSetEvents      chan event.GenericEvent
-	backendTLSPolicyEvents chan event.GenericEvent
-	gatewayClassEvents     chan event.GenericEvent
+	gatewaySource          *EventSource
+	httpRouteSource        *EventSource
+	listenerSetSource      *EventSource
+	backendTLSPolicySource *EventSource
+	gatewayClassSource     *EventSource
 
-	notifyCh chan struct{}
-	synced   bool
-	running  bool
+	registrations []toolscache.ResourceEventHandlerRegistration
+	notifyCh      chan struct{}
+	synced        bool
+	running       bool
 }
 
 func NewState() *State {
@@ -87,11 +151,11 @@ func NewState() *State {
 		secrets:                make(map[types.NamespacedName]*corev1.Secret),
 		referenceGrants:        make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant),
 		namespaces:             make(map[string]*corev1.Namespace),
-		gatewayEvents:          make(chan event.GenericEvent, eventChannelBufferSize),
-		httpRouteEvents:        make(chan event.GenericEvent, eventChannelBufferSize),
-		listenerSetEvents:      make(chan event.GenericEvent, eventChannelBufferSize),
-		backendTLSPolicyEvents: make(chan event.GenericEvent, eventChannelBufferSize),
-		gatewayClassEvents:     make(chan event.GenericEvent, eventChannelBufferSize),
+		gatewaySource:          NewEventSource(),
+		httpRouteSource:        NewEventSource(),
+		listenerSetSource:      NewEventSource(),
+		backendTLSPolicySource: NewEventSource(),
+		gatewayClassSource:     NewEventSource(),
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
 		running:                false,
@@ -116,12 +180,18 @@ func (s *State) SetOnGatewaysUpdate(fn func([]*gatewayv1.Gateway)) {
 	s.onGatewaysUpdate = fn
 }
 
-func (s *State) SetSynced(synced bool) {
+func (s *State) AddRegistration(reg toolscache.ResourceEventHandlerRegistration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.registrations = append(s.registrations, reg)
+}
+
+func (s *State) SetSynced(synced bool) {
+	s.mu.Lock()
 	s.synced = synced
+	s.mu.Unlock()
 	if synced {
-		s.recomputeLocked()
+		s.Recompute()
 	}
 }
 
@@ -131,24 +201,24 @@ func (s *State) Revision() uint64 {
 	return s.revision
 }
 
-func (s *State) GatewayEvents() chan event.GenericEvent {
-	return s.gatewayEvents
+func (s *State) GatewaySource() *EventSource {
+	return s.gatewaySource
 }
 
-func (s *State) HTTPRouteEvents() chan event.GenericEvent {
-	return s.httpRouteEvents
+func (s *State) HTTPRouteSource() *EventSource {
+	return s.httpRouteSource
 }
 
-func (s *State) ListenerSetEvents() chan event.GenericEvent {
-	return s.listenerSetEvents
+func (s *State) ListenerSetSource() *EventSource {
+	return s.listenerSetSource
 }
 
-func (s *State) BackendTLSPolicyEvents() chan event.GenericEvent {
-	return s.backendTLSPolicyEvents
+func (s *State) BackendTLSPolicySource() *EventSource {
+	return s.backendTLSPolicySource
 }
 
-func (s *State) GatewayClassEvents() chan event.GenericEvent {
-	return s.gatewayClassEvents
+func (s *State) GatewayClassSource() *EventSource {
+	return s.gatewayClassSource
 }
 
 func (s *State) triggerRecomputeLocked() {
@@ -169,10 +239,20 @@ func (s *State) triggerRecomputeLocked() {
 func (s *State) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.running = true
-	s.synced = true
 	s.mu.Unlock()
 
-	s.Recompute()
+	// Wait for all informer event handler registrations to be fully synced.
+	for _, reg := range s.registrations {
+		if !toolscache.WaitForCacheSync(ctx.Done(), reg.HasSynced) {
+			s.mu.Lock()
+			s.running = false
+			s.mu.Unlock()
+			return nil
+		}
+	}
+
+	// Mark state as synced and perform the initial full recomputation.
+	s.SetSynced(true)
 
 	const coalesceDelay = 10 * time.Millisecond
 	for {
@@ -209,8 +289,48 @@ func (s *State) Start(ctx context.Context) error {
 // sends events for changed objects, and updates the proxy.
 func (s *State) Recompute() *Outputs {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.recomputeLocked()
+	if !s.synced {
+		s.mu.Unlock()
+		return nil
+	}
+
+	start := time.Now()
+	inputs := s.snapshotInputsLocked()
+	outputs := ComputeOutputs(inputs)
+	outputs.Revision = inputs.Revision
+
+	duration := time.Since(start)
+	klog.V(2).Infof("Recomputed state outputs in %v (revision: %d, gateways: %d, httpRoutes: %d)",
+		duration, outputs.Revision, len(inputs.Gateways), len(inputs.HTTPRoutes))
+
+	s.diffAndEmitLocked(outputs)
+
+	prev := s.previousOutputs
+	proxyChanged := prev == nil ||
+		!reflect.DeepEqual(outputs.ProxyListeners, prev.ProxyListeners) ||
+		!reflect.DeepEqual(outputs.ProxyRoutes, prev.ProxyRoutes) ||
+		!certsMapEqual(outputs.CertificatesMap, prev.CertificatesMap) ||
+		!defaultCertEqual(outputs.DefaultCert, prev.DefaultCert)
+
+	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
+
+	p := s.proxy
+	onGatewaysUpdate := s.onGatewaysUpdate
+
+	s.previousOutputs = outputs
+	s.mu.Unlock()
+
+	// Run callbacks outside the lock to prevent deadlocks and avoid blocking state mutations.
+	if proxyChanged && p != nil {
+		p.UpdateConfig(outputs.ProxyListeners, outputs.ProxyRoutes)
+		p.UpdateCertificates(outputs.CertificatesMap, outputs.DefaultCert)
+	}
+
+	if gatewaysChanged && onGatewaysUpdate != nil {
+		onGatewaysUpdate(outputs.ResolvedGateways)
+	}
+
+	return outputs
 }
 
 func (s *State) recomputeLocked() *Outputs {
@@ -228,7 +348,29 @@ func (s *State) recomputeLocked() *Outputs {
 		duration, outputs.Revision, len(inputs.Gateways), len(inputs.HTTPRoutes))
 
 	s.diffAndEmitLocked(outputs)
+
+	prev := s.previousOutputs
+	proxyChanged := prev == nil ||
+		!reflect.DeepEqual(outputs.ProxyListeners, prev.ProxyListeners) ||
+		!reflect.DeepEqual(outputs.ProxyRoutes, prev.ProxyRoutes) ||
+		!certsMapEqual(outputs.CertificatesMap, prev.CertificatesMap) ||
+		!defaultCertEqual(outputs.DefaultCert, prev.DefaultCert)
+
+	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
+
+	p := s.proxy
+	onGatewaysUpdate := s.onGatewaysUpdate
+
 	s.previousOutputs = outputs
+
+	if proxyChanged && p != nil {
+		p.UpdateConfig(outputs.ProxyListeners, outputs.ProxyRoutes)
+		p.UpdateCertificates(outputs.CertificatesMap, outputs.DefaultCert)
+	}
+
+	if gatewaysChanged && onGatewaysUpdate != nil {
+		onGatewaysUpdate(outputs.ResolvedGateways)
+	}
 
 	return outputs
 }
@@ -270,6 +412,9 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 			listenerSets = append(listenerSets, lsState.ListenerSet)
 		}
 	}
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
 	sort.Slice(listenerSets, func(i, j int) bool {
 		if !listenerSets[i].CreationTimestamp.Equal(&listenerSets[j].CreationTimestamp) {
 			return listenerSets[i].CreationTimestamp.Before(&listenerSets[j].CreationTimestamp)
@@ -286,6 +431,9 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 			routes = append(routes, rState.HTTPRoute)
 		}
 	}
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
 	sort.Slice(routes, func(i, j int) bool {
 		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
 			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
@@ -355,13 +503,6 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 	}
 }
 
-func sendEvent(ch chan event.GenericEvent, obj client.Object) {
-	select {
-	case ch <- event.GenericEvent{Object: obj}:
-	default:
-	}
-}
-
 func (s *State) diffAndEmitLocked(outputs *Outputs) {
 	prev := s.previousOutputs
 
@@ -383,9 +524,7 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		cur, curOk := outputs.GatewayStatuses[k]
 		old, oldOk := prevGWStatuses[k]
 		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) {
-			sendEvent(s.gatewayEvents, &gatewayv1.Gateway{
-				ObjectMeta: metav1.ObjectMeta{Namespace: k.Namespace, Name: k.Name},
-			})
+			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -407,9 +546,7 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		cur, curOk := outputs.HTTPRouteStatuses[k]
 		old, oldOk := prevRouteStatuses[k]
 		if curOk != oldOk || (curOk && !HTTPRouteStatusesEqual(cur, old)) {
-			sendEvent(s.httpRouteEvents, &gatewayv1.HTTPRoute{
-				ObjectMeta: metav1.ObjectMeta{Namespace: k.Namespace, Name: k.Name},
-			})
+			s.httpRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -431,9 +568,7 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		cur, curOk := outputs.ListenerSetStatuses[k]
 		old, oldOk := prevLSStatuses[k]
 		if curOk != oldOk || (curOk && !ListenerSetStatusesEqual(cur, old)) {
-			sendEvent(s.listenerSetEvents, &gatewayv1.ListenerSet{
-				ObjectMeta: metav1.ObjectMeta{Namespace: k.Namespace, Name: k.Name},
-			})
+			s.listenerSetSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -455,9 +590,7 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		cur, curOk := outputs.BackendTLSPolicyStatuses[k]
 		old, oldOk := prevPolicyStatuses[k]
 		if curOk != oldOk || (curOk && !PolicyStatusesEqual(cur, old)) {
-			sendEvent(s.backendTLSPolicyEvents, &gatewayv1.BackendTLSPolicy{
-				ObjectMeta: metav1.ObjectMeta{Namespace: k.Namespace, Name: k.Name},
-			})
+			s.backendTLSPolicySource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -479,27 +612,8 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		cur, curOk := outputs.GatewayClassStatuses[k]
 		old, oldOk := prevGCStatuses[k]
 		if curOk != oldOk || (curOk && !GatewayClassStatusesEqual(cur, old)) {
-			sendEvent(s.gatewayClassEvents, &gatewayv1.GatewayClass{
-				ObjectMeta: metav1.ObjectMeta{Name: k.Name},
-			})
+			s.gatewayClassSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
-	}
-
-	// 6. Proxy Config & Certs diff
-	proxyChanged := prev == nil ||
-		!reflect.DeepEqual(outputs.ProxyListeners, prev.ProxyListeners) ||
-		!reflect.DeepEqual(outputs.ProxyRoutes, prev.ProxyRoutes) ||
-		!certsMapEqual(outputs.CertificatesMap, prev.CertificatesMap) ||
-		!defaultCertEqual(outputs.DefaultCert, prev.DefaultCert)
-
-	if proxyChanged && s.proxy != nil {
-		s.proxy.UpdateConfig(outputs.ProxyListeners, outputs.ProxyRoutes)
-		s.proxy.UpdateCertificates(outputs.CertificatesMap, outputs.DefaultCert)
-	}
-
-	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
-	if gatewaysChanged && s.onGatewaysUpdate != nil {
-		s.onGatewaysUpdate(outputs.ResolvedGateways)
 	}
 }
 
@@ -905,31 +1019,24 @@ func (s *State) GetService(name types.NamespacedName) *corev1.Service {
 	return s.services[name]
 }
 
-func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) metav1.Condition {
+func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) {
 	if route == nil {
-		return metav1.Condition{}
+		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 	old := s.httpRoutes[key]
+	if old != nil && old.HTTPRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
+		return
+	}
 
-	rs := &HTTPRouteState{
+	s.httpRoutes[key] = &HTTPRouteState{
 		HTTPRoute: route.DeepCopy(),
 	}
-	rs.Compile(s.services, s.getBackendTLSPoliciesLocked(), s.configMaps, lockedReferenceValidator{referenceGrants: s.referenceGrants})
-
-	if old != nil && old.HTTPRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
-		s.httpRoutes[key] = rs
-		return rs.Internal.ValidationCondition
-	}
-
-	s.httpRoutes[key] = rs
 	s.revision++
 	s.triggerRecomputeLocked()
-
-	return rs.Internal.ValidationCondition
 }
 
 func (s *State) GetHTTPRoute(name types.NamespacedName) *HTTPRouteState {
@@ -999,6 +1106,9 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 		routes = append(routes, route)
 	}
 
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
 	sort.Slice(routes, func(i, j int) bool {
 		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
 			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
@@ -1070,6 +1180,9 @@ func (s *State) GetListenerSets() []*ListenerSetState {
 		sets = append(sets, ls)
 	}
 
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
 	sort.Slice(sets, func(i, j int) bool {
 		if !sets[i].CreationTimestamp.Equal(&sets[j].CreationTimestamp) {
 			return sets[i].CreationTimestamp.Before(&sets[j].CreationTimestamp)
@@ -1092,20 +1205,4 @@ func (s *State) GetServices() map[types.NamespacedName]*corev1.Service {
 		services[k] = v
 	}
 	return services
-}
-
-func (s *State) getBackendTLSPoliciesLocked() []*gatewayv1.BackendTLSPolicy {
-	var policies []*gatewayv1.BackendTLSPolicy
-	for _, p := range s.backendTLSPolicies {
-		policies = append(policies, p)
-	}
-	return policies
-}
-
-type lockedReferenceValidator struct {
-	referenceGrants map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
-}
-
-func (v lockedReferenceValidator) IsReferencePermitted(from, to Reference) bool {
-	return isReferencePermitted(from, to, v.referenceGrants)
 }

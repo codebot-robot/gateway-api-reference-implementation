@@ -16,29 +16,14 @@ package state
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
-
-func drainEvents(ch <-chan event.GenericEvent) []types.NamespacedName {
-	var res []types.NamespacedName
-	for {
-		select {
-		case e := <-ch:
-			res = append(res, types.NamespacedName{
-				Namespace: e.Object.GetNamespace(),
-				Name:      e.Object.GetName(),
-			})
-		default:
-			return res
-		}
-	}
-}
 
 func TestComputeOutputs_UnchangedInputsProduceNoEvents(t *testing.T) {
 	st := NewState()
@@ -73,16 +58,16 @@ func TestComputeOutputs_UnchangedInputsProduceNoEvents(t *testing.T) {
 	st.UpsertHTTPRoute(route)
 
 	// Initial drain
-	drainEvents(st.GatewayClassEvents())
-	drainEvents(st.GatewayEvents())
-	drainEvents(st.HTTPRouteEvents())
+	st.GatewayClassSource().DrainEvents()
+	st.GatewaySource().DrainEvents()
+	st.HTTPRouteSource().DrainEvents()
 
 	// Recompute with unchanged inputs
 	st.Recompute()
 
-	gcEvents := drainEvents(st.GatewayClassEvents())
-	gwEvents := drainEvents(st.GatewayEvents())
-	routeEvents := drainEvents(st.HTTPRouteEvents())
+	gcEvents := st.GatewayClassSource().DrainEvents()
+	gwEvents := st.GatewaySource().DrainEvents()
+	routeEvents := st.HTTPRouteSource().DrainEvents()
 
 	if len(gcEvents) != 0 {
 		t.Errorf("expected 0 GatewayClass events for unchanged inputs, got %d", len(gcEvents))
@@ -134,15 +119,15 @@ func TestComputeOutputs_SingleChangeProducesEventsOnlyForAffectedObjects(t *test
 	st.UpsertGateway(gw)
 	st.UpsertGateway(gw2)
 
-	drainEvents(st.GatewayEvents())
-	drainEvents(st.GatewayClassEvents())
+	st.GatewaySource().DrainEvents()
+	st.GatewayClassSource().DrainEvents()
 
 	// Change only gw2 addresses
 	st.SetGatewayAddresses(types.NamespacedName{Namespace: "default", Name: "other-gw"}, []gatewayv1.GatewayStatusAddress{
 		{Value: "10.0.0.2"},
 	})
 
-	gwEvents := drainEvents(st.GatewayEvents())
+	gwEvents := st.GatewaySource().DrainEvents()
 	if len(gwEvents) != 1 {
 		t.Fatalf("expected exactly 1 Gateway event for other-gw, got %d (%v)", len(gwEvents), gwEvents)
 	}
@@ -150,7 +135,7 @@ func TestComputeOutputs_SingleChangeProducesEventsOnlyForAffectedObjects(t *test
 		t.Errorf("expected event for other-gw, got %s", gwEvents[0].Name)
 	}
 
-	gcEvents := drainEvents(st.GatewayClassEvents())
+	gcEvents := st.GatewayClassSource().DrainEvents()
 	if len(gcEvents) != 0 {
 		t.Errorf("expected 0 GatewayClass events when Gateway addresses change, got %d", len(gcEvents))
 	}
@@ -160,9 +145,15 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
 
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "infra-ns", Name: "prod-gw"},
 		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
 			Listeners: []gatewayv1.Listener{
 				{
 					Name:     "http",
@@ -202,6 +193,7 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 		},
 	}
 
+	st.UpsertGatewayClass(gc)
 	st.UpsertNamespace(ns)
 	st.UpsertGateway(gw)
 	st.UpsertHTTPRoute(route)
@@ -215,7 +207,7 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 		t.Fatalf("expected route initially Accepted=False, got %v", routeStatus.Parents[0].Conditions[0])
 	}
 
-	drainEvents(st.HTTPRouteEvents())
+	st.HTTPRouteSource().DrainEvents()
 
 	// Mutate namespace label to env: prod
 	nsUpdated := &corev1.Namespace{
@@ -227,7 +219,7 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 	st.UpsertNamespace(nsUpdated)
 
 	// Central recomputation should automatically detect route is now accepted and emit an event!
-	routeEvents := drainEvents(st.HTTPRouteEvents())
+	routeEvents := st.HTTPRouteSource().DrainEvents()
 	if len(routeEvents) != 1 {
 		t.Fatalf("expected 1 HTTPRoute event on namespace label change, got %d", len(routeEvents))
 	}
@@ -245,9 +237,15 @@ func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
 
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
 		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
 			Listeners: []gatewayv1.Listener{
 				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
 			},
@@ -303,6 +301,7 @@ func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 		},
 	}
 
+	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.UpsertService(svc)
 	st.UpsertReferenceGrant(rg)
@@ -317,13 +316,13 @@ func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 		t.Fatalf("expected ResolvedRefs=True, got %v", statusBefore.Parents[0].Conditions[1])
 	}
 
-	drainEvents(st.HTTPRouteEvents())
+	st.HTTPRouteSource().DrainEvents()
 
 	// Delete ReferenceGrant
 	st.DeleteReferenceGrant(types.NamespacedName{Namespace: "backend-ns", Name: "allow-route"})
 
 	// Central recomputation should detect ResolvedRefs became False and emit an event
-	events := drainEvents(st.HTTPRouteEvents())
+	events := st.HTTPRouteSource().DrainEvents()
 	if len(events) != 1 {
 		t.Fatalf("expected 1 HTTPRoute event on ReferenceGrant deletion, got %d", len(events))
 	}
@@ -342,9 +341,15 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
 
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
 		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
 			Listeners: []gatewayv1.Listener{
 				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
 			},
@@ -406,6 +411,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 		},
 	}
 
+	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.UpsertService(svc)
 	st.UpsertHTTPRoute(route)
@@ -421,7 +427,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 		t.Fatalf("expected policy Accepted=True, got %v", policyStatus.Ancestors[0].Conditions[0])
 	}
 
-	drainEvents(st.BackendTLSPolicyEvents())
+	st.BackendTLSPolicySource().DrainEvents()
 
 	// Update ConfigMap with invalid data
 	cmInvalid := &corev1.ConfigMap{
@@ -433,7 +439,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 	st.UpsertConfigMap(cmInvalid)
 
 	// Central recomputation should detect policy Accepted=False and emit an event
-	events := drainEvents(st.BackendTLSPolicyEvents())
+	events := st.BackendTLSPolicySource().DrainEvents()
 	if len(events) != 1 {
 		t.Fatalf("expected 1 BackendTLSPolicy event on ConfigMap change, got %d", len(events))
 	}
@@ -444,5 +450,57 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 	policyStatusAfter, _ := st.GetDesiredBackendTLSPolicyStatus(types.NamespacedName{Namespace: "default", Name: "tls-policy"})
 	if policyStatusAfter.Ancestors[0].Conditions[0].Status != metav1.ConditionFalse {
 		t.Errorf("expected policy Accepted=False after ConfigMap corruption, got %v", policyStatusAfter.Ancestors[0].Conditions[0])
+	}
+}
+
+func TestMergeHTTPRouteStatus_DeterministicOrderAndOtherControllers(t *testing.T) {
+	myCtrl := gatewayv1.GatewayController("example.net/gateway-controller")
+	otherCtrl := gatewayv1.GatewayController("other.org/other-controller")
+
+	t0 := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	c := []metav1.Condition{
+		{
+			Type:               "Accepted",
+			Status:             metav1.ConditionTrue,
+			Reason:             "Accepted",
+			Message:            "Accepted",
+			ObservedGeneration: 1,
+			LastTransitionTime: t0,
+		},
+	}
+
+	current := &gatewayv1.HTTPRouteStatus{
+		Parents: []gatewayv1.RouteParentStatus{
+			{ParentRef: gatewayv1.ParentReference{Name: "gw-other"}, ControllerName: otherCtrl, Conditions: c},
+			{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+			{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+		},
+	}
+
+	// Desired parents for our controller in unsorted order
+	desired := gatewayv1.HTTPRouteStatus{
+		Parents: []gatewayv1.RouteParentStatus{
+			{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+			{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+		},
+	}
+
+	updated := MergeHTTPRouteStatus(current, desired, "default", myCtrl)
+	if updated {
+		t.Errorf("expected updated=false when only ordering of existing entries differs")
+	}
+
+	// Current parents should now be deterministically sorted: gw-a, gw-b, then gw-other
+	if len(current.Parents) != 3 {
+		t.Fatalf("expected 3 parents, got %d", len(current.Parents))
+	}
+	if current.Parents[0].ParentRef.Name != "gw-a" || current.Parents[0].ControllerName != myCtrl {
+		t.Errorf("expected current.Parents[0] to be myCtrl/gw-a, got %+v", current.Parents[0])
+	}
+	if current.Parents[1].ParentRef.Name != "gw-b" || current.Parents[1].ControllerName != myCtrl {
+		t.Errorf("expected current.Parents[1] to be myCtrl/gw-b, got %+v", current.Parents[1])
+	}
+	if current.Parents[2].ParentRef.Name != "gw-other" || current.Parents[2].ControllerName != otherCtrl {
+		t.Errorf("expected current.Parents[2] to be otherCtrl/gw-other, got %+v", current.Parents[2])
 	}
 }

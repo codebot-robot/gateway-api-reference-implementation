@@ -19,15 +19,12 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -44,16 +41,7 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	var gc gatewayv1.GatewayClass
 	if err := r.Get(ctx, req.NamespacedName, &gc); err != nil {
-		if apierrors.IsNotFound(err) {
-			if r.State != nil {
-				r.State.DeleteGatewayClass(req.NamespacedName)
-			}
-		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	if r.State != nil {
-		r.State.UpsertGatewayClass(&gc)
 	}
 
 	if string(gc.Spec.ControllerName) != r.ControllerName {
@@ -62,12 +50,13 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	var desired gatewayv1.GatewayClassStatus
 	if r.State != nil {
+		r.State.UpsertGatewayClass(&gc)
+
 		d, ok := r.State.GetDesiredGatewayClassStatus(req.NamespacedName)
-		if ok {
-			desired = d
-		} else {
-			desired = state.ComputeDesiredGatewayClassStatus(&gc, r.ControllerName)
+		if !ok {
+			return ctrl.Result{}, nil
 		}
+		desired = d
 	} else {
 		desired = state.ComputeDesiredGatewayClassStatus(&gc, r.ControllerName)
 	}
@@ -89,7 +78,7 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.GatewayClass{})
 	if r.State != nil {
-		bldr.WatchesRawSource(source.Channel(r.State.GatewayClassEvents(), &handler.EnqueueRequestForObject{}))
+		bldr.WatchesRawSource(r.State.GatewayClassSource())
 	}
 	return bldr.Complete(r)
 }
@@ -127,12 +116,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	gw := &gatewayv1.Gateway{}
 	if err := r.Get(ctx, req.NamespacedName, gw); err != nil {
-		if apierrors.IsNotFound(err) {
-			if r.State != nil {
-				r.State.DeleteGateway(req.NamespacedName)
-				r.State.DeleteGatewayAddresses(req.NamespacedName)
-			}
-		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -145,11 +128,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if r.State != nil {
-		if _, ok := r.State.GetGatewayClass(string(gw.Spec.GatewayClassName)); !ok && r.Client != nil {
-			var gc gatewayv1.GatewayClass
-			if err := r.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &gc); err == nil {
-				r.State.UpsertGatewayClass(&gc)
+		// Check if this Gateway is owned by our controller
+		gc, ok := r.State.GetGatewayClass(string(gw.Spec.GatewayClassName))
+		if !ok && r.Client != nil {
+			var fetchedGC gatewayv1.GatewayClass
+			if err := r.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &fetchedGC); err == nil {
+				gc = &fetchedGC
+				r.State.UpsertGatewayClass(gc)
 			}
+		}
+
+		if gc == nil || string(gc.Spec.ControllerName) != r.ControllerName {
+			// Skip Gateways whose class isn't ours, and remove them from State.
+			r.State.DeleteGateway(req.NamespacedName)
+			r.State.DeleteGatewayAddresses(req.NamespacedName)
+			return ctrl.Result{}, nil
 		}
 
 		if r.AddressProvider != nil {
@@ -167,25 +160,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		desired, ok := r.State.GetDesiredGatewayStatus(req.NamespacedName)
 		if !ok {
-			cg := r.State.CompileModel(r.ControllerName).Gateways[req.NamespacedName]
-			var addrs []gatewayv1.GatewayStatusAddress
-			if r.State.GetGatewayAddresses() != nil {
-				addrs = r.State.GetGatewayAddresses()[req.NamespacedName]
-			}
-			desired = state.ComputeDesiredGatewayStatus(gw, cg, addrs)
+			return ctrl.Result{}, nil
 		}
+
 		if state.MergeGatewayStatus(&gw.Status, desired) {
 			if err := r.Status().Update(ctx, gw); err != nil {
 				l.Error(err, "unable to update Gateway status")
 				return ctrl.Result{}, err
 			}
+			l.Info("Updated Gateway status", "addresses", gw.Status.Addresses)
 		}
-	}
-
-	if len(gw.Status.Addresses) == 0 {
-		l.V(1).Info("Gateway has no address assigned yet")
-	} else {
-		l.Info("Updated Gateway status", "addresses", gw.Status.Addresses)
 	}
 
 	return ctrl.Result{}, nil
@@ -199,7 +183,7 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&gatewayv1.Gateway{})
 
 	if r.State != nil {
-		bldr.WatchesRawSource(source.Channel(r.State.GatewayEvents(), &handler.EnqueueRequestForObject{}))
+		bldr.WatchesRawSource(r.State.GatewaySource())
 	}
 
 	if watcher, ok := r.AddressProvider.(AddressWatcher); ok {

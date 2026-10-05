@@ -19,13 +19,10 @@ import (
 	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -42,11 +39,6 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	policy := &gatewayv1.BackendTLSPolicy{}
 	if err := r.Get(ctx, req.NamespacedName, policy); err != nil {
-		if apierrors.IsNotFound(err) {
-			if r.State != nil {
-				r.State.DeleteBackendTLSPolicy(req.NamespacedName)
-			}
-		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -55,10 +47,9 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 		desired, ok := r.State.GetDesiredBackendTLSPolicyStatus(req.NamespacedName)
 		if !ok {
-			compiled := r.State.CompileModel(r.ControllerName)
-			desiredPolicyStatus := state.ComputeDesiredBackendTLSPolicyStatus(policy, compiled, r.State.GetConfigMaps(), r.State.GetBackendTLSPolicies(), r.ControllerName)
-			desired = desiredPolicyStatus
+			return ctrl.Result{}, nil
 		}
+
 		if state.MergeBackendTLSPolicyStatus(&policy.Status, desired, gatewayv1.GatewayController(r.ControllerName)) {
 			if err := r.Status().Update(ctx, policy); err != nil {
 				l.Error(err, "unable to update BackendTLSPolicy status")
@@ -78,7 +69,7 @@ func (r *BackendTLSPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&gatewayv1.BackendTLSPolicy{})
 
 	if r.State != nil {
-		bldr.WatchesRawSource(source.Channel(r.State.BackendTLSPolicyEvents(), &handler.EnqueueRequestForObject{}))
+		bldr.WatchesRawSource(r.State.BackendTLSPolicySource())
 	}
 
 	return bldr.Complete(r)

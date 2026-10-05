@@ -155,91 +155,78 @@ func TestHTTPRouteReconciler_CustomControllerName(t *testing.T) {
 	}
 }
 
-func TestServiceAndSecretAndConfigMapReconcilers(t *testing.T) {
+type trackingAddressProvider struct {
+	called bool
+}
+
+func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error) {
+	p.called = true
+	return []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}, nil
+}
+
+func TestGatewayReconciler_SkipsOtherControllersGateways(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
+	st.SetControllerName("my.domain/controller")
 
-	svc := &corev1.Service{
+	otherGC := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "other-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "other.domain/controller"},
+	}
+	otherGW := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-svc",
+			Name:      "other-gw",
 			Namespace: "default",
 		},
-	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-secret",
-			Namespace: "default",
-		},
-	}
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-cm",
-			Namespace: "default",
-		},
-	}
-	ns := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "my-ns",
-			Labels: map[string]string{"env": "test"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "other-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
 		},
 	}
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(svc, secret, cm, ns).
+		WithObjects(otherGC, otherGW).
+		WithStatusSubresource(otherGW).
 		Build()
 
-	svcReconciler := &ServiceReconciler{
-		Client:         client,
-		Scheme:         scheme,
-		State:          st,
-		ControllerName: "test-controller",
-	}
-	secretReconciler := &SecretReconciler{
-		Client:         client,
-		Scheme:         scheme,
-		State:          st,
-		ControllerName: "test-controller",
-	}
-	cmReconciler := &ConfigMapReconciler{
-		Client:         client,
-		Scheme:         scheme,
-		State:          st,
-		ControllerName: "test-controller",
-	}
-	nsReconciler := &NamespaceReconciler{
-		Client:         client,
-		Scheme:         scheme,
-		State:          st,
-		ControllerName: "test-controller",
+	provider := &trackingAddressProvider{}
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "my.domain/controller",
+		AddressProvider: provider,
 	}
 
 	ctx := t.Context()
-
-	_, err := svcReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-svc"}})
-	if err != nil || st.GetService(types.NamespacedName{Namespace: "default", Name: "my-svc"}) == nil {
-		t.Fatalf("ServiceReconciler failed or service not in state: err=%v", err)
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "other-gw"}})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling other controller gateway: %v", err)
 	}
 
-	_, err = secretReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-secret"}})
-	if err != nil || st.GetSecrets()[types.NamespacedName{Namespace: "default", Name: "my-secret"}] == nil {
-		t.Fatalf("SecretReconciler failed or secret not in state: err=%v", err)
+	if provider.called {
+		t.Errorf("expected AddressProvider NOT to be called for other controller's Gateway")
 	}
 
-	_, err = cmReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-cm"}})
-	if err != nil || st.GetConfigMaps()[types.NamespacedName{Namespace: "default", Name: "my-cm"}] == nil {
-		t.Fatalf("ConfigMapReconciler failed or configmap not in state: err=%v", err)
+	var fetchedGW gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "other-gw"}, &fetchedGW); err != nil {
+		t.Fatalf("failed to fetch gateway: %v", err)
+	}
+	if len(fetchedGW.Status.Conditions) != 0 {
+		t.Errorf("expected no conditions written to other controller's Gateway, got %v", fetchedGW.Status.Conditions)
+	}
+	if len(fetchedGW.Status.Addresses) != 0 {
+		t.Errorf("expected no addresses written to other controller's Gateway, got %v", fetchedGW.Status.Addresses)
 	}
 
-	_, err = nsReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "my-ns"}})
-	if err != nil || st.GetNamespaces()["my-ns"] == nil {
-		t.Fatalf("NamespaceReconciler failed or namespace not in state: err=%v", err)
-	}
-	if len(st.GetNamespaces()) != 1 || st.GetNamespaces()["my-ns"] == nil {
-		t.Fatalf("expected namespace in state, got %v", st.GetNamespaces())
+	if len(st.GetGateways()) != 0 {
+		t.Errorf("expected other controller's Gateway not to be in State, got %v", st.GetGateways())
 	}
 }
 
@@ -265,24 +252,8 @@ func TestReconcilerSetupWithManager_RequiresControllerName(t *testing.T) {
 			setupErr: (&BackendTLSPolicyReconciler{}).SetupWithManager(nil),
 		},
 		{
-			name:     "ServiceReconciler",
-			setupErr: (&ServiceReconciler{}).SetupWithManager(nil),
-		},
-		{
-			name:     "ConfigMapReconciler",
-			setupErr: (&ConfigMapReconciler{}).SetupWithManager(nil),
-		},
-		{
-			name:     "SecretReconciler",
-			setupErr: (&SecretReconciler{}).SetupWithManager(nil),
-		},
-		{
-			name:     "ReferenceGrantReconciler",
-			setupErr: (&ReferenceGrantReconciler{}).SetupWithManager(nil),
-		},
-		{
-			name:     "NamespaceReconciler",
-			setupErr: (&NamespaceReconciler{}).SetupWithManager(nil),
+			name:     "ListenerSetReconciler",
+			setupErr: (&ListenerSetReconciler{}).SetupWithManager(nil),
 		},
 	}
 
