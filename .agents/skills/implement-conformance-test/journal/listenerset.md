@@ -151,3 +151,68 @@ Part 2a implements conflict detection (hostname and protocol), precedence mergin
     --- PASS: TestConformance/ListenerSetReferenceGrant (3.95s)
 ```
 
+# Conformance Test Journal: ListenerSet Support (Part 2b - Route Attachment & Scoping)
+
+## 1. Test Overview & Objectives
+
+Part 2b implements and validates route attachment rules and status scoping for `HTTPRoute` resources attaching through `ListenerSet` resources across four conformance tests:
+
+1. `ListenerSetAllowedRoutesNamespaces`:
+   - Verifies that `allowedRoutes.namespaces` (`Same`, `All`, `Selector`) on a `ListenerSet` listener is evaluated against the **ListenerSet's** namespace, not the parent Gateway's namespace.
+   - Cross-namespace ListenerSets: routes in the ListenerSet's namespace attach successfully when `allowedRoutes.namespaces.from: Same`, whereas routes in the Gateway's namespace receive `Accepted: False` with `Reason: NotAllowedByListeners`.
+   - Ingress data plane requests route to appropriate backends or return 404 based on listener namespace permissions.
+
+2. `ListenerSetGatewayParentSectionNameNotFound`:
+   - Verifies that a route referencing a `parentRef` with `kind: Gateway` (or omitted) and a `sectionName` matching only a listener on an attached `ListenerSet` (not the Gateway itself) must **not** attach to the ListenerSet listener.
+   - Condition expectations: `Accepted: False` (`Reason: NoMatchingParent`).
+
+3. `ListenerSetRouteStatusScopedToParentRef`:
+   - Verifies that `route.status.parents` contains entries **only** for the route's declared `parentRefs`.
+   - Attaching through a `ListenerSet` does not inject an implicit parent status entry for the parent `Gateway`, and vice versa.
+   - When a parentRef is removed, its entry is removed from `status.parents` for our controller while preserving entries from other controllers.
+
+4. `ListenerSetDualParentRefIndependence`:
+   - Verifies that when a route declares multiple `parentRefs` (e.g. one targeting a `Gateway` and one targeting a `ListenerSet`), each `parentRef`'s `Accepted` condition is evaluated independently.
+   - One parentRef can be `Accepted: True` while the other is `Accepted: False` (`Reason: NoMatchingParent`), and traffic arrives correctly for the accepted listener.
+
+## 2. Implementation Details
+
+- **Route Binding Evaluation (`pkg/state/compiled.go`)**:
+  - `bindRouteParentRef` evaluates candidate listeners based on the declared `parentRef.Kind`:
+    - `Gateway`: Only effective listeners owned by the `Gateway` (`el.Owner.Kind == "Gateway"`) are candidates.
+    - `ListenerSet`: Only effective listeners owned by the target `ListenerSet` (`el.Owner.Kind == "ListenerSet"`, matching namespace and name) are candidates.
+  - `allowedRoutes.namespaces` is evaluated using `el.Owner.Namespace` (`route.Namespace == el.Owner.Namespace` for `NamespacesFromSame`, or label selector for `NamespacesFromSelector`).
+  - SectionName and Port filters match against the candidate listener's name and port.
+- **Route Status Scoping & Multi-Controller Preservation (`pkg/state/conditions.go` & `pkg/state/compiled.go`)**:
+  - `UpdateRouteParentStatuses` accepts a managed `controllerName`.
+  - Normalizes and compares `ParentReference` using `reflectParentReferenceEqual` (handling group/kind defaults accurately).
+  - Stale parent statuses for the managed controller that are no longer declared in `route.Spec.ParentRefs` are removed.
+  - Parent status entries belonging to other controllers (`existing[j].ControllerName != controllerName`) are preserved unmodified.
+  - Condition `LastTransitionTime` is preserved when condition status is unchanged.
+
+## 3. Validation & Results
+
+- **Unit Tests**:
+  - `TestCompileModel_ListenerSetAllowedRoutesNamespaces` in `pkg/state/compiled_test.go`
+  - `TestCompileModel_ListenerSetGatewayParentSectionNameNotFound` in `pkg/state/compiled_test.go`
+  - `TestCompileModel_ListenerSetRouteStatusScopedToParentRef` in `pkg/state/compiled_test.go`
+  - `TestCompileModel_ListenerSetDualParentRefIndependence` in `pkg/state/compiled_test.go`
+  - `TestUpdateRouteParentStatuses_MultiController` in `pkg/state/conditions_test.go`
+- **Conformance Logs**:
+```
+--- PASS: TestConformance (85.71s)
+    --- PASS: TestConformance/ListenerSetAllowedNamespaceNone (5.51s)
+    --- PASS: TestConformance/ListenerSetAllowedNamespaceSame (6.91s)
+    --- PASS: TestConformance/ListenerSetAllowedNamespaceSelector (7.71s)
+    --- PASS: TestConformance/ListenerSetAllowedRoutesNamespaces (12.11s)
+    --- PASS: TestConformance/ListenerSetDefaultNotAllowed (7.11s)
+    --- PASS: TestConformance/ListenerSetDualParentRefIndependence (0.06s)
+    --- PASS: TestConformance/ListenerSetGatewayParentSectionNameNotFound (0.09s)
+    --- PASS: TestConformance/ListenerSetHostnameConflict (14.54s)
+    --- PASS: TestConformance/ListenerSetHTTPRouting (11.49s)
+    --- PASS: TestConformance/ListenerSetProtocolConflict (10.72s)
+    --- PASS: TestConformance/ListenerSetReferenceGrant (11.91s)
+    --- PASS: TestConformance/ListenerSetRouteStatusScopedToParentRef (0.10s)
+```
+
+

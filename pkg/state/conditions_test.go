@@ -189,3 +189,93 @@ func TestUpdateRouteParentStatuses(t *testing.T) {
 		t.Errorf("expected Accepted LastTransitionTime preserved on generation bump, got %v", resultBumped[0].Conditions[0].LastTransitionTime)
 	}
 }
+
+func TestUpdateRouteParentStatuses_MultiController(t *testing.T) {
+	myCtrl := gatewayv1.GatewayController("my-org/gateway-controller")
+	otherCtrl := gatewayv1.GatewayController("other-org/other-controller")
+
+	p1 := gatewayv1.ParentReference{Name: "gw-1"}
+	p2 := gatewayv1.ParentReference{Name: "gw-2"}
+	pOther := gatewayv1.ParentReference{Name: "gw-other"}
+
+	t0 := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+
+	c1 := NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1)
+	c1.LastTransitionTime = t0
+	cOther := NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1)
+	cOther.LastTransitionTime = t0
+
+	existing := []gatewayv1.RouteParentStatus{
+		{
+			ParentRef:      p1,
+			ControllerName: myCtrl,
+			Conditions:     []metav1.Condition{c1},
+		},
+		{
+			ParentRef:      pOther,
+			ControllerName: otherCtrl,
+			Conditions:     []metav1.Condition{cOther},
+		},
+	}
+
+	// Case 1: myCtrl updates p1, pOther from otherCtrl must be preserved
+	desired := []gatewayv1.RouteParentStatus{
+		{
+			ParentRef:      p1,
+			ControllerName: myCtrl,
+			Conditions: []metav1.Condition{
+				NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1),
+			},
+		},
+	}
+
+	res, updated := UpdateRouteParentStatuses(existing, desired, myCtrl)
+	if updated {
+		t.Errorf("expected updated=false when nothing changed for myCtrl")
+	}
+	if len(res) != 2 {
+		t.Fatalf("expected 2 parent statuses (including other controller), got %d", len(res))
+	}
+
+	// Case 2: myCtrl replaces p1 with p2. p1 is removed, p2 added, pOther preserved.
+	desiredP2 := []gatewayv1.RouteParentStatus{
+		{
+			ParentRef:      p2,
+			ControllerName: myCtrl,
+			Conditions: []metav1.Condition{
+				NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1),
+			},
+		},
+	}
+	res2, updated2 := UpdateRouteParentStatuses(existing, desiredP2, myCtrl)
+	if !updated2 {
+		t.Errorf("expected updated=true when parentRef changed for myCtrl")
+	}
+	if len(res2) != 2 {
+		t.Fatalf("expected 2 parent statuses, got %d", len(res2))
+	}
+	var foundP2, foundOther, foundP1 bool
+	for _, p := range res2 {
+		if p.ControllerName == myCtrl && p.ParentRef.Name == "gw-2" {
+			foundP2 = true
+		}
+		if p.ControllerName == otherCtrl && p.ParentRef.Name == "gw-other" {
+			foundOther = true
+		}
+		if p.ControllerName == myCtrl && p.ParentRef.Name == "gw-1" {
+			foundP1 = true
+		}
+	}
+	if !foundP2 || !foundOther || foundP1 {
+		t.Errorf("expected p2 and pOther present and p1 removed, got foundP2=%v, foundOther=%v, foundP1=%v", foundP2, foundOther, foundP1)
+	}
+
+	// Case 3: myCtrl removes all its parentRefs. pOther must still be preserved.
+	res3, updated3 := UpdateRouteParentStatuses(existing, nil, myCtrl)
+	if !updated3 {
+		t.Errorf("expected updated=true when myCtrl parentRefs removed")
+	}
+	if len(res3) != 1 || res3[0].ControllerName != otherCtrl {
+		t.Errorf("expected only otherCtrl parent preserved, got %+v", res3)
+	}
+}
