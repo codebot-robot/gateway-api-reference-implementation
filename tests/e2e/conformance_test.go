@@ -166,11 +166,15 @@ func TestConformance(t *testing.T) {
 		tests.ListenerSetAllowedNamespaceNone,
 		tests.ListenerSetAllowedNamespaceSame,
 		tests.ListenerSetAllowedNamespaceSelector,
+		tests.ListenerSetAllowedRoutesNamespaces,
 		tests.ListenerSetDefaultNotAllowed,
+		tests.ListenerSetDualParentRefIndependence,
+		tests.ListenerSetGatewayParentSectionNameNotFound,
 		tests.ListenerSetHostnameConflict,
 		tests.ListenerSetHTTPRouting,
 		tests.ListenerSetProtocolConflict,
 		tests.ListenerSetReferenceGrant,
+		tests.ListenerSetRouteStatusScopedToParentRef,
 	}
 
 	cSuite.Setup(t, selectedTests)

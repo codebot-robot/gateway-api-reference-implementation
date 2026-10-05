@@ -1540,3 +1540,491 @@ func TestCompileModel_GatewayUnresolvedCertRouteAttachment(t *testing.T) {
 		t.Errorf("expected Route Accepted=True, got %v", routeAccCond)
 	}
 }
+
+func TestCompileModel_ListenerSetAllowedRoutesNamespaces(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "gw-ns"},
+		Spec: gatewayv1.GatewaySpec{
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: Ptr(gatewayv1.NamespacesFromAll),
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "gw-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("gw.example.com")),
+				},
+			},
+		},
+	}
+
+	rg := &gatewayv1beta1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Name: "rg", Namespace: "gw-ns"},
+		Spec: gatewayv1beta1.ReferenceGrantSpec{
+			From: []gatewayv1beta1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      "ListenerSet",
+					Namespace: "ls-ns",
+				},
+			},
+			To: []gatewayv1beta1.ReferenceGrantTo{
+				{
+					Group: gatewayv1.GroupName,
+					Kind:  "Gateway",
+				},
+			},
+		},
+	}
+
+	ls := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "ls-ns"},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name:      "gw",
+				Namespace: Ptr(gatewayv1.Namespace("gw-ns")),
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "listener-all",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("all.example.com")),
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Namespaces: &gatewayv1.RouteNamespaces{
+							From: Ptr(gatewayv1.NamespacesFromAll),
+						},
+					},
+				},
+				{
+					Name:     "listener-same",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("same.example.com")),
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Namespaces: &gatewayv1.RouteNamespaces{
+							From: Ptr(gatewayv1.NamespacesFromSame),
+						},
+					},
+				},
+				{
+					Name:     "listener-sel",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("sel.example.com")),
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Namespaces: &gatewayv1.RouteNamespaces{
+							From: Ptr(gatewayv1.NamespacesFromSelector),
+							Selector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"allowed": "yes"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	makeRoute := func(ns, name, sectionName, hostname string) *gatewayv1.HTTPRoute {
+		r := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Kind:      Ptr(gatewayv1.Kind("ListenerSet")),
+							Name:      "ls",
+							Namespace: Ptr(gatewayv1.Namespace("ls-ns")),
+						},
+					},
+				},
+				Hostnames: []gatewayv1.Hostname{gatewayv1.Hostname(hostname)},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "svc",
+										Port: Ptr(gatewayv1.PortNumber(8080)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		if sectionName != "" {
+			r.Spec.ParentRefs[0].SectionName = Ptr(gatewayv1.SectionName(sectionName))
+		}
+		return r
+	}
+
+	routeInLSNS := makeRoute("ls-ns", "route-same-ns", "listener-same", "same.example.com")
+	routeInGWNS := makeRoute("gw-ns", "route-gw-ns", "listener-same", "same.example.com")
+	routeInSelNS := makeRoute("sel-ns", "route-sel-ns", "listener-sel", "sel.example.com")
+	routeInOtherNS := makeRoute("other-ns", "route-other-ns", "listener-sel", "sel.example.com")
+
+	namespaces := map[string]*corev1.Namespace{
+		"gw-ns":    {ObjectMeta: metav1.ObjectMeta{Name: "gw-ns"}},
+		"ls-ns":    {ObjectMeta: metav1.ObjectMeta{Name: "ls-ns"}},
+		"sel-ns":   {ObjectMeta: metav1.ObjectMeta{Name: "sel-ns", Labels: map[string]string{"allowed": "yes"}}},
+		"other-ns": {ObjectMeta: metav1.ObjectMeta{Name: "other-ns", Labels: map[string]string{"allowed": "no"}}},
+	}
+
+	s := NewState()
+	s.UpsertReferenceGrant(rg)
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:     []*gatewayv1.Gateway{gw},
+		ListenerSets: []*gatewayv1.ListenerSet{ls},
+		RefValidator: s,
+		HTTPRoutes:   []*gatewayv1.HTTPRoute{routeInLSNS, routeInGWNS, routeInSelNS, routeInOtherNS},
+		Namespaces:   namespaces,
+	})
+
+	// 1. routeInLSNS targeting listener-same: Accepted=True
+	crSame := compiled.HTTPRoutes[types.NamespacedName{Namespace: "ls-ns", Name: "route-same-ns"}]
+	if crSame == nil || len(crSame.ParentConditions) != 1 || crSame.ParentConditions[0].Status != metav1.ConditionTrue {
+		t.Fatalf("expected routeInLSNS Accepted=True, got %v", crSame)
+	}
+
+	// 2. routeInGWNS targeting listener-same: Accepted=False (Reason: NotAllowedByListeners)
+	// Because listener-same is scoped to ListenerSet's namespace (ls-ns), not the Gateway's namespace (gw-ns).
+	crGW := compiled.HTTPRoutes[types.NamespacedName{Namespace: "gw-ns", Name: "route-gw-ns"}]
+	if crGW == nil || len(crGW.ParentConditions) != 1 {
+		t.Fatalf("expected routeInGWNS compiled route, got %v", crGW)
+	}
+	if crGW.ParentConditions[0].Status != metav1.ConditionFalse || crGW.ParentConditions[0].Reason != string(gatewayv1.RouteReasonNotAllowedByListeners) {
+		t.Errorf("expected routeInGWNS Accepted=False (NotAllowedByListeners), got %v", crGW.ParentConditions[0])
+	}
+
+	// 3. routeInSelNS targeting listener-sel: Accepted=True
+	crSel := compiled.HTTPRoutes[types.NamespacedName{Namespace: "sel-ns", Name: "route-sel-ns"}]
+	if crSel == nil || len(crSel.ParentConditions) != 1 || crSel.ParentConditions[0].Status != metav1.ConditionTrue {
+		t.Fatalf("expected routeInSelNS Accepted=True, got %v", crSel)
+	}
+
+	// 4. routeInOtherNS targeting listener-sel: Accepted=False (Reason: NotAllowedByListeners)
+	crOther := compiled.HTTPRoutes[types.NamespacedName{Namespace: "other-ns", Name: "route-other-ns"}]
+	if crOther == nil || len(crOther.ParentConditions) != 1 {
+		t.Fatalf("expected routeInOtherNS compiled route, got %v", crOther)
+	}
+	if crOther.ParentConditions[0].Status != metav1.ConditionFalse || crOther.ParentConditions[0].Reason != string(gatewayv1.RouteReasonNotAllowedByListeners) {
+		t.Errorf("expected routeInOtherNS Accepted=False (NotAllowedByListeners), got %v", crOther.ParentConditions[0])
+	}
+}
+
+func TestCompileModel_ListenerSetGatewayParentSectionNameNotFound(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: Ptr(gatewayv1.NamespacesFromSame),
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "gw-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("gw.example.com")),
+				},
+			},
+		},
+	}
+
+	ls := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "default"},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "gw",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "ls-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("ls.example.com")),
+				},
+			},
+		},
+	}
+
+	// Route targeting Gateway with sectionName "ls-listener" (exists on ListenerSet, not Gateway)
+	routeViaGW := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-via-gw", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name:        "gw",
+						SectionName: Ptr(gatewayv1.SectionName("ls-listener")),
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "svc",
+									Port: Ptr(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Route targeting ListenerSet with sectionName "ls-listener"
+	routeViaLS := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-via-ls", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Kind:        Ptr(gatewayv1.Kind("ListenerSet")),
+						Name:        "ls",
+						SectionName: Ptr(gatewayv1.SectionName("ls-listener")),
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "svc",
+									Port: Ptr(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:     []*gatewayv1.Gateway{gw},
+		ListenerSets: []*gatewayv1.ListenerSet{ls},
+		HTTPRoutes:   []*gatewayv1.HTTPRoute{routeViaGW, routeViaLS},
+	})
+
+	crGW := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-via-gw"}]
+	if crGW == nil || len(crGW.ParentConditions) != 1 {
+		t.Fatalf("expected routeViaGW compiled route, got %v", crGW)
+	}
+	if crGW.ParentConditions[0].Status != metav1.ConditionFalse || crGW.ParentConditions[0].Reason != string(gatewayv1.RouteReasonNoMatchingParent) {
+		t.Errorf("expected routeViaGW Accepted=False (NoMatchingParent), got %v", crGW.ParentConditions[0])
+	}
+
+	crLS := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-via-ls"}]
+	if crLS == nil || len(crLS.ParentConditions) != 1 {
+		t.Fatalf("expected routeViaLS compiled route, got %v", crLS)
+	}
+	if crLS.ParentConditions[0].Status != metav1.ConditionTrue || crLS.ParentConditions[0].Reason != string(gatewayv1.RouteReasonAccepted) {
+		t.Errorf("expected routeViaLS Accepted=True (Accepted), got %v", crLS.ParentConditions[0])
+	}
+}
+
+func TestCompileModel_ListenerSetRouteStatusScopedToParentRef(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: Ptr(gatewayv1.NamespacesFromSame),
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "gw-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("gw.example.com")),
+				},
+			},
+		},
+	}
+
+	ls := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "default"},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "gw",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "ls-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("ls.example.com")),
+				},
+			},
+		},
+	}
+
+	routeGWOnly := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-gw", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{Name: "gw"},
+				},
+			},
+		},
+	}
+
+	routeLSOnly := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-ls", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Kind: Ptr(gatewayv1.Kind("ListenerSet")),
+						Name: "ls",
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:     []*gatewayv1.Gateway{gw},
+		ListenerSets: []*gatewayv1.ListenerSet{ls},
+		HTTPRoutes:   []*gatewayv1.HTTPRoute{routeGWOnly, routeLSOnly},
+	})
+
+	crGW := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-gw"}]
+	statusGW, _ := ComputeDesiredHTTPRouteStatus(routeGWOnly, crGW, "example.net/gateway-controller")
+	if len(statusGW.Parents) != 1 {
+		t.Fatalf("expected exactly 1 parent in status for routeGWOnly, got %d", len(statusGW.Parents))
+	}
+	if statusGW.Parents[0].ParentRef.Name != "gw" || ValueOf(statusGW.Parents[0].ParentRef.Kind) != "" {
+		t.Errorf("expected parentRef gw, got %+v", statusGW.Parents[0].ParentRef)
+	}
+
+	crLS := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-ls"}]
+	statusLS, _ := ComputeDesiredHTTPRouteStatus(routeLSOnly, crLS, "example.net/gateway-controller")
+	if len(statusLS.Parents) != 1 {
+		t.Fatalf("expected exactly 1 parent in status for routeLSOnly, got %d", len(statusLS.Parents))
+	}
+	if statusLS.Parents[0].ParentRef.Name != "ls" || ValueOf(statusLS.Parents[0].ParentRef.Kind) != "ListenerSet" {
+		t.Errorf("expected parentRef ls (ListenerSet), got %+v", statusLS.Parents[0].ParentRef)
+	}
+}
+
+func TestCompileModel_ListenerSetDualParentRefIndependence(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: Ptr(gatewayv1.NamespacesFromSame),
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "gw-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("gw.example.com")),
+				},
+			},
+		},
+	}
+
+	ls := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "ls", Namespace: "default"},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "gw",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "ls-listener",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("ls.example.com")),
+				},
+			},
+		},
+	}
+
+	// Route with both parentRefs valid
+	routeBothValid := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-both", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{Name: "gw"},
+					{
+						Kind: Ptr(gatewayv1.Kind("ListenerSet")),
+						Name: "ls",
+					},
+				},
+			},
+		},
+	}
+
+	// Route with Gateway parentRef invalid (sectionName ls-listener) and ListenerSet parentRef valid
+	routeOneValid := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "route-one", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name:        "gw",
+						SectionName: Ptr(gatewayv1.SectionName("ls-listener")),
+					},
+					{
+						Kind:        Ptr(gatewayv1.Kind("ListenerSet")),
+						Name:        "ls",
+						SectionName: Ptr(gatewayv1.SectionName("ls-listener")),
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:     []*gatewayv1.Gateway{gw},
+		ListenerSets: []*gatewayv1.ListenerSet{ls},
+		HTTPRoutes:   []*gatewayv1.HTTPRoute{routeBothValid, routeOneValid},
+	})
+
+	// Check route-both
+	crBoth := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-both"}]
+	if crBoth == nil || len(crBoth.ParentConditions) != 2 {
+		t.Fatalf("expected 2 parent conditions for route-both, got %v", crBoth)
+	}
+	if crBoth.ParentConditions[0].Status != metav1.ConditionTrue {
+		t.Errorf("expected parentRef[0] Accepted=True, got %v", crBoth.ParentConditions[0])
+	}
+	if crBoth.ParentConditions[1].Status != metav1.ConditionTrue {
+		t.Errorf("expected parentRef[1] Accepted=True, got %v", crBoth.ParentConditions[1])
+	}
+
+	// Check route-one
+	crOne := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-one"}]
+	if crOne == nil || len(crOne.ParentConditions) != 2 {
+		t.Fatalf("expected 2 parent conditions for route-one, got %v", crOne)
+	}
+	if crOne.ParentConditions[0].Status != metav1.ConditionFalse || crOne.ParentConditions[0].Reason != string(gatewayv1.RouteReasonNoMatchingParent) {
+		t.Errorf("expected parentRef[0] Accepted=False (NoMatchingParent), got %v", crOne.ParentConditions[0])
+	}
+	if crOne.ParentConditions[1].Status != metav1.ConditionTrue || crOne.ParentConditions[1].Reason != string(gatewayv1.RouteReasonAccepted) {
+		t.Errorf("expected parentRef[1] Accepted=True (Accepted), got %v", crOne.ParentConditions[1])
+	}
+}
