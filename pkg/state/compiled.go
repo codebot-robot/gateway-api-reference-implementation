@@ -85,6 +85,37 @@ type EffectiveListener struct {
 	Conditions     []metav1.Condition
 	AttachedRoutes int32
 	Routes         []InternalRoute
+	Generation     int64
+}
+
+// IsAccepted returns true if the listener has an Accepted condition with status True.
+func (el *EffectiveListener) IsAccepted() bool {
+	for _, c := range el.Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionAccepted) && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// IsProgrammed returns true if the listener has a Programmed condition with status True.
+func (el *EffectiveListener) IsProgrammed() bool {
+	for _, c := range el.Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// IsConflicted returns true if the listener has a Conflicted condition with status True.
+func (el *EffectiveListener) IsConflicted() bool {
+	for _, c := range el.Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionConflicted) && c.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // QualifiedName returns the listener name, qualified with owner namespace and name for ListenerSets.
@@ -452,6 +483,7 @@ func BuildEffectiveListener(
 		Conditions:     conditions,
 		AttachedRoutes: 0,
 		Routes:         nil,
+		Generation:     generation,
 	}
 }
 
@@ -462,11 +494,8 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 
 	for _, el := range effectiveListeners {
 		if el.Owner.Kind == "Gateway" {
-			for _, cond := range el.Conditions {
-				if cond.Type == string(gatewayv1.ListenerConditionAccepted) && cond.Status == metav1.ConditionTrue {
-					acceptedListenersCount++
-					break
-				}
+			if el.IsAccepted() {
+				acceptedListenersCount++
 			}
 		}
 	}
@@ -525,6 +554,45 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 	}
 }
 
+// areProtocolsCompatible returns true if two listeners on the same port can co-exist.
+// HTTP listeners can share a port with other HTTP listeners (differentiated by hostname).
+// HTTPS listeners can share a port with other HTTPS listeners (differentiated by SNI/hostname).
+// TODO: HTTPS and TLS listeners can also share a port (both routed by SNI); enable when TLSRoute is supported.
+func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
+	if p1 == p2 {
+		if p1 == gatewayv1.HTTPProtocolType || p1 == gatewayv1.HTTPSProtocolType || p1 == gatewayv1.TLSProtocolType {
+			return true
+		}
+		return false
+	}
+	// TODO: Support HTTPS and TLS protocol sharing on the same port once TLSRoute is implemented.
+	return false
+}
+
+func markListenerConflicted(el *EffectiveListener, reason gatewayv1.ListenerConditionReason, message string) {
+	SetCondition(&el.Conditions, NewCondition(
+		string(gatewayv1.ListenerConditionAccepted),
+		metav1.ConditionFalse,
+		string(reason),
+		message,
+		el.Generation,
+	))
+	SetCondition(&el.Conditions, NewCondition(
+		string(gatewayv1.ListenerConditionProgrammed),
+		metav1.ConditionFalse,
+		string(reason),
+		message,
+		el.Generation,
+	))
+	SetCondition(&el.Conditions, NewCondition(
+		string(gatewayv1.ListenerConditionConflicted),
+		metav1.ConditionTrue,
+		string(reason),
+		message,
+		el.Generation,
+	))
+}
+
 // CompileModel compiles the effective listeners, route bindings, and statuses across all Gateways and ListenerSets.
 func CompileModel(inputs ModelInputs) *CompiledModel {
 	cm := &CompiledModel{
@@ -549,7 +617,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			Gateway: gw,
 		}
 
-		// Gateway's own listeners
+		// Gateway's own listeners (highest precedence)
 		for _, l := range gw.Spec.Listeners {
 			el := BuildEffectiveListener(
 				ListenerToSpec(l),
@@ -562,26 +630,94 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 		}
 
-		// Allowed ListenerSets in precedence order
+		// Allowed ListenerSets in precedence order:
+		// 1. Creation time (oldest first)
+		// 2. Alphabetically by "{namespace}/{name}"
+		var allowedListenerSets []*gatewayv1.ListenerSet
 		for _, ls := range inputs.ListenerSets {
 			if ls == nil {
 				continue
 			}
 			if IsListenerSetParent(ls, gw) && IsListenerSetAllowed(ls, gw, inputs.Namespaces) {
-				cg.AttachedListenerSets++
-				for _, l := range ls.Spec.Listeners {
-					el := BuildEffectiveListener(
-						ListenerEntryToSpec(l),
-						ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name},
-						gwKey,
-						ls.Generation,
-						inputs.Secrets,
-						inputs.RefValidator,
-					)
-					cg.EffectiveListeners = append(cg.EffectiveListeners, el)
+				allowedListenerSets = append(allowedListenerSets, ls)
+			}
+		}
+
+		sort.Slice(allowedListenerSets, func(i, j int) bool {
+			if !allowedListenerSets[i].CreationTimestamp.Equal(&allowedListenerSets[j].CreationTimestamp) {
+				return allowedListenerSets[i].CreationTimestamp.Before(&allowedListenerSets[j].CreationTimestamp)
+			}
+			if allowedListenerSets[i].Namespace != allowedListenerSets[j].Namespace {
+				return allowedListenerSets[i].Namespace < allowedListenerSets[j].Namespace
+			}
+			return allowedListenerSets[i].Name < allowedListenerSets[j].Name
+		})
+
+		for _, ls := range allowedListenerSets {
+			for _, l := range ls.Spec.Listeners {
+				el := BuildEffectiveListener(
+					ListenerEntryToSpec(l),
+					ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name},
+					gwKey,
+					ls.Generation,
+					inputs.Secrets,
+					inputs.RefValidator,
+				)
+				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
+			}
+		}
+
+		// Conflict detection pass over all effective listeners on this Gateway in precedence order
+		for i := 0; i < len(cg.EffectiveListeners); i++ {
+			elCur := cg.EffectiveListeners[i]
+			for j := 0; j < i; j++ {
+				elPrev := cg.EffectiveListeners[j]
+				if elPrev.IsConflicted() {
+					continue
+				}
+				if elPrev.Port != elCur.Port {
+					continue
+				}
+
+				// Check protocol compatibility
+				if !areProtocolsCompatible(elPrev.Protocol, elCur.Protocol) {
+					var msg string
+					if elPrev.Protocol == elCur.Protocol {
+						msg = fmt.Sprintf("Multiple %q listeners cannot share port %d without hostname/SNI routing (conflicts with %q)", elCur.Protocol, elCur.Port, elPrev.QualifiedName())
+					} else {
+						msg = fmt.Sprintf("Protocol %q conflicts with higher-precedence listener %q protocol %q on port %d", elCur.Protocol, elPrev.QualifiedName(), elPrev.Protocol, elCur.Port)
+					}
+					markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
+					break
+				}
+
+				// Check hostname conflict for compatible protocols
+				hPrev := strings.ToLower(string(ValueOf(elPrev.Hostname)))
+				hCur := strings.ToLower(string(ValueOf(elCur.Hostname)))
+				if hPrev == hCur {
+					msg := fmt.Sprintf("Hostname %q conflicts with higher-precedence listener %q on port %d", hCur, elPrev.QualifiedName(), elCur.Port)
+					markListenerConflicted(elCur, gatewayv1.ListenerReasonHostnameConflict, msg)
+					break
 				}
 			}
 		}
+
+		// Count only accepted ListenerSets (where at least one listener is valid/programmed and unconflicted)
+		acceptedLSCount := int32(0)
+		for _, ls := range allowedListenerSets {
+			validCount := 0
+			for _, el := range cg.EffectiveListeners {
+				if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == ls.Namespace && el.Owner.Name == ls.Name {
+					if el.IsAccepted() && el.IsProgrammed() && !el.IsConflicted() {
+						validCount++
+					}
+				}
+			}
+			if validCount > 0 {
+				acceptedLSCount++
+			}
+		}
+		cg.AttachedListenerSets = acceptedLSCount
 
 		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, len(gw.Status.Addresses) > 0)
 		cm.Gateways[gwKey] = cg
@@ -677,7 +813,7 @@ func bindRouteParentRef(
 			)
 		}
 		for _, el := range cg.EffectiveListeners {
-			if el.Owner.Kind == "Gateway" {
+			if el.Owner.Kind == "Gateway" && el.IsAccepted() {
 				candidateListeners = append(candidateListeners, el)
 			}
 		}
@@ -709,7 +845,7 @@ func bindRouteParentRef(
 		}
 
 		for _, el := range cg.EffectiveListeners {
-			if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == targetLS.Namespace && el.Owner.Name == targetLS.Name {
+			if el.Owner.Kind == "ListenerSet" && el.Owner.Namespace == targetLS.Namespace && el.Owner.Name == targetLS.Name && el.IsAccepted() {
 				candidateListeners = append(candidateListeners, el)
 			}
 		}
@@ -850,6 +986,9 @@ func ExtractCertificates(
 			continue
 		}
 		for _, el := range cg.EffectiveListeners {
+			if !el.IsAccepted() {
+				continue
+			}
 			if (el.Protocol != gatewayv1.HTTPSProtocolType && el.Protocol != gatewayv1.TLSProtocolType) || el.TLS == nil {
 				continue
 			}
@@ -940,6 +1079,9 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 			continue
 		}
 		for _, el := range cg.EffectiveListeners {
+			if !el.IsAccepted() {
+				continue
+			}
 			iListener := el.ToInternalListener()
 			proxyListeners = append(proxyListeners, iListener)
 			proxyRoutes = append(proxyRoutes, el.Routes...)
@@ -1076,11 +1218,16 @@ func ComputeDesiredListenerSetStatus(
 		desiredStatus = &gatewayv1.ListenerSetStatus{}
 	}
 
-	acceptedCond, programmedCond := ComputeListenerSetAcceptedCondition(ls, parentGW, namespaces)
+	var effectiveListeners []*EffectiveListener
+	if compiledGw != nil {
+		effectiveListeners = compiledGw.EffectiveListeners
+	}
+
+	acceptedCond, programmedCond := ComputeListenerSetConditions(ls, parentGW, namespaces, effectiveListeners)
 	desiredConditions := []metav1.Condition{programmedCond, acceptedCond}
 
 	var desiredListeners []gatewayv1.ListenerEntryStatus
-	if acceptedCond.Status == metav1.ConditionTrue {
+	if parentGW != nil && IsListenerSetAllowed(ls, parentGW, namespaces) {
 		for _, l := range ls.Spec.Listeners {
 			var matchedEl *EffectiveListener
 			if compiledGw != nil {
@@ -1093,7 +1240,7 @@ func ComputeDesiredListenerSetStatus(
 			}
 
 			if matchedEl == nil {
-				// If an accepted ListenerSet listener is not found in the compiled model,
+				// If an allowed ListenerSet listener is not found in the compiled model,
 				// it indicates an internal inconsistency (e.g. missing compiled Gateway model).
 				// We skip setting status for this listener rather than attempting a fallback
 				// re-validation without secrets or a ReferenceGrant validator, which would
