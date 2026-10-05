@@ -1326,7 +1326,7 @@ func ComputeDesiredHTTPRouteStatus(
 		}
 	}
 
-	newParents, updated := UpdateRouteParentStatuses(desiredStatus.Parents, desiredParents, gatewayv1.GatewayController(controllerName))
+	newParents, updated := UpdateRouteParentStatuses(desiredStatus.Parents, desiredParents, route.Namespace, gatewayv1.GatewayController(controllerName))
 	desiredStatus.Parents = newParents
 
 	return *desiredStatus, updated

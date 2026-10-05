@@ -15,6 +15,9 @@
 package state
 
 import (
+	"cmp"
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -135,36 +138,75 @@ func normalizeKind(k *gatewayv1.Kind) string {
 	return string(val)
 }
 
-func reflectParentReferenceEqual(a, b gatewayv1.ParentReference) bool {
-	if a.Name != b.Name {
-		return false
+// CompareParentReference compares two ParentReferences for deterministic sorting.
+// It normalizes group and kind (defaulting nil/empty to the Gateway API standard group and Gateway kind),
+// and defaults unset namespace to defaultNamespace (typically the route's namespace).
+// The comparison order is: Group, Kind, Namespace, Name, SectionName, Port.
+func CompareParentReference(a, b gatewayv1.ParentReference, defaultNamespace string) int {
+	if c := cmp.Compare(normalizeGroup(a.Group), normalizeGroup(b.Group)); c != 0 {
+		return c
 	}
-	if normalizeGroup(a.Group) != normalizeGroup(b.Group) {
-		return false
+	if c := cmp.Compare(normalizeKind(a.Kind), normalizeKind(b.Kind)); c != 0 {
+		return c
 	}
-	if normalizeKind(a.Kind) != normalizeKind(b.Kind) {
-		return false
+	nsA := defaultNamespace
+	if a.Namespace != nil && *a.Namespace != "" {
+		nsA = string(*a.Namespace)
 	}
-	if ValueOf(a.Namespace) != ValueOf(b.Namespace) {
-		return false
+	nsB := defaultNamespace
+	if b.Namespace != nil && *b.Namespace != "" {
+		nsB = string(*b.Namespace)
 	}
-	if ValueOf(a.SectionName) != ValueOf(b.SectionName) {
-		return false
+	if c := cmp.Compare(nsA, nsB); c != 0 {
+		return c
 	}
-	if ValueOf(a.Port) != ValueOf(b.Port) {
-		return false
+	if c := cmp.Compare(string(a.Name), string(b.Name)); c != 0 {
+		return c
 	}
-	return true
+	secA := string(ValueOf(a.SectionName))
+	secB := string(ValueOf(b.SectionName))
+	if c := cmp.Compare(secA, secB); c != 0 {
+		return c
+	}
+	portA := int32(ValueOf(a.Port))
+	portB := int32(ValueOf(b.Port))
+	return cmp.Compare(portA, portB)
+}
+
+// CompareRouteParentStatus compares two RouteParentStatus entries for deterministic sorting.
+// It compares ControllerName first, then normalized ParentReference.
+func CompareRouteParentStatus(a, b gatewayv1.RouteParentStatus, defaultNamespace string) int {
+	if c := cmp.Compare(string(a.ControllerName), string(b.ControllerName)); c != 0 {
+		return c
+	}
+	return CompareParentReference(a.ParentRef, b.ParentRef, defaultNamespace)
+}
+
+// SortRouteParentStatuses sorts a slice of RouteParentStatus entries deterministically.
+func SortRouteParentStatuses(parents []gatewayv1.RouteParentStatus, defaultNamespace string) {
+	slices.SortStableFunc(parents, func(a, b gatewayv1.RouteParentStatus) int {
+		return CompareRouteParentStatus(a, b, defaultNamespace)
+	})
+}
+
+func reflectParentReferenceEqual(a, b gatewayv1.ParentReference, defaultNamespace ...string) bool {
+	ns := ""
+	if len(defaultNamespace) > 0 {
+		ns = defaultNamespace[0]
+	}
+	return CompareParentReference(a, b, ns) == 0
 }
 
 // UpdateRouteParentStatuses updates an existing slice of RouteParentStatus with desired statuses,
 // preserving LastTransitionTime for conditions whose Status has not changed.
-// Entries in existing belonging to other controllers (or controllers not in controllerNames if specified)
-// are preserved. Entries for the managed controller(s) that are no longer in desired are removed.
-// It returns the updated slice and a boolean indicating whether any changes occurred.
+// Entries belonging to our managed controllers are sorted deterministically by normalized ParentRef.
+// Entries belonging to other controllers are preserved in their existing relative order, after our entries.
+// If the only difference between existing and desired statuses is order, updated returns false.
+// It returns the updated slice and a boolean indicating whether any semantic changes occurred.
 func UpdateRouteParentStatuses(
 	existing []gatewayv1.RouteParentStatus,
 	desired []gatewayv1.RouteParentStatus,
+	routeNamespace string,
 	controllerNames ...gatewayv1.GatewayController,
 ) ([]gatewayv1.RouteParentStatus, bool) {
 	managedControllers := make(map[gatewayv1.GatewayController]bool)
@@ -179,7 +221,7 @@ func UpdateRouteParentStatuses(
 
 	updated := false
 
-	var result []gatewayv1.RouteParentStatus
+	var ourEntries []gatewayv1.RouteParentStatus
 
 	for _, d := range desired {
 		entry := gatewayv1.RouteParentStatus{
@@ -192,7 +234,7 @@ func UpdateRouteParentStatuses(
 		// Find matching existing parent status
 		var matchingExisting *gatewayv1.RouteParentStatus
 		for j := range existing {
-			if existing[j].ControllerName == d.ControllerName && reflectParentReferenceEqual(existing[j].ParentRef, d.ParentRef) {
+			if existing[j].ControllerName == d.ControllerName && reflectParentReferenceEqual(existing[j].ParentRef, d.ParentRef, routeNamespace) {
 				matchingExisting = &existing[j]
 				break
 			}
@@ -237,16 +279,20 @@ func UpdateRouteParentStatuses(
 			}
 		}
 
-		result = append(result, entry)
+		ourEntries = append(ourEntries, entry)
 	}
 
-	// Check for existing entries: preserve entries from unmanaged controllers,
+	// Sort our own entries deterministically
+	SortRouteParentStatuses(ourEntries, routeNamespace)
+
+	// Check for existing entries: preserve entries from unmanaged controllers in their relative order,
 	// and detect removals of entries from managed controllers.
+	var otherEntries []gatewayv1.RouteParentStatus
 	for _, e := range existing {
 		if managedControllers[e.ControllerName] {
 			found := false
 			for _, d := range desired {
-				if d.ControllerName == e.ControllerName && reflectParentReferenceEqual(d.ParentRef, e.ParentRef) {
+				if d.ControllerName == e.ControllerName && reflectParentReferenceEqual(d.ParentRef, e.ParentRef, routeNamespace) {
 					found = true
 					break
 				}
@@ -255,13 +301,14 @@ func UpdateRouteParentStatuses(
 				updated = true
 			}
 		} else {
-			result = append(result, e)
+			otherEntries = append(otherEntries, e)
 		}
 	}
 
-	if len(existing) != len(result) {
+	if len(existing) != len(ourEntries)+len(otherEntries) {
 		updated = true
 	}
 
+	result := append(ourEntries, otherEntries...)
 	return result, updated
 }

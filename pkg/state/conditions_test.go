@@ -156,7 +156,7 @@ func TestUpdateRouteParentStatuses(t *testing.T) {
 		},
 	}
 
-	result, updated := UpdateRouteParentStatuses(existing, desired)
+	result, updated := UpdateRouteParentStatuses(existing, desired, "")
 	if !updated {
 		t.Errorf("expected updated=true when adding ResolvedRefs condition")
 	}
@@ -178,7 +178,7 @@ func TestUpdateRouteParentStatuses(t *testing.T) {
 			},
 		},
 	}
-	resultBumped, updatedBumped := UpdateRouteParentStatuses(result, desiredBumped)
+	resultBumped, updatedBumped := UpdateRouteParentStatuses(result, desiredBumped, "")
 	if !updatedBumped {
 		t.Errorf("expected updated=true when observedGeneration changes")
 	}
@@ -229,7 +229,7 @@ func TestUpdateRouteParentStatuses_MultiController(t *testing.T) {
 		},
 	}
 
-	res, updated := UpdateRouteParentStatuses(existing, desired, myCtrl)
+	res, updated := UpdateRouteParentStatuses(existing, desired, "", myCtrl)
 	if updated {
 		t.Errorf("expected updated=false when nothing changed for myCtrl")
 	}
@@ -247,7 +247,7 @@ func TestUpdateRouteParentStatuses_MultiController(t *testing.T) {
 			},
 		},
 	}
-	res2, updated2 := UpdateRouteParentStatuses(existing, desiredP2, myCtrl)
+	res2, updated2 := UpdateRouteParentStatuses(existing, desiredP2, "", myCtrl)
 	if !updated2 {
 		t.Errorf("expected updated=true when parentRef changed for myCtrl")
 	}
@@ -271,11 +271,313 @@ func TestUpdateRouteParentStatuses_MultiController(t *testing.T) {
 	}
 
 	// Case 3: myCtrl removes all its parentRefs. pOther must still be preserved.
-	res3, updated3 := UpdateRouteParentStatuses(existing, nil, myCtrl)
+	res3, updated3 := UpdateRouteParentStatuses(existing, nil, "", myCtrl)
 	if !updated3 {
 		t.Errorf("expected updated=true when myCtrl parentRefs removed")
 	}
 	if len(res3) != 1 || res3[0].ControllerName != otherCtrl {
 		t.Errorf("expected only otherCtrl parent preserved, got %+v", res3)
+	}
+}
+
+func ptr[T any](v T) *T {
+	return &v
+}
+
+func TestCompareParentReference(t *testing.T) {
+	routeNS := "test-ns"
+
+	tests := []struct {
+		name     string
+		a        gatewayv1.ParentReference
+		b        gatewayv1.ParentReference
+		expected int
+	}{
+		{
+			name:     "identical references",
+			a:        gatewayv1.ParentReference{Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Name: "gw-1"},
+			expected: 0,
+		},
+		{
+			name:     "group comparison normalized",
+			a:        gatewayv1.ParentReference{Group: ptr(gatewayv1.Group("custom.io")), Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Group: ptr(gatewayv1.Group("gateway.networking.k8s.io")), Name: "gw-1"},
+			expected: -1,
+		},
+		{
+			name:     "nil group matches standard gateway group",
+			a:        gatewayv1.ParentReference{Group: nil, Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Group: ptr(gatewayv1.Group("gateway.networking.k8s.io")), Name: "gw-1"},
+			expected: 0,
+		},
+		{
+			name:     "kind comparison normalized (Gateway vs ListenerSet)",
+			a:        gatewayv1.ParentReference{Kind: ptr(gatewayv1.Kind("Gateway")), Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Kind: ptr(gatewayv1.Kind("ListenerSet")), Name: "gw-1"},
+			expected: -1,
+		},
+		{
+			name:     "nil kind matches Gateway",
+			a:        gatewayv1.ParentReference{Kind: nil, Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Kind: ptr(gatewayv1.Kind("Gateway")), Name: "gw-1"},
+			expected: 0,
+		},
+		{
+			name:     "namespace comparison with default route namespace",
+			a:        gatewayv1.ParentReference{Namespace: nil, Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Namespace: ptr(gatewayv1.Namespace("test-ns")), Name: "gw-1"},
+			expected: 0,
+		},
+		{
+			name:     "different namespaces",
+			a:        gatewayv1.ParentReference{Namespace: ptr(gatewayv1.Namespace("alpha")), Name: "gw-1"},
+			b:        gatewayv1.ParentReference{Namespace: ptr(gatewayv1.Namespace("beta")), Name: "gw-1"},
+			expected: -1,
+		},
+		{
+			name:     "different names",
+			a:        gatewayv1.ParentReference{Name: "gw-a"},
+			b:        gatewayv1.ParentReference{Name: "gw-b"},
+			expected: -1,
+		},
+		{
+			name:     "different sectionNames",
+			a:        gatewayv1.ParentReference{Name: "gw-1", SectionName: ptr(gatewayv1.SectionName("http"))},
+			b:        gatewayv1.ParentReference{Name: "gw-1", SectionName: ptr(gatewayv1.SectionName("https"))},
+			expected: -1,
+		},
+		{
+			name:     "nil sectionName before non-nil",
+			a:        gatewayv1.ParentReference{Name: "gw-1", SectionName: nil},
+			b:        gatewayv1.ParentReference{Name: "gw-1", SectionName: ptr(gatewayv1.SectionName("http"))},
+			expected: -1,
+		},
+		{
+			name:     "different ports",
+			a:        gatewayv1.ParentReference{Name: "gw-1", Port: ptr(gatewayv1.PortNumber(80))},
+			b:        gatewayv1.ParentReference{Name: "gw-1", Port: ptr(gatewayv1.PortNumber(443))},
+			expected: -1,
+		},
+		{
+			name:     "nil port before non-nil",
+			a:        gatewayv1.ParentReference{Name: "gw-1", Port: nil},
+			b:        gatewayv1.ParentReference{Name: "gw-1", Port: ptr(gatewayv1.PortNumber(80))},
+			expected: -1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CompareParentReference(tc.a, tc.b, routeNS)
+			if (tc.expected < 0 && got >= 0) || (tc.expected > 0 && got <= 0) || (tc.expected == 0 && got != 0) {
+				t.Errorf("CompareParentReference(%+v, %+v) = %d, expected sign of %d", tc.a, tc.b, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestUpdateRouteParentStatuses_DeterministicOrder(t *testing.T) {
+	myCtrl := gatewayv1.GatewayController("my-org/gateway-controller")
+
+	p1 := gatewayv1.ParentReference{Name: "gw-a", SectionName: ptr(gatewayv1.SectionName("http"))}
+	p2 := gatewayv1.ParentReference{Name: "gw-a", SectionName: ptr(gatewayv1.SectionName("https"))}
+	p3 := gatewayv1.ParentReference{Name: "gw-b"}
+	p4 := gatewayv1.ParentReference{Group: ptr(gatewayv1.Group("gateway.networking.k8s.io")), Kind: ptr(gatewayv1.Kind("ListenerSet")), Name: "ls-1"}
+
+	c := []metav1.Condition{NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1)}
+
+	// Desired entries provided in order: p4, p3, p2, p1
+	desired1 := []gatewayv1.RouteParentStatus{
+		{ParentRef: p4, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: p3, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: p2, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: p1, ControllerName: myCtrl, Conditions: c},
+	}
+
+	// Desired entries provided in reverse order: p1, p2, p3, p4
+	desired2 := []gatewayv1.RouteParentStatus{
+		{ParentRef: p1, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: p2, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: p3, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: p4, ControllerName: myCtrl, Conditions: c},
+	}
+
+	res1, _ := UpdateRouteParentStatuses(nil, desired1, "default", myCtrl)
+	res2, _ := UpdateRouteParentStatuses(nil, desired2, "default", myCtrl)
+
+	if len(res1) != 4 || len(res2) != 4 {
+		t.Fatalf("expected 4 parent statuses, got res1=%d res2=%d", len(res1), len(res2))
+	}
+
+	for i := range res1 {
+		if CompareParentReference(res1[i].ParentRef, res2[i].ParentRef, "default") != 0 {
+			t.Errorf("at index %d: res1 parentRef %+v != res2 parentRef %+v", i, res1[i].ParentRef, res2[i].ParentRef)
+		}
+	}
+
+	// Expected sorted order:
+	// 1. Gateway default/gw-a section=http (p1)
+	// 2. Gateway default/gw-a section=https (p2)
+	// 3. Gateway default/gw-b (p3)
+	// 4. ListenerSet default/ls-1 (p4)
+	if res1[0].ParentRef.Name != "gw-a" || ValueOf(res1[0].ParentRef.SectionName) != "http" {
+		t.Errorf("expected res1[0] to be gw-a/http, got %+v", res1[0].ParentRef)
+	}
+	if res1[1].ParentRef.Name != "gw-a" || ValueOf(res1[1].ParentRef.SectionName) != "https" {
+		t.Errorf("expected res1[1] to be gw-a/https, got %+v", res1[1].ParentRef)
+	}
+	if res1[2].ParentRef.Name != "gw-b" {
+		t.Errorf("expected res1[2] to be gw-b, got %+v", res1[2].ParentRef)
+	}
+	if res1[3].ParentRef.Name != "ls-1" || normalizeKind(res1[3].ParentRef.Kind) != "ListenerSet" {
+		t.Errorf("expected res1[3] to be ListenerSet/ls-1, got %+v", res1[3].ParentRef)
+	}
+}
+
+func TestUpdateRouteParentStatuses_OtherControllersPreservedOrderAndAfterOurs(t *testing.T) {
+	myCtrl := gatewayv1.GatewayController("my-org/my-ctrl")
+	otherCtrl1 := gatewayv1.GatewayController("other-org/ctrl-1")
+	otherCtrl2 := gatewayv1.GatewayController("other-org/ctrl-2")
+
+	c := []metav1.Condition{NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1)}
+
+	existing := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "z-parent"}, ControllerName: otherCtrl1, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "a-parent"}, ControllerName: otherCtrl2, Conditions: c},
+	}
+
+	desired := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+	}
+
+	res, updated := UpdateRouteParentStatuses(existing, desired, "default", myCtrl)
+	if !updated {
+		t.Errorf("expected updated=true when adding gw-a")
+	}
+
+	// Result should have:
+	// 1. myCtrl / gw-a
+	// 2. myCtrl / gw-b
+	// 3. otherCtrl1 / z-parent (preserved relative order)
+	// 4. otherCtrl2 / a-parent (preserved relative order)
+	if len(res) != 4 {
+		t.Fatalf("expected 4 parent statuses, got %d", len(res))
+	}
+
+	if res[0].ControllerName != myCtrl || res[0].ParentRef.Name != "gw-a" {
+		t.Errorf("expected res[0] to be myCtrl/gw-a, got %+v", res[0])
+	}
+	if res[1].ControllerName != myCtrl || res[1].ParentRef.Name != "gw-b" {
+		t.Errorf("expected res[1] to be myCtrl/gw-b, got %+v", res[1])
+	}
+	if res[2].ControllerName != otherCtrl1 || res[2].ParentRef.Name != "z-parent" {
+		t.Errorf("expected res[2] to be otherCtrl1/z-parent, got %+v", res[2])
+	}
+	if res[3].ControllerName != otherCtrl2 || res[3].ParentRef.Name != "a-parent" {
+		t.Errorf("expected res[3] to be otherCtrl2/a-parent, got %+v", res[3])
+	}
+}
+
+func TestUpdateRouteParentStatuses_OrderOnlyDifferenceNotAnUpdate(t *testing.T) {
+	myCtrl := gatewayv1.GatewayController("my-org/my-ctrl")
+	otherCtrl := gatewayv1.GatewayController("other-org/other-ctrl")
+
+	t0 := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	c := []metav1.Condition{
+		{
+			Type:               "Accepted",
+			Status:             metav1.ConditionTrue,
+			Reason:             "Accepted",
+			Message:            "Accepted",
+			ObservedGeneration: 1,
+			LastTransitionTime: t0,
+		},
+	}
+
+	// Existing has other controller first, then our entries in unsorted order
+	existing := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-other"}, ControllerName: otherCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+	}
+
+	desired := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+	}
+
+	res, updated := UpdateRouteParentStatuses(existing, desired, "default", myCtrl)
+	if updated {
+		t.Errorf("expected updated=false when only ordering differs")
+	}
+
+	// Verify that res is still returned in sorted order (our entries sorted, otherCtrl after)
+	if len(res) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(res))
+	}
+	if res[0].ControllerName != myCtrl || res[0].ParentRef.Name != "gw-a" {
+		t.Errorf("expected res[0] to be myCtrl/gw-a, got %+v", res[0])
+	}
+	if res[1].ControllerName != myCtrl || res[1].ParentRef.Name != "gw-b" {
+		t.Errorf("expected res[1] to be myCtrl/gw-b, got %+v", res[1])
+	}
+	if res[2].ControllerName != otherCtrl || res[2].ParentRef.Name != "gw-other" {
+		t.Errorf("expected res[2] to be otherCtrl/gw-other, got %+v", res[2])
+	}
+}
+
+func TestUpdateRouteParentStatuses_AddRemoveEntriesStability(t *testing.T) {
+	myCtrl := gatewayv1.GatewayController("my-org/my-ctrl")
+	otherCtrl := gatewayv1.GatewayController("other-org/other-ctrl")
+
+	c := []metav1.Condition{NewCondition("Accepted", metav1.ConditionTrue, "Accepted", "Accepted", 1)}
+
+	existing := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-c"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-z"}, ControllerName: otherCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-y"}, ControllerName: otherCtrl, Conditions: c},
+	}
+
+	// 1. Adding gw-b
+	desiredAdd := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-c"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-b"}, ControllerName: myCtrl, Conditions: c},
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-a"}, ControllerName: myCtrl, Conditions: c},
+	}
+
+	resAdd, updatedAdd := UpdateRouteParentStatuses(existing, desiredAdd, "default", myCtrl)
+	if !updatedAdd {
+		t.Errorf("expected updated=true when adding gw-b")
+	}
+	if len(resAdd) != 5 {
+		t.Fatalf("expected 5 parent statuses, got %d", len(resAdd))
+	}
+	expectedNamesAdd := []string{"gw-a", "gw-b", "gw-c", "gw-z", "gw-y"}
+	for i, exp := range expectedNamesAdd {
+		if resAdd[i].ParentRef.Name != gatewayv1.ObjectName(exp) {
+			t.Errorf("at index %d: expected name %q, got %q", i, exp, resAdd[i].ParentRef.Name)
+		}
+	}
+
+	// 2. Removing gw-a
+	desiredRemove := []gatewayv1.RouteParentStatus{
+		{ParentRef: gatewayv1.ParentReference{Name: "gw-c"}, ControllerName: myCtrl, Conditions: c},
+	}
+	resRemove, updatedRemove := UpdateRouteParentStatuses(existing, desiredRemove, "default", myCtrl)
+	if !updatedRemove {
+		t.Errorf("expected updated=true when removing gw-a")
+	}
+	if len(resRemove) != 3 {
+		t.Fatalf("expected 3 parent statuses, got %d", len(resRemove))
+	}
+	expectedNamesRemove := []string{"gw-c", "gw-z", "gw-y"}
+	for i, exp := range expectedNamesRemove {
+		if resRemove[i].ParentRef.Name != gatewayv1.ObjectName(exp) {
+			t.Errorf("at index %d: expected name %q, got %q", i, exp, resRemove[i].ParentRef.Name)
+		}
 	}
 }
