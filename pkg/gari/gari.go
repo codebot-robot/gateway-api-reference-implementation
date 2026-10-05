@@ -15,7 +15,6 @@
 package gari
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -289,45 +288,6 @@ func (s *Server) newTLSConfig() *tls.Config {
 	}
 }
 
-type altSvcResponseWriter struct {
-	http.ResponseWriter
-	altSvc        string
-	writtenHeader bool
-}
-
-func (w *altSvcResponseWriter) WriteHeader(statusCode int) {
-	if !w.writtenHeader {
-		w.Header().Set("Alt-Svc", w.altSvc)
-		w.writtenHeader = true
-	}
-	w.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (w *altSvcResponseWriter) Write(b []byte) (int, error) {
-	if !w.writtenHeader {
-		w.Header().Set("Alt-Svc", w.altSvc)
-		w.writtenHeader = true
-	}
-	return w.ResponseWriter.Write(b)
-}
-
-func (w *altSvcResponseWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
-}
-
-func (w *altSvcResponseWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (w *altSvcResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
-	}
-	return nil, nil, errors.New("underlying ResponseWriter does not implement http.Hijacker")
-}
-
 // StartProxyServers starts the HTTP and HTTPS proxy servers and blocks until ctx is canceled.
 func (s *Server) StartProxyServers(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
@@ -426,10 +386,8 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			if hasHTTP3 && advertisedH3Port > 0 {
 				altSvcVal := fmt.Sprintf(`h3=":%d"; ma=86400`, advertisedH3Port)
 				handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					s.proxy.ServeHTTP(&altSvcResponseWriter{
-						ResponseWriter: w,
-						altSvc:         altSvcVal,
-					}, r)
+					w.Header().Set("Alt-Svc", altSvcVal)
+					s.proxy.ServeHTTP(w, r)
 				})
 			}
 

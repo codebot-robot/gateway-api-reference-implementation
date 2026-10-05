@@ -817,6 +817,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		removeHopByHopHeaders(resp.Header)
+		resp.Header.Del("Alt-Svc")
 		for k, vv := range resp.Header {
 			for _, v := range vv {
 				w.Header().Add(k, v)
@@ -1067,6 +1068,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		}
 
 		removeHopByHopHeaders(resp.Header)
+		resp.Header.Del("Alt-Svc")
 
 		for k, vv := range resp.Header {
 			for _, v := range vv {
