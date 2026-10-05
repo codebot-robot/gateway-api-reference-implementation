@@ -836,10 +836,7 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 
 	// 1. Gateway Status
 	addresses := []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}
-	gwStatus, updated := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses)
-	if !updated {
-		t.Errorf("expected Gateway status updated=true")
-	}
+	gwStatus := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses)
 	if len(gwStatus.Conditions) != 2 {
 		t.Errorf("expected 2 Gateway conditions, got %d", len(gwStatus.Conditions))
 	}
@@ -854,10 +851,7 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 	}
 
 	// 2. ListenerSet Status
-	lsStatus, updated := ComputeDesiredListenerSetStatus(ls, gw, nil, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}])
-	if !updated {
-		t.Errorf("expected ListenerSet status updated=true")
-	}
+	lsStatus := ComputeDesiredListenerSetStatus(ls, gw, nil, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}])
 	if len(lsStatus.Conditions) != 2 {
 		t.Errorf("expected 2 ListenerSet conditions, got %d", len(lsStatus.Conditions))
 	}
@@ -866,10 +860,7 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 	}
 
 	// 3. HTTPRoute Status
-	routeStatus, updated := ComputeDesiredHTTPRouteStatus(route, compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "r1"}], "example.net/gateway-controller")
-	if !updated {
-		t.Errorf("expected HTTPRoute status updated=true")
-	}
+	routeStatus := ComputeDesiredHTTPRouteStatus(route, compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "r1"}], "example.net/gateway-controller")
 	if len(routeStatus.Parents) != 2 {
 		t.Fatalf("expected 2 parent statuses on route, got %d", len(routeStatus.Parents))
 	}
@@ -1232,7 +1223,7 @@ func TestCompileModel_PrecedenceAndConflicts(t *testing.T) {
 
 			// Check ListenerSet desired status
 			for _, ls := range tc.listenerSets {
-				lsStatus, _ := ComputeDesiredListenerSetStatus(ls, tc.gateway, map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}}, cg)
+				lsStatus := ComputeDesiredListenerSetStatus(ls, tc.gateway, map[string]*corev1.Namespace{"default": {ObjectMeta: metav1.ObjectMeta{Name: "default"}}}, cg)
 				expectedStatus, ok := tc.expectedLSStatus[ls.Name]
 				if ok {
 					var accCond *metav1.Condition
@@ -1349,7 +1340,7 @@ func TestCompileModel_ListenerSetReferenceGrant(t *testing.T) {
 			t.Errorf("expected AttachedListenerSets = 0 without grant, got %d", cg.AttachedListenerSets)
 		}
 
-		lsStatus, _ := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
+		lsStatus := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
 		var accCond, progCond *metav1.Condition
 		for i := range lsStatus.Conditions {
 			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {
@@ -1397,7 +1388,7 @@ func TestCompileModel_ListenerSetReferenceGrant(t *testing.T) {
 			t.Errorf("expected AttachedListenerSets = 1 with grant, got %d", cg.AttachedListenerSets)
 		}
 
-		lsStatus, _ := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
+		lsStatus := ComputeDesiredListenerSetStatus(ls, gw, namespaces, cg)
 		var accCond, progCond *metav1.Condition
 		for i := range lsStatus.Conditions {
 			if lsStatus.Conditions[i].Type == string(gatewayv1.ListenerSetConditionAccepted) {
@@ -1526,7 +1517,7 @@ func TestCompileModel_GatewayUnresolvedCertRouteAttachment(t *testing.T) {
 	if cr == nil {
 		t.Fatalf("compiled route not found")
 	}
-	routeStatus, _ := ComputeDesiredHTTPRouteStatus(route, cr, "example.net/gateway-controller")
+	routeStatus := ComputeDesiredHTTPRouteStatus(route, cr, "example.net/gateway-controller")
 	if len(routeStatus.Parents) != 1 {
 		t.Fatalf("expected 1 parent in route status, got %d", len(routeStatus.Parents))
 	}
@@ -1907,7 +1898,7 @@ func TestCompileModel_ListenerSetRouteStatusScopedToParentRef(t *testing.T) {
 	})
 
 	crGW := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-gw"}]
-	statusGW, _ := ComputeDesiredHTTPRouteStatus(routeGWOnly, crGW, "example.net/gateway-controller")
+	statusGW := ComputeDesiredHTTPRouteStatus(routeGWOnly, crGW, "example.net/gateway-controller")
 	if len(statusGW.Parents) != 1 {
 		t.Fatalf("expected exactly 1 parent in status for routeGWOnly, got %d", len(statusGW.Parents))
 	}
@@ -1916,7 +1907,7 @@ func TestCompileModel_ListenerSetRouteStatusScopedToParentRef(t *testing.T) {
 	}
 
 	crLS := compiled.HTTPRoutes[types.NamespacedName{Namespace: "default", Name: "route-ls"}]
-	statusLS, _ := ComputeDesiredHTTPRouteStatus(routeLSOnly, crLS, "example.net/gateway-controller")
+	statusLS := ComputeDesiredHTTPRouteStatus(routeLSOnly, crLS, "example.net/gateway-controller")
 	if len(statusLS.Parents) != 1 {
 		t.Fatalf("expected exactly 1 parent in status for routeLSOnly, got %d", len(statusLS.Parents))
 	}

@@ -17,6 +17,7 @@ package state
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"sort"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 // ListenerOwner identifies the resource (Gateway or ListenerSet) that defines a listener.
@@ -192,9 +194,12 @@ func (cm *CompiledModel) ResolvedGateways() []*gatewayv1.Gateway {
 	return res
 }
 
-// ModelInputs contains all inputs required to build a CompiledModel.
+// ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
+	Revision           uint64
 	Gateways           []*gatewayv1.Gateway
+	GatewayClasses     []*gatewayv1.GatewayClass
+	GatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
 	ListenerSets       []*gatewayv1.ListenerSet
 	HTTPRoutes         []*gatewayv1.HTTPRoute
 	Services           map[types.NamespacedName]*corev1.Service
@@ -202,8 +207,24 @@ type ModelInputs struct {
 	ConfigMaps         map[types.NamespacedName]*corev1.ConfigMap
 	Secrets            map[types.NamespacedName]*corev1.Secret
 	Namespaces         map[string]*corev1.Namespace
+	ReferenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 	RefValidator       ReferenceGrantValidator
 	ControllerName     string
+}
+
+// Outputs represents all computed outputs produced by ComputeOutputs.
+type Outputs struct {
+	Revision                 uint64
+	GatewayStatuses          map[types.NamespacedName]gatewayv1.GatewayStatus
+	HTTPRouteStatuses        map[types.NamespacedName]gatewayv1.HTTPRouteStatus
+	ListenerSetStatuses      map[types.NamespacedName]gatewayv1.ListenerSetStatus
+	BackendTLSPolicyStatuses map[types.NamespacedName]gatewayv1.PolicyStatus
+	GatewayClassStatuses     map[types.NamespacedName]gatewayv1.GatewayClassStatus
+	ProxyListeners           []InternalListener
+	ProxyRoutes              []InternalRoute
+	CertificatesMap          map[string]*tls.Certificate
+	DefaultCert              *tls.Certificate
+	ResolvedGateways         []*gatewayv1.Gateway
 }
 
 func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
@@ -555,9 +576,6 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 }
 
 // areProtocolsCompatible returns true if two listeners on the same port can co-exist.
-// HTTP listeners can share a port with other HTTP listeners (differentiated by hostname).
-// HTTPS listeners can share a port with other HTTPS listeners (differentiated by SNI/hostname).
-// TODO: HTTPS and TLS listeners can also share a port (both routed by SNI); enable when TLSRoute is supported.
 func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 	if p1 == p2 {
 		if p1 == gatewayv1.HTTPProtocolType || p1 == gatewayv1.HTTPSProtocolType || p1 == gatewayv1.TLSProtocolType {
@@ -565,7 +583,6 @@ func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 		}
 		return false
 	}
-	// TODO: Support HTTPS and TLS protocol sharing on the same port once TLSRoute is implemented.
 	return false
 }
 
@@ -595,6 +612,11 @@ func markListenerConflicted(el *EffectiveListener, reason gatewayv1.ListenerCond
 
 // CompileModel compiles the effective listeners, route bindings, and statuses across all Gateways and ListenerSets.
 func CompileModel(inputs ModelInputs) *CompiledModel {
+	refValidator := inputs.RefValidator
+	if refValidator == nil && len(inputs.ReferenceGrants) > 0 {
+		refValidator = mapReferenceValidator{referenceGrants: inputs.ReferenceGrants}
+	}
+
 	cm := &CompiledModel{
 		Gateways:     make(map[types.NamespacedName]*CompiledGateway),
 		HTTPRoutes:   make(map[types.NamespacedName]*CompiledRoute),
@@ -607,9 +629,22 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 	}
 
+	var managedGatewayClasses map[string]bool
+	if inputs.ControllerName != "" && len(inputs.GatewayClasses) > 0 {
+		managedGatewayClasses = make(map[string]bool)
+		for _, gc := range inputs.GatewayClasses {
+			if gc != nil && string(gc.Spec.ControllerName) == inputs.ControllerName {
+				managedGatewayClasses[gc.Name] = true
+			}
+		}
+	}
+
 	// 1. Compile each Gateway and its effective listeners
 	for _, gw := range inputs.Gateways {
 		if gw == nil {
+			continue
+		}
+		if managedGatewayClasses != nil && !managedGatewayClasses[string(gw.Spec.GatewayClassName)] {
 			continue
 		}
 		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
@@ -625,7 +660,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				gwKey,
 				gw.Generation,
 				inputs.Secrets,
-				inputs.RefValidator,
+				refValidator,
 			)
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 		}
@@ -661,7 +696,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 					gwKey,
 					ls.Generation,
 					inputs.Secrets,
-					inputs.RefValidator,
+					refValidator,
 				)
 				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 			}
@@ -719,7 +754,11 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		cg.AttachedListenerSets = acceptedLSCount
 
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, len(gw.Status.Addresses) > 0)
+		hasAddress := false
+		if inputs.GatewayAddresses != nil {
+			hasAddress = len(inputs.GatewayAddresses[gwKey]) > 0
+		}
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -730,7 +769,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
 		rs := &HTTPRouteState{HTTPRoute: route}
-		rs.Compile(inputs.Services, inputs.BackendTLSPolicies, inputs.ConfigMaps, inputs.RefValidator)
+		rs.Compile(inputs.Services, inputs.BackendTLSPolicies, inputs.ConfigMaps, refValidator)
 
 		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
 		boundListenersForRoute := make(map[*EffectiveListener]bool)
@@ -1091,17 +1130,117 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 	return proxyListeners, proxyRoutes
 }
 
+// ComputeOutputs computes all desired statuses, proxy configuration, certificates, and resolved gateways.
+func ComputeOutputs(inputs ModelInputs) *Outputs {
+	if inputs.RefValidator == nil && len(inputs.ReferenceGrants) > 0 {
+		inputs.RefValidator = mapReferenceValidator{referenceGrants: inputs.ReferenceGrants}
+	}
+
+	compiled := CompileModel(inputs)
+
+	outputs := &Outputs{
+		Revision:                 inputs.Revision,
+		GatewayStatuses:          make(map[types.NamespacedName]gatewayv1.GatewayStatus),
+		HTTPRouteStatuses:        make(map[types.NamespacedName]gatewayv1.HTTPRouteStatus),
+		ListenerSetStatuses:      make(map[types.NamespacedName]gatewayv1.ListenerSetStatus),
+		BackendTLSPolicyStatuses: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
+		GatewayClassStatuses:     make(map[types.NamespacedName]gatewayv1.GatewayClassStatus),
+	}
+
+	// 1. Gateway Statuses
+	for _, gw := range inputs.Gateways {
+		if gw == nil {
+			continue
+		}
+		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		cg := compiled.Gateways[gwKey]
+		if cg != nil {
+			var addrs []gatewayv1.GatewayStatusAddress
+			if inputs.GatewayAddresses != nil {
+				addrs = inputs.GatewayAddresses[gwKey]
+			}
+			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs)
+		}
+	}
+
+	// 2. ListenerSet Statuses
+	for _, ls := range inputs.ListenerSets {
+		if ls == nil {
+			continue
+		}
+		lsKey := types.NamespacedName{Namespace: ls.Namespace, Name: ls.Name}
+		var parentGW *gatewayv1.Gateway
+		for _, g := range inputs.Gateways {
+			if g != nil && IsListenerSetParent(ls, g) {
+				parentGW = g
+				break
+			}
+		}
+		var compiledGw *CompiledGateway
+		if parentGW != nil {
+			parentKey := types.NamespacedName{Namespace: parentGW.Namespace, Name: parentGW.Name}
+			compiledGw = compiled.Gateways[parentKey]
+		}
+		if parentGW != nil && (inputs.ControllerName == "" || compiledGw != nil) {
+			outputs.ListenerSetStatuses[lsKey] = ComputeDesiredListenerSetStatus(ls, parentGW, inputs.Namespaces, compiledGw)
+		}
+	}
+
+	// 3. HTTPRoute Statuses
+	for _, route := range inputs.HTTPRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		compiledRoute := compiled.HTTPRoutes[routeKey]
+		outputs.HTTPRouteStatuses[routeKey] = ComputeDesiredHTTPRouteStatus(route, compiledRoute, inputs.ControllerName)
+	}
+
+	// 4. BackendTLSPolicy Statuses
+	for _, policy := range inputs.BackendTLSPolicies {
+		if policy == nil {
+			continue
+		}
+		policyKey := types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}
+		outputs.BackendTLSPolicyStatuses[policyKey] = ComputeDesiredBackendTLSPolicyStatus(
+			policy,
+			compiled,
+			inputs.ConfigMaps,
+			inputs.BackendTLSPolicies,
+			inputs.ControllerName,
+		)
+	}
+
+	// 5. GatewayClass Statuses
+	for _, gc := range inputs.GatewayClasses {
+		if gc == nil {
+			continue
+		}
+		if inputs.ControllerName == "" || string(gc.Spec.ControllerName) == inputs.ControllerName {
+			gcKey := types.NamespacedName{Name: gc.Name}
+			outputs.GatewayClassStatuses[gcKey] = ComputeDesiredGatewayClassStatus(gc, inputs.ControllerName)
+		}
+	}
+
+	// 6. Proxy Config & Certs
+	proxyListeners, proxyRoutes := BuildProxyConfig(compiled.GatewaysList())
+	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList(), inputs.Secrets, inputs.RefValidator)
+
+	outputs.ProxyListeners = proxyListeners
+	outputs.ProxyRoutes = proxyRoutes
+	outputs.CertificatesMap = certsMap
+	outputs.DefaultCert = defaultCert
+	outputs.ResolvedGateways = compiled.ResolvedGateways()
+
+	return outputs
+}
+
 // ComputeDesiredGatewayStatus computes the desired GatewayStatus from the compiled model and address provider.
 func ComputeDesiredGatewayStatus(
 	gw *gatewayv1.Gateway,
 	compiledGw *CompiledGateway,
 	providedAddresses []gatewayv1.GatewayStatusAddress,
-) (gatewayv1.GatewayStatus, bool) {
-	desiredStatus := gw.Status.DeepCopy()
-	if desiredStatus == nil {
-		desiredStatus = &gatewayv1.GatewayStatus{}
-	}
-
+) gatewayv1.GatewayStatus {
 	hasAddress := len(providedAddresses) > 0
 	var effectiveListeners []*EffectiveListener
 	attachedLSCount := int32(0)
@@ -1112,7 +1251,6 @@ func ComputeDesiredGatewayStatus(
 
 	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress)
 
-	// Build desired listener statuses for Gateway's own listeners
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {
 		var matchedEl *EffectiveListener
@@ -1133,31 +1271,6 @@ func ComputeDesiredGatewayStatus(
 			copy(conds, matchedEl.Conditions)
 		}
 
-		// Find old listener status to preserve LastTransitionTime
-		var oldListener *gatewayv1.ListenerStatus
-		for _, ol := range desiredStatus.Listeners {
-			if ol.Name == l.Name {
-				oldListener = &ol
-				break
-			}
-		}
-
-		if oldListener != nil {
-			for i, nc := range conds {
-				for _, oc := range oldListener.Conditions {
-					if oc.Type == nc.Type && oc.Status == nc.Status && !oc.LastTransitionTime.IsZero() {
-						conds[i].LastTransitionTime = oc.LastTransitionTime
-						break
-					}
-				}
-			}
-		}
-		for i := range conds {
-			if conds[i].LastTransitionTime.IsZero() {
-				conds[i].LastTransitionTime = metav1.Now()
-			}
-		}
-
 		desiredListenerStatuses = append(desiredListenerStatuses, gatewayv1.ListenerStatus{
 			Name:           l.Name,
 			SupportedKinds: supportedKinds,
@@ -1166,7 +1279,6 @@ func ComputeDesiredGatewayStatus(
 		})
 	}
 
-	// Gateway accepted check for addresses
 	gwAccepted := false
 	for _, cond := range desiredConditions {
 		if cond.Type == string(gatewayv1.GatewayConditionAccepted) && cond.Status == metav1.ConditionTrue {
@@ -1180,30 +1292,12 @@ func ComputeDesiredGatewayStatus(
 		desiredAddresses = providedAddresses
 	}
 
-	// Update conditions preserving LastTransitionTime
-	conditionsChanged := SetConditions(&desiredStatus.Conditions, desiredConditions)
-
-	updated := conditionsChanged
-
-	// Check addresses
-	if !reflectAddressesEqual(desiredStatus.Addresses, desiredAddresses) {
-		desiredStatus.Addresses = desiredAddresses
-		updated = true
+	return gatewayv1.GatewayStatus{
+		Conditions:           desiredConditions,
+		Listeners:            desiredListenerStatuses,
+		Addresses:            desiredAddresses,
+		AttachedListenerSets: &attachedLSCount,
 	}
-
-	// Check listeners
-	if !reflectListenerStatusesEqual(desiredStatus.Listeners, desiredListenerStatuses) {
-		desiredStatus.Listeners = desiredListenerStatuses
-		updated = true
-	}
-
-	// Check AttachedListenerSets
-	if desiredStatus.AttachedListenerSets == nil || *desiredStatus.AttachedListenerSets != attachedLSCount {
-		desiredStatus.AttachedListenerSets = &attachedLSCount
-		updated = true
-	}
-
-	return *desiredStatus, updated
 }
 
 // ComputeDesiredListenerSetStatus computes the desired ListenerSetStatus from the compiled model.
@@ -1212,12 +1306,7 @@ func ComputeDesiredListenerSetStatus(
 	parentGW *gatewayv1.Gateway,
 	namespaces map[string]*corev1.Namespace,
 	compiledGw *CompiledGateway,
-) (gatewayv1.ListenerSetStatus, bool) {
-	desiredStatus := ls.Status.DeepCopy()
-	if desiredStatus == nil {
-		desiredStatus = &gatewayv1.ListenerSetStatus{}
-	}
-
+) gatewayv1.ListenerSetStatus {
 	var effectiveListeners []*EffectiveListener
 	if compiledGw != nil {
 		effectiveListeners = compiledGw.EffectiveListeners
@@ -1240,11 +1329,6 @@ func ComputeDesiredListenerSetStatus(
 			}
 
 			if matchedEl == nil {
-				// If an allowed ListenerSet listener is not found in the compiled model,
-				// it indicates an internal inconsistency (e.g. missing compiled Gateway model).
-				// We skip setting status for this listener rather than attempting a fallback
-				// re-validation without secrets or a ReferenceGrant validator, which would
-				// incorrectly report TLS certificate references as invalid.
 				continue
 			}
 
@@ -1252,30 +1336,6 @@ func ComputeDesiredListenerSetStatus(
 			attachedRoutes := matchedEl.AttachedRoutes
 			conds := make([]metav1.Condition, len(matchedEl.Conditions))
 			copy(conds, matchedEl.Conditions)
-
-			var oldListener *gatewayv1.ListenerEntryStatus
-			for _, ol := range desiredStatus.Listeners {
-				if ol.Name == l.Name {
-					oldListener = &ol
-					break
-				}
-			}
-
-			if oldListener != nil {
-				for i, nc := range conds {
-					for _, oc := range oldListener.Conditions {
-						if oc.Type == nc.Type && oc.Status == nc.Status && !oc.LastTransitionTime.IsZero() {
-							conds[i].LastTransitionTime = oc.LastTransitionTime
-							break
-						}
-					}
-				}
-			}
-			for i := range conds {
-				if conds[i].LastTransitionTime.IsZero() {
-					conds[i].LastTransitionTime = metav1.Now()
-				}
-			}
 
 			desiredListeners = append(desiredListeners, gatewayv1.ListenerEntryStatus{
 				Name:           l.Name,
@@ -1286,15 +1346,10 @@ func ComputeDesiredListenerSetStatus(
 		}
 	}
 
-	conditionsChanged := SetConditions(&desiredStatus.Conditions, desiredConditions)
-	updated := conditionsChanged
-
-	if !reflectListenerEntryStatusesEqual(desiredStatus.Listeners, desiredListeners) {
-		desiredStatus.Listeners = desiredListeners
-		updated = true
+	return gatewayv1.ListenerSetStatus{
+		Conditions: desiredConditions,
+		Listeners:  desiredListeners,
 	}
-
-	return *desiredStatus, updated
 }
 
 // ComputeDesiredHTTPRouteStatus computes the desired HTTPRouteStatus from the compiled model.
@@ -1302,12 +1357,7 @@ func ComputeDesiredHTTPRouteStatus(
 	route *gatewayv1.HTTPRoute,
 	compiledRoute *CompiledRoute,
 	controllerName string,
-) (gatewayv1.HTTPRouteStatus, bool) {
-	desiredStatus := route.Status.DeepCopy()
-	if desiredStatus == nil {
-		desiredStatus = &gatewayv1.HTTPRouteStatus{}
-	}
-
+) gatewayv1.HTTPRouteStatus {
 	var desiredParents []gatewayv1.RouteParentStatus
 	if compiledRoute != nil {
 		for i, parentRef := range route.Spec.ParentRefs {
@@ -1326,10 +1376,420 @@ func ComputeDesiredHTTPRouteStatus(
 		}
 	}
 
-	newParents, updated := UpdateRouteParentStatuses(desiredStatus.Parents, desiredParents, route.Namespace, gatewayv1.GatewayController(controllerName))
-	desiredStatus.Parents = newParents
+	return gatewayv1.HTTPRouteStatus{
+		Parents: desiredParents,
+	}
+}
 
-	return *desiredStatus, updated
+// ComputeDesiredBackendTLSPolicyStatus computes the desired BackendTLSPolicy PolicyStatus.
+func ComputeDesiredBackendTLSPolicyStatus(
+	policy *gatewayv1.BackendTLSPolicy,
+	compiled *CompiledModel,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	allPolicies []*gatewayv1.BackendTLSPolicy,
+	controllerName string,
+) gatewayv1.PolicyStatus {
+	isConflicted := false
+	var conflictingPolicy string
+	for _, targetRef := range policy.Spec.TargetRefs {
+		if string(targetRef.Group) != "" && string(targetRef.Group) != gatewayv1.GroupName {
+			continue
+		}
+		if string(targetRef.Kind) != "Service" {
+			continue
+		}
+
+		targetSvcNamespace := policy.Namespace
+		targetSvcName := string(targetRef.Name)
+
+		for _, p := range allPolicies {
+			if p == nil || (p.Namespace == policy.Namespace && p.Name == policy.Name) {
+				continue
+			}
+
+			for _, t := range p.Spec.TargetRefs {
+				if (string(t.Group) == "" || string(t.Group) == gatewayv1.GroupName) && string(t.Kind) == "Service" {
+					if p.Namespace == targetSvcNamespace && string(t.Name) == targetSvcName {
+						if p.CreationTimestamp.Time.Before(policy.CreationTimestamp.Time) {
+							isConflicted = true
+							conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+							break
+						}
+						if p.CreationTimestamp.Time.Equal(policy.CreationTimestamp.Time) {
+							if p.Namespace < policy.Namespace || (p.Namespace == policy.Namespace && p.Name < policy.Name) {
+								isConflicted = true
+								conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+								break
+							}
+						}
+					}
+				}
+			}
+			if isConflicted {
+				break
+			}
+		}
+		if isConflicted {
+			break
+		}
+	}
+
+	var unresolvedRefs []string
+	for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+		if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+			cmKey := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+			cm, ok := configMaps[cmKey]
+			if !ok || cm == nil {
+				unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+			} else {
+				var data []byte
+				if d, ok := cm.Data["ca.crt"]; ok {
+					data = []byte(d)
+				} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+					data = d
+				}
+
+				if len(data) == 0 {
+					unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+				} else {
+					block, _ := pem.Decode(data)
+					if block == nil || block.Type != "CERTIFICATE" {
+						unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+					}
+				}
+			}
+		} else {
+			unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+		}
+	}
+
+	acceptedStatus := metav1.ConditionTrue
+	acceptedReason := string(gatewayv1.PolicyReasonAccepted)
+	acceptedMessage := "Policy accepted"
+
+	resolvedRefsStatus := metav1.ConditionTrue
+	resolvedRefsReason := string(gatewayv1.BackendTLSPolicyReasonResolvedRefs)
+	resolvedRefsMessage := "All references resolved"
+
+	if len(unresolvedRefs) > 0 {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = "NoValidCACertificate"
+		acceptedMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
+
+		resolvedRefsStatus = metav1.ConditionFalse
+		resolvedRefsReason = "InvalidCACertificateRef"
+		resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
+	}
+
+	if isConflicted {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = string(gatewayv1.PolicyReasonConflicted)
+		acceptedMessage = fmt.Sprintf("Conflicted with older policy: %s", conflictingPolicy)
+	}
+
+	var ancestors []gatewayv1.PolicyAncestorStatus
+
+	if compiled != nil {
+		for _, cg := range compiled.Gateways {
+			if cg == nil || cg.Gateway == nil {
+				continue
+			}
+			gw := cg.Gateway
+
+			usesPolicy := false
+			for _, cr := range compiled.HTTPRoutes {
+				if cr == nil || cr.HTTPRoute == nil {
+					continue
+				}
+				route := cr.HTTPRoute
+
+				routeMatchesGw := false
+				for i, pref := range route.Spec.ParentRefs {
+					if string(pref.Name) == gw.Name && (ValueOf(pref.Namespace) == "" || string(ValueOf(pref.Namespace)) == gw.Namespace) {
+						if i < len(cr.ParentConditions) && cr.ParentConditions[i].Status == metav1.ConditionTrue {
+							routeMatchesGw = true
+							break
+						}
+					}
+				}
+
+				if routeMatchesGw {
+					for _, rule := range route.Spec.Rules {
+						for _, backendRef := range rule.BackendRefs {
+							if string(ValueOf(backendRef.Kind)) == "Service" || ValueOf(backendRef.Kind) == "" {
+								svcNs := route.Namespace
+								if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
+									svcNs = string(*backendRef.Namespace)
+								}
+								for _, targetRef := range policy.Spec.TargetRefs {
+									if svcNs == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
+										usesPolicy = true
+										break
+									}
+								}
+							}
+							if usesPolicy {
+								break
+							}
+						}
+						if usesPolicy {
+							break
+						}
+					}
+				}
+				if usesPolicy {
+					break
+				}
+			}
+
+			if usesPolicy {
+				ancestors = append(ancestors, gatewayv1.PolicyAncestorStatus{
+					AncestorRef: gatewayv1.ParentReference{
+						Group:     Ptr(gatewayv1.Group(gatewayv1.GroupName)),
+						Kind:      Ptr(gatewayv1.Kind("Gateway")),
+						Namespace: Ptr(gatewayv1.Namespace(gw.Namespace)),
+						Name:      gatewayv1.ObjectName(gw.Name),
+					},
+					ControllerName: gatewayv1.GatewayController(controllerName),
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(gatewayv1.PolicyConditionAccepted),
+							Status:             acceptedStatus,
+							ObservedGeneration: policy.Generation,
+							Reason:             acceptedReason,
+							Message:            acceptedMessage,
+						},
+						{
+							Type:               string(gatewayv1.BackendTLSPolicyConditionResolvedRefs),
+							Status:             resolvedRefsStatus,
+							ObservedGeneration: policy.Generation,
+							Reason:             resolvedRefsReason,
+							Message:            resolvedRefsMessage,
+						},
+					},
+				})
+			}
+		}
+	}
+
+	return gatewayv1.PolicyStatus{Ancestors: ancestors}
+}
+
+// ComputeDesiredGatewayClassStatus computes the desired GatewayClass status.
+func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string) gatewayv1.GatewayClassStatus {
+	acceptedStatus := metav1.ConditionTrue
+	acceptedReason := string(gatewayv1.GatewayClassReasonAccepted)
+	acceptedMessage := "GatewayClass accepted by reference implementation"
+
+	if gc.Spec.ParametersRef != nil {
+		acceptedStatus = metav1.ConditionFalse
+		acceptedReason = string(gatewayv1.GatewayClassReasonInvalidParameters)
+		acceptedMessage = "Invalid parametersRef: parametersRef is not supported"
+	}
+
+	return gatewayv1.GatewayClassStatus{
+		Conditions: []metav1.Condition{
+			{
+				Type:               string(gatewayv1.GatewayClassConditionStatusAccepted),
+				Status:             acceptedStatus,
+				ObservedGeneration: gc.Generation,
+				Reason:             acceptedReason,
+				Message:            acceptedMessage,
+			},
+		},
+	}
+}
+
+// MergeGatewayStatus merges desired GatewayStatus into current, preserving LastTransitionTime.
+func MergeGatewayStatus(current *gatewayv1.GatewayStatus, desired gatewayv1.GatewayStatus) bool {
+	updated := false
+	if SetConditions(&current.Conditions, desired.Conditions) {
+		updated = true
+	}
+	if !reflectAddressesEqual(current.Addresses, desired.Addresses) {
+		current.Addresses = desired.Addresses
+		updated = true
+	}
+	if (current.AttachedListenerSets == nil && desired.AttachedListenerSets != nil) ||
+		(current.AttachedListenerSets != nil && desired.AttachedListenerSets == nil) ||
+		(current.AttachedListenerSets != nil && desired.AttachedListenerSets != nil && *current.AttachedListenerSets != *desired.AttachedListenerSets) {
+		current.AttachedListenerSets = desired.AttachedListenerSets
+		updated = true
+	}
+
+	var newListeners []gatewayv1.ListenerStatus
+	for _, dl := range desired.Listeners {
+		entry := gatewayv1.ListenerStatus{
+			Name:           dl.Name,
+			SupportedKinds: dl.SupportedKinds,
+			AttachedRoutes: dl.AttachedRoutes,
+			Conditions:     make([]metav1.Condition, len(dl.Conditions)),
+		}
+		copy(entry.Conditions, dl.Conditions)
+
+		var matchedOld *gatewayv1.ListenerStatus
+		for _, ol := range current.Listeners {
+			if ol.Name == dl.Name {
+				matchedOld = &ol
+				break
+			}
+		}
+		if matchedOld != nil {
+			for k, dc := range entry.Conditions {
+				for _, oc := range matchedOld.Conditions {
+					if oc.Type == dc.Type {
+						if oc.Status == dc.Status {
+							entry.Conditions[k].LastTransitionTime = oc.LastTransitionTime
+						}
+						break
+					}
+				}
+			}
+		}
+		for k := range entry.Conditions {
+			if entry.Conditions[k].LastTransitionTime.IsZero() {
+				entry.Conditions[k].LastTransitionTime = metav1.Now()
+			}
+		}
+		newListeners = append(newListeners, entry)
+	}
+	if !reflectListenerStatusesEqual(current.Listeners, newListeners) {
+		current.Listeners = newListeners
+		updated = true
+	}
+	return updated
+}
+
+// MergeListenerSetStatus merges desired ListenerSetStatus into current, preserving LastTransitionTime.
+func MergeListenerSetStatus(current *gatewayv1.ListenerSetStatus, desired gatewayv1.ListenerSetStatus) bool {
+	updated := false
+	if SetConditions(&current.Conditions, desired.Conditions) {
+		updated = true
+	}
+	var newListeners []gatewayv1.ListenerEntryStatus
+	for _, dl := range desired.Listeners {
+		entry := gatewayv1.ListenerEntryStatus{
+			Name:           dl.Name,
+			SupportedKinds: dl.SupportedKinds,
+			AttachedRoutes: dl.AttachedRoutes,
+			Conditions:     make([]metav1.Condition, len(dl.Conditions)),
+		}
+		copy(entry.Conditions, dl.Conditions)
+
+		var matchedOld *gatewayv1.ListenerEntryStatus
+		for _, ol := range current.Listeners {
+			if ol.Name == dl.Name {
+				matchedOld = &ol
+				break
+			}
+		}
+		if matchedOld != nil {
+			for k, dc := range entry.Conditions {
+				for _, oc := range matchedOld.Conditions {
+					if oc.Type == dc.Type {
+						if oc.Status == dc.Status {
+							entry.Conditions[k].LastTransitionTime = oc.LastTransitionTime
+						}
+						break
+					}
+				}
+			}
+		}
+		for k := range entry.Conditions {
+			if entry.Conditions[k].LastTransitionTime.IsZero() {
+				entry.Conditions[k].LastTransitionTime = metav1.Now()
+			}
+		}
+		newListeners = append(newListeners, entry)
+	}
+	if !reflectListenerEntryStatusesEqual(current.Listeners, newListeners) {
+		current.Listeners = newListeners
+		updated = true
+	}
+	return updated
+}
+
+// MergeHTTPRouteStatus merges desired HTTPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
+func MergeHTTPRouteStatus(current *gatewayv1.HTTPRouteStatus, desired gatewayv1.HTTPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
+	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
+	if updated {
+		current.Parents = newParents
+	}
+	return updated
+}
+
+// MergeBackendTLSPolicyStatus merges desired PolicyStatus into current, preserving LastTransitionTime and other controllers' ancestors.
+func MergeBackendTLSPolicyStatus(current *gatewayv1.PolicyStatus, desired gatewayv1.PolicyStatus, controllerName gatewayv1.GatewayController) bool {
+	newAncestors, updated := UpdatePolicyAncestors(current.Ancestors, desired.Ancestors, controllerName)
+	if updated {
+		current.Ancestors = newAncestors
+	}
+	return updated
+}
+
+// MergeGatewayClassStatus merges desired GatewayClassStatus into current, preserving LastTransitionTime.
+func MergeGatewayClassStatus(current *gatewayv1.GatewayClassStatus, desired gatewayv1.GatewayClassStatus) bool {
+	return SetConditions(&current.Conditions, desired.Conditions)
+}
+
+// GatewayStatusesEqual compares two GatewayStatus objects (ignoring LastTransitionTime).
+func GatewayStatusesEqual(a, b gatewayv1.GatewayStatus) bool {
+	if !ConditionsEqual(a.Conditions, b.Conditions) {
+		return false
+	}
+	if !reflectAddressesEqual(a.Addresses, b.Addresses) {
+		return false
+	}
+	if (a.AttachedListenerSets == nil) != (b.AttachedListenerSets == nil) {
+		return false
+	}
+	if a.AttachedListenerSets != nil && b.AttachedListenerSets != nil && *a.AttachedListenerSets != *b.AttachedListenerSets {
+		return false
+	}
+	return reflectListenerStatusesEqual(a.Listeners, b.Listeners)
+}
+
+// HTTPRouteStatusesEqual compares two HTTPRouteStatus objects (ignoring LastTransitionTime).
+func HTTPRouteStatusesEqual(a, b gatewayv1.HTTPRouteStatus) bool {
+	if len(a.Parents) != len(b.Parents) {
+		return false
+	}
+	for i := range a.Parents {
+		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
+			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
+			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
+			return false
+		}
+	}
+	return true
+}
+
+// ListenerSetStatusesEqual compares two ListenerSetStatus objects (ignoring LastTransitionTime).
+func ListenerSetStatusesEqual(a, b gatewayv1.ListenerSetStatus) bool {
+	if !ConditionsEqual(a.Conditions, b.Conditions) {
+		return false
+	}
+	return reflectListenerEntryStatusesEqual(a.Listeners, b.Listeners)
+}
+
+// PolicyStatusesEqual compares two PolicyStatus objects (ignoring LastTransitionTime).
+func PolicyStatusesEqual(a, b gatewayv1.PolicyStatus) bool {
+	if len(a.Ancestors) != len(b.Ancestors) {
+		return false
+	}
+	for i := range a.Ancestors {
+		if !reflectParentReferenceEqual(a.Ancestors[i].AncestorRef, b.Ancestors[i].AncestorRef) ||
+			a.Ancestors[i].ControllerName != b.Ancestors[i].ControllerName ||
+			!ConditionsEqual(a.Ancestors[i].Conditions, b.Ancestors[i].Conditions) {
+			return false
+		}
+	}
+	return true
+}
+
+// GatewayClassStatusesEqual compares two GatewayClassStatus objects (ignoring LastTransitionTime).
+func GatewayClassStatusesEqual(a, b gatewayv1.GatewayClassStatus) bool {
+	return ConditionsEqual(a.Conditions, b.Conditions)
 }
 
 func reflectAddressesEqual(a, b []gatewayv1.GatewayStatusAddress) bool {
@@ -1390,7 +1850,7 @@ func reflectListenerEntryStatusesEqual(a, b []gatewayv1.ListenerEntryStatus) boo
 	return true
 }
 
-// CompileModelHelper on State compiles the state snapshot into a CompiledModel.
+// CompileModel on State compiles the state snapshot into a CompiledModel.
 func (s *State) CompileModel(controllerName string) *CompiledModel {
 	gatewaysMap := s.GetGateways()
 	var gateways []*gatewayv1.Gateway
@@ -1429,8 +1889,18 @@ func (s *State) CompileModel(controllerName string) *CompiledModel {
 		}
 	}
 
+	var gatewayClasses []*gatewayv1.GatewayClass
+	for _, gc := range s.GetGatewayClasses() {
+		if gc != nil {
+			gatewayClasses = append(gatewayClasses, gc)
+		}
+	}
+
 	return CompileModel(ModelInputs{
+		Revision:           s.Revision(),
 		Gateways:           gateways,
+		GatewayClasses:     gatewayClasses,
+		GatewayAddresses:   s.GetGatewayAddresses(),
 		ListenerSets:       listenerSets,
 		HTTPRoutes:         routes,
 		Services:           s.GetServices(),
@@ -1438,6 +1908,7 @@ func (s *State) CompileModel(controllerName string) *CompiledModel {
 		ConfigMaps:         s.GetConfigMaps(),
 		Secrets:            s.GetSecrets(),
 		Namespaces:         s.GetNamespaces(),
+		ReferenceGrants:    nil,
 		RefValidator:       s,
 		ControllerName:     controllerName,
 	})

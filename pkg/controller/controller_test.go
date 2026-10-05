@@ -25,7 +25,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -108,7 +107,6 @@ func TestHTTPRouteReconciler_CustomControllerName(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	customController := "custom.domain/controller"
 
@@ -138,7 +136,6 @@ func TestHTTPRouteReconciler_CustomControllerName(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: customController,
 	}
 
@@ -164,12 +161,6 @@ func TestServiceAndSecretAndConfigMapReconcilers(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
-
-	hookCalled := false
-	onUpdate := func(gws []*gatewayv1.Gateway) {
-		hookCalled = true
-	}
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -202,62 +193,50 @@ func TestServiceAndSecretAndConfigMapReconcilers(t *testing.T) {
 		Build()
 
 	svcReconciler := &ServiceReconciler{
-		Client:           client,
-		Scheme:           scheme,
-		State:            st,
-		Proxy:            p,
-		ControllerName:   "test-controller",
-		OnGatewaysUpdate: onUpdate,
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
 	}
 	secretReconciler := &SecretReconciler{
-		Client:           client,
-		Scheme:           scheme,
-		State:            st,
-		Proxy:            p,
-		ControllerName:   "test-controller",
-		OnGatewaysUpdate: onUpdate,
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
 	}
 	cmReconciler := &ConfigMapReconciler{
-		Client:           client,
-		Scheme:           scheme,
-		State:            st,
-		Proxy:            p,
-		ControllerName:   "test-controller",
-		OnGatewaysUpdate: onUpdate,
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
 	}
 	nsReconciler := &NamespaceReconciler{
-		Client:           client,
-		Scheme:           scheme,
-		State:            st,
-		Proxy:            p,
-		ControllerName:   "test-controller",
-		OnGatewaysUpdate: onUpdate,
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
 	}
 
 	ctx := t.Context()
 
-	hookCalled = false
 	_, err := svcReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-svc"}})
-	if err != nil || !hookCalled {
-		t.Fatalf("ServiceReconciler failed or hook not called: err=%v, hookCalled=%v", err, hookCalled)
+	if err != nil || st.GetService(types.NamespacedName{Namespace: "default", Name: "my-svc"}) == nil {
+		t.Fatalf("ServiceReconciler failed or service not in state: err=%v", err)
 	}
 
-	hookCalled = false
 	_, err = secretReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-secret"}})
-	if err != nil || !hookCalled {
-		t.Fatalf("SecretReconciler failed or hook not called: err=%v, hookCalled=%v", err, hookCalled)
+	if err != nil || st.GetSecrets()[types.NamespacedName{Namespace: "default", Name: "my-secret"}] == nil {
+		t.Fatalf("SecretReconciler failed or secret not in state: err=%v", err)
 	}
 
-	hookCalled = false
 	_, err = cmReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-cm"}})
-	if err != nil || !hookCalled {
-		t.Fatalf("ConfigMapReconciler failed or hook not called: err=%v, hookCalled=%v", err, hookCalled)
+	if err != nil || st.GetConfigMaps()[types.NamespacedName{Namespace: "default", Name: "my-cm"}] == nil {
+		t.Fatalf("ConfigMapReconciler failed or configmap not in state: err=%v", err)
 	}
 
-	hookCalled = false
 	_, err = nsReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "my-ns"}})
-	if err != nil || !hookCalled {
-		t.Fatalf("NamespaceReconciler failed or hook not called: err=%v, hookCalled=%v", err, hookCalled)
+	if err != nil || st.GetNamespaces()["my-ns"] == nil {
+		t.Fatalf("NamespaceReconciler failed or namespace not in state: err=%v", err)
 	}
 	if len(st.GetNamespaces()) != 1 || st.GetNamespaces()["my-ns"] == nil {
 		t.Fatalf("expected namespace in state, got %v", st.GetNamespaces())
@@ -351,7 +330,6 @@ func TestGatewayReconciler_TLSReferenceGrant(t *testing.T) {
 	_ = gatewayv1beta1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	certPEM, keyPEM := generateTestCertPEM(t)
 
@@ -411,7 +389,6 @@ func TestGatewayReconciler_TLSReferenceGrant(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: "test-controller",
 	}
 
@@ -571,7 +548,6 @@ func TestGatewayReconciler_InvalidParametersRef(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	gwClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
@@ -613,7 +589,6 @@ func TestGatewayReconciler_InvalidParametersRef(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: "test-controller",
 	}
 
@@ -651,7 +626,6 @@ func TestGatewayReconciler_UnsupportedProtocol(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	gwClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
@@ -711,7 +685,6 @@ func TestGatewayReconciler_UnsupportedProtocol(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: "test-controller",
 	}
 
@@ -784,7 +757,6 @@ func TestGatewayReconciler_InvalidRouteKind(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	gwClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
@@ -850,7 +822,6 @@ func TestGatewayReconciler_InvalidRouteKind(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: "test-controller",
 	}
 
@@ -933,7 +904,6 @@ func TestGatewayReconciler_AddressProvider(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	gwClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{
@@ -984,7 +954,6 @@ func TestGatewayReconciler_AddressProvider(t *testing.T) {
 		Client:          client,
 		Scheme:          scheme,
 		State:           st,
-		Proxy:           p,
 		ControllerName:  "test-controller",
 		AddressProvider: provider,
 	}
@@ -1099,7 +1068,6 @@ func TestGatewayReconciler_GatewayFilter(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	gwClass := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1156,7 +1124,6 @@ func TestGatewayReconciler_GatewayFilter(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: "test-controller",
 		GatewayFilter: func(gw *gatewayv1.Gateway) bool {
 			return gw.Labels["env"] == "prod"
@@ -1274,7 +1241,6 @@ func TestListenerSetReconciler(t *testing.T) {
 	}
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1286,7 +1252,6 @@ func TestListenerSetReconciler(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: DefaultControllerName,
 	}
 
@@ -1404,7 +1369,6 @@ func TestGatewayReconciler_AttachedListenerSets(t *testing.T) {
 	}
 
 	st := state.NewState()
-	p := proxy.NewProxy()
 
 	st.UpsertListenerSet(ls1)
 	st.UpsertListenerSet(ls2)
@@ -1419,7 +1383,6 @@ func TestGatewayReconciler_AttachedListenerSets(t *testing.T) {
 		Client:         client,
 		Scheme:         scheme,
 		State:          st,
-		Proxy:          p,
 		ControllerName: DefaultControllerName,
 	}
 

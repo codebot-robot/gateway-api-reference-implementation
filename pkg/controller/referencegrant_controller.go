@@ -18,24 +18,20 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type ReferenceGrantReconciler struct {
 	client.Client
-	Scheme           *runtime.Scheme
-	State            *state.State
-	Proxy            *proxy.Proxy
-	ControllerName   string
-	OnGatewaysUpdate func([]*gatewayv1.Gateway)
+	Scheme         *runtime.Scheme
+	State          *state.State
+	ControllerName string
 }
 
 func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -44,37 +40,20 @@ func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	rg := &gatewayv1beta1.ReferenceGrant{}
 	if err := r.Get(ctx, req.NamespacedName, rg); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.State.DeleteReferenceGrant(req.NamespacedName)
-			r.recomputeAndSyncRoutes(ctx)
-			r.updateProxy()
+			if r.State != nil {
+				r.State.DeleteReferenceGrant(req.NamespacedName)
+			}
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	r.State.UpsertReferenceGrant(rg)
-	r.recomputeAndSyncRoutes(ctx)
-	r.updateProxy()
+	if r.State != nil {
+		r.State.UpsertReferenceGrant(rg)
+	}
 
-	l.Info("Updated ReferenceGrant in state")
+	l.V(1).Info("Updated ReferenceGrant in state")
 
 	return ctrl.Result{}, nil
-}
-
-func (r *ReferenceGrantReconciler) recomputeAndSyncRoutes(ctx context.Context) {
-	services := r.State.GetServices()
-	policies := r.State.GetBackendTLSPolicies()
-	configMaps := r.State.GetConfigMaps()
-
-	// Recompile all routes stored in state against the updated reference grants
-	for _, route := range r.State.GetHTTPRoutes() {
-		if route.HTTPRoute != nil {
-			route.Compile(services, policies, configMaps, r.State)
-		}
-	}
-}
-
-func (r *ReferenceGrantReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
 }
 
 func (r *ReferenceGrantReconciler) SetupWithManager(mgr ctrl.Manager) error {

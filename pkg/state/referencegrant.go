@@ -32,6 +32,14 @@ type ReferenceGrantValidator interface {
 	IsReferencePermitted(from, to Reference) bool
 }
 
+type mapReferenceValidator struct {
+	referenceGrants map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+}
+
+func (v mapReferenceValidator) IsReferencePermitted(from, to Reference) bool {
+	return isReferencePermitted(from, to, v.referenceGrants)
+}
+
 // IsReferencePermitted checks whether a reference from one resource to another is permitted by the state's ReferenceGrants.
 func (s *State) IsReferencePermitted(from, to Reference) bool {
 	// References within the same namespace are always permitted.

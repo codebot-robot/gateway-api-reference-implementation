@@ -55,13 +55,23 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 	if controllerName == "" {
 		controllerName = DefaultControllerName
 	}
+
+	if st != nil {
+		st.SetControllerName(controllerName)
+		st.SetProxy(p)
+		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
+		st.SetSynced(false)
+
+		if err := mgr.Add(st); err != nil {
+			return fmt.Errorf("error adding state runner to manager: %w", err)
+		}
+	}
+
 	if err := (&HTTPRouteReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
 	}
@@ -69,119 +79,85 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 	if err := (&GatewayClassReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
+		State:          st,
 		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating GatewayClass controller: %w", err)
 	}
 
 	if err := (&GatewayReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
-		AddressProvider:  opts.AddressProvider,
-		GatewayFilter:    opts.GatewayFilter,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		State:           st,
+		ControllerName:  controllerName,
+		AddressProvider: opts.AddressProvider,
+		GatewayFilter:   opts.GatewayFilter,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
 
 	if err := (&ServiceReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Service controller: %w", err)
 	}
 
 	if err := (&BackendTLSPolicyReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
 	}
 
 	if err := (&ConfigMapReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating ConfigMap controller: %w", err)
 	}
 
 	if err := (&SecretReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Secret controller: %w", err)
 	}
 
 	if err := (&ReferenceGrantReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating ReferenceGrant controller: %w", err)
 	}
 
 	if err := (&NamespaceReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Namespace controller: %w", err)
 	}
 
 	if err := (&ListenerSetReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		State:            st,
-		Proxy:            p,
-		ControllerName:   controllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating ListenerSet controller: %w", err)
 	}
 
 	return nil
-}
-
-func updateProxy(st *state.State, p *proxy.Proxy, controllerName string, onGatewaysUpdate func([]*gatewayv1.Gateway)) {
-	if controllerName == "" {
-		controllerName = DefaultControllerName
-	}
-	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
-	compiled := st.CompileModel(controllerName)
-	if p != nil {
-		proxyListeners, proxyRoutes := state.BuildProxyConfig(compiled.GatewaysList())
-		p.UpdateConfig(proxyListeners, proxyRoutes)
-
-		certsMap, defaultCert := state.ExtractCertificates(compiled.GatewaysList(), st.GetSecrets(), st)
-		p.UpdateCertificates(certsMap, defaultCert)
-	}
-
-	if onGatewaysUpdate != nil {
-		onGatewaysUpdate(compiled.ResolvedGateways())
-	}
 }

@@ -18,9 +18,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,17 +26,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type ListenerSetReconciler struct {
 	client.Client
-	Scheme           *runtime.Scheme
-	State            *state.State
-	Proxy            *proxy.Proxy
-	ControllerName   string
-	OnGatewaysUpdate func([]*gatewayv1.Gateway)
+	Scheme         *runtime.Scheme
+	State          *state.State
+	ControllerName string
 }
 
 func (r *ListenerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -47,187 +43,62 @@ func (r *ListenerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	ls := &gatewayv1.ListenerSet{}
 	if err := r.Get(ctx, req.NamespacedName, ls); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.State.DeleteListenerSet(req.NamespacedName)
-			r.updateProxy()
+			if r.State != nil {
+				r.State.DeleteListenerSet(req.NamespacedName)
+			}
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, ls)
-	var gw *gatewayv1.Gateway
-	var fetchedGW gatewayv1.Gateway
-	if err := r.Get(ctx, gwKey, &fetchedGW); err == nil {
-		gc := &gatewayv1.GatewayClass{}
-		if err := r.Get(ctx, client.ObjectKey{Name: string(fetchedGW.Spec.GatewayClassName)}, gc); err == nil {
-			if string(gc.Spec.ControllerName) == r.ControllerName {
-				gw = &fetchedGW
+	if r.State != nil {
+		gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, ls)
+		var fetchedGW gatewayv1.Gateway
+		if err := r.Get(ctx, gwKey, &fetchedGW); err == nil {
+			if _, ok := r.State.GetGatewayClass(string(fetchedGW.Spec.GatewayClassName)); !ok {
+				var gc gatewayv1.GatewayClass
+				if err := r.Get(ctx, types.NamespacedName{Name: string(fetchedGW.Spec.GatewayClassName)}, &gc); err == nil {
+					r.State.UpsertGatewayClass(&gc)
+				}
+			}
+			r.State.UpsertGateway(&fetchedGW)
+		}
+
+		r.State.UpsertListenerSet(ls)
+
+		desired, ok := r.State.GetDesiredListenerSetStatus(req.NamespacedName)
+		if !ok {
+			compiled := r.State.CompileModel(r.ControllerName)
+			var parentGW *gatewayv1.Gateway
+			for _, g := range r.State.GetGateways() {
+				if g != nil && g.Gateway != nil && g.Gateway.Namespace == gwKey.Namespace && g.Gateway.Name == gwKey.Name {
+					parentGW = g.Gateway
+					break
+				}
+			}
+			desired = state.ComputeDesiredListenerSetStatus(ls, parentGW, r.State.GetNamespaces(), compiled.Gateways[gwKey])
+		}
+		if state.MergeListenerSetStatus(&ls.Status, desired) {
+			if err := r.Status().Update(ctx, ls); err != nil {
+				l.Error(err, "unable to update ListenerSet status")
+				return ctrl.Result{}, err
 			}
 		}
 	}
 
-	if gw != nil {
-		r.State.UpsertGateway(gw)
-	}
-	r.State.UpsertListenerSet(ls)
-
-	// TODO(incremental-state): Centralize model recomputation and diffing to avoid recompiling in both reconciler and updateProxy.
-	compiled := r.State.CompileModel(r.ControllerName)
-	compiledGw := compiled.Gateways[gwKey]
-
-	namespaces := r.State.GetNamespaces()
-	newStatus, updated := state.ComputeDesiredListenerSetStatus(ls, gw, namespaces, compiledGw)
-
-	if updated {
-		ls.Status = newStatus
-		if err := r.Status().Update(ctx, ls); err != nil {
-			l.Error(err, "unable to update ListenerSet status")
-			return ctrl.Result{}, err
-		}
-	}
-
-	r.State.UpsertListenerSet(ls)
-	r.updateProxy()
-
 	return ctrl.Result{}, nil
 }
-
-func (r *ListenerSetReconciler) updateProxy() {
-	updateProxy(r.State, r.Proxy, r.ControllerName, r.OnGatewaysUpdate)
-}
-
-const listenerSetSecretIndex = ".spec.listeners.tls.certificateRefs"
 
 func (r *ListenerSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ControllerName == "" {
 		return fmt.Errorf("ControllerName is required")
 	}
 
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &gatewayv1.ListenerSet{}, listenerSetSecretIndex, func(obj client.Object) []string {
-		ls := obj.(*gatewayv1.ListenerSet)
-		var secretKeys []string
-		for _, l := range ls.Spec.Listeners {
-			if l.TLS != nil {
-				for _, ref := range l.TLS.CertificateRefs {
-					secKey := ResolveNamespacedName(ref.Namespace, ref.Name, ls)
-					secretKeys = append(secretKeys, secKey.String())
-				}
-			}
-		}
-		return secretKeys
-	}); err != nil {
-		return fmt.Errorf("failed to create field indexer for ListenerSet secrets: %w", err)
+	bldr := ctrl.NewControllerManagedBy(mgr).
+		For(&gatewayv1.ListenerSet{})
+
+	if r.State != nil {
+		bldr.WatchesRawSource(source.Channel(r.State.ListenerSetEvents(), &handler.EnqueueRequestForObject{}))
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&gatewayv1.ListenerSet{}).
-		Watches(&gatewayv1.ListenerSet{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			changedLS := obj.(*gatewayv1.ListenerSet)
-			var lsList gatewayv1.ListenerSetList
-			if err := r.List(ctx, &lsList); err != nil {
-				return nil
-			}
-			var requests []ctrl.Request
-			changedGwKey := ResolveNamespacedName(changedLS.Spec.ParentRef.Namespace, changedLS.Spec.ParentRef.Name, changedLS)
-			for _, ls := range lsList.Items {
-				if ls.Namespace == changedLS.Namespace && ls.Name == changedLS.Name {
-					continue
-				}
-				gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, &ls)
-				if gwKey == changedGwKey {
-					requests = append(requests, ctrl.Request{
-						NamespacedName: types.NamespacedName{
-							Namespace: ls.Namespace,
-							Name:      ls.Name,
-						},
-					})
-				}
-			}
-			return requests
-		})).
-		Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			gw := obj.(*gatewayv1.Gateway)
-			var lsList gatewayv1.ListenerSetList
-			if err := r.List(ctx, &lsList); err != nil {
-				return nil
-			}
-			var requests []ctrl.Request
-			for _, ls := range lsList.Items {
-				gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, &ls)
-				if gwKey.Name == gw.Name && gwKey.Namespace == gw.Namespace {
-					requests = append(requests, ctrl.Request{
-						NamespacedName: types.NamespacedName{
-							Namespace: ls.Namespace,
-							Name:      ls.Name,
-						},
-					})
-				}
-			}
-			return requests
-		})).
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			var lsList gatewayv1.ListenerSetList
-			if err := r.List(ctx, &lsList); err != nil {
-				return nil
-			}
-			var requests []ctrl.Request
-			for _, ls := range lsList.Items {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: ls.Namespace,
-						Name:      ls.Name,
-					},
-				})
-			}
-			return requests
-		})).
-		Watches(&gatewayv1.HTTPRoute{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			route := obj.(*gatewayv1.HTTPRoute)
-			var requests []ctrl.Request
-			for _, parentRef := range route.Spec.ParentRefs {
-				pKind := state.ValueOf(parentRef.Kind)
-				pGroup := state.ValueOf(parentRef.Group)
-				if (pGroup == "" || pGroup == gatewayv1.GroupName) && pKind == "ListenerSet" {
-					lsKey := ResolveNamespacedName(parentRef.Namespace, parentRef.Name, route)
-					requests = append(requests, ctrl.Request{
-						NamespacedName: lsKey,
-					})
-				}
-			}
-			return requests
-		})).
-		Watches(&gatewayv1beta1.ReferenceGrant{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			var lsList gatewayv1.ListenerSetList
-			if err := r.List(ctx, &lsList); err != nil {
-				return nil
-			}
-			var requests []ctrl.Request
-			for _, ls := range lsList.Items {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: ls.Namespace,
-						Name:      ls.Name,
-					},
-				})
-			}
-			return requests
-		})).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
-			secret := obj.(*corev1.Secret)
-			secretKey := types.NamespacedName{Namespace: secret.Namespace, Name: secret.Name}.String()
-			var lsList gatewayv1.ListenerSetList
-			if err := r.List(ctx, &lsList, client.MatchingFields{listenerSetSecretIndex: secretKey}); err != nil {
-				return nil
-			}
-			var requests []ctrl.Request
-			for _, ls := range lsList.Items {
-				requests = append(requests, ctrl.Request{
-					NamespacedName: types.NamespacedName{
-						Namespace: ls.Namespace,
-						Name:      ls.Name,
-					},
-				})
-			}
-			return requests
-		})).
-		Complete(r)
+	return bldr.Complete(r)
 }
