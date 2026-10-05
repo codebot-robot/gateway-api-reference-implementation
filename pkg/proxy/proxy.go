@@ -808,6 +808,8 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 	}
 	defer resp.Body.Close()
 
+	resp.Header.Del("Alt-Svc")
+
 	if backend.ResponseHeaderModifier != nil {
 		modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
 	}
@@ -1050,6 +1052,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		}
 
 		defer resp.Body.Close()
+
+		resp.Header.Del("Alt-Svc")
 
 		effectiveCORS := respCORS
 		if backend.CORS != nil {

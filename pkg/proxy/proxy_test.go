@@ -1620,6 +1620,7 @@ func TestProxyWebSocket(t *testing.T) {
 			resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 				"Upgrade: websocket\r\n" +
 				"Connection: Upgrade\r\n" +
+				"Alt-Svc: h2=\":8443\"\r\n" +
 				"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
 			conn.Write([]byte(resp))
 
@@ -1699,6 +1700,9 @@ func TestProxyWebSocket(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("expected status 101, got %d", resp.StatusCode)
+	}
+	if altSvc := resp.Header.Get("Alt-Svc"); altSvc != "" {
+		t.Errorf("expected no Alt-Svc on WebSocket response, got %q", altSvc)
 	}
 
 	// Send message and verify echo
@@ -2030,5 +2034,106 @@ func TestProxyRequestMirror_BodyTooLarge(t *testing.T) {
 	resp := w.Result()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected status 413 (Payload Too Large), got %d", resp.StatusCode)
+	}
+}
+
+func TestProxy_StripBackendAltSvc(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", `h2=":8443"`)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server url: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/test", nil)
+	w := httptest.NewRecorder()
+
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Alt-Svc"); got != "" {
+		t.Errorf("expected Alt-Svc header to be stripped, got %q", got)
+	}
+}
+
+func TestProxy_StripBackendAltSvc_ResponseHeaderModifier(t *testing.T) {
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", `h2=":8443"`)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer backendServer.Close()
+
+	u, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server url: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{
+							Host:   host,
+							Port:   int32(port),
+							Weight: 1,
+						},
+					},
+					ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+						Set: []gatewayv1.HTTPHeader{
+							{Name: "Alt-Svc", Value: `h3=":443"`},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/test", nil)
+	w := httptest.NewRecorder()
+
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	altSvcValues := resp.Header.Values("Alt-Svc")
+	if len(altSvcValues) != 1 {
+		t.Fatalf("expected exactly 1 Alt-Svc header, got %d: %v", len(altSvcValues), altSvcValues)
+	}
+	if altSvcValues[0] != `h3=":443"` {
+		t.Errorf("expected Alt-Svc %q, got %q", `h3=":443"`, altSvcValues[0])
 	}
 }
