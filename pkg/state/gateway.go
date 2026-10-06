@@ -21,7 +21,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -650,59 +649,4 @@ func getPathLen(m *InternalMatch) int {
 		return 1
 	}
 	return len(m.Path.Value)
-}
-
-func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) ([]InternalListener, []InternalRoute) {
-	var httpRoutes []*gatewayv1.HTTPRoute
-	for _, r := range routes {
-		if r != nil && r.HTTPRoute != nil {
-			httpRoutes = append(httpRoutes, r.HTTPRoute)
-		}
-	}
-
-	var nsMap map[string]*corev1.Namespace
-	var listenerSetsList []*gatewayv1.ListenerSet
-	var secrets map[types.NamespacedName]*corev1.Secret
-	if st, ok := refValidator.(*State); ok {
-		nsMap = st.GetNamespaces()
-		for _, ls := range st.GetListenerSets() {
-			if ls != nil && ls.ListenerSet != nil {
-				listenerSetsList = append(listenerSetsList, ls.ListenerSet)
-			}
-		}
-		secrets = st.GetSecrets()
-	}
-
-	var gcs []*gatewayv1.GatewayClass
-	if s.Gateway != nil {
-		gcs = append(gcs, &gatewayv1.GatewayClass{
-			ObjectMeta: metav1.ObjectMeta{Name: string(s.Spec.GatewayClassName)},
-			Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayv1.GatewayController(controllerName)},
-		})
-	}
-
-	compiled := CompileModel(ModelInputs{
-		Gateways:           []*gatewayv1.Gateway{s.Gateway},
-		GatewayClasses:     gcs,
-		ListenerSets:       listenerSetsList,
-		HTTPRoutes:         httpRoutes,
-		Services:           services,
-		BackendTLSPolicies: backendTLSPolicies,
-		ConfigMaps:         configMaps,
-		Secrets:            secrets,
-		Namespaces:         nsMap,
-		RefValidator:       refValidator,
-		ControllerName:     controllerName,
-	})
-
-	cg := compiled.Gateways[types.NamespacedName{Namespace: s.Namespace, Name: s.Name}]
-	if cg == nil {
-		return nil, nil
-	}
-	return BuildProxyConfig([]*CompiledGateway{cg})
-}
-
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, refValidator ReferenceGrantValidator, controllerName string) []InternalRoute {
-	_, allInternalRoutes := s.BuildInternalState(routes, services, backendTLSPolicies, configMaps, refValidator, controllerName)
-	return allInternalRoutes
 }

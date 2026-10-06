@@ -63,6 +63,7 @@ func (s *EventSource) Start(ctx context.Context, q workqueue.TypedRateLimitingIn
 	for req := range s.pending {
 		q.Add(req)
 	}
+	s.pending = make(map[reconcile.Request]struct{})
 	s.mu.Unlock()
 
 	go func() {
@@ -132,6 +133,7 @@ type State struct {
 	notifyCh      chan struct{}
 	synced        bool
 	running       bool
+	dirty         bool
 }
 
 func NewState() *State {
@@ -191,10 +193,17 @@ func (s *State) AddRegistration(reg toolscache.ResourceEventHandlerRegistration)
 func (s *State) SetSynced(synced bool) {
 	s.mu.Lock()
 	s.synced = synced
+	running := s.running
 	s.mu.Unlock()
-	if synced {
+	if synced && running {
 		s.Recompute()
 	}
+}
+
+func (s *State) IsDirty() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dirty
 }
 
 func (s *State) Revision() uint64 {
@@ -224,22 +233,14 @@ func (s *State) GatewayClassSource() *EventSource {
 }
 
 func (s *State) triggerRecomputeLocked() {
-	if !s.synced {
-		return
-	}
-	if !s.running {
-		s.recomputeAsyncLocked()
+	s.dirty = true
+	if !s.synced || !s.running {
 		return
 	}
 	select {
 	case s.notifyCh <- struct{}{}:
 	default:
 	}
-}
-
-func (s *State) recomputeAsyncLocked() {
-	// Snapshot inputs and release s.mu before running Recompute
-	go s.Recompute()
 }
 
 // Start runs the background coalescing loop and recomputes outputs when inputs change.
@@ -260,6 +261,7 @@ func (s *State) Start(ctx context.Context) error {
 
 	// Mark state as synced and perform the initial full recomputation.
 	s.SetSynced(true)
+	s.Recompute()
 
 	const coalesceDelay = 10 * time.Millisecond
 	for {
@@ -304,6 +306,7 @@ func (s *State) Recompute() *Outputs {
 		return nil
 	}
 
+	s.dirty = false
 	start := time.Now()
 	inputs := s.snapshotInputsLocked()
 	outputs := ComputeOutputs(inputs)

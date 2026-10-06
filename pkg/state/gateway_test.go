@@ -2227,14 +2227,39 @@ func TestBuildInternalRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			st := NewState()
-			for _, rg := range tt.referenceGrants {
-				st.UpsertReferenceGrant(rg)
+			var routes []*gatewayv1.HTTPRoute
+			for _, r := range tt.routes {
+				if r != nil && r.HTTPRoute != nil {
+					routes = append(routes, r.HTTPRoute)
+				}
 			}
-			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, st, controllerName)
+			var gcs []*gatewayv1.GatewayClass
+			if tt.gateway != nil && tt.gateway.Gateway != nil {
+				gcs = append(gcs, &gatewayv1.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{Name: string(tt.gateway.Spec.GatewayClassName)},
+					Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayv1.GatewayController(controllerName)},
+				})
+			}
+			rgMap := make(map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant)
+			for _, rg := range tt.referenceGrants {
+				if rg != nil {
+					rgMap[types.NamespacedName{Namespace: rg.Namespace, Name: rg.Name}] = rg
+				}
+			}
+			outputs := ComputeOutputs(ModelInputs{
+				Gateways:           []*gatewayv1.Gateway{tt.gateway.Gateway},
+				GatewayClasses:     gcs,
+				HTTPRoutes:         routes,
+				Services:           tt.services,
+				BackendTLSPolicies: tt.backendTLSPolicies,
+				ConfigMaps:         tt.configMaps,
+				ReferenceGrants:    rgMap,
+				ControllerName:     controllerName,
+			})
+			actual := outputs.ProxyRoutes
 			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
 			if diff != "" {
-				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
+				t.Errorf("ComputeOutputs() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
