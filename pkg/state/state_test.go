@@ -203,6 +203,45 @@ func TestEventSource_BuffersEventsBeforeStart(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("expected 2 buffered items flushed into workqueue, got %d (%v)", len(items), items)
 	}
+
+	// A second Start call should not re-flush old pending requests because pending was cleared
+	q2 := newTestQueue()
+	if err := source.Start(ctx, q2); err != nil {
+		t.Fatalf("second Start failed: %v", err)
+	}
+	items2 := q2.drain()
+	if len(items2) != 0 {
+		t.Fatalf("expected 0 items flushed into second workqueue after pending cleared, got %d (%v)", len(items2), items2)
+	}
+}
+
+func TestState_NotRunningMarksDirtyWithoutAsyncRecompute(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	if st.IsDirty() {
+		t.Errorf("expected initial state not dirty")
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	// Mutating state when not running should mark state dirty
+	st.UpsertGatewayClass(gc)
+	if !st.IsDirty() {
+		t.Errorf("expected state to be marked dirty after UpsertGatewayClass")
+	}
+
+	// Calling Recompute clears dirty flag and produces outputs
+	outputs := st.Recompute()
+	if outputs == nil {
+		t.Fatalf("expected non-nil outputs from Recompute")
+	}
+	if st.IsDirty() {
+		t.Errorf("expected state to not be dirty after explicit Recompute")
+	}
 }
 
 func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
