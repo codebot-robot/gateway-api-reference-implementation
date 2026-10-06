@@ -141,11 +141,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
 			providedAddresses, ready, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 			if err != nil {
-				l.Error(err, "unable to fetch gateway addresses from address provider")
-				return ctrl.Result{}, err
+				l.Error(err, "unable to provision or fetch gateway addresses from address provider")
+				// If error is a provisioning conflict, record on status and do not requeue endlessly
+				r.State.SetGatewayProvisioningError(req.NamespacedName, err.Error())
+				r.State.SetGatewayReadiness(req.NamespacedName, false)
+			} else {
+				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+				r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
+				r.State.SetGatewayReadiness(req.NamespacedName, ready)
 			}
-			r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
-			r.State.SetGatewayReadiness(req.NamespacedName, ready)
 		}
 
 		desired, ok := r.State.GetDesiredGatewayStatus(req.NamespacedName)

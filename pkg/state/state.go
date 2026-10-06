@@ -108,6 +108,7 @@ type State struct {
 	gateways           map[types.NamespacedName]*GatewayState
 	gatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
 	gatewayReadiness   map[types.NamespacedName]bool
+	provisioningErrors map[types.NamespacedName]string
 	listenerSets       map[types.NamespacedName]*ListenerSetState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
@@ -143,6 +144,7 @@ func NewState() *State {
 		gateways:               make(map[types.NamespacedName]*GatewayState),
 		gatewayAddresses:       make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress),
 		gatewayReadiness:       make(map[types.NamespacedName]bool),
+		provisioningErrors:     make(map[types.NamespacedName]string),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
 		backendTLSPolicies:     make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
@@ -384,6 +386,11 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		gwReady[k] = v
 	}
 
+	gwProvErrs := make(map[types.NamespacedName]string)
+	for k, v := range s.provisioningErrors {
+		gwProvErrs[k] = v
+	}
+
 	var listenerSets []*gatewayv1.ListenerSet
 	for _, lsState := range s.listenerSets {
 		if lsState != nil && lsState.ListenerSet != nil {
@@ -469,6 +476,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		GatewayClasses:     gcs,
 		GatewayAddresses:   gwAddrs,
 		GatewayReadiness:   gwReady,
+		ProvisioningErrors: gwProvErrs,
 		ListenerSets:       listenerSets,
 		HTTPRoutes:         routes,
 		Services:           services,
@@ -754,6 +762,7 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 			delete(s.gateways, key)
 			delete(s.gatewayAddresses, key)
 			delete(s.gatewayReadiness, key)
+			delete(s.provisioningErrors, key)
 			s.revision++
 			s.triggerRecomputeLocked()
 		}
@@ -780,6 +789,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 		delete(s.gateways, name)
 		delete(s.gatewayAddresses, name)
 		delete(s.gatewayReadiness, name)
+		delete(s.provisioningErrors, name)
 		s.revision++
 		s.triggerRecomputeLocked()
 	}
@@ -837,6 +847,23 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, ready bool) {
 	}
 
 	s.gatewayReadiness[key] = ready
+	s.revision++
+	s.triggerRecomputeLocked()
+}
+
+func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if cur, ok := s.provisioningErrors[key]; ok && cur == provErr {
+		return
+	}
+
+	if provErr == "" {
+		delete(s.provisioningErrors, key)
+	} else {
+		s.provisioningErrors[key] = provErr
+	}
 	s.revision++
 	s.triggerRecomputeLocked()
 }

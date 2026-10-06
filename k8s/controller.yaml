@@ -20,13 +20,17 @@ rules:
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterrolebindings"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  resourceNames: ["gari-dataplane"]
+  verbs: ["get", "update", "patch"]
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterroles"]
   resourceNames: ["gari-dataplane"]
   verbs: ["bind"]
 - apiGroups: [""]
-  resources: ["configmaps", "secrets", "namespaces"]
+  resources: ["configmaps", "secrets", "namespaces", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status"]
@@ -63,6 +67,16 @@ subjects:
 - kind: ServiceAccount
   name: gari-controller
   namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gari-dataplane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gari-dataplane
+subjects: []
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass

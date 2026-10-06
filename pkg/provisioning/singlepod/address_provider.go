@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -69,6 +70,9 @@ const (
 
 	// DataplaneClusterRoleName is the name of the ClusterRole for per-Gateway data-plane instances.
 	DataplaneClusterRoleName = "gari-dataplane"
+
+	// DataplaneClusterRoleBindingName is the name of the shared ClusterRoleBinding for data-plane service accounts.
+	DataplaneClusterRoleBindingName = "gari-dataplane"
 )
 
 // ResourceNameForGateway computes the resource name for a Gateway within its namespace.
@@ -78,17 +82,6 @@ func ResourceNameForGateway(gwName string) string {
 		return base
 	}
 	h := sha256.Sum256([]byte(gwName))
-	suffix := "-" + hex.EncodeToString(h[:4])
-	return base[:63-len(suffix)] + suffix
-}
-
-// ClusterRoleBindingNameForGateway computes the cluster-scoped ClusterRoleBinding name for a Gateway.
-func ClusterRoleBindingNameForGateway(gwNamespace, gwName string) string {
-	base := fmt.Sprintf("%s-%s-gari", gwNamespace, gwName)
-	if len(base) <= 63 {
-		return base
-	}
-	h := sha256.Sum256([]byte(gwNamespace + "/" + gwName))
 	suffix := "-" + hex.EncodeToString(h[:4])
 	return base[:63-len(suffix)] + suffix
 }
@@ -110,9 +103,10 @@ func WithEnableH2C(enable bool) Option {
 	}
 }
 
-// AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBindings.
+// AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 type AddressProvider struct {
 	client         client.Client
+	apiReader      client.Reader
 	dataplaneImage string
 	enableH2C      bool
 }
@@ -176,12 +170,103 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway, name string) (map[string]s
 }
 
 func computeTemplateHash(template *corev1.PodTemplateSpec) string {
-	b, _ := json.Marshal(template.Spec)
+	b, _ := json.Marshal(template)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:8])
 }
 
-// GatewayAddresses reconciles the per-Gateway ServiceAccount, ClusterRoleBinding, Deployment, and LoadBalancer Service,
+// ensureClusterRoleBindingSubject ensures that the given ServiceAccount is listed as a subject in the shared gari-dataplane ClusterRoleBinding.
+func (p *AddressProvider) ensureClusterRoleBindingSubject(ctx context.Context, saNamespace, saName string) error {
+	if p.client == nil {
+		return nil
+	}
+
+	reader := p.apiReader
+	if reader == nil {
+		reader = p.client
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var crb rbacv1.ClusterRoleBinding
+		if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err != nil {
+			return err
+		}
+
+		subjectExists := false
+		for _, s := range crb.Subjects {
+			if s.Kind == "ServiceAccount" && s.Namespace == saNamespace && s.Name == saName {
+				subjectExists = true
+				break
+			}
+		}
+
+		if subjectExists {
+			return nil
+		}
+
+		crb.Subjects = append(crb.Subjects, rbacv1.Subject{
+			Kind:      "ServiceAccount",
+			Namespace: saNamespace,
+			Name:      saName,
+		})
+
+		sortSubjects(crb.Subjects)
+
+		return p.client.Update(ctx, &crb)
+	})
+}
+
+// removeClusterRoleBindingSubject removes the given ServiceAccount from the shared gari-dataplane ClusterRoleBinding.
+func (p *AddressProvider) removeClusterRoleBindingSubject(ctx context.Context, saNamespace, saName string) error {
+	if p.client == nil {
+		return nil
+	}
+
+	reader := p.apiReader
+	if reader == nil {
+		reader = p.client
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var crb rbacv1.ClusterRoleBinding
+		if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+
+		var newSubjects []rbacv1.Subject
+		found := false
+		for _, s := range crb.Subjects {
+			if s.Kind == "ServiceAccount" && s.Namespace == saNamespace && s.Name == saName {
+				found = true
+				continue
+			}
+			newSubjects = append(newSubjects, s)
+		}
+
+		if !found {
+			return nil
+		}
+
+		crb.Subjects = newSubjects
+		sortSubjects(crb.Subjects)
+
+		return p.client.Update(ctx, &crb)
+	})
+}
+
+func sortSubjects(subjects []rbacv1.Subject) {
+	sort.Slice(subjects, func(i, j int) bool {
+		if subjects[i].Namespace != subjects[j].Namespace {
+			return subjects[i].Namespace < subjects[j].Namespace
+		}
+		return subjects[i].Name < subjects[j].Name
+	})
+}
+
+// GatewayAddresses reconciles the per-Gateway ServiceAccount, ClusterRoleBinding subject, Deployment, and LoadBalancer Service,
 // and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
 func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
 	if p.client == nil {
@@ -189,7 +274,6 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	name := ResourceNameForGateway(gw.Name)
-	crbName := ClusterRoleBindingNameForGateway(gw.Namespace, gw.Name)
 	gwNamespace := gw.Namespace
 
 	labels, annotations := buildLabelsAndAnnotations(gw, name)
@@ -246,57 +330,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	}
 
-	// 2. Reconcile per-Gateway ClusterRoleBinding (cluster-scoped, cannot have namespaced ownerReference)
-	desiredCRB := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   crbName,
-			Labels: labels,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     DataplaneClusterRoleName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      name,
-				Namespace: gwNamespace,
-			},
-		},
-	}
-	var existingCRB rbacv1.ClusterRoleBinding
-	err = p.client.Get(ctx, types.NamespacedName{Name: crbName}, &existingCRB)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			if createErr := p.client.Create(ctx, desiredCRB); createErr != nil {
-				return nil, false, fmt.Errorf("failed to create ClusterRoleBinding %s for Gateway %s/%s: %w", crbName, gw.Namespace, gw.Name, createErr)
-			}
-		} else {
-			return nil, false, err
-		}
-	} else {
-		if !isOwnedByGateway(&existingCRB, gw) {
-			return nil, false, fmt.Errorf("conflict: existing ClusterRoleBinding %s is not owned by Gateway %s/%s", crbName, gw.Namespace, gw.Name)
-		}
-		needsCRBUpdate := false
-		if !reflectMapEqual(existingCRB.Labels, desiredCRB.Labels) {
-			existingCRB.Labels = desiredCRB.Labels
-			needsCRBUpdate = true
-		}
-		if !reflect.DeepEqual(existingCRB.Subjects, desiredCRB.Subjects) {
-			existingCRB.Subjects = desiredCRB.Subjects
-			needsCRBUpdate = true
-		}
-		if !reflect.DeepEqual(existingCRB.RoleRef, desiredCRB.RoleRef) {
-			existingCRB.RoleRef = desiredCRB.RoleRef
-			needsCRBUpdate = true
-		}
-		if needsCRBUpdate {
-			if updateErr := p.client.Update(ctx, &existingCRB); updateErr != nil {
-				return nil, false, fmt.Errorf("failed to update ClusterRoleBinding %s: %w", existingCRB.Name, updateErr)
-			}
-		}
+	// 2. Ensure ServiceAccount is in shared gari-dataplane ClusterRoleBinding
+	if err := p.ensureClusterRoleBindingSubject(ctx, gwNamespace, name); err != nil {
+		return nil, false, fmt.Errorf("failed to add subject to ClusterRoleBinding %s: %w", DataplaneClusterRoleBindingName, err)
 	}
 
 	// 3. Reconcile per-Gateway Deployment in Gateway namespace
@@ -570,14 +606,13 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addresses, deployReady, nil
 }
 
-// OnGatewayDeleted cleans up the ServiceAccount, ClusterRoleBinding, Deployment, and Service for the deleted Gateway if they exist and are owned by it.
+// OnGatewayDeleted cleans up the ServiceAccount, Deployment, Service, and ClusterRoleBinding subject for the deleted Gateway if they exist and are owned by it.
 func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.NamespacedName) error {
 	if p.client == nil {
 		return nil
 	}
 
 	name := ResourceNameForGateway(gwKey.Name)
-	crbName := ClusterRoleBindingNameForGateway(gwKey.Namespace, gwKey.Name)
 
 	dummyGW := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -619,21 +654,14 @@ func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.Name
 		return fmt.Errorf("failed to check ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
 	}
 
-	var crb rbacv1.ClusterRoleBinding
-	if err := p.client.Get(ctx, types.NamespacedName{Name: crbName}, &crb); err == nil {
-		if isOwnedByGateway(&crb, dummyGW) {
-			if err := p.client.Delete(ctx, &crb); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete ClusterRoleBinding %s: %w", crbName, err)
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check ClusterRoleBinding %s: %w", crbName, err)
+	if err := p.removeClusterRoleBindingSubject(ctx, gwKey.Namespace, name); err != nil {
+		return fmt.Errorf("failed to remove subject from ClusterRoleBinding %s: %w", DataplaneClusterRoleBindingName, err)
 	}
 
 	return nil
 }
 
-// SweepOrphans garbage-collects provisioned Services, Deployments, ServiceAccounts, and ClusterRoleBindings across all namespaces whose corresponding Gateway no longer exists.
+// SweepOrphans garbage-collects provisioned Services, Deployments, ServiceAccounts, and ClusterRoleBinding subjects across all namespaces whose corresponding Gateway no longer exists.
 func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 	if p.client == nil {
 		return nil
@@ -701,22 +729,42 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 		}
 	}
 
-	var crbList rbacv1.ClusterRoleBindingList
-	if err := p.client.List(ctx, &crbList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
-		errs = append(errs, fmt.Errorf("failed to list managed clusterrolebindings: %w", err))
-	} else {
-		for _, crb := range crbList.Items {
-			gwNs := crb.Labels[LabelGatewayNamespace]
-			gwName := crb.Labels[LabelGatewayName]
-			if gwNs == "" || gwName == "" {
+	// Sweep subjects in shared gari-dataplane ClusterRoleBinding
+	reader := p.apiReader
+	if reader == nil {
+		reader = p.client
+	}
+	var crb rbacv1.ClusterRoleBinding
+	if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err == nil {
+		var validSubjects []rbacv1.Subject
+		changed := false
+		for _, s := range crb.Subjects {
+			if s.Kind != "ServiceAccount" {
+				validSubjects = append(validSubjects, s)
 				continue
 			}
-			var gw gatewayv1.Gateway
-			err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNs, Name: gwName}, &gw)
-			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
-				if delErr := p.client.Delete(ctx, &crb); delErr != nil && !apierrors.IsNotFound(delErr) {
-					errs = append(errs, fmt.Errorf("failed to delete orphaned ClusterRoleBinding %s: %w", crb.Name, delErr))
+			// Check if ServiceAccount still exists and has managed label
+			var sa corev1.ServiceAccount
+			err := p.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.Name}, &sa)
+			if apierrors.IsNotFound(err) || (sa.Labels != nil && sa.Labels[LabelManagedBy] == ManagedByValue && sa.Labels[LabelGatewayName] != "") {
+				if apierrors.IsNotFound(err) {
+					changed = true
+					continue
 				}
+				gwName := sa.Labels[LabelGatewayName]
+				var gw gatewayv1.Gateway
+				if gwErr := p.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: gwName}, &gw); apierrors.IsNotFound(gwErr) || (gwErr == nil && gw.DeletionTimestamp != nil) {
+					changed = true
+					continue
+				}
+			}
+			validSubjects = append(validSubjects, s)
+		}
+		if changed {
+			crb.Subjects = validSubjects
+			sortSubjects(crb.Subjects)
+			if updErr := p.client.Update(ctx, &crb); updErr != nil && !apierrors.IsNotFound(updErr) {
+				errs = append(errs, fmt.Errorf("failed to update ClusterRoleBinding %s during orphan sweep: %w", DataplaneClusterRoleBindingName, updErr))
 			}
 		}
 	}
@@ -726,8 +774,11 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 
 // SetupWatches registers watches on managed Services and Deployments, and starts the orphan sweep runnable.
 func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
-	if p.client == nil && mgr != nil {
-		p.client = mgr.GetClient()
+	if mgr != nil {
+		if p.client == nil {
+			p.client = mgr.GetClient()
+		}
+		p.apiReader = mgr.GetAPIReader()
 	}
 
 	if mgr != nil {
