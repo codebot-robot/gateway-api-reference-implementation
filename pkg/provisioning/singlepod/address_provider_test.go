@@ -16,11 +16,13 @@ package singlepod
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,6 +54,8 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 			Infrastructure: &gatewayv1.GatewayInfrastructure{
 				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
 					"custom-label": "custom-val",
+					// User label with reserved prefix should be ignored
+					"gateway.networking.k8s.io/gateway-name": "malicious-name",
 				},
 				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
 					"custom-anno": "custom-val",
@@ -96,7 +100,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 
 	p := NewAddressProvider(client, WithEnableH2C(true))
 
-	// 1. Initial reconcile creates SA, Deployment and Service in my-ns, but no Ingress and replicas not ready yet
+	// 1. Initial reconcile creates SA, CRB, Deployment and Service in my-ns, but no Ingress and replicas not ready yet
 	addrs, ready, err := p.GatewayAddresses(ctx, gw, effectiveListeners)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -120,6 +124,9 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	if svc.Labels["custom-label"] != "custom-val" {
 		t.Errorf("expected custom-label on Service, got %s", svc.Labels["custom-label"])
 	}
+	if svc.Labels[LabelGatewayName] != "my-gw" {
+		t.Errorf("expected LabelGatewayName to not be overridden by user label, got %s", svc.Labels[LabelGatewayName])
+	}
 	if svc.Annotations["custom-anno"] != "custom-val" {
 		t.Errorf("expected custom-anno on Service, got %s", svc.Annotations["custom-anno"])
 	}
@@ -140,6 +147,16 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Errorf("expected custom-label on ServiceAccount, got %s", sa.Labels["custom-label"])
 	}
 
+	// Verify ClusterRoleBinding was created
+	crbName := ClusterRoleBindingNameForGateway("my-ns", "my-gw")
+	var crb rbacv1.ClusterRoleBinding
+	if err := client.Get(ctx, types.NamespacedName{Name: crbName}, &crb); err != nil {
+		t.Fatalf("failed to get created ClusterRoleBinding: %v", err)
+	}
+	if len(crb.Subjects) != 1 || crb.Subjects[0].Name != name || crb.Subjects[0].Namespace != "my-ns" {
+		t.Errorf("expected CRB subject to be %s in my-ns, got %+v", name, crb.Subjects)
+	}
+
 	// Verify Deployment was created in my-ns
 	var deploy appsv1.Deployment
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &deploy); err != nil {
@@ -153,6 +170,9 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	}
 	if deploy.Spec.Template.Spec.ServiceAccountName != name {
 		t.Errorf("expected ServiceAccountName %s, got %s", name, deploy.Spec.Template.Spec.ServiceAccountName)
+	}
+	if deploy.Annotations[AnnotationTemplateHash] == "" {
+		t.Errorf("expected template hash annotation on Deployment")
 	}
 
 	// 2. Simulate MetalLB assigning LB Ingress IP and Deployment replicas becoming available
@@ -180,7 +200,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Fatalf("expected IP 172.18.255.201, got %+v", addrs)
 	}
 
-	// 3. Delete Gateway -> cleans up Service, Deployment, and ServiceAccount
+	// 3. Delete Gateway -> cleans up Service, Deployment, ServiceAccount, and ClusterRoleBinding
 	gwKey := types.NamespacedName{Namespace: "my-ns", Name: "my-gw"}
 	if err := p.OnGatewayDeleted(ctx, gwKey); err != nil {
 		t.Fatalf("OnGatewayDeleted failed: %v", err)
@@ -200,6 +220,52 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected ServiceAccount to be deleted, got err: %v", err)
 	}
+	var deletedCRB rbacv1.ClusterRoleBinding
+	err = client.Get(ctx, types.NamespacedName{Name: crbName}, &deletedCRB)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected ClusterRoleBinding to be deleted, got err: %v", err)
+	}
+}
+
+func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	// Existing service not created by GARI
+	foreignSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ResourceNameForGateway("conflict-gw"),
+			Namespace: "default",
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(foreignSvc).
+		Build()
+
+	ctx := t.Context()
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "conflict-gw",
+			Namespace: "default",
+			UID:       types.UID("99999"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	p := NewAddressProvider(client)
+
+	// GatewayAddresses should fail with conflict error and not overwrite the foreign service
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("expected conflict error, got: %v", err)
+	}
 }
 
 func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
@@ -208,6 +274,7 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 	_ = gatewayv1.AddToScheme(scheme)
 
 	orphanName := ResourceNameForGateway("deleted-gw")
+	orphanCRBName := ClusterRoleBindingNameForGateway("test-ns", "deleted-gw")
 	orphanSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      orphanName,
@@ -241,6 +308,16 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 			},
 		},
 	}
+	orphanCRB := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: orphanCRBName,
+			Labels: map[string]string{
+				LabelGatewayNamespace: "test-ns",
+				LabelGatewayName:      "deleted-gw",
+				LabelManagedBy:        ManagedByValue,
+			},
+		},
+	}
 
 	activeGw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
@@ -263,7 +340,7 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(orphanSvc, orphanDeploy, orphanSA, activeGw, activeSvc).
+		WithObjects(orphanSvc, orphanDeploy, orphanSA, orphanCRB, activeGw, activeSvc).
 		Build()
 
 	ctx := t.Context()
@@ -285,6 +362,10 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 	var checkSA corev1.ServiceAccount
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkSA); !apierrors.IsNotFound(err) {
 		t.Errorf("expected orphan ServiceAccount to be deleted, got err: %v", err)
+	}
+	var checkCRB rbacv1.ClusterRoleBinding
+	if err := client.Get(ctx, types.NamespacedName{Name: orphanCRBName}, &checkCRB); !apierrors.IsNotFound(err) {
+		t.Errorf("expected orphan ClusterRoleBinding to be deleted, got err: %v", err)
 	}
 
 	// Active gateway resources should remain

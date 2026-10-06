@@ -753,6 +753,7 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 		if _, ok := s.gateways[key]; ok {
 			delete(s.gateways, key)
 			delete(s.gatewayAddresses, key)
+			delete(s.gatewayReadiness, key)
 			s.revision++
 			s.triggerRecomputeLocked()
 		}
@@ -778,6 +779,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 	if _, ok := s.gateways[name]; ok {
 		delete(s.gateways, name)
 		delete(s.gatewayAddresses, name)
+		delete(s.gatewayReadiness, name)
 		s.revision++
 		s.triggerRecomputeLocked()
 	}
@@ -830,7 +832,7 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, ready bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.gatewayReadiness[key] == ready {
+	if cur, ok := s.gatewayReadiness[key]; ok && cur == ready {
 		return
 	}
 

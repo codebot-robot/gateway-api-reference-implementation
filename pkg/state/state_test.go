@@ -625,3 +625,67 @@ func TestMergeHTTPRouteStatus_DeterministicOrderAndOtherControllers(t *testing.T
 		t.Errorf("expected current.Parents[2] to be otherCtrl/gw-other, got %+v", current.Parents[2])
 	}
 }
+
+func TestState_GatewayReadinessGating(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+
+	// 1. Initial recompute with ready=false -> Programmed=False, Reason=Pending
+	st.SetGatewayReadiness(gwKey, false)
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	var progCond *metav1.Condition
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected Programmed=False Reason=Pending when ready=false, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+	}
+
+	// 2. Set ready=true -> Programmed=True, Reason=Programmed
+	st.SetGatewayReadiness(gwKey, true)
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True Reason=Programmed when ready=true, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+	}
+}

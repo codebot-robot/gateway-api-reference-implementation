@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
@@ -179,10 +180,11 @@ func (o *Options) complete() error {
 
 // Server encapsulates GARI components: state, proxy, manager, and proxy servers.
 type Server struct {
-	opts    Options
-	manager ctrl.Manager
-	state   *state.State
-	proxy   *proxy.Proxy
+	opts        Options
+	manager     ctrl.Manager
+	state       *state.State
+	proxy       *proxy.Proxy
+	proxySynced atomic.Bool
 }
 
 // State returns the internal state store.
@@ -266,13 +268,26 @@ func NewWithManager(mgr ctrl.Manager, opts Options) (*Server, error) {
 
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	userHook := s.opts.OnGatewaysUpdate
+	wrappedHook := func(gateways []*gatewayv1.Gateway) {
+		s.proxySynced.Store(true)
+		if userHook != nil {
+			userHook(gateways)
+		}
+	}
+
+	if err := mgr.AddReadyzCheck("readyz", healthz.Checker(func(req *http.Request) error {
+		if !s.proxySynced.Load() {
+			return errors.New("proxy configuration not yet applied")
+		}
+		return nil
+	})); err != nil {
 		return fmt.Errorf("failed to register readyz check: %w", err)
 	}
 
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
 		ControllerName:       s.opts.ControllerName,
-		OnGatewaysUpdate:     s.opts.OnGatewaysUpdate,
+		OnGatewaysUpdate:     wrappedHook,
 		AddressProvider:      s.opts.AddressProvider,
 		GatewayFilter:        s.opts.GatewayFilter,
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,

@@ -18,15 +18,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -54,6 +57,18 @@ const (
 
 	// ManagedByValue is the value of LabelManagedBy.
 	ManagedByValue = "gari-singlepod"
+
+	// LabelAppName is the label identifying the data-plane component.
+	LabelAppName = "app.kubernetes.io/name"
+
+	// AppNameValue is the value for LabelAppName on data-plane components.
+	AppNameValue = "gari-dataplane"
+
+	// AnnotationTemplateHash is the annotation recording the SHA256 hash of the desired pod template spec.
+	AnnotationTemplateHash = "gari.networking.k8s.io/template-hash"
+
+	// DataplaneClusterRoleName is the name of the ClusterRole for per-Gateway data-plane instances.
+	DataplaneClusterRoleName = "gari-dataplane"
 )
 
 // ResourceNameForGateway computes the resource name for a Gateway within its namespace.
@@ -63,6 +78,17 @@ func ResourceNameForGateway(gwName string) string {
 		return base
 	}
 	h := sha256.Sum256([]byte(gwName))
+	suffix := "-" + hex.EncodeToString(h[:4])
+	return base[:63-len(suffix)] + suffix
+}
+
+// ClusterRoleBindingNameForGateway computes the cluster-scoped ClusterRoleBinding name for a Gateway.
+func ClusterRoleBindingNameForGateway(gwNamespace, gwName string) string {
+	base := fmt.Sprintf("%s-%s-gari", gwNamespace, gwName)
+	if len(base) <= 63 {
+		return base
+	}
+	h := sha256.Sum256([]byte(gwNamespace + "/" + gwName))
 	suffix := "-" + hex.EncodeToString(h[:4])
 	return base[:63-len(suffix)] + suffix
 }
@@ -84,7 +110,7 @@ func WithEnableH2C(enable bool) Option {
 	}
 }
 
-// AddressProvider manages per-Gateway ServiceAccounts, Deployments, and LoadBalancer Services in the Gateway's namespace.
+// AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBindings.
 type AddressProvider struct {
 	client         client.Client
 	dataplaneImage string
@@ -103,38 +129,70 @@ func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	return p
 }
 
-// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service in the Gateway's namespace,
+// isOwnedByGateway checks if the object was created for this Gateway via controller OwnerReference or labels.
+func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Kind == "Gateway" && ref.Name == gw.Name && (ref.Controller != nil && *ref.Controller) {
+			return true
+		}
+	}
+	labels := obj.GetLabels()
+	if labels != nil && labels[LabelManagedBy] == ManagedByValue && labels[LabelGatewayName] == gw.Name {
+		if labels[LabelGatewayNamespace] == "" || labels[LabelGatewayNamespace] == gw.Namespace {
+			return true
+		}
+	}
+	return false
+}
+
+func buildLabelsAndAnnotations(gw *gatewayv1.Gateway, name string) (map[string]string, map[string]string) {
+	labels := make(map[string]string)
+	var annotations map[string]string
+
+	if gw.Spec.Infrastructure != nil {
+		if gw.Spec.Infrastructure.Labels != nil {
+			for k, v := range gw.Spec.Infrastructure.Labels {
+				keyStr := string(k)
+				if !strings.HasPrefix(keyStr, "gateway.networking.k8s.io/") {
+					labels[keyStr] = string(v)
+				}
+			}
+		}
+		if gw.Spec.Infrastructure.Annotations != nil {
+			annotations = make(map[string]string)
+			for k, v := range gw.Spec.Infrastructure.Annotations {
+				annotations[string(k)] = string(v)
+			}
+		}
+	}
+
+	// GARI-owned labels override user labels
+	labels[LabelGatewayName] = gw.Name
+	labels[LabelGatewayNamespace] = gw.Namespace
+	labels[LabelManagedBy] = ManagedByValue
+	labels[LabelAppName] = AppNameValue
+
+	return labels, annotations
+}
+
+func computeTemplateHash(template *corev1.PodTemplateSpec) string {
+	b, _ := json.Marshal(template.Spec)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:8])
+}
+
+// GatewayAddresses reconciles the per-Gateway ServiceAccount, ClusterRoleBinding, Deployment, and LoadBalancer Service,
 // and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
-//
-// Note: GatewayAddresses currently handles provisioning (creation and updates) of the ServiceAccount, Deployment, and Service.
-// This will be factored into a dedicated provisioner interface in the future.
 func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
 	if p.client == nil {
 		return nil, false, nil
 	}
 
 	name := ResourceNameForGateway(gw.Name)
+	crbName := ClusterRoleBindingNameForGateway(gw.Namespace, gw.Name)
 	gwNamespace := gw.Namespace
 
-	labels := map[string]string{
-		LabelGatewayName:      gw.Name,
-		LabelGatewayNamespace: gw.Namespace,
-		LabelManagedBy:        ManagedByValue,
-		"app":                 name,
-	}
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.Labels != nil {
-		for k, v := range gw.Spec.Infrastructure.Labels {
-			labels[string(k)] = string(v)
-		}
-	}
-
-	var annotations map[string]string
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.Annotations != nil {
-		annotations = make(map[string]string)
-		for k, v := range gw.Spec.Infrastructure.Annotations {
-			annotations[string(k)] = string(v)
-		}
-	}
+	labels, annotations := buildLabelsAndAnnotations(gw, name)
 
 	ownerRef := metav1.OwnerReference{
 		APIVersion: gatewayv1.GroupVersion.String(),
@@ -165,6 +223,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			return nil, false, err
 		}
 	} else {
+		if !isOwnedByGateway(&existingSA, gw) {
+			return nil, false, fmt.Errorf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name)
+		}
 		needsSAUpdate := false
 		if !reflectMapEqual(existingSA.Labels, desiredSA.Labels) {
 			existingSA.Labels = desiredSA.Labels
@@ -174,6 +235,10 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			existingSA.Annotations = desiredSA.Annotations
 			needsSAUpdate = true
 		}
+		if !reflect.DeepEqual(existingSA.OwnerReferences, desiredSA.OwnerReferences) {
+			existingSA.OwnerReferences = desiredSA.OwnerReferences
+			needsSAUpdate = true
+		}
 		if needsSAUpdate {
 			if updateErr := p.client.Update(ctx, &existingSA); updateErr != nil {
 				return nil, false, fmt.Errorf("failed to update ServiceAccount %s/%s: %w", existingSA.Namespace, existingSA.Name, updateErr)
@@ -181,7 +246,60 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	}
 
-	// 2. Reconcile per-Gateway Deployment in Gateway namespace
+	// 2. Reconcile per-Gateway ClusterRoleBinding (cluster-scoped, cannot have namespaced ownerReference)
+	desiredCRB := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   crbName,
+			Labels: labels,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     DataplaneClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      name,
+				Namespace: gwNamespace,
+			},
+		},
+	}
+	var existingCRB rbacv1.ClusterRoleBinding
+	err = p.client.Get(ctx, types.NamespacedName{Name: crbName}, &existingCRB)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if createErr := p.client.Create(ctx, desiredCRB); createErr != nil {
+				return nil, false, fmt.Errorf("failed to create ClusterRoleBinding %s for Gateway %s/%s: %w", crbName, gw.Namespace, gw.Name, createErr)
+			}
+		} else {
+			return nil, false, err
+		}
+	} else {
+		if !isOwnedByGateway(&existingCRB, gw) {
+			return nil, false, fmt.Errorf("conflict: existing ClusterRoleBinding %s is not owned by Gateway %s/%s", crbName, gw.Namespace, gw.Name)
+		}
+		needsCRBUpdate := false
+		if !reflectMapEqual(existingCRB.Labels, desiredCRB.Labels) {
+			existingCRB.Labels = desiredCRB.Labels
+			needsCRBUpdate = true
+		}
+		if !reflect.DeepEqual(existingCRB.Subjects, desiredCRB.Subjects) {
+			existingCRB.Subjects = desiredCRB.Subjects
+			needsCRBUpdate = true
+		}
+		if !reflect.DeepEqual(existingCRB.RoleRef, desiredCRB.RoleRef) {
+			existingCRB.RoleRef = desiredCRB.RoleRef
+			needsCRBUpdate = true
+		}
+		if needsCRBUpdate {
+			if updateErr := p.client.Update(ctx, &existingCRB); updateErr != nil {
+				return nil, false, fmt.Errorf("failed to update ClusterRoleBinding %s: %w", existingCRB.Name, updateErr)
+			}
+		}
+	}
+
+	// 3. Reconcile per-Gateway Deployment in Gateway namespace
 	args := []string{
 		"--dataplane-mode",
 		fmt.Sprintf("--gateway-namespace=%s", gw.Namespace),
@@ -203,65 +321,75 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		image = DefaultDataplaneImage
 	}
 
+	podTemplate := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName: name,
+			Containers: []corev1.Container{
+				{
+					Name:            "dataplane",
+					Image:           image,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Args:            args,
+					Ports: []corev1.ContainerPort{
+						{
+							Name:          "http",
+							ContainerPort: 8000,
+							Protocol:      corev1.ProtocolTCP,
+						},
+						{
+							Name:          "https",
+							ContainerPort: 8443,
+							Protocol:      corev1.ProtocolTCP,
+						},
+						{
+							Name:          "http3",
+							ContainerPort: 8443,
+							Protocol:      corev1.ProtocolUDP,
+						},
+					},
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/readyz",
+								Port: intstr.FromInt32(8081),
+							},
+						},
+						InitialDelaySeconds: 1,
+						PeriodSeconds:       2,
+					},
+				},
+			},
+		},
+	}
+
+	templateHash := computeTemplateHash(&podTemplate)
+	deployAnnotations := make(map[string]string)
+	for k, v := range annotations {
+		deployAnnotations[k] = v
+	}
+	deployAnnotations[AnnotationTemplateHash] = templateHash
+
 	desiredDeploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       gwNamespace,
 			Labels:          labels,
-			Annotations:     annotations,
+			Annotations:     deployAnnotations,
 			OwnerReferences: []metav1.OwnerReference{ownerRef},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: state.Ptr(int32(1)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": name,
+					LabelGatewayName: gw.Name,
+					LabelAppName:     AppNameValue,
 				},
 			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:      labels,
-					Annotations: annotations,
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName: name,
-					Containers: []corev1.Container{
-						{
-							Name:            "dataplane",
-							Image:           image,
-							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args:            args,
-							Ports: []corev1.ContainerPort{
-								{
-									Name:          "http",
-									ContainerPort: 8000,
-									Protocol:      corev1.ProtocolTCP,
-								},
-								{
-									Name:          "https",
-									ContainerPort: 8443,
-									Protocol:      corev1.ProtocolTCP,
-								},
-								{
-									Name:          "http3",
-									ContainerPort: 8443,
-									Protocol:      corev1.ProtocolUDP,
-								},
-							},
-							ReadinessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/readyz",
-										Port: intstr.FromInt32(8081),
-									},
-								},
-								InitialDelaySeconds: 1,
-								PeriodSeconds:       2,
-							},
-						},
-					},
-				},
-			},
+			Template: podTemplate,
 		},
 	}
 
@@ -276,25 +404,24 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			return nil, false, err
 		}
 	} else {
+		if !isOwnedByGateway(&existingDeploy, gw) {
+			return nil, false, fmt.Errorf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name)
+		}
 		needsUpdate := false
-		if !reflect.DeepEqual(existingDeploy.Spec.Template.Spec, desiredDeploy.Spec.Template.Spec) {
-			existingDeploy.Spec.Template.Spec = desiredDeploy.Spec.Template.Spec
+		if existingDeploy.Annotations == nil || existingDeploy.Annotations[AnnotationTemplateHash] != templateHash {
+			existingDeploy.Spec.Template = desiredDeploy.Spec.Template
+			if existingDeploy.Annotations == nil {
+				existingDeploy.Annotations = make(map[string]string)
+			}
+			existingDeploy.Annotations[AnnotationTemplateHash] = templateHash
 			needsUpdate = true
 		}
 		if !reflectMapEqual(existingDeploy.Labels, desiredDeploy.Labels) {
 			existingDeploy.Labels = desiredDeploy.Labels
 			needsUpdate = true
 		}
-		if !reflectMapEqual(existingDeploy.Annotations, desiredDeploy.Annotations) {
-			existingDeploy.Annotations = desiredDeploy.Annotations
-			needsUpdate = true
-		}
-		if !reflectMapEqual(existingDeploy.Spec.Template.Labels, desiredDeploy.Spec.Template.Labels) {
-			existingDeploy.Spec.Template.Labels = desiredDeploy.Spec.Template.Labels
-			needsUpdate = true
-		}
-		if !reflectMapEqual(existingDeploy.Spec.Template.Annotations, desiredDeploy.Spec.Template.Annotations) {
-			existingDeploy.Spec.Template.Annotations = desiredDeploy.Spec.Template.Annotations
+		if !reflect.DeepEqual(existingDeploy.OwnerReferences, desiredDeploy.OwnerReferences) {
+			existingDeploy.OwnerReferences = desiredDeploy.OwnerReferences
 			needsUpdate = true
 		}
 		if needsUpdate {
@@ -304,8 +431,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	}
 
-	// 3. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
-	// Derive ports from effective listeners (including ListenerSets), falling back to gw.Spec.Listeners if effective listeners not compiled yet
+	// 4. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
 	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
 	if len(effectiveListeners) > 0 {
 		for _, el := range effectiveListeners {
@@ -365,7 +491,8 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeLoadBalancer,
 			Selector: map[string]string{
-				"app": name,
+				LabelGatewayName: gw.Name,
+				LabelAppName:     AppNameValue,
 			},
 			Ports: svcPorts,
 		},
@@ -385,6 +512,10 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		return nil, false, err
 	}
 
+	if !isOwnedByGateway(&existingSvc, gw) {
+		return nil, false, fmt.Errorf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name)
+	}
+
 	needsSvcUpdate := false
 	if !reflectPortsEqual(existingSvc.Spec.Ports, desiredSvc.Spec.Ports) {
 		existingSvc.Spec.Ports = desiredSvc.Spec.Ports
@@ -402,13 +533,17 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		existingSvc.Annotations = desiredSvc.Annotations
 		needsSvcUpdate = true
 	}
+	if !reflect.DeepEqual(existingSvc.OwnerReferences, desiredSvc.OwnerReferences) {
+		existingSvc.OwnerReferences = desiredSvc.OwnerReferences
+		needsSvcUpdate = true
+	}
 	if needsSvcUpdate {
 		if updateErr := p.client.Update(ctx, &existingSvc); updateErr != nil {
 			return nil, false, fmt.Errorf("failed to update Service %s/%s: %w", existingSvc.Namespace, existingSvc.Name, updateErr)
 		}
 	}
 
-	// 4. Check Readiness and LB Addresses
+	// 5. Check Readiness and LB Addresses
 	deployReady := false
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy); err == nil {
 		if existingDeploy.Status.AvailableReplicas > 0 || existingDeploy.Status.ReadyReplicas > 0 {
@@ -435,18 +570,28 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addresses, deployReady, nil
 }
 
-// OnGatewayDeleted cleans up the ServiceAccount, Deployment, and Service for the deleted Gateway if they exist.
+// OnGatewayDeleted cleans up the ServiceAccount, ClusterRoleBinding, Deployment, and Service for the deleted Gateway if they exist and are owned by it.
 func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.NamespacedName) error {
 	if p.client == nil {
 		return nil
 	}
 
 	name := ResourceNameForGateway(gwKey.Name)
+	crbName := ClusterRoleBindingNameForGateway(gwKey.Namespace, gwKey.Name)
+
+	dummyGW := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gwKey.Name,
+			Namespace: gwKey.Namespace,
+		},
+	}
 
 	var svc corev1.Service
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &svc); err == nil {
-		if err := p.client.Delete(ctx, &svc); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete Service %s/%s: %w", gwKey.Namespace, name, err)
+		if isOwnedByGateway(&svc, dummyGW) {
+			if err := p.client.Delete(ctx, &svc); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete Service %s/%s: %w", gwKey.Namespace, name, err)
+			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to check Service %s/%s: %w", gwKey.Namespace, name, err)
@@ -454,8 +599,10 @@ func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.Name
 
 	var deploy appsv1.Deployment
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &deploy); err == nil {
-		if err := p.client.Delete(ctx, &deploy); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete Deployment %s/%s: %w", gwKey.Namespace, name, err)
+		if isOwnedByGateway(&deploy, dummyGW) {
+			if err := p.client.Delete(ctx, &deploy); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete Deployment %s/%s: %w", gwKey.Namespace, name, err)
+			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to check Deployment %s/%s: %w", gwKey.Namespace, name, err)
@@ -463,17 +610,30 @@ func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.Name
 
 	var sa corev1.ServiceAccount
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &sa); err == nil {
-		if err := p.client.Delete(ctx, &sa); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
+		if isOwnedByGateway(&sa, dummyGW) {
+			if err := p.client.Delete(ctx, &sa); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
+			}
 		}
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to check ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
 	}
 
+	var crb rbacv1.ClusterRoleBinding
+	if err := p.client.Get(ctx, types.NamespacedName{Name: crbName}, &crb); err == nil {
+		if isOwnedByGateway(&crb, dummyGW) {
+			if err := p.client.Delete(ctx, &crb); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete ClusterRoleBinding %s: %w", crbName, err)
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check ClusterRoleBinding %s: %w", crbName, err)
+	}
+
 	return nil
 }
 
-// SweepOrphans garbage-collects provisioned Services, Deployments, and ServiceAccounts across all namespaces whose corresponding Gateway no longer exists.
+// SweepOrphans garbage-collects provisioned Services, Deployments, ServiceAccounts, and ClusterRoleBindings across all namespaces whose corresponding Gateway no longer exists.
 func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 	if p.client == nil {
 		return nil
@@ -536,6 +696,26 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
 				if delErr := p.client.Delete(ctx, &sa); delErr != nil && !apierrors.IsNotFound(delErr) {
 					errs = append(errs, fmt.Errorf("failed to delete orphaned ServiceAccount %s/%s: %w", sa.Namespace, sa.Name, delErr))
+				}
+			}
+		}
+	}
+
+	var crbList rbacv1.ClusterRoleBindingList
+	if err := p.client.List(ctx, &crbList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to list managed clusterrolebindings: %w", err))
+	} else {
+		for _, crb := range crbList.Items {
+			gwNs := crb.Labels[LabelGatewayNamespace]
+			gwName := crb.Labels[LabelGatewayName]
+			if gwNs == "" || gwName == "" {
+				continue
+			}
+			var gw gatewayv1.Gateway
+			err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNs, Name: gwName}, &gw)
+			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
+				if delErr := p.client.Delete(ctx, &crb); delErr != nil && !apierrors.IsNotFound(delErr) {
+					errs = append(errs, fmt.Errorf("failed to delete orphaned ClusterRoleBinding %s: %w", crb.Name, delErr))
 				}
 			}
 		}
