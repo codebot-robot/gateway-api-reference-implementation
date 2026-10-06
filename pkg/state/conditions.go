@@ -199,7 +199,7 @@ func reflectParentReferenceEqual(a, b gatewayv1.ParentReference, defaultNamespac
 
 // UpdateRouteParentStatuses updates an existing slice of RouteParentStatus with desired statuses,
 // preserving LastTransitionTime for conditions whose Status has not changed.
-// Entries belonging to our managed controllers are sorted deterministically by normalized ParentRef.
+// Entries belonging to our managed controller are sorted deterministically by normalized ParentRef.
 // Entries belonging to other controllers are preserved in their existing relative order, after our entries.
 // If the only difference between existing and desired statuses is order, updated returns false.
 // It returns the updated slice and a boolean indicating whether any semantic changes occurred.
@@ -207,18 +207,8 @@ func UpdateRouteParentStatuses(
 	existing []gatewayv1.RouteParentStatus,
 	desired []gatewayv1.RouteParentStatus,
 	routeNamespace string,
-	controllerNames ...gatewayv1.GatewayController,
+	controllerName gatewayv1.GatewayController,
 ) ([]gatewayv1.RouteParentStatus, bool) {
-	managedControllers := make(map[gatewayv1.GatewayController]bool)
-	for _, c := range controllerNames {
-		managedControllers[c] = true
-	}
-	if len(managedControllers) == 0 {
-		for _, d := range desired {
-			managedControllers[d.ControllerName] = true
-		}
-	}
-
 	updated := false
 
 	var ourEntries []gatewayv1.RouteParentStatus
@@ -229,12 +219,144 @@ func UpdateRouteParentStatuses(
 			ControllerName: d.ControllerName,
 			Conditions:     make([]metav1.Condition, len(d.Conditions)),
 		}
+		if entry.ControllerName == "" && controllerName != "" {
+			entry.ControllerName = controllerName
+		}
 		copy(entry.Conditions, d.Conditions)
 
 		// Find matching existing parent status
 		var matchingExisting *gatewayv1.RouteParentStatus
 		for j := range existing {
-			if existing[j].ControllerName == d.ControllerName && reflectParentReferenceEqual(existing[j].ParentRef, d.ParentRef, routeNamespace) {
+			if existing[j].ControllerName == entry.ControllerName && reflectParentReferenceEqual(existing[j].ParentRef, entry.ParentRef, routeNamespace) {
+				matchingExisting = &existing[j]
+				break
+			}
+		}
+
+		if matchingExisting == nil {
+			updated = true
+			for k := range entry.Conditions {
+				if entry.Conditions[k].LastTransitionTime.IsZero() {
+					entry.Conditions[k].LastTransitionTime = metav1.Now()
+				}
+			}
+		} else {
+			if len(matchingExisting.Conditions) != len(entry.Conditions) {
+				updated = true
+			}
+			for k, dc := range entry.Conditions {
+				found := false
+				for _, ec := range matchingExisting.Conditions {
+					if ec.Type == dc.Type {
+						found = true
+						if ec.Status == dc.Status {
+							entry.Conditions[k].LastTransitionTime = ec.LastTransitionTime
+						} else {
+							updated = true
+							if entry.Conditions[k].LastTransitionTime.IsZero() {
+								entry.Conditions[k].LastTransitionTime = metav1.Now()
+							}
+						}
+						if ec.Status != dc.Status || ec.Reason != dc.Reason || ec.Message != dc.Message || ec.ObservedGeneration != dc.ObservedGeneration {
+							updated = true
+						}
+						break
+					}
+				}
+				if !found {
+					updated = true
+					if entry.Conditions[k].LastTransitionTime.IsZero() {
+						entry.Conditions[k].LastTransitionTime = metav1.Now()
+					}
+				}
+			}
+		}
+
+		ourEntries = append(ourEntries, entry)
+	}
+
+	// Sort our own entries deterministically
+	SortRouteParentStatuses(ourEntries, routeNamespace)
+
+	// Check for existing entries: preserve entries from unmanaged controllers in their relative order,
+	// and detect removals of entries from managed controller(s).
+	var otherEntries []gatewayv1.RouteParentStatus
+	for _, e := range existing {
+		if controllerName != "" && e.ControllerName == controllerName {
+			found := false
+			for _, d := range desired {
+				dCtrl := d.ControllerName
+				if dCtrl == "" {
+					dCtrl = controllerName
+				}
+				if dCtrl == e.ControllerName && reflectParentReferenceEqual(d.ParentRef, e.ParentRef, routeNamespace) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				updated = true
+			}
+		} else if controllerName == "" {
+			isManaged := false
+			for _, d := range desired {
+				if d.ControllerName == e.ControllerName {
+					isManaged = true
+					break
+				}
+			}
+			if isManaged {
+				found := false
+				for _, d := range desired {
+					if d.ControllerName == e.ControllerName && reflectParentReferenceEqual(d.ParentRef, e.ParentRef, routeNamespace) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					updated = true
+				}
+			} else {
+				otherEntries = append(otherEntries, e)
+			}
+		} else {
+			otherEntries = append(otherEntries, e)
+		}
+	}
+
+	if len(existing) != len(ourEntries)+len(otherEntries) {
+		updated = true
+	}
+
+	result := append(ourEntries, otherEntries...)
+	return result, updated
+}
+
+// UpdatePolicyAncestors updates an existing slice of PolicyAncestorStatus with desired statuses,
+// preserving LastTransitionTime for conditions whose Status has not changed.
+// Entries belonging to other controllers are preserved.
+func UpdatePolicyAncestors(
+	existing []gatewayv1.PolicyAncestorStatus,
+	desired []gatewayv1.PolicyAncestorStatus,
+	controllerName gatewayv1.GatewayController,
+) ([]gatewayv1.PolicyAncestorStatus, bool) {
+	updated := false
+	var result []gatewayv1.PolicyAncestorStatus
+
+	for _, d := range desired {
+		entry := gatewayv1.PolicyAncestorStatus{
+			AncestorRef:    d.AncestorRef,
+			ControllerName: d.ControllerName,
+			Conditions:     make([]metav1.Condition, len(d.Conditions)),
+		}
+		if entry.ControllerName == "" && controllerName != "" {
+			entry.ControllerName = controllerName
+		}
+		copy(entry.Conditions, d.Conditions)
+
+		var matchingExisting *gatewayv1.PolicyAncestorStatus
+		for j := range existing {
+			if existing[j].ControllerName == d.ControllerName && reflectParentReferenceEqual(existing[j].AncestorRef, d.AncestorRef) {
 				matchingExisting = &existing[j]
 				break
 			}
@@ -278,21 +400,14 @@ func UpdateRouteParentStatuses(
 				}
 			}
 		}
-
-		ourEntries = append(ourEntries, entry)
+		result = append(result, entry)
 	}
 
-	// Sort our own entries deterministically
-	SortRouteParentStatuses(ourEntries, routeNamespace)
-
-	// Check for existing entries: preserve entries from unmanaged controllers in their relative order,
-	// and detect removals of entries from managed controllers.
-	var otherEntries []gatewayv1.RouteParentStatus
 	for _, e := range existing {
-		if managedControllers[e.ControllerName] {
+		if controllerName != "" && e.ControllerName == controllerName {
 			found := false
 			for _, d := range desired {
-				if d.ControllerName == e.ControllerName && reflectParentReferenceEqual(d.ParentRef, e.ParentRef, routeNamespace) {
+				if d.ControllerName == e.ControllerName && reflectParentReferenceEqual(d.AncestorRef, e.AncestorRef) {
 					found = true
 					break
 				}
@@ -300,15 +415,36 @@ func UpdateRouteParentStatuses(
 			if !found {
 				updated = true
 			}
+		} else if controllerName == "" {
+			isManaged := false
+			for _, d := range desired {
+				if d.ControllerName == e.ControllerName {
+					isManaged = true
+					break
+				}
+			}
+			if isManaged {
+				found := false
+				for _, d := range desired {
+					if d.ControllerName == e.ControllerName && reflectParentReferenceEqual(d.AncestorRef, e.AncestorRef) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					updated = true
+				}
+			} else {
+				result = append(result, e)
+			}
 		} else {
-			otherEntries = append(otherEntries, e)
+			result = append(result, e)
 		}
 	}
 
-	if len(existing) != len(ourEntries)+len(otherEntries) {
+	if len(existing) != len(result) {
 		updated = true
 	}
 
-	result := append(ourEntries, otherEntries...)
 	return result, updated
 }

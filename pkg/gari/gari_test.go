@@ -323,13 +323,20 @@ func TestOnGatewaysUpdateHookAndCustomControllerName(t *testing.T) {
 		WithStatusSubresource(gw, gc, route).
 		Build()
 
+	st.SetProxy(p)
+	st.SetControllerName(customControllerName)
+	st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.UpsertHTTPRoute(route)
+	st.UpsertService(svc)
+	st.Recompute()
+
 	gwReconciler := &controller.GatewayReconciler{
-		Client:           fakeClient,
-		Scheme:           scheme,
-		State:            st,
-		Proxy:            p,
-		ControllerName:   customControllerName,
-		OnGatewaysUpdate: opts.OnGatewaysUpdate,
+		Client:         fakeClient,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: customControllerName,
 	}
 
 	ctx := t.Context()

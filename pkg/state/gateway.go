@@ -673,8 +673,17 @@ func (s *GatewayState) BuildInternalState(routes []*HTTPRouteState, services map
 		secrets = st.GetSecrets()
 	}
 
+	var gcs []*gatewayv1.GatewayClass
+	if s.Gateway != nil {
+		gcs = append(gcs, &gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: string(s.Spec.GatewayClassName)},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayv1.GatewayController(controllerName)},
+		})
+	}
+
 	compiled := CompileModel(ModelInputs{
 		Gateways:           []*gatewayv1.Gateway{s.Gateway},
+		GatewayClasses:     gcs,
 		ListenerSets:       listenerSetsList,
 		HTTPRoutes:         httpRoutes,
 		Services:           services,

@@ -156,7 +156,7 @@ func TestUpdateRouteParentStatuses(t *testing.T) {
 		},
 	}
 
-	result, updated := UpdateRouteParentStatuses(existing, desired, "")
+	result, updated := UpdateRouteParentStatuses(existing, desired, "", controller)
 	if !updated {
 		t.Errorf("expected updated=true when adding ResolvedRefs condition")
 	}
@@ -178,7 +178,7 @@ func TestUpdateRouteParentStatuses(t *testing.T) {
 			},
 		},
 	}
-	resultBumped, updatedBumped := UpdateRouteParentStatuses(result, desiredBumped, "")
+	resultBumped, updatedBumped := UpdateRouteParentStatuses(result, desiredBumped, "", controller)
 	if !updatedBumped {
 		t.Errorf("expected updated=true when observedGeneration changes")
 	}
