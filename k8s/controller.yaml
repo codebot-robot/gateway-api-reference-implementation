@@ -4,12 +4,6 @@ metadata:
   name: gari-controller
   namespace: default
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: gari-dataplane
-  namespace: default
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -19,7 +13,7 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: [""]
-  resources: ["services"]
+  resources: ["services", "serviceaccounts"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
@@ -31,6 +25,10 @@ rules:
   resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status"]
   verbs: ["update", "patch"]
 ---
+# Security notice: each per-Gateway data-plane pod currently runs state computation
+# for its Gateway and therefore reads cluster resources. In a future update, configuration
+# will be computed centrally and pushed as a per-Gateway secret so data-plane pods only
+# need read access to their own namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -68,9 +66,9 @@ roleRef:
   kind: ClusterRole
   name: gari-dataplane
 subjects:
-- kind: ServiceAccount
-  name: gari-dataplane
-  namespace: default
+- kind: Group
+  name: system:serviceaccounts
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -98,4 +96,4 @@ spec:
       containers:
       - name: controller
         image: gari-controller:latest
-        args: ["--controller-namespace", "default"]
+        args: []

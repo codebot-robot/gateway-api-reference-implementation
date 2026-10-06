@@ -32,24 +32,17 @@ func main() {
 	opts := gari.DefaultOptions()
 
 	var (
-		controllerNamespace string
-		dataplaneMode       bool
-		gatewayNamespace    string
-		gatewayName         string
-		dataplaneImage      string
+		dataplaneMode    bool
+		gatewayNamespace string
+		gatewayName      string
+		dataplaneImage   string
 	)
-
-	defaultNs := os.Getenv("POD_NAMESPACE")
-	if defaultNs == "" {
-		defaultNs = singlepod.DefaultControllerNamespace
-	}
 
 	defaultImg := os.Getenv("GARI_IMAGE")
 	if defaultImg == "" {
 		defaultImg = singlepod.DefaultDataplaneImage
 	}
 
-	flag.StringVar(&controllerNamespace, "controller-namespace", defaultNs, "The namespace of the controller where per-Gateway Services and Deployments are provisioned.")
 	flag.BoolVar(&dataplaneMode, "dataplane-mode", false, "Run in data-plane mode serving a single Gateway.")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
 	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
@@ -77,6 +70,7 @@ func main() {
 			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
 			os.Exit(1)
 		}
+		opts.DisableStatusUpdates = true
 		opts.LeaderElection = false
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
 		opts.AddressProvider = nil
@@ -89,7 +83,6 @@ func main() {
 		opts.ProxyHTTP3Addr = ""
 		opts.AddressProvider = singlepod.NewAddressProvider(
 			nil,
-			controllerNamespace,
 			singlepod.WithDataplaneImage(dataplaneImage),
 			singlepod.WithEnableH2C(opts.EnableH2C),
 		)

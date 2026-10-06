@@ -40,14 +40,8 @@ import (
 )
 
 const (
-	// DefaultControllerNamespace is the default namespace of the controller where per-Gateway resources are provisioned.
-	DefaultControllerNamespace = "default"
-
 	// DefaultDataplaneImage is the default container image for per-Gateway data-plane deployments.
 	DefaultDataplaneImage = "gari-controller:latest"
-
-	// DefaultDataplaneServiceAccount is the default service account for per-Gateway data-plane deployments.
-	DefaultDataplaneServiceAccount = "gari-dataplane"
 
 	// LabelGatewayName is the label identifying the Gateway name on provisioned resources.
 	LabelGatewayName = "gateway.networking.k8s.io/gateway-name"
@@ -62,10 +56,15 @@ const (
 	ManagedByValue = "gari-singlepod"
 )
 
-// ServiceNameForGateway computes a deterministic resource name for a Gateway.
-func ServiceNameForGateway(gwNamespace, gwName string) string {
-	h := sha256.Sum256([]byte(gwNamespace + "/" + gwName))
-	return fmt.Sprintf("gari-gw-%s", hex.EncodeToString(h[:6]))
+// ResourceNameForGateway computes the resource name for a Gateway within its namespace.
+func ResourceNameForGateway(gwName string) string {
+	base := fmt.Sprintf("%s-gari", gwName)
+	if len(base) <= 63 {
+		return base
+	}
+	h := sha256.Sum256([]byte(gwName))
+	suffix := "-" + hex.EncodeToString(h[:4])
+	return base[:63-len(suffix)] + suffix
 }
 
 // Option configures an AddressProvider.
@@ -85,32 +84,18 @@ func WithEnableH2C(enable bool) Option {
 	}
 }
 
-// WithDataplaneServiceAccount configures the service account for data-plane pods.
-func WithDataplaneServiceAccount(sa string) Option {
-	return func(p *AddressProvider) {
-		p.dataplaneServiceAccount = sa
-	}
-}
-
-// AddressProvider manages per-Gateway Deployments and LoadBalancer Services.
+// AddressProvider manages per-Gateway ServiceAccounts, Deployments, and LoadBalancer Services in the Gateway's namespace.
 type AddressProvider struct {
-	client                  client.Client
-	namespace               string
-	dataplaneImage          string
-	enableH2C               bool
-	dataplaneServiceAccount string
+	client         client.Client
+	dataplaneImage string
+	enableH2C      bool
 }
 
-// NewAddressProvider creates a new singlepod AddressProvider for the given controller namespace.
-func NewAddressProvider(c client.Client, namespace string, opts ...Option) *AddressProvider {
-	if namespace == "" {
-		namespace = DefaultControllerNamespace
-	}
+// NewAddressProvider creates a new singlepod AddressProvider.
+func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	p := &AddressProvider{
-		client:                  c,
-		namespace:               namespace,
-		dataplaneImage:          DefaultDataplaneImage,
-		dataplaneServiceAccount: DefaultDataplaneServiceAccount,
+		client:         c,
+		dataplaneImage: DefaultDataplaneImage,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -118,25 +103,85 @@ func NewAddressProvider(c client.Client, namespace string, opts ...Option) *Addr
 	return p
 }
 
-// GatewayAddresses reconciles the per-Gateway Deployment and LoadBalancer Service,
+// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service in the Gateway's namespace,
 // and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
 //
-// Note: GatewayAddresses currently handles provisioning (creation and updates) of the Deployment and Service.
+// Note: GatewayAddresses currently handles provisioning (creation and updates) of the ServiceAccount, Deployment, and Service.
 // This will be factored into a dedicated provisioner interface in the future.
 func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
 	if p.client == nil {
 		return nil, false, nil
 	}
 
-	name := ServiceNameForGateway(gw.Namespace, gw.Name)
+	name := ResourceNameForGateway(gw.Name)
+	gwNamespace := gw.Namespace
+
 	labels := map[string]string{
 		LabelGatewayName:      gw.Name,
 		LabelGatewayNamespace: gw.Namespace,
 		LabelManagedBy:        ManagedByValue,
 		"app":                 name,
 	}
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.Labels != nil {
+		for k, v := range gw.Spec.Infrastructure.Labels {
+			labels[string(k)] = string(v)
+		}
+	}
 
-	// 1. Reconcile per-Gateway Deployment
+	var annotations map[string]string
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.Annotations != nil {
+		annotations = make(map[string]string)
+		for k, v := range gw.Spec.Infrastructure.Annotations {
+			annotations[string(k)] = string(v)
+		}
+	}
+
+	ownerRef := metav1.OwnerReference{
+		APIVersion: gatewayv1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: state.Ptr(true),
+	}
+
+	// 1. Reconcile per-Gateway ServiceAccount in Gateway namespace
+	desiredSA := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       gwNamespace,
+			Labels:          labels,
+			Annotations:     annotations,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+	}
+	var existingSA corev1.ServiceAccount
+	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if createErr := p.client.Create(ctx, desiredSA); createErr != nil {
+				return nil, false, fmt.Errorf("failed to create ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, createErr)
+			}
+		} else {
+			return nil, false, err
+		}
+	} else {
+		needsSAUpdate := false
+		if !reflectMapEqual(existingSA.Labels, desiredSA.Labels) {
+			existingSA.Labels = desiredSA.Labels
+			needsSAUpdate = true
+		}
+		if !reflectMapEqual(existingSA.Annotations, desiredSA.Annotations) {
+			existingSA.Annotations = desiredSA.Annotations
+			needsSAUpdate = true
+		}
+		if needsSAUpdate {
+			if updateErr := p.client.Update(ctx, &existingSA); updateErr != nil {
+				return nil, false, fmt.Errorf("failed to update ServiceAccount %s/%s: %w", existingSA.Namespace, existingSA.Name, updateErr)
+			}
+		}
+	}
+
+	// 2. Reconcile per-Gateway Deployment in Gateway namespace
 	args := []string{
 		"--dataplane-mode",
 		fmt.Sprintf("--gateway-namespace=%s", gw.Namespace),
@@ -160,9 +205,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 
 	desiredDeploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: p.namespace,
-			Labels:    labels,
+			Name:            name,
+			Namespace:       gwNamespace,
+			Labels:          labels,
+			Annotations:     annotations,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: state.Ptr(int32(1)),
@@ -173,10 +220,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
+					Labels:      labels,
+					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: p.dataplaneServiceAccount,
+					ServiceAccountName: name,
 					Containers: []corev1.Container{
 						{
 							Name:            "dataplane",
@@ -218,7 +266,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	var existingDeploy appsv1.Deployment
-	err := p.client.Get(ctx, types.NamespacedName{Namespace: p.namespace, Name: name}, &existingDeploy)
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			if createErr := p.client.Create(ctx, desiredDeploy); createErr != nil {
@@ -228,7 +276,6 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			return nil, false, err
 		}
 	} else {
-		// Update deployment if pod template spec or labels changed
 		needsUpdate := false
 		if !reflect.DeepEqual(existingDeploy.Spec.Template.Spec, desiredDeploy.Spec.Template.Spec) {
 			existingDeploy.Spec.Template.Spec = desiredDeploy.Spec.Template.Spec
@@ -238,8 +285,16 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 			existingDeploy.Labels = desiredDeploy.Labels
 			needsUpdate = true
 		}
+		if !reflectMapEqual(existingDeploy.Annotations, desiredDeploy.Annotations) {
+			existingDeploy.Annotations = desiredDeploy.Annotations
+			needsUpdate = true
+		}
 		if !reflectMapEqual(existingDeploy.Spec.Template.Labels, desiredDeploy.Spec.Template.Labels) {
 			existingDeploy.Spec.Template.Labels = desiredDeploy.Spec.Template.Labels
+			needsUpdate = true
+		}
+		if !reflectMapEqual(existingDeploy.Spec.Template.Annotations, desiredDeploy.Spec.Template.Annotations) {
+			existingDeploy.Spec.Template.Annotations = desiredDeploy.Spec.Template.Annotations
 			needsUpdate = true
 		}
 		if needsUpdate {
@@ -249,7 +304,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	}
 
-	// 2. Reconcile per-Gateway LoadBalancer Service
+	// 3. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
 	// Derive ports from effective listeners (including ListenerSets), falling back to gw.Spec.Listeners if effective listeners not compiled yet
 	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
 	if len(effectiveListeners) > 0 {
@@ -301,9 +356,11 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 
 	desiredSvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: p.namespace,
-			Labels:    labels,
+			Name:            name,
+			Namespace:       gwNamespace,
+			Labels:          labels,
+			Annotations:     annotations,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 		},
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeLoadBalancer,
@@ -315,7 +372,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	var existingSvc corev1.Service
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: p.namespace, Name: name}, &existingSvc)
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			if len(svcPorts) > 0 {
@@ -341,15 +398,19 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		existingSvc.Labels = desiredSvc.Labels
 		needsSvcUpdate = true
 	}
+	if !reflectMapEqual(existingSvc.Annotations, desiredSvc.Annotations) {
+		existingSvc.Annotations = desiredSvc.Annotations
+		needsSvcUpdate = true
+	}
 	if needsSvcUpdate {
 		if updateErr := p.client.Update(ctx, &existingSvc); updateErr != nil {
 			return nil, false, fmt.Errorf("failed to update Service %s/%s: %w", existingSvc.Namespace, existingSvc.Name, updateErr)
 		}
 	}
 
-	// 3. Check Readiness and LB Addresses
+	// 4. Check Readiness and LB Addresses
 	deployReady := false
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.namespace, Name: name}, &existingDeploy); err == nil {
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy); err == nil {
 		if existingDeploy.Status.AvailableReplicas > 0 || existingDeploy.Status.ReadyReplicas > 0 {
 			deployReady = true
 		}
@@ -374,36 +435,45 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addresses, deployReady, nil
 }
 
-// OnGatewayDeleted cleans up the Deployment and Service for the deleted Gateway if they exist.
+// OnGatewayDeleted cleans up the ServiceAccount, Deployment, and Service for the deleted Gateway if they exist.
 func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.NamespacedName) error {
 	if p.client == nil {
 		return nil
 	}
 
-	name := ServiceNameForGateway(gwKey.Namespace, gwKey.Name)
+	name := ResourceNameForGateway(gwKey.Name)
 
 	var svc corev1.Service
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.namespace, Name: name}, &svc); err == nil {
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &svc); err == nil {
 		if err := p.client.Delete(ctx, &svc); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete Service %s/%s: %w", p.namespace, name, err)
+			return fmt.Errorf("failed to delete Service %s/%s: %w", gwKey.Namespace, name, err)
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check Service %s/%s: %w", p.namespace, name, err)
+		return fmt.Errorf("failed to check Service %s/%s: %w", gwKey.Namespace, name, err)
 	}
 
 	var deploy appsv1.Deployment
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: p.namespace, Name: name}, &deploy); err == nil {
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &deploy); err == nil {
 		if err := p.client.Delete(ctx, &deploy); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete Deployment %s/%s: %w", p.namespace, name, err)
+			return fmt.Errorf("failed to delete Deployment %s/%s: %w", gwKey.Namespace, name, err)
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check Deployment %s/%s: %w", p.namespace, name, err)
+		return fmt.Errorf("failed to check Deployment %s/%s: %w", gwKey.Namespace, name, err)
+	}
+
+	var sa corev1.ServiceAccount
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &sa); err == nil {
+		if err := p.client.Delete(ctx, &sa); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to check ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
 	}
 
 	return nil
 }
 
-// SweepOrphans garbage-collects provisioned Services and Deployments whose corresponding Gateway no longer exists.
+// SweepOrphans garbage-collects provisioned Services, Deployments, and ServiceAccounts across all namespaces whose corresponding Gateway no longer exists.
 func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 	if p.client == nil {
 		return nil
@@ -412,7 +482,7 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 	var errs []error
 
 	var svcList corev1.ServiceList
-	if err := p.client.List(ctx, &svcList, client.InNamespace(p.namespace), client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+	if err := p.client.List(ctx, &svcList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
 		errs = append(errs, fmt.Errorf("failed to list managed services: %w", err))
 	} else {
 		for _, svc := range svcList.Items {
@@ -432,7 +502,7 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 	}
 
 	var deployList appsv1.DeploymentList
-	if err := p.client.List(ctx, &deployList, client.InNamespace(p.namespace), client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+	if err := p.client.List(ctx, &deployList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
 		errs = append(errs, fmt.Errorf("failed to list managed deployments: %w", err))
 	} else {
 		for _, deploy := range deployList.Items {
@@ -446,6 +516,26 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
 				if delErr := p.client.Delete(ctx, &deploy); delErr != nil && !apierrors.IsNotFound(delErr) {
 					errs = append(errs, fmt.Errorf("failed to delete orphaned Deployment %s/%s: %w", deploy.Namespace, deploy.Name, delErr))
+				}
+			}
+		}
+	}
+
+	var saList corev1.ServiceAccountList
+	if err := p.client.List(ctx, &saList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
+		errs = append(errs, fmt.Errorf("failed to list managed serviceaccounts: %w", err))
+	} else {
+		for _, sa := range saList.Items {
+			gwNs := sa.Labels[LabelGatewayNamespace]
+			gwName := sa.Labels[LabelGatewayName]
+			if gwNs == "" || gwName == "" {
+				continue
+			}
+			var gw gatewayv1.Gateway
+			err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNs, Name: gwName}, &gw)
+			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
+				if delErr := p.client.Delete(ctx, &sa); delErr != nil && !apierrors.IsNotFound(delErr) {
+					errs = append(errs, fmt.Errorf("failed to delete orphaned ServiceAccount %s/%s: %w", sa.Namespace, sa.Name, delErr))
 				}
 			}
 		}
@@ -473,9 +563,6 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	}
 
 	mapFunc := func(ctx context.Context, obj client.Object) []ctrl.Request {
-		if obj.GetNamespace() != p.namespace {
-			return nil
-		}
 		labels := obj.GetLabels()
 		if labels == nil || labels[LabelManagedBy] != ManagedByValue {
 			return nil

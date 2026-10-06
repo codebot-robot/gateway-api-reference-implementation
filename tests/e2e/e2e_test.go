@@ -143,19 +143,24 @@ spec:
 		t.Errorf("Expected second Gateway to get distinct address, got same: %s", secondGwAddr)
 	}
 
-	// Verify Service and Deployment were created for second-gateway
-	secondSvcName := singlepod.ServiceNameForGateway("default", "second-gateway")
-	out := h.runCmd("kubectl", "get", "svc", secondSvcName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
-	if strings.TrimSpace(out) != secondSvcName {
-		t.Errorf("Expected Service %s to exist, got: %s", secondSvcName, out)
+	// Verify Service, Deployment, and ServiceAccount were created for second-gateway
+	secondResName := singlepod.ResourceNameForGateway("second-gateway")
+	out := h.runCmd("kubectl", "get", "svc", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(out) != secondResName {
+		t.Errorf("Expected Service %s to exist, got: %s", secondResName, out)
 	}
-	deployOut := h.runCmd("kubectl", "get", "deployment", secondSvcName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
-	if strings.TrimSpace(deployOut) != secondSvcName {
-		t.Errorf("Expected Deployment %s to exist, got: %s", secondSvcName, deployOut)
+	deployOut := h.runCmd("kubectl", "get", "deployment", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(deployOut) != secondResName {
+		t.Errorf("Expected Deployment %s to exist, got: %s", secondResName, deployOut)
+	}
+	saOut := h.runCmd("kubectl", "get", "serviceaccount", secondResName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(saOut) != secondResName {
+		t.Errorf("Expected ServiceAccount %s to exist, got: %s", secondResName, saOut)
 	}
 
-	// Delete second-gateway and verify Service and Deployment are cleaned up
+	// Delete second-gateway and verify Service, Deployment, and ServiceAccount are cleaned up
 	h.runCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
-	h.WaitForResourceDeletion("svc", secondSvcName, "default", 30*time.Second)
-	h.WaitForResourceDeletion("deployment", secondSvcName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("svc", secondResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("deployment", secondResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("serviceaccount", secondResName, "default", 30*time.Second)
 }

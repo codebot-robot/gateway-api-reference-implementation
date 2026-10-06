@@ -280,7 +280,7 @@ func (h *Harness) DeployController() {
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
 	h.runCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
-	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--controller-namespace","default","--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
+	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
 	h.runCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
 	h.runCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 }
