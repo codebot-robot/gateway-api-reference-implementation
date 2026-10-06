@@ -177,6 +177,44 @@ func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
 	h.runCmd("kubectl", "wait", "--namespace", "default", "--for=condition=available", "--timeout="+timeout.String(), "deployment/"+name)
 }
 
+func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
+	h.t.Logf("Waiting for Gateway %s/%s to have an address assigned", namespace, name)
+	start := time.Now()
+	for {
+		if time.Since(start) > timeout {
+			logs := h.runCmd("kubectl", "logs", "deployment/gari-controller", "--namespace=default")
+			h.t.Logf("Controller logs on timeout:\n%s", logs)
+			h.t.Fatalf("Timeout waiting for Gateway %s/%s address", namespace, name)
+		}
+
+		out, err := exec.Command("kubectl", "get", "gateway", name, "--namespace", namespace, "-o", "jsonpath={.status.addresses[0].value}").Output()
+		if err == nil {
+			addr := strings.TrimSpace(string(out))
+			if addr != "" {
+				h.t.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
+				return addr
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (h *Harness) WaitForResourceDeletion(kind, name, namespace string, timeout time.Duration) {
+	h.t.Logf("Waiting for %s %s/%s to be deleted", kind, namespace, name)
+	start := time.Now()
+	for {
+		if time.Since(start) > timeout {
+			h.t.Fatalf("Timeout waiting for %s %s/%s deletion", kind, namespace, name)
+		}
+
+		out, err := exec.Command("kubectl", "get", kind, name, "--namespace", namespace, "-o", "jsonpath={.metadata.name}").Output()
+		if err != nil || strings.TrimSpace(string(out)) == "" {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (h *Harness) DeletePod(name string) {
 	h.t.Logf("Deleting pod %s", name)
 	exec.Command("kubectl", "delete", "pod", name, "--namespace", "default", "--ignore-not-found").Run()
@@ -197,6 +235,12 @@ func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
 				return
 			}
 			if phase == "Failed" {
+				podLogs := h.GetPodLogs(name)
+				h.t.Logf("Pod %s logs on failure:\n%s", name, podLogs)
+				dataplaneLogs := h.runCmd("kubectl", "logs", "--selector=app.kubernetes.io/managed-by=gari-singlepod", "--namespace=default")
+				h.t.Logf("Dataplane logs on failure:\n%s", dataplaneLogs)
+				dataplanePods := h.runCmd("kubectl", "get", "pods", "--namespace=default")
+				h.t.Logf("All pods on failure:\n%s", dataplanePods)
 				h.t.Fatalf("Pod %s failed", name)
 			}
 		}
@@ -236,8 +280,7 @@ func (h *Harness) DeployController() {
 
 	h.KubectlApplyFile(filepath.Join(gitRoot, "k8s/controller.yaml"))
 	h.runCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
-	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never"}]}}}}`)
-	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "--type=json", "-p", `[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--enable-h2c"}]`)
+	h.runCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--controller-namespace","default","--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
 	h.runCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
 	h.runCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 }

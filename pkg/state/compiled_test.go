@@ -836,7 +836,7 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 
 	// 1. Gateway Status
 	addresses := []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}
-	gwStatus := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses)
+	gwStatus := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses, true)
 	if len(gwStatus.Conditions) != 2 {
 		t.Errorf("expected 2 Gateway conditions, got %d", len(gwStatus.Conditions))
 	}

@@ -162,9 +162,9 @@ type trackingAddressProvider struct {
 	called bool
 }
 
-func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error) {
+func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
 	p.called = true
-	return []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}, nil
+	return nil, false, nil
 }
 
 func TestGatewayReconciler_SkipsOtherControllersGateways(t *testing.T) {
@@ -876,11 +876,16 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 
 type fakeAddressProvider struct {
 	addresses []gatewayv1.GatewayStatusAddress
+	ready     bool
 	err       error
 }
 
-func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error) {
-	return f.addresses, f.err
+func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+	ready := f.ready
+	if !ready && f.err == nil && len(f.addresses) > 0 {
+		ready = true
+	}
+	return f.addresses, ready, f.err
 }
 
 type fakeAddressWatcherProvider struct {

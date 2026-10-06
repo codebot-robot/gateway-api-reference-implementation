@@ -15,10 +15,13 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 )
 
 func TestGatewayAPI(t *testing.T) {
@@ -51,14 +54,13 @@ func TestGatewayAPI(t *testing.T) {
 	h.CreateTLSSecret("gateway-tls-cert", "default", certPEM, keyPEM)
 
 	h.KubectlApplyContent(h.ExampleGatewayManifest())
-	// Give the controller some time to reconcile
-	time.Sleep(5 * time.Second)
+	gwAddr := h.WaitForGatewayAddress("reference-gateway", "default", 1*time.Minute)
 
 	// 5. Run Client Pod (HTTP)
 	clientPodName := "test-client"
 	h.DeletePod(clientPodName)
 
-	h.KubectlApplyContent(h.ClientManifest("http://gari-proxy", "example.com"))
+	h.KubectlApplyContent(h.ClientManifest(fmt.Sprintf("http://%s", gwAddr), "example.com"))
 	h.WaitForPodSuccess(clientPodName, 1*time.Minute)
 
 	logs := h.GetPodLogs(clientPodName)
@@ -80,7 +82,7 @@ func TestGatewayAPI(t *testing.T) {
 	httpsClientPodName := "test-client-https"
 	h.DeletePod(httpsClientPodName)
 
-	h.KubectlApplyContent(h.ClientManifestWithArgs(httpsClientPodName, "--insecure", "--sni", "example.com", "https://gari-proxy:443", "example.com"))
+	h.KubectlApplyContent(h.ClientManifestWithArgs(httpsClientPodName, "--insecure", "--sni", "example.com", fmt.Sprintf("https://%s:443", gwAddr), "example.com"))
 	h.WaitForPodSuccess(httpsClientPodName, 1*time.Minute)
 
 	httpsLogs := h.GetPodLogs(httpsClientPodName)
@@ -99,7 +101,7 @@ func TestGatewayAPI(t *testing.T) {
 	h3ClientPodName := "test-client-http3"
 	h.DeletePod(h3ClientPodName)
 
-	h.KubectlApplyContent(h.ClientManifestWithArgs(h3ClientPodName, "--http3", "--insecure", "--sni", "example.com", "https://gari-proxy:443", "example.com"))
+	h.KubectlApplyContent(h.ClientManifestWithArgs(h3ClientPodName, "--http3", "--insecure", "--sni", "example.com", fmt.Sprintf("https://%s:443", gwAddr), "example.com"))
 	h.WaitForPodSuccess(h3ClientPodName, 1*time.Minute)
 
 	h3Logs := h.GetPodLogs(h3ClientPodName)
@@ -107,4 +109,53 @@ func TestGatewayAPI(t *testing.T) {
 	if !strings.Contains(h3Logs, "Status: 200 OK") || (!strings.Contains(h3Logs, "\"hostname\":\"example.com\"") && !strings.Contains(h3Logs, "\"host\": \"example.com\"")) {
 		t.Errorf("Expected HTTP/3 200 OK with hostname example.com, got: %s", h3Logs)
 	}
+
+	// 9. Verify Multi-Gateway Isolation & Deletion Cleanup
+	secondGwManifest := `
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: second-gateway
+  namespace: default
+spec:
+  gatewayClassName: reference-class
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: second-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: second-gateway
+  rules:
+  - backendRefs:
+    - name: backend
+      port: 8080
+`
+	h.KubectlApplyContent(secondGwManifest)
+	secondGwAddr := h.WaitForGatewayAddress("second-gateway", "default", 1*time.Minute)
+	if secondGwAddr == gwAddr {
+		t.Errorf("Expected second Gateway to get distinct address, got same: %s", secondGwAddr)
+	}
+
+	// Verify Service and Deployment were created for second-gateway
+	secondSvcName := singlepod.ServiceNameForGateway("default", "second-gateway")
+	out := h.runCmd("kubectl", "get", "svc", secondSvcName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(out) != secondSvcName {
+		t.Errorf("Expected Service %s to exist, got: %s", secondSvcName, out)
+	}
+	deployOut := h.runCmd("kubectl", "get", "deployment", secondSvcName, "--namespace=default", "-o", "jsonpath={.metadata.name}")
+	if strings.TrimSpace(deployOut) != secondSvcName {
+		t.Errorf("Expected Deployment %s to exist, got: %s", secondSvcName, deployOut)
+	}
+
+	// Delete second-gateway and verify Service and Deployment are cleaned up
+	h.runCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
+	h.WaitForResourceDeletion("svc", secondSvcName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("deployment", secondSvcName, "default", 30*time.Second)
 }

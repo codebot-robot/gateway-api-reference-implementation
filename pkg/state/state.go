@@ -107,6 +107,7 @@ type State struct {
 	gatewayClasses     map[types.NamespacedName]*gatewayv1.GatewayClass
 	gateways           map[types.NamespacedName]*GatewayState
 	gatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	gatewayReadiness   map[types.NamespacedName]bool
 	listenerSets       map[types.NamespacedName]*ListenerSetState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
@@ -141,6 +142,7 @@ func NewState() *State {
 		gatewayClasses:         make(map[types.NamespacedName]*gatewayv1.GatewayClass),
 		gateways:               make(map[types.NamespacedName]*GatewayState),
 		gatewayAddresses:       make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress),
+		gatewayReadiness:       make(map[types.NamespacedName]bool),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
 		backendTLSPolicies:     make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
@@ -377,6 +379,11 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		gwAddrs[k] = copied
 	}
 
+	gwReady := make(map[types.NamespacedName]bool)
+	for k, v := range s.gatewayReadiness {
+		gwReady[k] = v
+	}
+
 	var listenerSets []*gatewayv1.ListenerSet
 	for _, lsState := range s.listenerSets {
 		if lsState != nil && lsState.ListenerSet != nil {
@@ -461,6 +468,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		Gateways:           gws,
 		GatewayClasses:     gcs,
 		GatewayAddresses:   gwAddrs,
+		GatewayReadiness:   gwReady,
 		ListenerSets:       listenerSets,
 		HTTPRoutes:         routes,
 		Services:           services,
@@ -816,6 +824,33 @@ func (s *State) GetGatewayAddresses() map[types.NamespacedName][]gatewayv1.Gatew
 		gwAddrs[k] = copied
 	}
 	return gwAddrs
+}
+
+func (s *State) SetGatewayReadiness(key types.NamespacedName, ready bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.gatewayReadiness[key] == ready {
+		return
+	}
+
+	s.gatewayReadiness[key] = ready
+	s.revision++
+	s.triggerRecomputeLocked()
+}
+
+func (s *State) GetEffectiveListeners(key types.NamespacedName) []*EffectiveListener {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.previousOutputs == nil || s.previousOutputs.CompiledGateways == nil {
+		return nil
+	}
+	cg := s.previousOutputs.CompiledGateways[key]
+	if cg == nil {
+		return nil
+	}
+	return cg.EffectiveListeners
 }
 
 func (s *State) UpsertNamespace(ns *corev1.Namespace) {

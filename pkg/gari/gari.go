@@ -37,6 +37,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -141,6 +142,10 @@ type Options struct {
 	// GatewayFilter is an optional filter func restricting which Gateways this instance serves.
 	// If set, only Gateways for which GatewayFilter returns true are reconciled and served.
 	GatewayFilter func(gw *gatewayv1.Gateway) bool
+
+	// DisableStatusUpdates disables writing status back to the Kubernetes API.
+	// Useful for data-plane instances where the control-plane controller owns status reporting.
+	DisableStatusUpdates bool
 
 	// Manager is an optional controller-runtime manager. If provided, New will
 	// register reconcilers with it instead of creating a new manager.
@@ -261,11 +266,16 @@ func NewWithManager(mgr ctrl.Manager, opts Options) (*Server, error) {
 
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return fmt.Errorf("failed to register readyz check: %w", err)
+	}
+
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
-		ControllerName:   s.opts.ControllerName,
-		OnGatewaysUpdate: s.opts.OnGatewaysUpdate,
-		AddressProvider:  s.opts.AddressProvider,
-		GatewayFilter:    s.opts.GatewayFilter,
+		ControllerName:       s.opts.ControllerName,
+		OnGatewaysUpdate:     s.opts.OnGatewaysUpdate,
+		AddressProvider:      s.opts.AddressProvider,
+		GatewayFilter:        s.opts.GatewayFilter,
+		DisableStatusUpdates: s.opts.DisableStatusUpdates,
 	})
 }
 

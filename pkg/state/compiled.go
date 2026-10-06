@@ -200,6 +200,7 @@ type ModelInputs struct {
 	Gateways           []*gatewayv1.Gateway
 	GatewayClasses     []*gatewayv1.GatewayClass
 	GatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	GatewayReadiness   map[types.NamespacedName]bool
 	ListenerSets       []*gatewayv1.ListenerSet
 	HTTPRoutes         []*gatewayv1.HTTPRoute
 	Services           map[types.NamespacedName]*corev1.Service
@@ -225,6 +226,7 @@ type Outputs struct {
 	CertificatesMap          map[string]*tls.Certificate
 	DefaultCert              *tls.Certificate
 	ResolvedGateways         []*gatewayv1.Gateway
+	CompiledGateways         map[types.NamespacedName]*CompiledGateway
 }
 
 func isSupportedProtocol(protocol gatewayv1.ProtocolType) bool {
@@ -509,7 +511,7 @@ func BuildEffectiveListener(
 }
 
 // ComputeGatewayConditions computes the top-level conditions for a Gateway.
-func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener, hasAddress bool) []metav1.Condition {
+func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener, hasAddress bool, infraReady bool) []metav1.Condition {
 	totalListeners := len(gw.Spec.Listeners)
 	acceptedListenersCount := 0
 
@@ -555,6 +557,10 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
 		gwProgrammedMessage = "Waiting for address to be assigned to the Gateway"
+	} else if !infraReady {
+		gwProgrammedStatus = metav1.ConditionFalse
+		gwProgrammedReason = gatewayv1.GatewayReasonPending
+		gwProgrammedMessage = "Waiting for data-plane deployment to become available"
 	}
 
 	return []metav1.Condition{
@@ -760,7 +766,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if inputs.GatewayAddresses != nil {
 			hasAddress = len(inputs.GatewayAddresses[gwKey]) > 0
 		}
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress)
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, true)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -1161,7 +1167,13 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			if inputs.GatewayAddresses != nil {
 				addrs = inputs.GatewayAddresses[gwKey]
 			}
-			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs)
+			infraReady := true
+			if inputs.GatewayReadiness != nil {
+				if r, ok := inputs.GatewayReadiness[gwKey]; ok {
+					infraReady = r
+				}
+			}
+			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, infraReady)
 		}
 	}
 
@@ -1233,6 +1245,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 	outputs.CertificatesMap = certsMap
 	outputs.DefaultCert = defaultCert
 	outputs.ResolvedGateways = compiled.ResolvedGateways()
+	outputs.CompiledGateways = compiled.Gateways
 
 	return outputs
 }
@@ -1242,6 +1255,7 @@ func ComputeDesiredGatewayStatus(
 	gw *gatewayv1.Gateway,
 	compiledGw *CompiledGateway,
 	providedAddresses []gatewayv1.GatewayStatusAddress,
+	infraReady bool,
 ) gatewayv1.GatewayStatus {
 	hasAddress := len(providedAddresses) > 0
 	var effectiveListeners []*EffectiveListener
@@ -1251,7 +1265,7 @@ func ComputeDesiredGatewayStatus(
 		attachedLSCount = compiledGw.AttachedListenerSets
 	}
 
-	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress)
+	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, infraReady)
 
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {
