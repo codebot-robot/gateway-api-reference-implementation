@@ -20,7 +20,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,8 +49,6 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	var desired gatewayv1.GatewayClassStatus
 	if r.State != nil {
-		r.State.UpsertGatewayClass(&gc)
-
 		d, ok := r.State.GetDesiredGatewayClassStatus(req.NamespacedName)
 		if !ok {
 			return ctrl.Result{}, nil
@@ -101,14 +98,6 @@ type GatewayReconciler struct {
 	State           *state.State
 	ControllerName  string
 	AddressProvider AddressProvider
-	GatewayFilter   func(gw *gatewayv1.Gateway) bool
-}
-
-func (r *GatewayReconciler) inScope(gw *gatewayv1.Gateway) bool {
-	if r.GatewayFilter != nil && !r.GatewayFilter(gw) {
-		return false
-	}
-	return true
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -119,29 +108,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if !r.inScope(gw) {
-		if r.State != nil {
-			r.State.DeleteGateway(req.NamespacedName)
-			r.State.DeleteGatewayAddresses(req.NamespacedName)
-		}
-		return ctrl.Result{}, nil
-	}
-
 	if r.State != nil {
-		// Check if this Gateway is owned by our controller
+		// Verify this Gateway is managed by us in State before requesting addresses
 		gc, ok := r.State.GetGatewayClass(string(gw.Spec.GatewayClassName))
-		if !ok && r.Client != nil {
-			var fetchedGC gatewayv1.GatewayClass
-			if err := r.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &fetchedGC); err == nil {
-				gc = &fetchedGC
-				r.State.UpsertGatewayClass(gc)
-			}
-		}
-
-		if gc == nil || string(gc.Spec.ControllerName) != r.ControllerName {
-			// Skip Gateways whose class isn't ours, and remove them from State.
-			r.State.DeleteGateway(req.NamespacedName)
-			r.State.DeleteGatewayAddresses(req.NamespacedName)
+		if !ok || string(gc.Spec.ControllerName) != r.ControllerName {
 			return ctrl.Result{}, nil
 		}
 
@@ -152,11 +122,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{}, err
 			}
 			r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
-		} else {
-			r.State.SetGatewayAddresses(req.NamespacedName, nil)
 		}
-
-		r.State.UpsertGateway(gw)
 
 		desired, ok := r.State.GetDesiredGatewayStatus(req.NamespacedName)
 		if !ok {

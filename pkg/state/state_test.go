@@ -21,13 +21,44 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
+type testQueue struct {
+	workqueue.TypedRateLimitingInterface[reconcile.Request]
+}
+
+func newTestQueue() *testQueue {
+	return &testQueue{
+		TypedRateLimitingInterface: workqueue.NewTypedRateLimitingQueue[reconcile.Request](workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]()),
+	}
+}
+
+func (q *testQueue) drain() []types.NamespacedName {
+	var res []types.NamespacedName
+	for q.Len() > 0 {
+		item, _ := q.Get()
+		res = append(res, item.NamespacedName)
+		q.Done(item)
+	}
+	return res
+}
+
 func TestComputeOutputs_UnchangedInputsProduceNoEvents(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
+
+	qGC := newTestQueue()
+	qGW := newTestQueue()
+	qRoute := newTestQueue()
+
+	ctx := t.Context()
+	_ = st.GatewayClassSource().Start(ctx, qGC)
+	_ = st.GatewaySource().Start(ctx, qGW)
+	_ = st.HTTPRouteSource().Start(ctx, qRoute)
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -56,18 +87,19 @@ func TestComputeOutputs_UnchangedInputsProduceNoEvents(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.UpsertHTTPRoute(route)
+	st.Recompute()
 
 	// Initial drain
-	st.GatewayClassSource().DrainEvents()
-	st.GatewaySource().DrainEvents()
-	st.HTTPRouteSource().DrainEvents()
+	qGC.drain()
+	qGW.drain()
+	qRoute.drain()
 
 	// Recompute with unchanged inputs
 	st.Recompute()
 
-	gcEvents := st.GatewayClassSource().DrainEvents()
-	gwEvents := st.GatewaySource().DrainEvents()
-	routeEvents := st.HTTPRouteSource().DrainEvents()
+	gcEvents := qGC.drain()
+	gwEvents := qGW.drain()
+	routeEvents := qRoute.drain()
 
 	if len(gcEvents) != 0 {
 		t.Errorf("expected 0 GatewayClass events for unchanged inputs, got %d", len(gcEvents))
@@ -91,6 +123,13 @@ func TestComputeOutputs_UnchangedInputsProduceNoEvents(t *testing.T) {
 func TestComputeOutputs_SingleChangeProducesEventsOnlyForAffectedObjects(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
+
+	qGC := newTestQueue()
+	qGW := newTestQueue()
+
+	ctx := t.Context()
+	_ = st.GatewayClassSource().Start(ctx, qGC)
+	_ = st.GatewaySource().Start(ctx, qGW)
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -118,16 +157,18 @@ func TestComputeOutputs_SingleChangeProducesEventsOnlyForAffectedObjects(t *test
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.UpsertGateway(gw2)
+	st.Recompute()
 
-	st.GatewaySource().DrainEvents()
-	st.GatewayClassSource().DrainEvents()
+	qGW.drain()
+	qGC.drain()
 
 	// Change only gw2 addresses
 	st.SetGatewayAddresses(types.NamespacedName{Namespace: "default", Name: "other-gw"}, []gatewayv1.GatewayStatusAddress{
 		{Value: "10.0.0.2"},
 	})
+	st.Recompute()
 
-	gwEvents := st.GatewaySource().DrainEvents()
+	gwEvents := qGW.drain()
 	if len(gwEvents) != 1 {
 		t.Fatalf("expected exactly 1 Gateway event for other-gw, got %d (%v)", len(gwEvents), gwEvents)
 	}
@@ -135,15 +176,42 @@ func TestComputeOutputs_SingleChangeProducesEventsOnlyForAffectedObjects(t *test
 		t.Errorf("expected event for other-gw, got %s", gwEvents[0].Name)
 	}
 
-	gcEvents := st.GatewayClassSource().DrainEvents()
+	gcEvents := qGC.drain()
 	if len(gcEvents) != 0 {
 		t.Errorf("expected 0 GatewayClass events when Gateway addresses change, got %d", len(gcEvents))
+	}
+}
+
+func TestEventSource_BuffersEventsBeforeStart(t *testing.T) {
+	source := NewEventSource()
+
+	req1 := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-1"}}
+	req2 := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-2"}}
+
+	// Enqueue before Start
+	source.Enqueue(req1)
+	source.Enqueue(req2)
+	source.Enqueue(req1) // duplicate should dedupe in set
+
+	q := newTestQueue()
+	ctx := t.Context()
+	if err := source.Start(ctx, q); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	items := q.drain()
+	if len(items) != 2 {
+		t.Fatalf("expected 2 buffered items flushed into workqueue, got %d (%v)", len(items), items)
 	}
 }
 
 func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
+
+	qRoute := newTestQueue()
+	ctx := t.Context()
+	_ = st.HTTPRouteSource().Start(ctx, qRoute)
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -197,6 +265,7 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 	st.UpsertNamespace(ns)
 	st.UpsertGateway(gw)
 	st.UpsertHTTPRoute(route)
+	st.Recompute()
 
 	// Route should initially be not accepted because namespace label is env: dev
 	routeStatus, ok := st.GetDesiredHTTPRouteStatus(types.NamespacedName{Namespace: "app-ns", Name: "app-route"})
@@ -207,7 +276,7 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 		t.Fatalf("expected route initially Accepted=False, got %v", routeStatus.Parents[0].Conditions[0])
 	}
 
-	st.HTTPRouteSource().DrainEvents()
+	qRoute.drain()
 
 	// Mutate namespace label to env: prod
 	nsUpdated := &corev1.Namespace{
@@ -217,9 +286,10 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 		},
 	}
 	st.UpsertNamespace(nsUpdated)
+	st.Recompute()
 
 	// Central recomputation should automatically detect route is now accepted and emit an event!
-	routeEvents := st.HTTPRouteSource().DrainEvents()
+	routeEvents := qRoute.drain()
 	if len(routeEvents) != 1 {
 		t.Fatalf("expected 1 HTTPRoute event on namespace label change, got %d", len(routeEvents))
 	}
@@ -236,6 +306,10 @@ func TestState_NamespaceLabelChangeDependencyWithoutMapping(t *testing.T) {
 func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
+
+	qRoute := newTestQueue()
+	ctx := t.Context()
+	_ = st.HTTPRouteSource().Start(ctx, qRoute)
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -306,6 +380,7 @@ func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 	st.UpsertService(svc)
 	st.UpsertReferenceGrant(rg)
 	st.UpsertHTTPRoute(route)
+	st.Recompute()
 
 	// Initially ResolvedRefs should be True
 	statusBefore, ok := st.GetDesiredHTTPRouteStatus(types.NamespacedName{Namespace: "default", Name: "cross-ns-route"})
@@ -316,13 +391,14 @@ func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 		t.Fatalf("expected ResolvedRefs=True, got %v", statusBefore.Parents[0].Conditions[1])
 	}
 
-	st.HTTPRouteSource().DrainEvents()
+	qRoute.drain()
 
 	// Delete ReferenceGrant
 	st.DeleteReferenceGrant(types.NamespacedName{Namespace: "backend-ns", Name: "allow-route"})
+	st.Recompute()
 
 	// Central recomputation should detect ResolvedRefs became False and emit an event
-	events := st.HTTPRouteSource().DrainEvents()
+	events := qRoute.drain()
 	if len(events) != 1 {
 		t.Fatalf("expected 1 HTTPRoute event on ReferenceGrant deletion, got %d", len(events))
 	}
@@ -340,6 +416,10 @@ func TestState_ReferenceGrantDeletionDependencyWithoutMapping(t *testing.T) {
 func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testing.T) {
 	st := NewState()
 	st.SetControllerName("example.net/gateway-controller")
+
+	qPolicy := newTestQueue()
+	ctx := t.Context()
+	_ = st.BackendTLSPolicySource().Start(ctx, qPolicy)
 
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
@@ -417,6 +497,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 	st.UpsertHTTPRoute(route)
 	st.UpsertConfigMap(cm)
 	st.UpsertBackendTLSPolicy(policy)
+	st.Recompute()
 
 	// Policy should be Accepted=True
 	policyStatus, ok := st.GetDesiredBackendTLSPolicyStatus(types.NamespacedName{Namespace: "default", Name: "tls-policy"})
@@ -427,7 +508,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 		t.Fatalf("expected policy Accepted=True, got %v", policyStatus.Ancestors[0].Conditions[0])
 	}
 
-	st.BackendTLSPolicySource().DrainEvents()
+	qPolicy.drain()
 
 	// Update ConfigMap with invalid data
 	cmInvalid := &corev1.ConfigMap{
@@ -437,9 +518,10 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 		},
 	}
 	st.UpsertConfigMap(cmInvalid)
+	st.Recompute()
 
 	// Central recomputation should detect policy Accepted=False and emit an event
-	events := st.BackendTLSPolicySource().DrainEvents()
+	events := qPolicy.drain()
 	if len(events) != 1 {
 		t.Fatalf("expected 1 BackendTLSPolicy event on ConfigMap change, got %d", len(events))
 	}

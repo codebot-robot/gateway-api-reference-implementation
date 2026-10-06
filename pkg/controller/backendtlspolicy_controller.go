@@ -43,8 +43,6 @@ func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if r.State != nil {
-		r.State.UpsertBackendTLSPolicy(policy)
-
 		desired, ok := r.State.GetDesiredBackendTLSPolicyStatus(req.NamespacedName)
 		if !ok {
 			return ctrl.Result{}, nil

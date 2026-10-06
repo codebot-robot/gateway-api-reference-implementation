@@ -64,6 +64,7 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		st.SetControllerName(controllerName)
 		st.SetProxy(p)
 		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
+		st.SetGatewayFilter(opts.GatewayFilter)
 		st.SetSynced(false)
 
 		if err := registerInformerHandlers(context.Background(), mgr, st); err != nil {
@@ -99,7 +100,6 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		State:           st,
 		ControllerName:  controllerName,
 		AddressProvider: opts.AddressProvider,
-		GatewayFilter:   opts.GatewayFilter,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
@@ -173,7 +173,6 @@ func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.S
 				}
 				if gw, ok := obj.(*gatewayv1.Gateway); ok {
 					st.DeleteGateway(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
-					st.DeleteGatewayAddresses(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
 				}
 			},
 		},

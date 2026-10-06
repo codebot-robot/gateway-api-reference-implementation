@@ -20,7 +20,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -44,35 +43,6 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	if r.State != nil {
-		if r.Client != nil {
-			for _, pref := range route.Spec.ParentRefs {
-				parentNs := route.Namespace
-				if pref.Namespace != nil && string(*pref.Namespace) != "" {
-					parentNs = string(*pref.Namespace)
-				}
-				kind := state.ValueOf(pref.Kind)
-				if kind == "" || kind == "Gateway" {
-					var fetchedGW gatewayv1.Gateway
-					if err := r.Get(ctx, types.NamespacedName{Namespace: parentNs, Name: string(pref.Name)}, &fetchedGW); err == nil {
-						if _, ok := r.State.GetGatewayClass(string(fetchedGW.Spec.GatewayClassName)); !ok {
-							var gc gatewayv1.GatewayClass
-							if err := r.Get(ctx, types.NamespacedName{Name: string(fetchedGW.Spec.GatewayClassName)}, &gc); err == nil {
-								r.State.UpsertGatewayClass(&gc)
-							}
-						}
-						r.State.UpsertGateway(&fetchedGW)
-					}
-				} else if kind == "ListenerSet" {
-					var fetchedLS gatewayv1.ListenerSet
-					if err := r.Get(ctx, types.NamespacedName{Namespace: parentNs, Name: string(pref.Name)}, &fetchedLS); err == nil {
-						r.State.UpsertListenerSet(&fetchedLS)
-					}
-				}
-			}
-		}
-
-		r.State.UpsertHTTPRoute(route)
-
 		desired, ok := r.State.GetDesiredHTTPRouteStatus(req.NamespacedName)
 		if !ok {
 			return ctrl.Result{}, nil

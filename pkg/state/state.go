@@ -42,15 +42,16 @@ type ProxyConfigUpdater interface {
 
 // EventSource implements source.TypedSource[reconcile.Request].
 // It delivers reconcile requests directly to controller workqueues without dropping events.
+// If requests arrive before a controller starts, they are buffered as pending and flushed upon Start.
 type EventSource struct {
-	mu     sync.Mutex
-	queues []workqueue.TypedRateLimitingInterface[reconcile.Request]
-	testCh chan types.NamespacedName
+	mu      sync.Mutex
+	queues  []workqueue.TypedRateLimitingInterface[reconcile.Request]
+	pending map[reconcile.Request]struct{}
 }
 
 func NewEventSource() *EventSource {
 	return &EventSource{
-		testCh: make(chan types.NamespacedName, 10000),
+		pending: make(map[reconcile.Request]struct{}),
 	}
 }
 
@@ -58,6 +59,10 @@ func NewEventSource() *EventSource {
 func (s *EventSource) Start(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
 	s.mu.Lock()
 	s.queues = append(s.queues, q)
+	// Flush any pending requests that arrived before Start was called
+	for req := range s.pending {
+		q.Add(req)
+	}
 	s.mu.Unlock()
 
 	go func() {
@@ -75,29 +80,17 @@ func (s *EventSource) Start(ctx context.Context, q workqueue.TypedRateLimitingIn
 	return nil
 }
 
-// Enqueue adds a reconcile.Request to all active controller workqueues.
+// Enqueue adds a reconcile.Request to all active controller workqueues,
+// or buffers it if no workqueues are active yet.
 func (s *EventSource) Enqueue(req reconcile.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.queues) == 0 {
+		s.pending[req] = struct{}{}
+		return
+	}
 	for _, q := range s.queues {
 		q.Add(req)
-	}
-	select {
-	case s.testCh <- req.NamespacedName:
-	default:
-	}
-}
-
-// DrainEvents drains and returns any events recorded on the test channel.
-func (s *EventSource) DrainEvents() []types.NamespacedName {
-	var res []types.NamespacedName
-	for {
-		select {
-		case k := <-s.testCh:
-			res = append(res, k)
-		default:
-			return res
-		}
 	}
 }
 
@@ -105,6 +98,8 @@ var _ source.TypedSource[reconcile.Request] = (*EventSource)(nil)
 
 type State struct {
 	mu sync.RWMutex
+
+	recomputeMu sync.Mutex
 
 	revision uint64
 
@@ -123,6 +118,7 @@ type State struct {
 	controllerName   string
 	proxy            ProxyConfigUpdater
 	onGatewaysUpdate func([]*gatewayv1.Gateway)
+	gatewayFilter    func(gw *gatewayv1.Gateway) bool
 
 	previousOutputs *Outputs
 
@@ -180,6 +176,12 @@ func (s *State) SetOnGatewaysUpdate(fn func([]*gatewayv1.Gateway)) {
 	s.onGatewaysUpdate = fn
 }
 
+func (s *State) SetGatewayFilter(fn func(gw *gatewayv1.Gateway) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gatewayFilter = fn
+}
+
 func (s *State) AddRegistration(reg toolscache.ResourceEventHandlerRegistration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -226,13 +228,18 @@ func (s *State) triggerRecomputeLocked() {
 		return
 	}
 	if !s.running {
-		s.recomputeLocked()
+		s.recomputeAsyncLocked()
 		return
 	}
 	select {
 	case s.notifyCh <- struct{}{}:
 	default:
 	}
+}
+
+func (s *State) recomputeAsyncLocked() {
+	// Snapshot inputs and release s.mu before running Recompute
+	go s.Recompute()
 }
 
 // Start runs the background coalescing loop and recomputes outputs when inputs change.
@@ -288,6 +295,9 @@ func (s *State) Start(ctx context.Context) error {
 // Recompute synchronously computes all outputs from recorded inputs, diffs against previous outputs,
 // sends events for changed objects, and updates the proxy.
 func (s *State) Recompute() *Outputs {
+	s.recomputeMu.Lock()
+	defer s.recomputeMu.Unlock()
+
 	s.mu.Lock()
 	if !s.synced {
 		s.mu.Unlock()
@@ -321,48 +331,6 @@ func (s *State) Recompute() *Outputs {
 	s.mu.Unlock()
 
 	// Run callbacks outside the lock to prevent deadlocks and avoid blocking state mutations.
-	if proxyChanged && p != nil {
-		p.UpdateConfig(outputs.ProxyListeners, outputs.ProxyRoutes)
-		p.UpdateCertificates(outputs.CertificatesMap, outputs.DefaultCert)
-	}
-
-	if gatewaysChanged && onGatewaysUpdate != nil {
-		onGatewaysUpdate(outputs.ResolvedGateways)
-	}
-
-	return outputs
-}
-
-func (s *State) recomputeLocked() *Outputs {
-	if !s.synced {
-		return nil
-	}
-
-	start := time.Now()
-	inputs := s.snapshotInputsLocked()
-	outputs := ComputeOutputs(inputs)
-	outputs.Revision = inputs.Revision
-
-	duration := time.Since(start)
-	klog.V(2).Infof("Recomputed state outputs in %v (revision: %d, gateways: %d, httpRoutes: %d)",
-		duration, outputs.Revision, len(inputs.Gateways), len(inputs.HTTPRoutes))
-
-	s.diffAndEmitLocked(outputs)
-
-	prev := s.previousOutputs
-	proxyChanged := prev == nil ||
-		!reflect.DeepEqual(outputs.ProxyListeners, prev.ProxyListeners) ||
-		!reflect.DeepEqual(outputs.ProxyRoutes, prev.ProxyRoutes) ||
-		!certsMapEqual(outputs.CertificatesMap, prev.CertificatesMap) ||
-		!defaultCertEqual(outputs.DefaultCert, prev.DefaultCert)
-
-	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
-
-	p := s.proxy
-	onGatewaysUpdate := s.onGatewaysUpdate
-
-	s.previousOutputs = outputs
-
 	if proxyChanged && p != nil {
 		p.UpdateConfig(outputs.ProxyListeners, outputs.ProxyRoutes)
 		p.UpdateCertificates(outputs.CertificatesMap, outputs.DefaultCert)
@@ -769,6 +737,17 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 	defer s.mu.Unlock()
 
 	key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+
+	if s.gatewayFilter != nil && !s.gatewayFilter(gw) {
+		if _, ok := s.gateways[key]; ok {
+			delete(s.gateways, key)
+			delete(s.gatewayAddresses, key)
+			s.revision++
+			s.triggerRecomputeLocked()
+		}
+		return
+	}
+
 	old := s.gateways[key]
 	if old != nil && old.Gateway != nil && reflect.DeepEqual(old.Spec, gw.Spec) && reflect.DeepEqual(old.Labels, gw.Labels) && old.Generation == gw.Generation {
 		return
@@ -787,6 +766,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 
 	if _, ok := s.gateways[name]; ok {
 		delete(s.gateways, name)
+		delete(s.gatewayAddresses, name)
 		s.revision++
 		s.triggerRecomputeLocked()
 	}

@@ -20,7 +20,6 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -43,22 +42,6 @@ func (r *ListenerSetReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if r.State != nil {
-		if r.Client != nil {
-			gwKey := ResolveNamespacedName(ls.Spec.ParentRef.Namespace, ls.Spec.ParentRef.Name, ls)
-			var fetchedGW gatewayv1.Gateway
-			if err := r.Get(ctx, gwKey, &fetchedGW); err == nil {
-				if _, ok := r.State.GetGatewayClass(string(fetchedGW.Spec.GatewayClassName)); !ok {
-					var gc gatewayv1.GatewayClass
-					if err := r.Get(ctx, types.NamespacedName{Name: string(fetchedGW.Spec.GatewayClassName)}, &gc); err == nil {
-						r.State.UpsertGatewayClass(&gc)
-					}
-				}
-				r.State.UpsertGateway(&fetchedGW)
-			}
-		}
-
-		r.State.UpsertListenerSet(ls)
-
 		desired, ok := r.State.GetDesiredListenerSetStatus(req.NamespacedName)
 		if !ok {
 			return ctrl.Result{}, nil

@@ -326,6 +326,11 @@ func TestOnGatewaysUpdateHookAndCustomControllerName(t *testing.T) {
 	st.SetProxy(p)
 	st.SetControllerName(customControllerName)
 	st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.UpsertHTTPRoute(route)
+	st.UpsertService(svc)
+	st.Recompute()
 
 	gwReconciler := &controller.GatewayReconciler{
 		Client:         fakeClient,
