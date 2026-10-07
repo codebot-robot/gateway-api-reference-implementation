@@ -1422,7 +1422,7 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	isConflicted := false
 	var conflictingPolicy string
 	for _, targetRef := range policy.Spec.TargetRefs {
-		if string(targetRef.Group) != "" && string(targetRef.Group) != gatewayv1.GroupName {
+		if string(targetRef.Group) != "" {
 			continue
 		}
 		if string(targetRef.Kind) != "Service" {
@@ -1438,7 +1438,7 @@ func ComputeDesiredBackendTLSPolicyStatus(
 			}
 
 			for _, t := range p.Spec.TargetRefs {
-				if (string(t.Group) == "" || string(t.Group) == gatewayv1.GroupName) && string(t.Kind) == "Service" {
+				if string(t.Group) == "" && string(t.Kind) == "Service" {
 					if p.Namespace == targetSvcNamespace && string(t.Name) == targetSvcName {
 						if p.CreationTimestamp.Time.Before(policy.CreationTimestamp.Time) {
 							isConflicted = true
@@ -1465,31 +1465,45 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	}
 
 	var unresolvedRefs []string
-	for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-		if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-			cmKey := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-			cm, ok := configMaps[cmKey]
-			if !ok || cm == nil {
-				unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
-			} else {
-				var data []byte
-				if d, ok := cm.Data["ca.crt"]; ok {
-					data = []byte(d)
-				} else if d, ok := cm.BinaryData["ca.crt"]; ok {
-					data = d
-				}
+	hasInvalidKind := false
+	hasInvalidCACertRef := false
 
-				if len(data) == 0 {
+	if policy.Spec.Validation.WellKnownCACertificates != nil {
+		if *policy.Spec.Validation.WellKnownCACertificates != gatewayv1.WellKnownCACertificatesSystem {
+			hasInvalidKind = true
+			unresolvedRefs = append(unresolvedRefs, string(*policy.Spec.Validation.WellKnownCACertificates))
+		}
+	} else {
+		for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+			if string(caRef.Group) != "" || string(caRef.Kind) != "ConfigMap" {
+				unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+				hasInvalidKind = true
+			} else {
+				cmKey := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+				cm, ok := configMaps[cmKey]
+				if !ok || cm == nil {
 					unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+					hasInvalidCACertRef = true
 				} else {
-					block, _ := pem.Decode(data)
-					if block == nil || block.Type != "CERTIFICATE" {
+					var data []byte
+					if d, ok := cm.Data["ca.crt"]; ok {
+						data = []byte(d)
+					} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+						data = d
+					}
+
+					if len(data) == 0 {
 						unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+						hasInvalidCACertRef = true
+					} else {
+						block, _ := pem.Decode(data)
+						if block == nil || block.Type != "CERTIFICATE" {
+							unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
+							hasInvalidCACertRef = true
+						}
 					}
 				}
 			}
-		} else {
-			unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
 		}
 	}
 
@@ -1501,14 +1515,19 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	resolvedRefsReason := string(gatewayv1.BackendTLSPolicyReasonResolvedRefs)
 	resolvedRefsMessage := "All references resolved"
 
-	if len(unresolvedRefs) > 0 {
+	if hasInvalidKind || hasInvalidCACertRef {
 		acceptedStatus = metav1.ConditionFalse
-		acceptedReason = "NoValidCACertificate"
+		acceptedReason = string(gatewayv1.BackendTLSPolicyReasonNoValidCACertificate)
 		acceptedMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
 
 		resolvedRefsStatus = metav1.ConditionFalse
-		resolvedRefsReason = "InvalidCACertificateRef"
-		resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
+		if hasInvalidKind {
+			resolvedRefsReason = string(gatewayv1.BackendTLSPolicyReasonInvalidKind)
+			resolvedRefsMessage = fmt.Sprintf("Unsupported or unknown CA certificate reference kind: %v", unresolvedRefs)
+		} else {
+			resolvedRefsReason = string(gatewayv1.BackendTLSPolicyReasonInvalidCACertificateRef)
+			resolvedRefsMessage = fmt.Sprintf("Unresolved or invalid CA certificate references: %v", unresolvedRefs)
+		}
 	}
 
 	if isConflicted {
@@ -1552,7 +1571,8 @@ func ComputeDesiredBackendTLSPolicyStatus(
 									svcNs = string(*backendRef.Namespace)
 								}
 								for _, targetRef := range policy.Spec.TargetRefs {
-									if svcNs == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
+									if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+										svcNs == policy.Namespace && string(backendRef.Name) == string(targetRef.Name) {
 										usesPolicy = true
 										break
 									}
@@ -1601,6 +1621,10 @@ func ComputeDesiredBackendTLSPolicyStatus(
 			}
 		}
 	}
+
+	sort.Slice(ancestors, func(i, j int) bool {
+		return CompareParentReference(ancestors[i].AncestorRef, ancestors[j].AncestorRef, policy.Namespace) < 0
+	})
 
 	return gatewayv1.PolicyStatus{Ancestors: ancestors}
 }

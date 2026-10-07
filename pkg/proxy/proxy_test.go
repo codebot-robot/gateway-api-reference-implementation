@@ -2137,3 +2137,62 @@ func TestProxy_StripBackendAltSvc_ResponseHeaderModifier(t *testing.T) {
 		t.Errorf("expected Alt-Svc %q, got %q", `h3=":443"`, altSvcValues[0])
 	}
 }
+
+func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
+	p := NewProxy()
+
+	systemWellKnown := gatewayv1.WellKnownCACertificatesSystem
+	httpsProto := "https"
+
+	// 1. WellKnownCACertificates: System -> RootCAs == nil && !InsecureSkipVerify
+	systemBackend := state.InternalBackend{
+		Host:        "backend.example.com",
+		Port:        443,
+		AppProtocol: &httpsProto,
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname:                "backend.example.com",
+			WellKnownCACertificates: &systemWellKnown,
+		},
+	}
+	trSystem := p.buildTransport(systemBackend)
+	httpTrSystem, ok := trSystem.(*http.Transport)
+	if !ok || httpTrSystem.TLSClientConfig == nil {
+		t.Fatalf("expected *http.Transport with non-nil TLSClientConfig")
+	}
+	if httpTrSystem.TLSClientConfig.InsecureSkipVerify {
+		t.Errorf("expected InsecureSkipVerify=false for System well-known CA, got true")
+	}
+	if httpTrSystem.TLSClientConfig.RootCAs != nil {
+		t.Errorf("expected RootCAs == nil for System well-known CA, got %v", httpTrSystem.TLSClientConfig.RootCAs)
+	}
+	if httpTrSystem.TLSClientConfig.ServerName != "backend.example.com" {
+		t.Errorf("expected ServerName 'backend.example.com', got %q", httpTrSystem.TLSClientConfig.ServerName)
+	}
+
+	// 2. Invalid policy (no CA certs, not System) -> non-nil empty pool && !InsecureSkipVerify
+	invalidBackend := state.InternalBackend{
+		Host:        "backend.example.com",
+		Port:        443,
+		AppProtocol: &httpsProto,
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname: "backend.example.com",
+			CACerts:  nil,
+		},
+	}
+	trInvalid := p.buildTransport(invalidBackend)
+	httpTrInvalid, ok := trInvalid.(*http.Transport)
+	if !ok || httpTrInvalid.TLSClientConfig == nil {
+		t.Fatalf("expected *http.Transport with non-nil TLSClientConfig")
+	}
+	if httpTrInvalid.TLSClientConfig.InsecureSkipVerify {
+		t.Errorf("expected InsecureSkipVerify=false for invalid policy, got true")
+	}
+	if httpTrInvalid.TLSClientConfig.RootCAs == nil {
+		t.Errorf("expected non-nil empty RootCAs for invalid policy, got nil")
+	} else if len(httpTrInvalid.TLSClientConfig.RootCAs.Subjects()) != 0 {
+		t.Errorf("expected 0 certs in RootCAs for invalid policy, got %d", len(httpTrInvalid.TLSClientConfig.RootCAs.Subjects()))
+	}
+	if httpTrInvalid.TLSClientConfig.ServerName != "backend.example.com" {
+		t.Errorf("expected ServerName 'backend.example.com', got %q", httpTrInvalid.TLSClientConfig.ServerName)
+	}
+}

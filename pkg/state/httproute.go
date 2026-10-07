@@ -15,6 +15,7 @@
 package state
 
 import (
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -775,9 +776,11 @@ func resolveBackendTarget(
 		Name:      string(backendRef.Name),
 	}
 
+	var svc *corev1.Service
 	var appProtocol *string
 	if services != nil {
-		svc, ok := services[svcKey]
+		var ok bool
+		svc, ok = services[svcKey]
 		if !ok || svc == nil {
 			msg := fmt.Sprintf("Backend service %s/%s not found", svcNamespace, string(backendRef.Name))
 			errCond := NewCondition(
@@ -807,34 +810,52 @@ func resolveBackendTarget(
 
 	// BackendTLSPolicy resolution
 	var tlsConfig *InternalTLSConfig
+	var backendErr *ErrorState
 	for _, policy := range sortedTLSPolicies {
-		if tlsConfig != nil {
+		if tlsConfig != nil || backendErr != nil {
 			break
 		}
 		for _, targetRef := range policy.Spec.TargetRefs {
-			if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+			if string(targetRef.Group) == "" &&
+				string(targetRef.Kind) == "Service" &&
 				string(targetRef.Name) == string(backendRef.Name) &&
 				policy.Namespace == svcNamespace {
-				https := "https"
-				appProtocol = &https
 
-				var caCerts [][]byte
-				for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-					if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-						cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-						if cm, ok := configMaps[cmName]; ok {
-							if data, ok := cm.Data["ca.crt"]; ok {
-								caCerts = append(caCerts, []byte(data))
-							} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-								caCerts = append(caCerts, data)
+				if targetRef.SectionName != nil && *targetRef.SectionName != "" {
+					matchesSection := false
+					if svc != nil {
+						for _, p := range svc.Spec.Ports {
+							if p.Port == port && p.Name == string(*targetRef.SectionName) {
+								matchesSection = true
+								break
 							}
 						}
 					}
+					if !matchesSection {
+						continue
+					}
+				}
+
+				https := "https"
+				appProtocol = &https
+
+				caCerts, isValid := validateBackendTLSPolicy(policy, configMaps)
+				if !isValid {
+					tlsConfig = &InternalTLSConfig{
+						Hostname: string(policy.Spec.Validation.Hostname),
+						CACerts:  nil,
+					}
+					backendErr = &ErrorState{
+						HTTPStatusCode: http.StatusInternalServerError,
+						HTTPMessage:    "Invalid or unresolvable BackendTLSPolicy",
+					}
+					break
 				}
 
 				tlsConfig = &InternalTLSConfig{
-					Hostname: string(policy.Spec.Validation.Hostname),
-					CACerts:  caCerts,
+					Hostname:                string(policy.Spec.Validation.Hostname),
+					CACerts:                 caCerts,
+					WellKnownCACertificates: policy.Spec.Validation.WellKnownCACertificates,
 				}
 				break
 			}
@@ -846,7 +867,54 @@ func resolveBackendTarget(
 		Port:        port,
 		AppProtocol: appProtocol,
 		TLSConfig:   tlsConfig,
+		Error:       backendErr,
 	}, nil
+}
+
+// validateBackendTLSPolicy validates that all CACertificateRefs of the BackendTLSPolicy can be resolved
+// and contain valid PEM certificate data, or that WellKnownCACertificates is valid.
+func validateBackendTLSPolicy(
+	policy *gatewayv1.BackendTLSPolicy,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+) ([][]byte, bool) {
+	if policy == nil {
+		return nil, false
+	}
+	if policy.Spec.Validation.WellKnownCACertificates != nil {
+		if *policy.Spec.Validation.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
+			return nil, true
+		}
+		return nil, false
+	}
+	if len(policy.Spec.Validation.CACertificateRefs) == 0 {
+		return nil, true
+	}
+	var caCerts [][]byte
+	for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+		if string(caRef.Group) != "" || string(caRef.Kind) != "ConfigMap" {
+			return nil, false
+		}
+		cmKey := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+		cm, ok := configMaps[cmKey]
+		if !ok || cm == nil {
+			return nil, false
+		}
+		var data []byte
+		if d, ok := cm.Data["ca.crt"]; ok {
+			data = []byte(d)
+		} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+			data = d
+		}
+		if len(data) == 0 {
+			return nil, false
+		}
+		block, _ := pem.Decode(data)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return nil, false
+		}
+		caCerts = append(caCerts, data)
+	}
+	return caCerts, true
 }
 
 // compileRequestMirrorFilter validates the filter settings and resolves the mirror backend target.
