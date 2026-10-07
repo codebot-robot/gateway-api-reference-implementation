@@ -21,6 +21,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/http"
 	"testing"
 	"time"
 
@@ -2212,5 +2213,218 @@ func TestCompileModel_ListenerSetDualParentRefIndependence(t *testing.T) {
 	}
 	if crOne.ParentConditions[1].Status != metav1.ConditionTrue || crOne.ParentConditions[1].Reason != string(gatewayv1.RouteReasonAccepted) {
 		t.Errorf("expected parentRef[1] Accepted=True (Accepted), got %v", crOne.ParentConditions[1])
+	}
+}
+
+func TestGatewayHTTPListenerIsolation(t *testing.T) {
+	allFrom := gatewayv1.NamespacesFromAll
+	controllerName := "example.com/gateway-controller"
+
+	listeners := []gatewayv1.Listener{
+		{
+			Name:     "empty-hostname",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+			AllowedRoutes: &gatewayv1.AllowedRoutes{
+				Namespaces: &gatewayv1.RouteNamespaces{From: &allFrom},
+			},
+		},
+		{
+			Name:     "wildcard-example-com",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+			Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+			AllowedRoutes: &gatewayv1.AllowedRoutes{
+				Namespaces: &gatewayv1.RouteNamespaces{From: &allFrom},
+			},
+		},
+		{
+			Name:     "wildcard-foo-example-com",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+			Hostname: Ptr(gatewayv1.Hostname("*.foo.example.com")),
+			AllowedRoutes: &gatewayv1.AllowedRoutes{
+				Namespaces: &gatewayv1.RouteNamespaces{From: &allFrom},
+			},
+		},
+		{
+			Name:     "abc-foo-example-com",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+			Hostname: Ptr(gatewayv1.Hostname("abc.foo.example.com")),
+			AllowedRoutes: &gatewayv1.AllowedRoutes{
+				Namespaces: &gatewayv1.RouteNamespaces{From: &allFrom},
+			},
+		},
+	}
+
+	createRoute := func(name, sectionName string, hostnames []gatewayv1.Hostname, path string, backendHost string) *gatewayv1.HTTPRoute {
+		return &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Name:        "gw",
+							SectionName: Ptr(gatewayv1.SectionName(sectionName)),
+						},
+					},
+				},
+				Hostnames: hostnames,
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: []gatewayv1.HTTPRouteMatch{
+							{
+								Path: &gatewayv1.HTTPPathMatch{
+									Type:  Ptr(gatewayv1.PathMatchPathPrefix),
+									Value: Ptr(path),
+								},
+							},
+						},
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: gatewayv1.ObjectName(backendHost),
+										Port: Ptr(gatewayv1.PortNumber(8080)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	type requestTest struct {
+		host        string
+		path        string
+		wantBackend string // empty means 404
+	}
+
+	testMatrix := []requestTest{
+		// bar.com matches only empty-hostname listener
+		{host: "bar.com", path: "/empty-hostname", wantBackend: "backend-empty.default.svc.cluster.local"},
+		{host: "bar.com", path: "/wildcard-example-com", wantBackend: ""},
+		{host: "bar.com", path: "/wildcard-foo-example-com", wantBackend: ""},
+		{host: "bar.com", path: "/abc-foo-example-com", wantBackend: ""},
+
+		// bar.example.com matches wildcard-example-com listener (*.example.com)
+		{host: "bar.example.com", path: "/empty-hostname", wantBackend: ""},
+		{host: "bar.example.com", path: "/wildcard-example-com", wantBackend: "backend-wildcard-example.default.svc.cluster.local"},
+		{host: "bar.example.com", path: "/wildcard-foo-example-com", wantBackend: ""},
+		{host: "bar.example.com", path: "/abc-foo-example-com", wantBackend: ""},
+
+		// bar.foo.example.com matches wildcard-foo-example-com listener (*.foo.example.com)
+		{host: "bar.foo.example.com", path: "/empty-hostname", wantBackend: ""},
+		{host: "bar.foo.example.com", path: "/wildcard-example-com", wantBackend: ""},
+		{host: "bar.foo.example.com", path: "/wildcard-foo-example-com", wantBackend: "backend-wildcard-foo.default.svc.cluster.local"},
+		{host: "bar.foo.example.com", path: "/abc-foo-example-com", wantBackend: ""},
+
+		// abc.foo.example.com matches abc-foo-example-com listener (abc.foo.example.com)
+		{host: "abc.foo.example.com", path: "/empty-hostname", wantBackend: ""},
+		{host: "abc.foo.example.com", path: "/wildcard-example-com", wantBackend: ""},
+		{host: "abc.foo.example.com", path: "/wildcard-foo-example-com", wantBackend: ""},
+		{host: "abc.foo.example.com", path: "/abc-foo-example-com", wantBackend: "backend-abc-foo.default.svc.cluster.local"},
+	}
+
+	variants := []struct {
+		name   string
+		routes []*gatewayv1.HTTPRoute
+	}{
+		{
+			name: "hostnames configured only in listeners",
+			routes: []*gatewayv1.HTTPRoute{
+				createRoute("attaches-to-empty-hostname", "empty-hostname", nil, "/empty-hostname", "backend-empty"),
+				createRoute("attaches-to-wildcard-example-com", "wildcard-example-com", nil, "/wildcard-example-com", "backend-wildcard-example"),
+				createRoute("attaches-to-wildcard-foo-example-com", "wildcard-foo-example-com", nil, "/wildcard-foo-example-com", "backend-wildcard-foo"),
+				createRoute("attaches-to-abc-foo-example-com", "abc-foo-example-com", nil, "/abc-foo-example-com", "backend-abc-foo"),
+			},
+		},
+		{
+			name: "intersecting hostnames configured in listeners and HTTPRoutes",
+			routes: []*gatewayv1.HTTPRoute{
+				createRoute(
+					"attaches-to-empty-hostname-with-hostname-intersection",
+					"empty-hostname",
+					[]gatewayv1.Hostname{"bar.com", "*.example.com", "*.foo.example.com", "abc.foo.example.com"},
+					"/empty-hostname",
+					"backend-empty",
+				),
+				createRoute(
+					"attaches-to-wildcard-example-com-with-hostname-intersection",
+					"wildcard-example-com",
+					[]gatewayv1.Hostname{"bar.com", "*.example.com", "*.foo.example.com", "abc.foo.example.com"},
+					"/wildcard-example-com",
+					"backend-wildcard-example",
+				),
+				createRoute(
+					"attaches-to-wildcard-foo-example-com-with-hostname-intersection",
+					"wildcard-foo-example-com",
+					[]gatewayv1.Hostname{"bar.com", "*.example.com", "*.foo.example.com", "abc.foo.example.com"},
+					"/wildcard-foo-example-com",
+					"backend-wildcard-foo",
+				),
+				createRoute(
+					"attaches-to-abc-foo-example-com-with-hostname-intersection",
+					"abc-foo-example-com",
+					[]gatewayv1.Hostname{"bar.com", "*.example.com", "*.foo.example.com", "abc.foo.example.com"},
+					"/abc-foo-example-com",
+					"backend-abc-foo",
+				),
+			},
+		},
+	}
+
+	for _, v := range variants {
+		t.Run(v.name, func(t *testing.T) {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "reference-class",
+					Listeners:        listeners,
+				},
+			}
+			gc := &gatewayv1.GatewayClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+				Spec:       gatewayv1.GatewayClassSpec{ControllerName: gatewayv1.GatewayController(controllerName)},
+			}
+
+			outputs := ComputeOutputs(ModelInputs{
+				Gateways:       []*gatewayv1.Gateway{gw},
+				GatewayClasses: []*gatewayv1.GatewayClass{gc},
+				HTTPRoutes:     v.routes,
+				ControllerName: controllerName,
+			})
+
+			for _, tc := range testMatrix {
+				t.Run(tc.host+tc.path, func(t *testing.T) {
+					req, err := http.NewRequest("GET", "http://"+tc.host+tc.path, nil)
+					if err != nil {
+						t.Fatalf("failed to create request: %v", err)
+					}
+					reqHostListeners, _ := MatchListeners(outputs.ProxyListeners, tc.host)
+					var matchedRoutes []InternalRoute
+					for _, l := range reqHostListeners {
+						matchedRoutes = append(matchedRoutes, l.Routes...)
+					}
+					bestRule, _ := MatchRoute(matchedRoutes, req)
+
+					if tc.wantBackend == "" {
+						if bestRule != nil && len(bestRule.Backends) > 0 {
+							t.Errorf("expected 404 (no match), but matched backend %q", bestRule.Backends[0].Host)
+						}
+					} else {
+						if bestRule == nil || len(bestRule.Backends) == 0 {
+							t.Fatalf("expected backend %q, but got 404 (no match)", tc.wantBackend)
+						}
+						if bestRule.Backends[0].Host != tc.wantBackend {
+							t.Errorf("got backend %q, want %q", bestRule.Backends[0].Host, tc.wantBackend)
+						}
+					}
+				})
+			}
+		})
 	}
 }
