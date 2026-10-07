@@ -102,7 +102,8 @@ type State struct {
 
 	recomputeMu sync.Mutex
 
-	revision uint64
+	revision   uint64
+	recomputes uint64
 
 	gatewayClasses     map[types.NamespacedName]*gatewayv1.GatewayClass
 	gateways           map[types.NamespacedName]*GatewayState
@@ -196,12 +197,8 @@ func (s *State) AddRegistration(reg toolscache.ResourceEventHandlerRegistration)
 
 func (s *State) SetSynced(synced bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.synced = synced
-	running := s.running
-	s.mu.Unlock()
-	if synced && running {
-		s.Recompute()
-	}
 }
 
 func (s *State) IsDirty() bool {
@@ -236,7 +233,7 @@ func (s *State) GatewayClassSource() *EventSource {
 	return s.gatewayClassSource
 }
 
-func (s *State) triggerRecomputeLocked() {
+func (s *State) markDirtyLocked() {
 	s.dirty = true
 	if !s.synced || !s.running {
 		return
@@ -310,6 +307,7 @@ func (s *State) Recompute() *Outputs {
 		return nil
 	}
 
+	s.recomputes++
 	s.dirty = false
 	start := time.Now()
 	inputs := s.snapshotInputsLocked()
@@ -714,7 +712,7 @@ func (s *State) UpsertGatewayClass(gc *gatewayv1.GatewayClass) {
 
 	s.gatewayClasses[key] = gc.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteGatewayClass(name types.NamespacedName) {
@@ -725,7 +723,7 @@ func (s *State) DeleteGatewayClass(name types.NamespacedName) {
 	if _, ok := s.gatewayClasses[key]; ok {
 		delete(s.gatewayClasses, key)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -764,7 +762,7 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 			delete(s.gatewayReadiness, key)
 			delete(s.provisioningErrors, key)
 			s.revision++
-			s.triggerRecomputeLocked()
+			s.markDirtyLocked()
 		}
 		return
 	}
@@ -778,7 +776,7 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 		Gateway: gw.DeepCopy(),
 	}
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteGateway(name types.NamespacedName) {
@@ -791,7 +789,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 		delete(s.gatewayReadiness, name)
 		delete(s.provisioningErrors, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -811,7 +809,7 @@ func (s *State) SetGatewayAddresses(key types.NamespacedName, addrs []gatewayv1.
 		s.gatewayAddresses[key] = copied
 	}
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteGatewayAddresses(key types.NamespacedName) {
@@ -821,7 +819,7 @@ func (s *State) DeleteGatewayAddresses(key types.NamespacedName) {
 	if _, ok := s.gatewayAddresses[key]; ok {
 		delete(s.gatewayAddresses, key)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -848,7 +846,7 @@ func (s *State) SetGatewayReadiness(key types.NamespacedName, ready bool) {
 
 	s.gatewayReadiness[key] = ready
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr string) {
@@ -865,7 +863,7 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr st
 		s.provisioningErrors[key] = provErr
 	}
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) GetEffectiveListeners(key types.NamespacedName) []*EffectiveListener {
@@ -896,7 +894,7 @@ func (s *State) UpsertNamespace(ns *corev1.Namespace) {
 
 	s.namespaces[ns.Name] = ns.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteNamespace(name string) {
@@ -906,7 +904,7 @@ func (s *State) DeleteNamespace(name string) {
 	if _, ok := s.namespaces[name]; ok {
 		delete(s.namespaces, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -936,7 +934,7 @@ func (s *State) UpsertReferenceGrant(rg *gatewayv1beta1.ReferenceGrant) {
 
 	s.referenceGrants[key] = rg.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
@@ -946,7 +944,7 @@ func (s *State) DeleteReferenceGrant(name types.NamespacedName) {
 	if _, ok := s.referenceGrants[name]; ok {
 		delete(s.referenceGrants, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -965,7 +963,7 @@ func (s *State) UpsertSecret(secret *corev1.Secret) {
 
 	s.secrets[key] = secret.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteSecret(name types.NamespacedName) {
@@ -975,7 +973,7 @@ func (s *State) DeleteSecret(name types.NamespacedName) {
 	if _, ok := s.secrets[name]; ok {
 		delete(s.secrets, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -1005,7 +1003,7 @@ func (s *State) UpsertConfigMap(cm *corev1.ConfigMap) {
 
 	s.configMaps[key] = cm.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteConfigMap(name types.NamespacedName) {
@@ -1015,7 +1013,7 @@ func (s *State) DeleteConfigMap(name types.NamespacedName) {
 	if _, ok := s.configMaps[name]; ok {
 		delete(s.configMaps, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -1045,7 +1043,7 @@ func (s *State) UpsertService(svc *corev1.Service) {
 
 	s.services[key] = svc.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteService(name types.NamespacedName) {
@@ -1055,7 +1053,7 @@ func (s *State) DeleteService(name types.NamespacedName) {
 	if _, ok := s.services[name]; ok {
 		delete(s.services, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -1083,7 +1081,7 @@ func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) {
 		HTTPRoute: route.DeepCopy(),
 	}
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) GetHTTPRoute(name types.NamespacedName) *HTTPRouteState {
@@ -1100,7 +1098,7 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 	if _, ok := s.httpRoutes[name]; ok {
 		delete(s.httpRoutes, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -1119,7 +1117,7 @@ func (s *State) UpsertBackendTLSPolicy(policy *gatewayv1.BackendTLSPolicy) {
 
 	s.backendTLSPolicies[key] = policy.DeepCopy()
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteBackendTLSPolicy(name types.NamespacedName) {
@@ -1129,7 +1127,7 @@ func (s *State) DeleteBackendTLSPolicy(name types.NamespacedName) {
 	if _, ok := s.backendTLSPolicies[name]; ok {
 		delete(s.backendTLSPolicies, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 
@@ -1197,7 +1195,7 @@ func (s *State) UpsertListenerSet(ls *gatewayv1.ListenerSet) {
 		ListenerSet: ls.DeepCopy(),
 	}
 	s.revision++
-	s.triggerRecomputeLocked()
+	s.markDirtyLocked()
 }
 
 func (s *State) DeleteListenerSet(name types.NamespacedName) {
@@ -1207,7 +1205,7 @@ func (s *State) DeleteListenerSet(name types.NamespacedName) {
 	if _, ok := s.listenerSets[name]; ok {
 		delete(s.listenerSets, name)
 		s.revision++
-		s.triggerRecomputeLocked()
+		s.markDirtyLocked()
 	}
 }
 

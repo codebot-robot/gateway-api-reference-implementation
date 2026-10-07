@@ -15,6 +15,9 @@
 package state
 
 import (
+	"context"
+	"crypto/tls"
+	"sync"
 	"testing"
 	"time"
 
@@ -687,5 +690,141 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	}
 	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
 		t.Errorf("expected Programmed=True Reason=Programmed when ready=true, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+	}
+}
+
+type countingProxyUpdater struct {
+	mu          sync.Mutex
+	updateCount int
+}
+
+func (c *countingProxyUpdater) UpdateConfig(listeners []InternalListener, routes []InternalRoute) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updateCount++
+}
+
+func (c *countingProxyUpdater) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
+}
+
+func (c *countingProxyUpdater) Count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.updateCount
+}
+
+func recomputeCount(st *State) uint64 {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.recomputes
+}
+
+func pollUntil(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !condition() {
+		t.Fatalf("condition not met within %v", timeout)
+	}
+}
+
+func TestState_SetSyncedDoesNotRecomputeDirectly(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+	st.SetSynced(false)
+
+	if recomputeCount(st) != 0 {
+		t.Fatalf("expected 0 recomputes initially, got %d", recomputeCount(st))
+	}
+
+	st.SetSynced(true)
+	if recomputeCount(st) != 0 {
+		t.Fatalf("expected SetSynced(true) to not trigger recompute directly, got %d", recomputeCount(st))
+	}
+
+	st.Recompute()
+	if recomputeCount(st) != 1 {
+		t.Fatalf("expected Recompute() to perform exactly 1 recompute, got %d", recomputeCount(st))
+	}
+}
+
+func TestState_StartInitialRecomputeOnce(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+	st.SetSynced(false)
+
+	updater := &countingProxyUpdater{}
+	st.SetProxy(updater)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+
+	if recomputeCount(st) != 0 {
+		t.Fatalf("expected 0 recomputes before Start, got %d", recomputeCount(st))
+	}
+	if updater.Count() != 0 {
+		t.Fatalf("expected 0 proxy updates before Start, got %d", updater.Count())
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.Start(ctx)
+	}()
+
+	// Poll until the initial recompute has completed.
+	pollUntil(t, 2*time.Second, func() bool {
+		return recomputeCount(st) >= 1
+	})
+
+	// Verify that the recompute count remains exactly 1 over a short window (no duplicate initial recompute).
+	time.Sleep(30 * time.Millisecond)
+	if got := recomputeCount(st); got != 1 {
+		t.Fatalf("expected initial recompute to run exactly 1 time, got %d", got)
+	}
+
+	// Verify that only one proxy push reaches the data plane at startup.
+	if got := updater.Count(); got != 1 {
+		t.Fatalf("expected initial proxy update to run exactly 1 time, got %d", got)
+	}
+
+	// Mutate state while running; should trigger a coalesced recompute via notification channel.
+	st.UpsertNamespace(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "new-ns"},
+	})
+
+	// Poll for the second recompute after mutation.
+	pollUntil(t, 2*time.Second, func() bool {
+		return recomputeCount(st) >= 2
+	})
+
+	time.Sleep(30 * time.Millisecond)
+	if got := recomputeCount(st); got != 2 {
+		t.Fatalf("expected 2 recomputes after mutation while running, got %d", got)
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start returned error: %v", err)
 	}
 }
