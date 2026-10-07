@@ -110,6 +110,8 @@ func TestConformance(t *testing.T) {
 		tests.GatewaySecretMissingReferenceGrant,
 		tests.GatewaySecretReferenceGrantAllInNamespace,
 		tests.GatewaySecretReferenceGrantSpecific,
+		tests.GatewayWithAttachedRoutes,
+		tests.GatewayWithAttachedRoutesWithPort8080,
 		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
 		tests.HTTPRoute308Redirect,
