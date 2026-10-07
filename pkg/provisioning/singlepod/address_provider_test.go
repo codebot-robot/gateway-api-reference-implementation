@@ -619,3 +619,672 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 		t.Errorf("expected 0 requests for unmanaged service, got %+v", reqsOther)
 	}
 }
+
+func setupTestClient(t *testing.T) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	sharedCRB := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: DataplaneClusterRoleBindingName,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     DataplaneClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{},
+	}
+
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sharedCRB).
+		Build()
+}
+
+func TestSinglePodAddressProvider_InfrastructureLabelsAndAnnotationsLandOnAllFour(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
+					"example.com/tier": "frontend",
+					"custom-label":     "value-1",
+				},
+				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					"example.com/cost-center": "12345",
+					"custom-anno":             "anno-val-1",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+
+	// 1. ServiceAccount
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if sa.Labels["example.com/tier"] != "frontend" || sa.Labels["custom-label"] != "value-1" {
+		t.Errorf("ServiceAccount missing infrastructure labels: got %+v", sa.Labels)
+	}
+	if sa.Annotations["example.com/cost-center"] != "12345" || sa.Annotations["custom-anno"] != "anno-val-1" {
+		t.Errorf("ServiceAccount missing infrastructure annotations: got %+v", sa.Annotations)
+	}
+
+	// 2. Deployment
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if deploy.Labels["example.com/tier"] != "frontend" || deploy.Labels["custom-label"] != "value-1" {
+		t.Errorf("Deployment missing infrastructure labels: got %+v", deploy.Labels)
+	}
+	if deploy.Annotations["example.com/cost-center"] != "12345" || deploy.Annotations["custom-anno"] != "anno-val-1" {
+		t.Errorf("Deployment missing infrastructure annotations: got %+v", deploy.Annotations)
+	}
+	if deploy.Annotations[AnnotationTemplateHash] == "" {
+		t.Errorf("Deployment missing template hash annotation")
+	}
+
+	// 3. Pod Template
+	if deploy.Spec.Template.Labels["example.com/tier"] != "frontend" || deploy.Spec.Template.Labels["custom-label"] != "value-1" {
+		t.Errorf("Pod template missing infrastructure labels: got %+v", deploy.Spec.Template.Labels)
+	}
+	if deploy.Spec.Template.Annotations["example.com/cost-center"] != "12345" || deploy.Spec.Template.Annotations["custom-anno"] != "anno-val-1" {
+		t.Errorf("Pod template missing infrastructure annotations: got %+v", deploy.Spec.Template.Annotations)
+	}
+
+	// 4. Service
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.Labels["example.com/tier"] != "frontend" || svc.Labels["custom-label"] != "value-1" {
+		t.Errorf("Service missing infrastructure labels: got %+v", svc.Labels)
+	}
+	if svc.Annotations["example.com/cost-center"] != "12345" || svc.Annotations["custom-anno"] != "anno-val-1" {
+		t.Errorf("Service missing infrastructure annotations: got %+v", svc.Annotations)
+	}
+}
+
+func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
+					"tier": "frontend-v1",
+				},
+				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					"cost-center": "1000",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on initial reconcile: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+	var initialDeploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &initialDeploy); err != nil {
+		t.Fatalf("failed to get initial Deployment: %v", err)
+	}
+	initialHash := initialDeploy.Annotations[AnnotationTemplateHash]
+
+	// Update label and annotation values in Gateway infrastructure
+	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
+	gw.Spec.Infrastructure.Annotations["cost-center"] = "2000"
+
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on update reconcile: %v", err)
+	}
+
+	// 1. ServiceAccount
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if sa.Labels["tier"] != "frontend-v2" {
+		t.Errorf("ServiceAccount label not updated: got %s, want frontend-v2", sa.Labels["tier"])
+	}
+	if sa.Annotations["cost-center"] != "2000" {
+		t.Errorf("ServiceAccount annotation not updated: got %s, want 2000", sa.Annotations["cost-center"])
+	}
+
+	// 2. Deployment
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if deploy.Labels["tier"] != "frontend-v2" {
+		t.Errorf("Deployment label not updated: got %s, want frontend-v2", deploy.Labels["tier"])
+	}
+	if deploy.Annotations["cost-center"] != "2000" {
+		t.Errorf("Deployment annotation not updated: got %s, want 2000", deploy.Annotations["cost-center"])
+	}
+	if deploy.Annotations[AnnotationTemplateHash] == initialHash {
+		t.Errorf("Deployment template hash did not change after updating infrastructure values")
+	}
+
+	// 3. Pod Template (ensures pods are rolled)
+	if deploy.Spec.Template.Labels["tier"] != "frontend-v2" {
+		t.Errorf("Pod template label not updated: got %s, want frontend-v2", deploy.Spec.Template.Labels["tier"])
+	}
+	if deploy.Spec.Template.Annotations["cost-center"] != "2000" {
+		t.Errorf("Pod template annotation not updated: got %s, want 2000", deploy.Spec.Template.Annotations["cost-center"])
+	}
+
+	// 4. Service
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.Labels["tier"] != "frontend-v2" {
+		t.Errorf("Service label not updated: got %s, want frontend-v2", svc.Labels["tier"])
+	}
+	if svc.Annotations["cost-center"] != "2000" {
+		t.Errorf("Service annotation not updated: got %s, want 2000", svc.Annotations["cost-center"])
+	}
+}
+
+func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
+					"tier":      "frontend",
+					"remove-me": "label-val",
+				},
+				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					"cost-center": "1000",
+					"remove-me":   "anno-val",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on initial reconcile: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+	var initialDeploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &initialDeploy); err != nil {
+		t.Fatalf("failed to get initial Deployment: %v", err)
+	}
+	initialHash := initialDeploy.Annotations[AnnotationTemplateHash]
+
+	// Remove keys from Gateway infrastructure
+	delete(gw.Spec.Infrastructure.Labels, "remove-me")
+	delete(gw.Spec.Infrastructure.Annotations, "remove-me")
+
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on removal reconcile: %v", err)
+	}
+
+	// 1. ServiceAccount
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if _, ok := sa.Labels["remove-me"]; ok {
+		t.Errorf("ServiceAccount still has removed label: %+v", sa.Labels)
+	}
+	if sa.Labels["tier"] != "frontend" {
+		t.Errorf("ServiceAccount lost retained label 'tier'")
+	}
+	if _, ok := sa.Annotations["remove-me"]; ok {
+		t.Errorf("ServiceAccount still has removed annotation: %+v", sa.Annotations)
+	}
+	if sa.Annotations["cost-center"] != "1000" {
+		t.Errorf("ServiceAccount lost retained annotation 'cost-center'")
+	}
+
+	// 2. Deployment
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if _, ok := deploy.Labels["remove-me"]; ok {
+		t.Errorf("Deployment still has removed label: %+v", deploy.Labels)
+	}
+	if deploy.Labels["tier"] != "frontend" {
+		t.Errorf("Deployment lost retained label 'tier'")
+	}
+	if _, ok := deploy.Annotations["remove-me"]; ok {
+		t.Errorf("Deployment still has removed annotation: %+v", deploy.Annotations)
+	}
+	if deploy.Annotations["cost-center"] != "1000" {
+		t.Errorf("Deployment lost retained annotation 'cost-center'")
+	}
+	if deploy.Annotations[AnnotationTemplateHash] == initialHash {
+		t.Errorf("Deployment template hash did not change after removing infrastructure keys")
+	}
+
+	// 3. Pod Template
+	if _, ok := deploy.Spec.Template.Labels["remove-me"]; ok {
+		t.Errorf("Pod template still has removed label: %+v", deploy.Spec.Template.Labels)
+	}
+	if deploy.Spec.Template.Labels["tier"] != "frontend" {
+		t.Errorf("Pod template lost retained label 'tier'")
+	}
+	if _, ok := deploy.Spec.Template.Annotations["remove-me"]; ok {
+		t.Errorf("Pod template still has removed annotation: %+v", deploy.Spec.Template.Annotations)
+	}
+	if deploy.Spec.Template.Annotations["cost-center"] != "1000" {
+		t.Errorf("Pod template lost retained annotation 'cost-center'")
+	}
+
+	// 4. Service
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if _, ok := svc.Labels["remove-me"]; ok {
+		t.Errorf("Service still has removed label: %+v", svc.Labels)
+	}
+	if svc.Labels["tier"] != "frontend" {
+		t.Errorf("Service lost retained label 'tier'")
+	}
+	if _, ok := svc.Annotations["remove-me"]; ok {
+		t.Errorf("Service still has removed annotation: %+v", svc.Annotations)
+	}
+	if svc.Annotations["cost-center"] != "1000" {
+		t.Errorf("Service lost retained annotation 'cost-center'")
+	}
+}
+
+func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLabelsOrSelectors(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
+					"gateway.networking.k8s.io/gateway-name":      "override-name",
+					"gateway.networking.k8s.io/gateway-namespace": "override-ns",
+					"gateway.networking.k8s.io/custom-reserved":   "malicious-val",
+					"app.kubernetes.io/managed-by":                "override-managed-by",
+					"app.kubernetes.io/name":                      "override-name",
+					"custom-valid-label":                          "valid-val",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+
+	type labelHolder struct {
+		name   string
+		labels map[string]string
+	}
+	holders := []labelHolder{
+		{name: "ServiceAccount", labels: sa.Labels},
+		{name: "Deployment", labels: deploy.Labels},
+		{name: "PodTemplate", labels: deploy.Spec.Template.Labels},
+		{name: "Service", labels: svc.Labels},
+	}
+
+	for _, h := range holders {
+		if h.labels[LabelGatewayName] != "test-gw" {
+			t.Errorf("%s: LabelGatewayName was overridden: got %q, want %q", h.name, h.labels[LabelGatewayName], "test-gw")
+		}
+		if h.labels[LabelGatewayNamespace] != "test-ns" {
+			t.Errorf("%s: LabelGatewayNamespace was overridden: got %q, want %q", h.name, h.labels[LabelGatewayNamespace], "test-ns")
+		}
+		if h.labels[LabelManagedBy] != ManagedByValue {
+			t.Errorf("%s: LabelManagedBy was overridden: got %q, want %q", h.name, h.labels[LabelManagedBy], ManagedByValue)
+		}
+		if h.labels[LabelAppName] != AppNameValue {
+			t.Errorf("%s: LabelAppName was overridden: got %q, want %q", h.name, h.labels[LabelAppName], AppNameValue)
+		}
+		if _, ok := h.labels["gateway.networking.k8s.io/custom-reserved"]; ok {
+			t.Errorf("%s: contains forbidden gateway.networking.k8s.io/* label", h.name)
+		}
+		if h.labels["custom-valid-label"] != "valid-val" {
+			t.Errorf("%s: missing valid custom label: got %q", h.name, h.labels["custom-valid-label"])
+		}
+	}
+
+	// Verify Deployment selector is not overridden
+	expectedDeploySelector := map[string]string{
+		LabelGatewayName: "test-gw",
+		LabelAppName:     AppNameValue,
+	}
+	if !reflectMapEqual(deploy.Spec.Selector.MatchLabels, expectedDeploySelector) {
+		t.Errorf("Deployment selector was modified: got %+v, want %+v", deploy.Spec.Selector.MatchLabels, expectedDeploySelector)
+	}
+
+	// Verify Service selector is not overridden
+	if !reflectMapEqual(svc.Spec.Selector, expectedDeploySelector) {
+		t.Errorf("Service selector was modified: got %+v, want %+v", svc.Spec.Selector, expectedDeploySelector)
+	}
+}
+
+func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
+					"tier":       "frontend",
+					"remove-lbl": "old-val",
+				},
+				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					"cost-center": "1000",
+					"remove-anno": "old-val",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on initial reconcile: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+
+	// Inject foreign annotation and foreign label onto existing ServiceAccount, Deployment, and Service
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	sa.Labels["custom.io/zone"] = "us-central1-a"
+	sa.Annotations["cloud.google.com/neg-status"] = `{"network_endpoint_groups":{"80":"k8s1-neg"}}`
+	if err := c.Update(ctx, &sa); err != nil {
+		t.Fatalf("failed to update ServiceAccount with foreign metadata: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deploy.Labels["custom.io/zone"] = "us-central1-a"
+	deploy.Annotations["deployment.kubernetes.io/revision"] = "1"
+	deploy.Annotations["cloud.google.com/neg-status"] = `{"network_endpoint_groups":{"80":"k8s1-neg"}}`
+	if err := c.Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update Deployment with foreign metadata: %v", err)
+	}
+
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	svc.Labels["custom.io/zone"] = "us-central1-a"
+	svc.Annotations["cloud.google.com/neg-status"] = `{"network_endpoint_groups":{"80":"k8s1-neg"}}`
+	svc.Annotations["metallb.universe.tf/ip-allocated-from-pool"] = "example"
+	if err := c.Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to update Service with foreign metadata: %v", err)
+	}
+
+	// Update infrastructure metadata: change one value and remove one key
+	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
+	delete(gw.Spec.Infrastructure.Labels, "remove-lbl")
+	gw.Spec.Infrastructure.Annotations["cost-center"] = "2000"
+	delete(gw.Spec.Infrastructure.Annotations, "remove-anno")
+
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+
+	// Verify ServiceAccount preserves foreign labels/annotations and updates/removes infra keys
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if sa.Labels["custom.io/zone"] != "us-central1-a" {
+		t.Errorf("ServiceAccount lost foreign label: got %+v", sa.Labels)
+	}
+	if sa.Annotations["cloud.google.com/neg-status"] != `{"network_endpoint_groups":{"80":"k8s1-neg"}}` {
+		t.Errorf("ServiceAccount lost foreign annotation: got %+v", sa.Annotations)
+	}
+	if sa.Labels["tier"] != "frontend-v2" {
+		t.Errorf("ServiceAccount did not update tier label: got %q", sa.Labels["tier"])
+	}
+	if _, ok := sa.Labels["remove-lbl"]; ok {
+		t.Errorf("ServiceAccount still has removed label: got %+v", sa.Labels)
+	}
+	if sa.Annotations["cost-center"] != "2000" {
+		t.Errorf("ServiceAccount did not update cost-center annotation: got %q", sa.Annotations["cost-center"])
+	}
+	if _, ok := sa.Annotations["remove-anno"]; ok {
+		t.Errorf("ServiceAccount still has removed annotation: got %+v", sa.Annotations)
+	}
+
+	// Verify Deployment preserves foreign labels/annotations and updates/removes infra keys
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if deploy.Labels["custom.io/zone"] != "us-central1-a" {
+		t.Errorf("Deployment lost foreign label: got %+v", deploy.Labels)
+	}
+	if deploy.Annotations["cloud.google.com/neg-status"] != `{"network_endpoint_groups":{"80":"k8s1-neg"}}` {
+		t.Errorf("Deployment lost foreign annotation cloud.google.com/neg-status: got %+v", deploy.Annotations)
+	}
+	if deploy.Annotations["deployment.kubernetes.io/revision"] != "1" {
+		t.Errorf("Deployment lost foreign annotation deployment.kubernetes.io/revision: got %+v", deploy.Annotations)
+	}
+	if deploy.Labels["tier"] != "frontend-v2" {
+		t.Errorf("Deployment did not update tier label: got %q", deploy.Labels["tier"])
+	}
+	if _, ok := deploy.Labels["remove-lbl"]; ok {
+		t.Errorf("Deployment still has removed label: got %+v", deploy.Labels)
+	}
+	if deploy.Annotations["cost-center"] != "2000" {
+		t.Errorf("Deployment did not update cost-center annotation: got %q", deploy.Annotations["cost-center"])
+	}
+	if _, ok := deploy.Annotations["remove-anno"]; ok {
+		t.Errorf("Deployment still has removed annotation: got %+v", deploy.Annotations)
+	}
+
+	// Verify Service preserves foreign labels/annotations and updates/removes infra keys
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.Labels["custom.io/zone"] != "us-central1-a" {
+		t.Errorf("Service lost foreign label: got %+v", svc.Labels)
+	}
+	if svc.Annotations["cloud.google.com/neg-status"] != `{"network_endpoint_groups":{"80":"k8s1-neg"}}` {
+		t.Errorf("Service lost foreign annotation cloud.google.com/neg-status: got %+v", svc.Annotations)
+	}
+	if svc.Annotations["metallb.universe.tf/ip-allocated-from-pool"] != "example" {
+		t.Errorf("Service lost foreign annotation metallb.universe.tf/ip-allocated-from-pool: got %+v", svc.Annotations)
+	}
+	if svc.Labels["tier"] != "frontend-v2" {
+		t.Errorf("Service did not update tier label: got %q", svc.Labels["tier"])
+	}
+	if _, ok := svc.Labels["remove-lbl"]; ok {
+		t.Errorf("Service still has removed label: got %+v", svc.Labels)
+	}
+	if svc.Annotations["cost-center"] != "2000" {
+		t.Errorf("Service did not update cost-center annotation: got %q", svc.Annotations["cost-center"])
+	}
+	if _, ok := svc.Annotations["remove-anno"]; ok {
+		t.Errorf("Service still has removed annotation: got %+v", svc.Annotations)
+	}
+}
+
+func TestSinglePodAddressProvider_StaleControllerOwnerRefUIDUpdated(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	initialGW := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-original"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, initialGW, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on initial reconcile: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+
+	// Simulate objects retaining stale UID (e.g. Gateway was deleted and recreated with a new UID)
+	staleUID := types.UID("stale-uid-12345")
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	sa.OwnerReferences[0].UID = staleUID
+	if err := c.Update(ctx, &sa); err != nil {
+		t.Fatalf("failed to set stale UID on ServiceAccount: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deploy.OwnerReferences[0].UID = staleUID
+	if err := c.Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to set stale UID on Deployment: %v", err)
+	}
+
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	svc.OwnerReferences[0].UID = staleUID
+	if err := c.Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to set stale UID on Service: %v", err)
+	}
+
+	// Reconcile with new Gateway having new UID
+	newGW := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-new"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err = p.GatewayAddresses(ctx, newGW, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on reconcile with new Gateway UID: %v", err)
+	}
+
+	// Verify all three objects have their controller ownerRef updated to newGW.UID
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if len(sa.OwnerReferences) == 0 || sa.OwnerReferences[0].UID != "gw-uid-new" {
+		t.Errorf("ServiceAccount ownerRef UID not updated: got %+v, want gw-uid-new", sa.OwnerReferences)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if len(deploy.OwnerReferences) == 0 || deploy.OwnerReferences[0].UID != "gw-uid-new" {
+		t.Errorf("Deployment ownerRef UID not updated: got %+v, want gw-uid-new", deploy.OwnerReferences)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if len(svc.OwnerReferences) == 0 || svc.OwnerReferences[0].UID != "gw-uid-new" {
+		t.Errorf("Service ownerRef UID not updated: got %+v, want gw-uid-new", svc.OwnerReferences)
+	}
+}
