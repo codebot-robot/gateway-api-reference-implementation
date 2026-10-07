@@ -308,7 +308,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	} else {
 		if !isOwnedByGateway(&existingSA, gw) {
-			return nil, false, fmt.Errorf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name)
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
 		}
 		needsSAUpdate := false
 		if !reflectMapEqual(existingSA.Labels, desiredSA.Labels) {
@@ -441,7 +443,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	} else {
 		if !isOwnedByGateway(&existingDeploy, gw) {
-			return nil, false, fmt.Errorf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name)
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
 		}
 		needsUpdate := false
 		if existingDeploy.Annotations == nil || existingDeploy.Annotations[AnnotationTemplateHash] != templateHash {
@@ -549,7 +553,9 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	if !isOwnedByGateway(&existingSvc, gw) {
-		return nil, false, fmt.Errorf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name)
+		return nil, false, &controller.OwnershipConflictError{
+			Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+		}
 	}
 
 	needsSvcUpdate := false

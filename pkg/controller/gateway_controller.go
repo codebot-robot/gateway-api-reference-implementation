@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -100,6 +101,15 @@ type AddressWatcher interface {
 	SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error
 }
 
+// OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
+type OwnershipConflictError struct {
+	Message string
+}
+
+func (e *OwnershipConflictError) Error() string {
+	return e.Message
+}
+
 type GatewayReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
@@ -141,10 +151,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
 			providedAddresses, ready, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 			if err != nil {
-				l.Error(err, "unable to provision or fetch gateway addresses from address provider")
-				// If error is a provisioning conflict, record on status and do not requeue endlessly
-				r.State.SetGatewayProvisioningError(req.NamespacedName, err.Error())
-				r.State.SetGatewayReadiness(req.NamespacedName, false)
+				var conflictErr *OwnershipConflictError
+				if errors.As(err, &conflictErr) {
+					l.Error(err, "ownership conflict provisioning gateway")
+					r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
+					r.State.SetGatewayReadiness(req.NamespacedName, false)
+				} else {
+					l.Error(err, "unable to provision or fetch gateway addresses from address provider")
+					return ctrl.Result{}, err
+				}
 			} else {
 				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
 				r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
