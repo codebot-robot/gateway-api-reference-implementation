@@ -24,6 +24,14 @@ The `gateway-api-reference-implementation` is intended to be a simple, pure Go, 
     - Well-structured commits.
     - Reference issues in the commit body.
 
+### Commit messages and PR descriptions
+
+The git history is the permanent record; the GitHub PR description is not. It is not part of the merged artifact and is effectively lost after merge.
+
+- **Put anything worth keeping in the code or the commits**: design decisions and non-obvious behaviour belong in code comments; the reasoning behind a change belongs in the commit message.
+- **Keep the PR description to bookkeeping**: normally just `Fixes #<issue>`. Don't summarize or "sell" the change; the code and commits should stand on their own.
+- When you revise a PR in response to review, don't maintain a changelog in the PR description.
+
 ### Commands
 
 The project uses the `ap` tool for various tasks. Since `ap` is a custom tool, it should be run using `go run`:
