@@ -21,7 +21,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,9 +164,9 @@ type trackingAddressProvider struct {
 	called bool
 }
 
-func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error) {
+func (p *trackingAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
 	p.called = true
-	return []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}, nil
+	return nil, false, nil
 }
 
 func TestGatewayReconciler_SkipsOtherControllersGateways(t *testing.T) {
@@ -876,11 +878,16 @@ func findCondition(conditions []metav1.Condition, condType string) *metav1.Condi
 
 type fakeAddressProvider struct {
 	addresses []gatewayv1.GatewayStatusAddress
+	ready     bool
 	err       error
 }
 
-func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error) {
-	return f.addresses, f.err
+func (f *fakeAddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+	ready := f.ready
+	if !ready && f.err == nil && len(f.addresses) > 0 {
+		ready = true
+	}
+	return f.addresses, ready, f.err
 }
 
 type fakeAddressWatcherProvider struct {
@@ -1053,6 +1060,102 @@ func TestGatewayReconciler_AddressProvider(t *testing.T) {
 	progCond = findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
 	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
 		t.Errorf("expected Programmed=False/AddressNotAssigned, got %+v", progCond)
+	}
+}
+
+func TestGatewayReconciler_ErrorHandling(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-class",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	// 1. Transient error: should be returned from Reconcile
+	transientProvider := &fakeAddressProvider{
+		err: errors.New("transient network failure"),
+	}
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: transientProvider,
+	}
+
+	_, err := r.Reconcile(ctx, req)
+	if err == nil || err.Error() != "transient network failure" {
+		t.Fatalf("expected transient error returned from Reconcile, got: %v", err)
+	}
+
+	// 2. OwnershipConflictError: should NOT be returned from Reconcile, but recorded on Gateway status
+	conflictProvider := &fakeAddressProvider{
+		err: &OwnershipConflictError{
+			Message: "conflict: existing Service default/test-gw-gari is not owned by Gateway test-gw",
+		},
+	}
+	r.AddressProvider = conflictProvider
+
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("expected nil error on OwnershipConflictError, got: %v", err)
+	}
+
+	st.Recompute()
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("expected nil error on second reconcile, got: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	progCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Fatalf("expected Programmed=False/Pending on conflict, got %+v", progCond)
+	}
+	if !strings.Contains(progCond.Message, "conflict: existing Service") {
+		t.Errorf("expected conflict message in condition, got %s", progCond.Message)
 	}
 }
 

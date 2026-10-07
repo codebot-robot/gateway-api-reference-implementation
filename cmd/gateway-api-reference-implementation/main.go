@@ -16,12 +16,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 var setupLog = ctrl.Log.WithName("setup")
@@ -30,12 +32,21 @@ func main() {
 	opts := gari.DefaultOptions()
 
 	var (
-		serviceName      string
-		serviceNamespace string
+		dataplaneMode    bool
+		gatewayNamespace string
+		gatewayName      string
+		dataplaneImage   string
 	)
 
-	flag.StringVar(&serviceName, "service-name", singlepod.DefaultServiceName, "The name of the Service whose LoadBalancer address is used for Gateways.")
-	flag.StringVar(&serviceNamespace, "service-namespace", singlepod.DefaultServiceNamespace, "The namespace of the Service whose LoadBalancer address is used for Gateways.")
+	defaultImg := os.Getenv("GARI_IMAGE")
+	if defaultImg == "" {
+		defaultImg = singlepod.DefaultDataplaneImage
+	}
+
+	flag.BoolVar(&dataplaneMode, "dataplane-mode", false, "Run in data-plane mode serving a single Gateway.")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
+	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
+	flag.StringVar(&dataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
 	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to.")
@@ -54,7 +65,28 @@ func main() {
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	opts.AddressProvider = singlepod.NewAddressProvider(nil, serviceNamespace, serviceName)
+	if dataplaneMode {
+		if gatewayNamespace == "" || gatewayName == "" {
+			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
+			os.Exit(1)
+		}
+		opts.DisableStatusUpdates = true
+		opts.LeaderElection = false
+		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
+		opts.AddressProvider = nil
+		opts.GatewayFilter = func(gw *gatewayv1.Gateway) bool {
+			return gw.Namespace == gatewayNamespace && gw.Name == gatewayName
+		}
+	} else {
+		opts.ProxyAddr = ""
+		opts.ProxyHTTPSAddr = ""
+		opts.ProxyHTTP3Addr = ""
+		opts.AddressProvider = singlepod.NewAddressProvider(
+			nil,
+			singlepod.WithDataplaneImage(dataplaneImage),
+			singlepod.WithEnableH2C(opts.EnableH2C),
+		)
+	}
 
 	ctx := ctrl.SetupSignalHandler()
 	if err := gari.Run(ctx, opts); err != nil {

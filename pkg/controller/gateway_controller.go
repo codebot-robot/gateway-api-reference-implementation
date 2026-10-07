@@ -16,10 +16,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -80,16 +83,31 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return bldr.Complete(r)
 }
 
-// AddressProvider returns the addresses to report in Gateway.status.addresses.
+// AddressProvider returns the addresses to report in Gateway.status.addresses and whether the Gateway infrastructure is ready.
 // An empty result means the address is not assigned yet.
 type AddressProvider interface {
-	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway) ([]gatewayv1.GatewayStatusAddress, error)
+	GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) (addresses []gatewayv1.GatewayStatusAddress, ready bool, err error)
+}
+
+// GatewayDeleteHandler is an optional interface that an AddressProvider can implement
+// to clean up resources when a Gateway is deleted.
+type GatewayDeleteHandler interface {
+	OnGatewayDeleted(ctx context.Context, gw types.NamespacedName) error
 }
 
 // AddressWatcher is an optional interface that an AddressProvider can implement
 // to register custom watches with the Gateway controller.
 type AddressWatcher interface {
 	SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error
+}
+
+// OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
+type OwnershipConflictError struct {
+	Message string
+}
+
+func (e *OwnershipConflictError) Error() string {
+	return e.Message
 }
 
 type GatewayReconciler struct {
@@ -105,6 +123,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	gw := &gatewayv1.Gateway{}
 	if err := r.Get(ctx, req.NamespacedName, gw); err != nil {
+		if apierrors.IsNotFound(err) {
+			if handler, ok := r.AddressProvider.(GatewayDeleteHandler); ok {
+				if err := handler.OnGatewayDeleted(ctx, req.NamespacedName); err != nil {
+					l.Error(err, "error cleaning up resources for deleted Gateway", "gateway", req.NamespacedName)
+					return ctrl.Result{}, err
+				}
+			}
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -112,16 +138,33 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// Verify this Gateway is managed by us in State before requesting addresses
 		gc, ok := r.State.GetGatewayClass(string(gw.Spec.GatewayClassName))
 		if !ok || string(gc.Spec.ControllerName) != r.ControllerName {
+			if handler, ok := r.AddressProvider.(GatewayDeleteHandler); ok {
+				if err := handler.OnGatewayDeleted(ctx, req.NamespacedName); err != nil {
+					l.Error(err, "error cleaning up resources for unmanaged Gateway", "gateway", req.NamespacedName)
+					return ctrl.Result{}, err
+				}
+			}
 			return ctrl.Result{}, nil
 		}
 
 		if r.AddressProvider != nil {
-			providedAddresses, err := r.AddressProvider.GatewayAddresses(ctx, gw)
+			effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
+			providedAddresses, ready, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
 			if err != nil {
-				l.Error(err, "unable to fetch gateway addresses from address provider")
-				return ctrl.Result{}, err
+				var conflictErr *OwnershipConflictError
+				if errors.As(err, &conflictErr) {
+					l.Error(err, "ownership conflict provisioning gateway")
+					r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
+					r.State.SetGatewayReadiness(req.NamespacedName, false)
+				} else {
+					l.Error(err, "unable to provision or fetch gateway addresses from address provider")
+					return ctrl.Result{}, err
+				}
+			} else {
+				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+				r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
+				r.State.SetGatewayReadiness(req.NamespacedName, ready)
 			}
-			r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
 		}
 
 		desired, ok := r.State.GetDesiredGatewayStatus(req.NamespacedName)

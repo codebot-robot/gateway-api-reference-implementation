@@ -47,10 +47,11 @@ func ResolveNamespacedName[N ~string, M ~string](namespace *N, name M, src clien
 
 // ReconcilerOptions contains configuration for setting up GARI reconcilers.
 type ReconcilerOptions struct {
-	ControllerName   string
-	OnGatewaysUpdate func([]*gatewayv1.Gateway)
-	AddressProvider  AddressProvider
-	GatewayFilter    func(gw *gatewayv1.Gateway) bool
+	ControllerName       string
+	OnGatewaysUpdate     func([]*gatewayv1.Gateway)
+	AddressProvider      AddressProvider
+	GatewayFilter        func(gw *gatewayv1.Gateway) bool
+	DisableStatusUpdates bool
 }
 
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
@@ -74,6 +75,10 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		if err := mgr.Add(st); err != nil {
 			return fmt.Errorf("error adding state runner to manager: %w", err)
 		}
+	}
+
+	if opts.DisableStatusUpdates {
+		return nil
 	}
 
 	if err := (&HTTPRouteReconciler{
