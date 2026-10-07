@@ -787,6 +787,201 @@ func TestCompileModel_AttachedRoutesCount(t *testing.T) {
 	}
 }
 
+func TestCompileModel_AttachedRoutes_TableDriven(t *testing.T) {
+	tests := []struct {
+		name                   string
+		gateway                *gatewayv1.Gateway
+		secrets                map[types.NamespacedName]*corev1.Secret
+		routes                 []*gatewayv1.HTTPRoute
+		expectedAttachedRoutes map[gatewayv1.SectionName]int32
+		expectedRouteReason    map[string]gatewayv1.RouteConditionReason
+	}{
+		{
+			name: "route with non-intersecting hostnames is not counted and reports NoMatchingListenerHostname",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "http",
+							Port:     80,
+							Protocol: gatewayv1.HTTPProtocolType,
+							Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+						},
+					},
+				},
+			},
+			routes: []*gatewayv1.HTTPRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "route-mismatched", Namespace: "default"},
+					Spec: gatewayv1.HTTPRouteSpec{
+						CommonRouteSpec: gatewayv1.CommonRouteSpec{
+							ParentRefs: []gatewayv1.ParentReference{
+								{Name: "gw"},
+							},
+						},
+						Hostnames: []gatewayv1.Hostname{"not-accepted.test.com"},
+					},
+				},
+			},
+			expectedAttachedRoutes: map[gatewayv1.SectionName]int32{
+				"http": 0,
+			},
+			expectedRouteReason: map[string]gatewayv1.RouteConditionReason{
+				"route-mismatched": gatewayv1.RouteReasonNoMatchingListenerHostname,
+			},
+		},
+		{
+			name: "unresolved certificateRef still reports attachedRoutes",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "unresolved-gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "tls",
+							Port:     443,
+							Protocol: gatewayv1.HTTPSProtocolType,
+							TLS: &gatewayv1.ListenerTLSConfig{
+								Mode: Ptr(gatewayv1.TLSModeTerminate),
+								CertificateRefs: []gatewayv1.SecretObjectReference{
+									{Name: "missing-cert"},
+								},
+							},
+						},
+					},
+				},
+			},
+			routes: []*gatewayv1.HTTPRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "route-tls", Namespace: "default"},
+					Spec: gatewayv1.HTTPRouteSpec{
+						CommonRouteSpec: gatewayv1.CommonRouteSpec{
+							ParentRefs: []gatewayv1.ParentReference{
+								{Name: "unresolved-gw", SectionName: Ptr(gatewayv1.SectionName("tls"))},
+							},
+						},
+					},
+				},
+			},
+			expectedAttachedRoutes: map[gatewayv1.SectionName]int32{
+				"tls": 1,
+			},
+			expectedRouteReason: map[string]gatewayv1.RouteConditionReason{
+				"route-tls": gatewayv1.RouteReasonAccepted,
+			},
+		},
+		{
+			name: "route with sectionName is counted only on the named listener",
+			gateway: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "multi-listener-gw", Namespace: "default"},
+				Spec: gatewayv1.GatewaySpec{
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "http-unattached",
+							Port:     8080,
+							Protocol: gatewayv1.HTTPProtocolType,
+						},
+						{
+							Name:     "http",
+							Port:     80,
+							Protocol: gatewayv1.HTTPProtocolType,
+						},
+					},
+				},
+			},
+			routes: []*gatewayv1.HTTPRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "route-section", Namespace: "default"},
+					Spec: gatewayv1.HTTPRouteSpec{
+						CommonRouteSpec: gatewayv1.CommonRouteSpec{
+							ParentRefs: []gatewayv1.ParentReference{
+								{Name: "multi-listener-gw", SectionName: Ptr(gatewayv1.SectionName("http"))},
+							},
+						},
+					},
+				},
+			},
+			expectedAttachedRoutes: map[gatewayv1.SectionName]int32{
+				"http-unattached": 0,
+				"http":            1,
+			},
+			expectedRouteReason: map[string]gatewayv1.RouteConditionReason{
+				"route-section": gatewayv1.RouteReasonAccepted,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			compiled := CompileModel(ModelInputs{
+				Gateways:   []*gatewayv1.Gateway{tc.gateway},
+				HTTPRoutes: tc.routes,
+				Secrets:    tc.secrets,
+			})
+
+			gwKey := types.NamespacedName{Namespace: tc.gateway.Namespace, Name: tc.gateway.Name}
+			cg := compiled.Gateways[gwKey]
+			if cg == nil {
+				t.Fatalf("compiled gateway not found")
+			}
+
+			// Verify EffectiveListeners
+			for sectionName, expectedCount := range tc.expectedAttachedRoutes {
+				var matchedEl *EffectiveListener
+				for _, el := range cg.EffectiveListeners {
+					if el.Owner.Kind == "Gateway" && el.Name == sectionName {
+						matchedEl = el
+						break
+					}
+				}
+				if matchedEl == nil {
+					t.Fatalf("listener %q not found in effective listeners", sectionName)
+				}
+				if matchedEl.AttachedRoutes != expectedCount {
+					t.Errorf("listener %q: expected AttachedRoutes = %d, got %d", sectionName, expectedCount, matchedEl.AttachedRoutes)
+				}
+			}
+
+			// Verify GatewayStatus
+			gwStatus := ComputeDesiredGatewayStatus(tc.gateway, cg, nil, false, "")
+			for _, ls := range gwStatus.Listeners {
+				if expectedCount, ok := tc.expectedAttachedRoutes[ls.Name]; ok {
+					if ls.AttachedRoutes != expectedCount {
+						t.Errorf("gateway status listener %q: expected AttachedRoutes = %d, got %d", ls.Name, expectedCount, ls.AttachedRoutes)
+					}
+				}
+			}
+
+			// Verify route parent condition reasons
+			for _, route := range tc.routes {
+				routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+				cr := compiled.HTTPRoutes[routeKey]
+				if cr == nil {
+					t.Fatalf("compiled route %q not found", route.Name)
+				}
+				routeStatus := ComputeDesiredHTTPRouteStatus(route, cr, "example.net/gateway-controller")
+				if len(routeStatus.Parents) == 0 {
+					t.Fatalf("route %q has no parent statuses", route.Name)
+				}
+				expectedReason := tc.expectedRouteReason[route.Name]
+				var acceptedCond *metav1.Condition
+				for i := range routeStatus.Parents[0].Conditions {
+					if routeStatus.Parents[0].Conditions[i].Type == string(gatewayv1.RouteConditionAccepted) {
+						acceptedCond = &routeStatus.Parents[0].Conditions[i]
+						break
+					}
+				}
+				if acceptedCond == nil {
+					t.Fatalf("route %q has no Accepted condition", route.Name)
+				}
+				if acceptedCond.Reason != string(expectedReason) {
+					t.Errorf("route %q: expected Accepted reason %q, got %q", route.Name, expectedReason, acceptedCond.Reason)
+				}
+			}
+		})
+	}
+}
+
 func TestStatusComputation_PureFunctions(t *testing.T) {
 	sameFrom := gatewayv1.NamespacesFromSame
 	gw := &gatewayv1.Gateway{
