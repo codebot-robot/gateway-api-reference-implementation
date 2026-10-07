@@ -101,6 +101,7 @@ func TestConformance(t *testing.T) {
 		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
 		tests.GatewayClassObservedGenerationBump,
 		tests.GatewayHTTPListenerIsolation,
+		tests.GatewayInfrastructure,
 		tests.GatewayInvalidParametersRef,
 		tests.GatewayInvalidRouteKind,
 		tests.GatewayInvalidTLSConfiguration,
