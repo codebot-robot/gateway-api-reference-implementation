@@ -386,8 +386,9 @@ type InternalBackend struct {
 }
 
 type InternalTLSConfig struct {
-	Hostname string
-	CACerts  [][]byte
+	Hostname                string
+	CACerts                 [][]byte
+	WellKnownCACertificates *gatewayv1.WellKnownCACertificatesType
 }
 
 type InternalRedirect struct {

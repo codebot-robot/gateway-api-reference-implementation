@@ -590,7 +590,7 @@ func containsToken(header, token string) bool {
 
 func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backend state.InternalBackend, body io.Reader) (*http.Request, *url.URL, error) {
 	scheme := "http"
-	if state.ValueOf(backend.AppProtocol) == "https" {
+	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
 		scheme = "https"
 	}
 
@@ -627,19 +627,22 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 }
 
 func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
-	if state.ValueOf(backend.AppProtocol) == "https" {
+	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
 		tlsConfig := &tls.Config{InsecureSkipVerify: false}
 		if backend.TLSConfig != nil {
 			if backend.TLSConfig.Hostname != "" {
 				tlsConfig.ServerName = backend.TLSConfig.Hostname
 			}
-			if len(backend.TLSConfig.CACerts) > 0 {
+			if backend.TLSConfig.WellKnownCACertificates != nil && *backend.TLSConfig.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
+				// Leave RootCAs nil so the system pool is used
+				tlsConfig.RootCAs = nil
+			} else if len(backend.TLSConfig.CACerts) > 0 {
 				tlsConfig.RootCAs = x509.NewCertPool()
 				for _, cert := range backend.TLSConfig.CACerts {
 					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
 				}
 			} else {
-				tlsConfig.InsecureSkipVerify = true
+				tlsConfig.RootCAs = x509.NewCertPool()
 			}
 		} else {
 			tlsConfig.InsecureSkipVerify = true
@@ -687,7 +690,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 	}
 
 	scheme := "http"
-	if state.ValueOf(backend.AppProtocol) == "https" || state.ValueOf(backend.AppProtocol) == "wss" {
+	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") || strings.EqualFold(state.ValueOf(backend.AppProtocol), "wss") {
 		scheme = "https"
 	}
 
@@ -708,13 +711,16 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 			if backend.TLSConfig.Hostname != "" {
 				tlsConfig.ServerName = backend.TLSConfig.Hostname
 			}
-			if len(backend.TLSConfig.CACerts) > 0 {
+			if backend.TLSConfig.WellKnownCACertificates != nil && *backend.TLSConfig.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
+				// Leave RootCAs nil so the system pool is used
+				tlsConfig.RootCAs = nil
+			} else if len(backend.TLSConfig.CACerts) > 0 {
 				tlsConfig.RootCAs = x509.NewCertPool()
 				for _, cert := range backend.TLSConfig.CACerts {
 					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
 				}
 			} else {
-				tlsConfig.InsecureSkipVerify = true
+				tlsConfig.RootCAs = x509.NewCertPool()
 			}
 		} else {
 			tlsConfig.InsecureSkipVerify = true
@@ -875,7 +881,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 	}
 
 	scheme := "http"
-	if state.ValueOf(backend.AppProtocol) == "https" {
+	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
 		scheme = "https"
 	}
 
