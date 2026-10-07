@@ -103,6 +103,13 @@ func WithEnableH2C(enable bool) Option {
 	}
 }
 
+// WithAPIReader configures the direct API reader for the AddressProvider.
+func WithAPIReader(reader client.Reader) Option {
+	return func(p *AddressProvider) {
+		p.apiReader = reader
+	}
+}
+
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 type AddressProvider struct {
 	client         client.Client
@@ -751,7 +758,7 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 			}
 			// Check if ServiceAccount still exists and has managed label
 			var sa corev1.ServiceAccount
-			err := p.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.Name}, &sa)
+			err := reader.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.Name}, &sa)
 			if apierrors.IsNotFound(err) || (sa.Labels != nil && sa.Labels[LabelManagedBy] == ManagedByValue && sa.Labels[LabelGatewayName] != "") {
 				if apierrors.IsNotFound(err) {
 					changed = true

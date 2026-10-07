@@ -693,6 +693,76 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	}
 }
 
+func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, true)
+
+	// 1. With provisioning error -> Programmed=False, Message=error
+	provErr := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"
+	st.SetGatewayProvisioningError(gwKey, provErr)
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	var progCond *metav1.Condition
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionFalse || progCond.Message != provErr {
+		t.Errorf("expected Programmed=False Message=%q when provisioning error present, got Status=%s Message=%q", provErr, progCond.Status, progCond.Message)
+	}
+
+	// 2. Clear provisioning error -> Programmed=True restored (given address and readiness)
+	st.SetGatewayProvisioningError(gwKey, "")
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	progCond = nil
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True Reason=Programmed when provisioning error cleared, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+	}
+}
+
 type countingProxyUpdater struct {
 	mu          sync.Mutex
 	updateCount int

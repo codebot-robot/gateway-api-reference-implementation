@@ -1126,7 +1126,7 @@ func TestGatewayReconciler_ErrorHandling(t *testing.T) {
 		t.Fatalf("expected transient error returned from Reconcile, got: %v", err)
 	}
 
-	// 2. OwnershipConflictError: should NOT be returned from Reconcile, but recorded on Gateway status
+	// 2. OwnershipConflictError: should NOT be returned from Reconcile, but recorded on Gateway status, and requeued after delay
 	conflictProvider := &fakeAddressProvider{
 		err: &OwnershipConflictError{
 			Message: "conflict: existing Service default/test-gw-gari is not owned by Gateway test-gw",
@@ -1134,15 +1134,21 @@ func TestGatewayReconciler_ErrorHandling(t *testing.T) {
 	}
 	r.AddressProvider = conflictProvider
 
-	_, err = r.Reconcile(ctx, req)
+	res, err := r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("expected nil error on OwnershipConflictError, got: %v", err)
 	}
+	if res.RequeueAfter != DefaultConflictRequeueDelay {
+		t.Fatalf("expected RequeueAfter %v on OwnershipConflictError, got: %v", DefaultConflictRequeueDelay, res.RequeueAfter)
+	}
 
 	st.Recompute()
-	_, err = r.Reconcile(ctx, req)
+	res, err = r.Reconcile(ctx, req)
 	if err != nil {
 		t.Fatalf("expected nil error on second reconcile, got: %v", err)
+	}
+	if res.RequeueAfter != DefaultConflictRequeueDelay {
+		t.Fatalf("expected RequeueAfter %v on second reconcile, got: %v", DefaultConflictRequeueDelay, res.RequeueAfter)
 	}
 
 	var reconciledGW gatewayv1.Gateway

@@ -196,23 +196,22 @@ func (cm *CompiledModel) ResolvedGateways() []*gatewayv1.Gateway {
 
 // ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
-	Revision            uint64
-	Gateways            []*gatewayv1.Gateway
-	GatewayClasses      []*gatewayv1.GatewayClass
-	GatewayAddresses    map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	GatewayReadiness    map[types.NamespacedName]bool
-	ProvisioningErrors  map[types.NamespacedName]string
-	ListenerSets        []*gatewayv1.ListenerSet
-	HTTPRoutes          []*gatewayv1.HTTPRoute
-	Services            map[types.NamespacedName]*corev1.Service
-	BackendTLSPolicies  []*gatewayv1.BackendTLSPolicy
-	ConfigMaps          map[types.NamespacedName]*corev1.ConfigMap
-	Secrets             map[types.NamespacedName]*corev1.Secret
-	Namespaces          map[string]*corev1.Namespace
-	ReferenceGrants     map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
-	RefValidator        ReferenceGrantValidator
-	ControllerName      string
-	ManagedClassMatched bool
+	Revision           uint64
+	Gateways           []*gatewayv1.Gateway
+	GatewayClasses     []*gatewayv1.GatewayClass
+	GatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	GatewayReadiness   map[types.NamespacedName]bool
+	ProvisioningErrors map[types.NamespacedName]string
+	ListenerSets       []*gatewayv1.ListenerSet
+	HTTPRoutes         []*gatewayv1.HTTPRoute
+	Services           map[types.NamespacedName]*corev1.Service
+	BackendTLSPolicies []*gatewayv1.BackendTLSPolicy
+	ConfigMaps         map[types.NamespacedName]*corev1.ConfigMap
+	Secrets            map[types.NamespacedName]*corev1.Secret
+	Namespaces         map[string]*corev1.Namespace
+	ReferenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	RefValidator       ReferenceGrantValidator
+	ControllerName     string
 }
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
