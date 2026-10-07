@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -110,12 +111,16 @@ func (e *OwnershipConflictError) Error() string {
 	return e.Message
 }
 
+// DefaultConflictRequeueDelay is the duration after which a Gateway with an ownership conflict is requeued.
+const DefaultConflictRequeueDelay = time.Minute
+
 type GatewayReconciler struct {
 	client.Client
-	Scheme          *runtime.Scheme
-	State           *state.State
-	ControllerName  string
-	AddressProvider AddressProvider
+	Scheme               *runtime.Scheme
+	State                *state.State
+	ControllerName       string
+	AddressProvider      AddressProvider
+	ConflictRequeueDelay time.Duration
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -134,6 +139,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	var requeueAfter time.Duration
 	if r.State != nil {
 		// Verify this Gateway is managed by us in State before requesting addresses
 		gc, ok := r.State.GetGatewayClass(string(gw.Spec.GatewayClassName))
@@ -156,6 +162,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					l.Error(err, "ownership conflict provisioning gateway")
 					r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
 					r.State.SetGatewayReadiness(req.NamespacedName, false)
+					delay := r.ConflictRequeueDelay
+					if delay == 0 {
+						delay = DefaultConflictRequeueDelay
+					}
+					requeueAfter = delay
 				} else {
 					l.Error(err, "unable to provision or fetch gateway addresses from address provider")
 					return ctrl.Result{}, err
@@ -169,7 +180,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		desired, ok := r.State.GetDesiredGatewayStatus(req.NamespacedName)
 		if !ok {
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
 		}
 
 		if state.MergeGatewayStatus(&gw.Status, desired) {
@@ -181,7 +192,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {

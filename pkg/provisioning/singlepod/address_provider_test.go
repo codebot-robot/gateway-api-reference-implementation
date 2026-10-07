@@ -495,6 +495,71 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 	}
 }
 
+func TestSinglePodAddressProvider_SweepOrphans_APIReaderServiceAccount(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	activeName := ResourceNameForGateway("active-gw")
+	activeGw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "active-gw",
+			Namespace: "test-ns",
+		},
+	}
+	activeSA := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      activeName,
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				LabelGatewayNamespace: "test-ns",
+				LabelGatewayName:      "active-gw",
+				LabelManagedBy:        ManagedByValue,
+			},
+		},
+	}
+	sharedCRB := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: DataplaneClusterRoleBindingName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      activeName,
+				Namespace: "test-ns",
+			},
+		},
+	}
+
+	// cachedClient does NOT have activeSA (simulating cache lag where SA was created recently)
+	cachedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sharedCRB.DeepCopy(), activeGw).
+		Build()
+
+	// apiReader DOES have activeSA (reading from API server directly)
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(sharedCRB.DeepCopy(), activeGw, activeSA).
+		Build()
+
+	ctx := t.Context()
+	p := NewAddressProvider(cachedClient, WithAPIReader(apiReader))
+
+	if err := p.SweepOrphans(ctx); err != nil {
+		t.Fatalf("SweepOrphans failed: %v", err)
+	}
+
+	// CRB should retain activeSA subject because it exists in the API reader
+	var checkCRB rbacv1.ClusterRoleBinding
+	if err := cachedClient.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &checkCRB); err != nil {
+		t.Fatalf("failed to get CRB: %v", err)
+	}
+	if len(checkCRB.Subjects) != 1 || checkCRB.Subjects[0].Name != activeName {
+		t.Errorf("expected active-gw ServiceAccount to be retained in CRB subjects, got %+v", checkCRB.Subjects)
+	}
+}
+
 func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
