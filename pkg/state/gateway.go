@@ -70,6 +70,61 @@ type InternalListener struct {
 	Hostname    string
 	GatewayName types.NamespacedName
 	Routes      []InternalRoute
+	TLSMode     *gatewayv1.TLSModeType
+	TLSBackends map[string][]string
+}
+
+// SelectTLSBackends finds the backend targets matching the given SNI for a TLS listener.
+// Follows Gateway API precedence: Exact match > longest matching wildcard > catch-all.
+func (l *InternalListener) SelectTLSBackends(sni string) ([]string, bool) {
+	if l == nil || len(l.TLSBackends) == 0 {
+		return nil, false
+	}
+	if h, _, err := net.SplitHostPort(sni); err == nil {
+		sni = h
+	}
+	cleanSNI := strings.ToLower(sni)
+
+	// 1. Exact match
+	if cleanSNI != "" {
+		if backends, ok := l.TLSBackends[cleanSNI]; ok && len(backends) > 0 {
+			return backends, true
+		}
+	}
+
+	// 2. Wildcard match (most specific / longest pattern wins)
+	var bestWildcardBackends []string
+	bestWildcardLen := -1
+	for pattern, backends := range l.TLSBackends {
+		if strings.HasPrefix(pattern, "*.") && MatchesWildcard(pattern, cleanSNI) {
+			if len(pattern) > bestWildcardLen {
+				bestWildcardLen = len(pattern)
+				bestWildcardBackends = backends
+			}
+		}
+	}
+	if bestWildcardLen > 0 && len(bestWildcardBackends) > 0 {
+		return bestWildcardBackends, true
+	}
+
+	// 3. Catch-all match ("*" or "")
+	if backends, ok := l.TLSBackends["*"]; ok && len(backends) > 0 {
+		return backends, true
+	}
+	if backends, ok := l.TLSBackends[""]; ok && len(backends) > 0 {
+		return backends, true
+	}
+
+	return nil, false
+}
+
+// SelectTLSBackend returns the primary backend target matching the given SNI.
+func (l *InternalListener) SelectTLSBackend(sni string) (string, bool) {
+	backends, ok := l.SelectTLSBackends(sni)
+	if !ok || len(backends) == 0 {
+		return "", false
+	}
+	return backends[0], true
 }
 
 type listenerMatchCandidate struct {

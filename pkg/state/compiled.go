@@ -87,6 +87,7 @@ type EffectiveListener struct {
 	Conditions     []metav1.Condition
 	AttachedRoutes int32
 	Routes         []InternalRoute
+	TLSBackends    map[string][]string
 	Generation     int64
 }
 
@@ -130,6 +131,19 @@ func (el *EffectiveListener) QualifiedName() string {
 
 // ToInternalListener converts the effective listener to an InternalListener for proxy routing.
 func (el *EffectiveListener) ToInternalListener() InternalListener {
+	var tlsMode *gatewayv1.TLSModeType
+	if el.TLS != nil && el.TLS.Mode != nil {
+		tlsMode = el.TLS.Mode
+	}
+	var tlsBackends map[string][]string
+	if len(el.TLSBackends) > 0 {
+		tlsBackends = make(map[string][]string, len(el.TLSBackends))
+		for k, v := range el.TLSBackends {
+			copied := make([]string, len(v))
+			copy(copied, v)
+			tlsBackends[k] = copied
+		}
+	}
 	return InternalListener{
 		Name:        el.QualifiedName(),
 		Protocol:    el.Protocol,
@@ -137,6 +151,8 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		Hostname:    string(ValueOf(el.Hostname)),
 		GatewayName: el.ParentGateway,
 		Routes:      el.Routes,
+		TLSMode:     tlsMode,
+		TLSBackends: tlsBackends,
 	}
 }
 
@@ -155,10 +171,18 @@ type CompiledRoute struct {
 	ParentConditions []metav1.Condition
 }
 
-// CompiledModel is the complete compiled model of Gateways, ListenerSets, and HTTPRoutes.
+// CompiledTLSRoute contains the compiled state for a TLSRoute.
+type CompiledTLSRoute struct {
+	TLSRoute         *gatewayv1.TLSRoute
+	RouteState       *TLSRouteState
+	ParentConditions []metav1.Condition
+}
+
+// CompiledModel is the complete compiled model of Gateways, ListenerSets, HTTPRoutes, and TLSRoutes.
 type CompiledModel struct {
 	Gateways     map[types.NamespacedName]*CompiledGateway
 	HTTPRoutes   map[types.NamespacedName]*CompiledRoute
+	TLSRoutes    map[types.NamespacedName]*CompiledTLSRoute
 	ListenerSets map[types.NamespacedName]*gatewayv1.ListenerSet
 }
 
@@ -204,6 +228,7 @@ type ModelInputs struct {
 	ProvisioningErrors map[types.NamespacedName]string
 	ListenerSets       []*gatewayv1.ListenerSet
 	HTTPRoutes         []*gatewayv1.HTTPRoute
+	TLSRoutes          []*gatewayv1.TLSRoute
 	Services           map[types.NamespacedName]*corev1.Service
 	BackendTLSPolicies []*gatewayv1.BackendTLSPolicy
 	ConfigMaps         map[types.NamespacedName]*corev1.ConfigMap
@@ -219,6 +244,7 @@ type Outputs struct {
 	Revision                 uint64
 	GatewayStatuses          map[types.NamespacedName]gatewayv1.GatewayStatus
 	HTTPRouteStatuses        map[types.NamespacedName]gatewayv1.HTTPRouteStatus
+	TLSRouteStatuses         map[types.NamespacedName]gatewayv1.TLSRouteStatus
 	ListenerSetStatuses      map[types.NamespacedName]gatewayv1.ListenerSetStatus
 	BackendTLSPolicyStatuses map[types.NamespacedName]gatewayv1.PolicyStatus
 	GatewayClassStatuses     map[types.NamespacedName]gatewayv1.GatewayClassStatus
@@ -589,13 +615,17 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 // areProtocolsCompatible returns true if two listeners on the same port can co-exist.
 // HTTP listeners can share a port with other HTTP listeners (differentiated by hostname).
 // HTTPS listeners can share a port with other HTTPS listeners (differentiated by SNI/hostname).
-// TODO: HTTPS and TLS listeners can also share a port (both routed by SNI); enable when TLSRoute is supported.
+// HTTPS and TLS listeners can also share a port (both routed by SNI).
 func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 	if p1 == p2 {
 		if p1 == gatewayv1.HTTPProtocolType || p1 == gatewayv1.HTTPSProtocolType || p1 == gatewayv1.TLSProtocolType {
 			return true
 		}
 		return false
+	}
+	if (p1 == gatewayv1.HTTPSProtocolType && p2 == gatewayv1.TLSProtocolType) ||
+		(p1 == gatewayv1.TLSProtocolType && p2 == gatewayv1.HTTPSProtocolType) {
+		return true
 	}
 	return false
 }
@@ -634,6 +664,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 	cm := &CompiledModel{
 		Gateways:     make(map[types.NamespacedName]*CompiledGateway),
 		HTTPRoutes:   make(map[types.NamespacedName]*CompiledRoute),
+		TLSRoutes:    make(map[types.NamespacedName]*CompiledTLSRoute),
 		ListenerSets: make(map[types.NamespacedName]*gatewayv1.ListenerSet),
 	}
 
@@ -809,19 +840,58 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 	}
 
+	// 3. Compile TLSRoutes and perform route binding
+	for _, route := range inputs.TLSRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		rs := &TLSRouteState{TLSRoute: route}
+		rs.Compile(inputs.Services, refValidator)
+
+		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
+		boundListenersForRoute := make(map[*EffectiveListener]bool)
+
+		for pIdx, parentRef := range route.Spec.ParentRefs {
+			parentConditions[pIdx] = bindTLSRouteParentRef(
+				route,
+				rs,
+				parentRef,
+				cm,
+				inputs.Namespaces,
+				boundListenersForRoute,
+			)
+		}
+
+		cm.TLSRoutes[routeKey] = &CompiledTLSRoute{
+			TLSRoute:         route,
+			RouteState:       rs,
+			ParentConditions: parentConditions,
+		}
+	}
+
 	return cm
 }
 
-func bindRouteParentRef(
-	route *gatewayv1.HTTPRoute,
-	rs *HTTPRouteState,
+type routeBindingConfig struct {
+	namespace            string
+	generation           int64
+	hostnames            []string
+	validationCond       *metav1.Condition
+	isProtocolCompatible func(el *EffectiveListener) bool
+	isKindAllowed        func(group *gatewayv1.Group, kind gatewayv1.Kind) bool
+	onBind               func(el *EffectiveListener, effectiveHostnames []string)
+}
+
+func bindParentRef(
+	cfg routeBindingConfig,
 	parentRef gatewayv1.ParentReference,
 	cm *CompiledModel,
 	namespaces map[string]*corev1.Namespace,
 	boundListenersForRoute map[*EffectiveListener]bool,
 ) metav1.Condition {
-	if rs.Internal != nil && rs.Internal.ValidationCondition.Status == metav1.ConditionFalse {
-		return rs.Internal.ValidationCondition
+	if cfg.validationCond != nil && cfg.validationCond.Status == metav1.ConditionFalse {
+		return *cfg.validationCond
 	}
 
 	group := ValueOf(parentRef.Group)
@@ -831,7 +901,7 @@ func bindRouteParentRef(
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNoMatchingParent),
 			fmt.Sprintf("Unsupported parent group: %s", group),
-			route.Generation,
+			cfg.generation,
 		)
 	}
 
@@ -845,11 +915,11 @@ func bindRouteParentRef(
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNoMatchingParent),
 			fmt.Sprintf("Unsupported parent kind: %s", kind),
-			route.Generation,
+			cfg.generation,
 		)
 	}
 
-	targetNamespace := route.Namespace
+	targetNamespace := cfg.namespace
 	if parentNamespace := ValueOf(parentRef.Namespace); parentNamespace != "" {
 		targetNamespace = string(parentNamespace)
 	}
@@ -865,7 +935,7 @@ func bindRouteParentRef(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonNoMatchingParent),
 				"Gateway not found",
-				route.Generation,
+				cfg.generation,
 			)
 		}
 		for _, el := range cg.EffectiveListeners {
@@ -881,7 +951,7 @@ func bindRouteParentRef(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonNoMatchingParent),
 				"ListenerSet not found",
-				route.Generation,
+				cfg.generation,
 			)
 		}
 
@@ -896,7 +966,7 @@ func bindRouteParentRef(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonNoMatchingParent),
 				"Parent ListenerSet is not accepted by Gateway",
-				route.Generation,
+				cfg.generation,
 			)
 		}
 
@@ -921,7 +991,7 @@ func bindRouteParentRef(
 		hasMatchingListener = true
 
 		// Check protocol compatibility
-		if el.Protocol != gatewayv1.HTTPProtocolType && el.Protocol != gatewayv1.HTTPSProtocolType {
+		if !cfg.isProtocolCompatible(el) {
 			continue
 		}
 
@@ -929,7 +999,7 @@ func bindRouteParentRef(
 		if el.AllowedRoutes != nil && len(el.AllowedRoutes.Kinds) > 0 {
 			kindAllowed := false
 			for _, k := range el.AllowedRoutes.Kinds {
-				if IsHTTPRoute(k.Group, k.Kind) {
+				if cfg.isKindAllowed(k.Group, k.Kind) {
 					kindAllowed = true
 					break
 				}
@@ -943,7 +1013,7 @@ func bindRouteParentRef(
 		if el.AllowedRoutes != nil && el.AllowedRoutes.Namespaces != nil && el.AllowedRoutes.Namespaces.From != nil {
 			switch *el.AllowedRoutes.Namespaces.From {
 			case gatewayv1.NamespacesFromSame:
-				if route.Namespace != el.Owner.Namespace {
+				if cfg.namespace != el.Owner.Namespace {
 					continue
 				}
 			case gatewayv1.NamespacesFromAll:
@@ -956,38 +1026,36 @@ func bindRouteParentRef(
 					}
 					var nsObj *corev1.Namespace
 					if namespaces != nil {
-						nsObj = namespaces[route.Namespace]
+						nsObj = namespaces[cfg.namespace]
 					}
 					if nsObj != nil {
 						if !sel.Matches(labels.Set(nsObj.Labels)) {
 							continue
 						}
-					} else if route.Namespace != el.Owner.Namespace && namespaces != nil {
+					} else if cfg.namespace != el.Owner.Namespace && namespaces != nil {
 						continue
 					}
 				}
 			}
 		} else {
 			// Default is Same namespace
-			if route.Namespace != el.Owner.Namespace {
+			if cfg.namespace != el.Owner.Namespace {
 				continue
 			}
 		}
 
 		hasAllowedListener = true
 
-		effectiveHostnames := IntersectHostnames(rs.GetHostnames(), string(ValueOf(el.Hostname)))
-		if len(effectiveHostnames) > 0 || len(route.Spec.Hostnames) == 0 {
+		effectiveHostnames := IntersectHostnames(cfg.hostnames, string(ValueOf(el.Hostname)))
+		if len(effectiveHostnames) > 0 || len(cfg.hostnames) == 0 {
 			hasMatchingHostname = true
 
 			if !boundListenersForRoute[el] {
 				boundListenersForRoute[el] = true
 				el.AttachedRoutes++
-				ir := InternalRoute{
-					Hostnames: effectiveHostnames,
-					Rules:     rs.Internal.Rules,
+				if cfg.onBind != nil {
+					cfg.onBind(el, effectiveHostnames)
 				}
-				el.Routes = append(el.Routes, ir)
 			}
 		}
 	}
@@ -998,7 +1066,7 @@ func bindRouteParentRef(
 			metav1.ConditionTrue,
 			string(gatewayv1.RouteReasonAccepted),
 			"Route accepted by reference implementation",
-			route.Generation,
+			cfg.generation,
 		)
 	}
 	if hasAllowedListener {
@@ -1007,7 +1075,7 @@ func bindRouteParentRef(
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNoMatchingListenerHostname),
 			"No matching listener hostname",
-			route.Generation,
+			cfg.generation,
 		)
 	}
 	if hasMatchingListener {
@@ -1016,7 +1084,7 @@ func bindRouteParentRef(
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonNotAllowedByListeners),
 			"Not allowed by listener permissions or protocol",
-			route.Generation,
+			cfg.generation,
 		)
 	}
 	return NewCondition(
@@ -1024,7 +1092,87 @@ func bindRouteParentRef(
 		metav1.ConditionFalse,
 		string(gatewayv1.RouteReasonNoMatchingParent),
 		"No matching listener for parentRef",
-		route.Generation,
+		cfg.generation,
+	)
+}
+
+func bindRouteParentRef(
+	route *gatewayv1.HTTPRoute,
+	rs *HTTPRouteState,
+	parentRef gatewayv1.ParentReference,
+	cm *CompiledModel,
+	namespaces map[string]*corev1.Namespace,
+	boundListenersForRoute map[*EffectiveListener]bool,
+) metav1.Condition {
+	var valCond *metav1.Condition
+	if rs.Internal != nil {
+		valCond = &rs.Internal.ValidationCondition
+	}
+	return bindParentRef(
+		routeBindingConfig{
+			namespace:      route.Namespace,
+			generation:     route.Generation,
+			hostnames:      rs.GetHostnames(),
+			validationCond: valCond,
+			isProtocolCompatible: func(el *EffectiveListener) bool {
+				return el.Protocol == gatewayv1.HTTPProtocolType || el.Protocol == gatewayv1.HTTPSProtocolType
+			},
+			isKindAllowed: IsHTTPRoute,
+			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+				ir := InternalRoute{
+					Hostnames: effectiveHostnames,
+					Rules:     rs.Internal.Rules,
+				}
+				el.Routes = append(el.Routes, ir)
+			},
+		},
+		parentRef,
+		cm,
+		namespaces,
+		boundListenersForRoute,
+	)
+}
+
+func bindTLSRouteParentRef(
+	route *gatewayv1.TLSRoute,
+	rs *TLSRouteState,
+	parentRef gatewayv1.ParentReference,
+	cm *CompiledModel,
+	namespaces map[string]*corev1.Namespace,
+	boundListenersForRoute map[*EffectiveListener]bool,
+) metav1.Condition {
+	var valCond *metav1.Condition
+	if rs.Internal != nil {
+		valCond = &rs.Internal.ValidationCondition
+	}
+	return bindParentRef(
+		routeBindingConfig{
+			namespace:      route.Namespace,
+			generation:     route.Generation,
+			hostnames:      rs.GetHostnames(),
+			validationCond: valCond,
+			isProtocolCompatible: func(el *EffectiveListener) bool {
+				return el.Protocol == gatewayv1.TLSProtocolType &&
+					el.TLS != nil && el.TLS.Mode != nil && *el.TLS.Mode == gatewayv1.TLSModePassthrough
+			},
+			isKindAllowed: IsTLSRoute,
+			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+				if el.TLSBackends == nil {
+					el.TLSBackends = make(map[string][]string)
+				}
+				for _, eh := range effectiveHostnames {
+					if rs.Internal != nil {
+						for _, rule := range rs.Internal.Rules {
+							el.TLSBackends[eh] = append(el.TLSBackends[eh], rule.Backends...)
+						}
+					}
+				}
+			},
+		},
+		parentRef,
+		cm,
+		namespaces,
+		boundListenersForRoute,
 	)
 }
 
@@ -1046,6 +1194,9 @@ func ExtractCertificates(
 				continue
 			}
 			if (el.Protocol != gatewayv1.HTTPSProtocolType && el.Protocol != gatewayv1.TLSProtocolType) || el.TLS == nil {
+				continue
+			}
+			if el.Protocol == gatewayv1.TLSProtocolType && (el.TLS.Mode != nil && *el.TLS.Mode == gatewayv1.TLSModePassthrough) {
 				continue
 			}
 
@@ -1159,6 +1310,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		Revision:                 inputs.Revision,
 		GatewayStatuses:          make(map[types.NamespacedName]gatewayv1.GatewayStatus),
 		HTTPRouteStatuses:        make(map[types.NamespacedName]gatewayv1.HTTPRouteStatus),
+		TLSRouteStatuses:         make(map[types.NamespacedName]gatewayv1.TLSRouteStatus),
 		ListenerSetStatuses:      make(map[types.NamespacedName]gatewayv1.ListenerSetStatus),
 		BackendTLSPolicyStatuses: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
 		GatewayClassStatuses:     make(map[types.NamespacedName]gatewayv1.GatewayClassStatus),
@@ -1223,7 +1375,17 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		outputs.HTTPRouteStatuses[routeKey] = ComputeDesiredHTTPRouteStatus(route, compiledRoute, inputs.ControllerName)
 	}
 
-	// 4. BackendTLSPolicy Statuses
+	// 4. TLSRoute Statuses
+	for _, route := range inputs.TLSRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		compiledRoute := compiled.TLSRoutes[routeKey]
+		outputs.TLSRouteStatuses[routeKey] = ComputeDesiredTLSRouteStatus(route, compiledRoute, inputs.ControllerName)
+	}
+
+	// 5. BackendTLSPolicy Statuses
 	for _, policy := range inputs.BackendTLSPolicies {
 		if policy == nil {
 			continue
@@ -1408,6 +1570,37 @@ func ComputeDesiredHTTPRouteStatus(
 
 	return gatewayv1.HTTPRouteStatus{
 		Parents: desiredParents,
+	}
+}
+
+// ComputeDesiredTLSRouteStatus computes the desired TLSRouteStatus from the compiled model.
+func ComputeDesiredTLSRouteStatus(
+	route *gatewayv1.TLSRoute,
+	compiledRoute *CompiledTLSRoute,
+	controllerName string,
+) gatewayv1.TLSRouteStatus {
+	var desiredParents []gatewayv1.RouteParentStatus
+	if compiledRoute != nil {
+		for i, parentRef := range route.Spec.ParentRefs {
+			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
+			if i < len(compiledRoute.ParentConditions) {
+				cond = compiledRoute.ParentConditions[i]
+			}
+			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
+				ParentRef:      parentRef,
+				ControllerName: gatewayv1.GatewayController(controllerName),
+				Conditions: []metav1.Condition{
+					cond,
+					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				},
+			})
+		}
+	}
+
+	return gatewayv1.TLSRouteStatus{
+		RouteStatus: gatewayv1.RouteStatus{
+			Parents: desiredParents,
+		},
 	}
 }
 
@@ -1772,6 +1965,14 @@ func MergeHTTPRouteStatus(current *gatewayv1.HTTPRouteStatus, desired gatewayv1.
 	return updated
 }
 
+// MergeTLSRouteStatus merges desired TLSRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
+// It returns true if semantic changes occurred that require updating status in the API server.
+func MergeTLSRouteStatus(current *gatewayv1.TLSRouteStatus, desired gatewayv1.TLSRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
+	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
+	current.Parents = newParents
+	return updated
+}
+
 // MergeBackendTLSPolicyStatus merges desired PolicyStatus into current, preserving LastTransitionTime and other controllers' ancestors.
 func MergeBackendTLSPolicyStatus(current *gatewayv1.PolicyStatus, desired gatewayv1.PolicyStatus, controllerName gatewayv1.GatewayController) bool {
 	newAncestors, updated := UpdatePolicyAncestors(current.Ancestors, desired.Ancestors, controllerName)
@@ -1805,6 +2006,21 @@ func GatewayStatusesEqual(a, b gatewayv1.GatewayStatus) bool {
 
 // HTTPRouteStatusesEqual compares two HTTPRouteStatus objects (ignoring LastTransitionTime).
 func HTTPRouteStatusesEqual(a, b gatewayv1.HTTPRouteStatus) bool {
+	if len(a.Parents) != len(b.Parents) {
+		return false
+	}
+	for i := range a.Parents {
+		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
+			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
+			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
+			return false
+		}
+	}
+	return true
+}
+
+// TLSRouteStatusesEqual compares two TLSRouteStatus objects (ignoring LastTransitionTime).
+func TLSRouteStatusesEqual(a, b gatewayv1.TLSRouteStatus) bool {
 	if len(a.Parents) != len(b.Parents) {
 		return false
 	}
