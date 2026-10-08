@@ -31,9 +31,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/sni"
 )
 
 // ServerConfig holds configuration options for the frontend server.
