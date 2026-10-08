@@ -389,6 +389,7 @@ type InternalTLSConfig struct {
 	Hostname                string
 	CACerts                 [][]byte
 	WellKnownCACertificates *gatewayv1.WellKnownCACertificatesType
+	SubjectAltNames         []gatewayv1.SubjectAltName
 }
 
 type InternalRedirect struct {

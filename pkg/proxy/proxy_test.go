@@ -17,8 +17,16 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2194,5 +2202,186 @@ func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
 	}
 	if httpTrInvalid.TLSClientConfig.ServerName != "backend.example.com" {
 		t.Errorf("expected ServerName 'backend.example.com', got %q", httpTrInvalid.TLSClientConfig.ServerName)
+	}
+}
+
+func generateTestCAAndCert(t *testing.T, dnsNames []string, uris []*url.URL) ([]byte, tls.Certificate) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(1 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+	}
+	caBytes, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create CA certificate: %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caBytes})
+	caCert, err := x509.ParseCertificate(caBytes)
+	if err != nil {
+		t.Fatalf("failed to parse CA certificate: %v", err)
+	}
+
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate server key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "backend"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+		URIs:         uris,
+	}
+	srvBytes, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("failed to create server certificate: %v", err)
+	}
+	srvPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvBytes})
+	keyBytes, err := x509.MarshalECPrivateKey(srvKey)
+	if err != nil {
+		t.Fatalf("failed to marshal server key: %v", err)
+	}
+	srvKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+
+	tlsCert, err := tls.X509KeyPair(srvPEM, srvKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to create X509 key pair: %v", err)
+	}
+
+	return caPEM, tlsCert
+}
+
+func TestBackendTLSPolicy_SubjectAltNamesVerification(t *testing.T) {
+	testURI, _ := url.Parse("spiffe://example.com/test-service")
+	caPEM, tlsCert := generateTestCAAndCert(t, []string{"dns.backend.local"}, []*url.URL{testURI})
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	httpsProto := "https"
+
+	tests := []struct {
+		name          string
+		hostname      string
+		sans          []gatewayv1.SubjectAltName
+		expectSuccess bool
+	}{
+		{
+			name:     "matching DNS SAN verifies successfully",
+			hostname: "dns.backend.local",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.HostnameSubjectAltNameType, Hostname: "dns.backend.local"},
+			},
+			expectSuccess: true,
+		},
+		{
+			name:     "matching URI SAN verifies successfully",
+			hostname: "anything.local",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.URISubjectAltNameType, URI: "spiffe://example.com/test-service"},
+			},
+			expectSuccess: true,
+		},
+		{
+			name:     "certificate matches SAN but not hostname (hostname is SNI only)",
+			hostname: "sni-only.example.com",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.HostnameSubjectAltNameType, Hostname: "dns.backend.local"},
+			},
+			expectSuccess: true,
+		},
+		{
+			name:     "mismatched DNS SAN fails handshake",
+			hostname: "dns.backend.local",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.HostnameSubjectAltNameType, Hostname: "mismatch.backend.local"},
+			},
+			expectSuccess: false,
+		},
+		{
+			name:     "mismatched URI SAN fails handshake",
+			hostname: "anything.local",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.URISubjectAltNameType, URI: "spiffe://example.com/wrong-service"},
+			},
+			expectSuccess: false,
+		},
+		{
+			name:     "multiple SANs with one matching verifies successfully",
+			hostname: "sni.local",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.HostnameSubjectAltNameType, Hostname: "wrong.local"},
+				{Type: gatewayv1.URISubjectAltNameType, URI: "spiffe://example.com/test-service"},
+			},
+			expectSuccess: true,
+		},
+		{
+			name:     "multiple SANs with none matching fails handshake",
+			hostname: "sni.local",
+			sans: []gatewayv1.SubjectAltName{
+				{Type: gatewayv1.HostnameSubjectAltNameType, Hostname: "wrong1.local"},
+				{Type: gatewayv1.URISubjectAltNameType, URI: "spiffe://example.com/wrong-service"},
+			},
+			expectSuccess: false,
+		},
+	}
+
+	p := NewProxy()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := state.InternalBackend{
+				Host:        host,
+				Port:        int32(port),
+				AppProtocol: &httpsProto,
+				TLSConfig: &state.InternalTLSConfig{
+					Hostname:        tc.hostname,
+					CACerts:         [][]byte{caPEM},
+					SubjectAltNames: tc.sans,
+				},
+			}
+			tr := p.buildTransport(backend)
+			client := &http.Client{Transport: tr}
+			req, _ := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
+			resp, err := client.Do(req)
+
+			if tc.expectSuccess {
+				if err != nil {
+					t.Fatalf("expected request to succeed, got error: %v", err)
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+				}
+			} else {
+				if err == nil {
+					resp.Body.Close()
+					t.Fatalf("expected TLS handshake to fail, but request succeeded with status %d", resp.StatusCode)
+				}
+			}
+		})
 	}
 }

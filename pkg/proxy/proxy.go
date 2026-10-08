@@ -626,29 +626,103 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 	return req, targetURL, nil
 }
 
+func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config {
+	if backend.TLSConfig == nil {
+		return &tls.Config{InsecureSkipVerify: true}
+	}
+
+	var rootCAs *x509.CertPool
+	if backend.TLSConfig.WellKnownCACertificates != nil && *backend.TLSConfig.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
+		// Leave RootCAs nil so the system pool is used
+		rootCAs = nil
+	} else if len(backend.TLSConfig.CACerts) > 0 {
+		rootCAs = x509.NewCertPool()
+		for _, cert := range backend.TLSConfig.CACerts {
+			rootCAs.AppendCertsFromPEM(cert)
+		}
+	} else {
+		rootCAs = x509.NewCertPool()
+	}
+
+	serverName := backend.TLSConfig.Hostname
+
+	if len(backend.TLSConfig.SubjectAltNames) > 0 {
+		sans := backend.TLSConfig.SubjectAltNames
+		return &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: true,
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 {
+					return fmt.Errorf("no peer certificates presented")
+				}
+				leaf := cs.PeerCertificates[0]
+
+				verifyOpts := x509.VerifyOptions{
+					Roots:         rootCAs,
+					Intermediates: x509.NewCertPool(),
+				}
+				for _, cert := range cs.PeerCertificates[1:] {
+					verifyOpts.Intermediates.AddCert(cert)
+				}
+				if _, err := leaf.Verify(verifyOpts); err != nil {
+					return fmt.Errorf("certificate verification failed: %w", err)
+				}
+
+				if !verifySubjectAltNames(leaf, sans) {
+					return fmt.Errorf("certificate does not match any configured SubjectAltNames")
+				}
+				return nil
+			},
+		}
+	}
+
+	return &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: false,
+		RootCAs:            rootCAs,
+	}
+}
+
+func verifySubjectAltNames(cert *x509.Certificate, sans []gatewayv1.SubjectAltName) bool {
+	for _, san := range sans {
+		switch san.Type {
+		case gatewayv1.HostnameSubjectAltNameType:
+			expectedHost := string(san.Hostname)
+			if err := cert.VerifyHostname(expectedHost); err == nil {
+				return true
+			}
+			for _, dns := range cert.DNSNames {
+				if strings.EqualFold(dns, expectedHost) {
+					return true
+				}
+			}
+		case gatewayv1.URISubjectAltNameType:
+			expectedURI := string(san.URI)
+			parsedExpected, err := url.Parse(expectedURI)
+			for _, u := range cert.URIs {
+				if u == nil {
+					continue
+				}
+				if u.String() == expectedURI {
+					return true
+				}
+				if err == nil &&
+					strings.EqualFold(u.Scheme, parsedExpected.Scheme) &&
+					strings.EqualFold(u.Host, parsedExpected.Host) &&
+					u.Path == parsedExpected.Path &&
+					u.RawQuery == parsedExpected.RawQuery {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
 	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
-		tlsConfig := &tls.Config{InsecureSkipVerify: false}
-		if backend.TLSConfig != nil {
-			if backend.TLSConfig.Hostname != "" {
-				tlsConfig.ServerName = backend.TLSConfig.Hostname
-			}
-			if backend.TLSConfig.WellKnownCACertificates != nil && *backend.TLSConfig.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
-				// Leave RootCAs nil so the system pool is used
-				tlsConfig.RootCAs = nil
-			} else if len(backend.TLSConfig.CACerts) > 0 {
-				tlsConfig.RootCAs = x509.NewCertPool()
-				for _, cert := range backend.TLSConfig.CACerts {
-					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
-				}
-			} else {
-				tlsConfig.RootCAs = x509.NewCertPool()
-			}
-		} else {
-			tlsConfig.InsecureSkipVerify = true
-		}
 		return &http.Transport{
-			TLSClientConfig: tlsConfig,
+			TLSClientConfig: p.buildBackendTLSConfig(backend),
 		}
 	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
 		return &http2.Transport{
@@ -706,25 +780,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 	var err error
 
 	if scheme == "https" {
-		tlsConfig := &tls.Config{InsecureSkipVerify: false}
-		if backend.TLSConfig != nil {
-			if backend.TLSConfig.Hostname != "" {
-				tlsConfig.ServerName = backend.TLSConfig.Hostname
-			}
-			if backend.TLSConfig.WellKnownCACertificates != nil && *backend.TLSConfig.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
-				// Leave RootCAs nil so the system pool is used
-				tlsConfig.RootCAs = nil
-			} else if len(backend.TLSConfig.CACerts) > 0 {
-				tlsConfig.RootCAs = x509.NewCertPool()
-				for _, cert := range backend.TLSConfig.CACerts {
-					tlsConfig.RootCAs.AppendCertsFromPEM(cert)
-				}
-			} else {
-				tlsConfig.RootCAs = x509.NewCertPool()
-			}
-		} else {
-			tlsConfig.InsecureSkipVerify = true
-		}
+		tlsConfig := p.buildBackendTLSConfig(backend)
 		var d net.Dialer
 		backendConn, err = tls.DialWithDialer(&d, "tcp", targetAddr, tlsConfig)
 	} else {
