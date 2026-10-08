@@ -112,6 +112,7 @@ type State struct {
 	provisioningErrors map[types.NamespacedName]string
 	listenerSets       map[types.NamespacedName]*ListenerSetState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
+	tlsRoutes          map[types.NamespacedName]*TLSRouteState
 	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services           map[types.NamespacedName]*corev1.Service
 	configMaps         map[types.NamespacedName]*corev1.ConfigMap
@@ -128,6 +129,7 @@ type State struct {
 
 	gatewaySource          *EventSource
 	httpRouteSource        *EventSource
+	tlsRouteSource         *EventSource
 	listenerSetSource      *EventSource
 	backendTLSPolicySource *EventSource
 	gatewayClassSource     *EventSource
@@ -148,6 +150,7 @@ func NewState() *State {
 		provisioningErrors:     make(map[types.NamespacedName]string),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
+		tlsRoutes:              make(map[types.NamespacedName]*TLSRouteState),
 		backendTLSPolicies:     make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:               make(map[types.NamespacedName]*corev1.Service),
 		configMaps:             make(map[types.NamespacedName]*corev1.ConfigMap),
@@ -156,6 +159,7 @@ func NewState() *State {
 		namespaces:             make(map[string]*corev1.Namespace),
 		gatewaySource:          NewEventSource(),
 		httpRouteSource:        NewEventSource(),
+		tlsRouteSource:         NewEventSource(),
 		listenerSetSource:      NewEventSource(),
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
@@ -219,6 +223,10 @@ func (s *State) GatewaySource() *EventSource {
 
 func (s *State) HTTPRouteSource() *EventSource {
 	return s.httpRouteSource
+}
+
+func (s *State) TLSRouteSource() *EventSource {
+	return s.tlsRouteSource
 }
 
 func (s *State) ListenerSetSource() *EventSource {
@@ -427,6 +435,25 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		return routes[i].Name < routes[j].Name
 	})
 
+	var tlsRoutes []*gatewayv1.TLSRoute
+	for _, rState := range s.tlsRoutes {
+		if rState != nil && rState.TLSRoute != nil {
+			tlsRoutes = append(tlsRoutes, rState.TLSRoute)
+		}
+	}
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(tlsRoutes, func(i, j int) bool {
+		if !tlsRoutes[i].CreationTimestamp.Equal(&tlsRoutes[j].CreationTimestamp) {
+			return tlsRoutes[i].CreationTimestamp.Before(&tlsRoutes[j].CreationTimestamp)
+		}
+		if tlsRoutes[i].Namespace != tlsRoutes[j].Namespace {
+			return tlsRoutes[i].Namespace < tlsRoutes[j].Namespace
+		}
+		return tlsRoutes[i].Name < tlsRoutes[j].Name
+	})
+
 	var backendTLSPolicies []*gatewayv1.BackendTLSPolicy
 	for _, b := range s.backendTLSPolicies {
 		if b != nil {
@@ -477,6 +504,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		ProvisioningErrors: gwProvErrs,
 		ListenerSets:       listenerSets,
 		HTTPRoutes:         routes,
+		TLSRoutes:          tlsRoutes,
 		Services:           services,
 		BackendTLSPolicies: backendTLSPolicies,
 		ConfigMaps:         configMaps,
@@ -532,6 +560,28 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		old, oldOk := prevRouteStatuses[k]
 		if curOk != oldOk || (curOk && !HTTPRouteStatusesEqual(cur, old)) {
 			s.httpRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
+		}
+	}
+
+	// 2b. TLSRoute diff
+	var prevTLSRouteStatuses map[types.NamespacedName]gatewayv1.TLSRouteStatus
+	if prev != nil {
+		prevTLSRouteStatuses = prev.TLSRouteStatuses
+	}
+	allTLSRouteKeys := make(map[types.NamespacedName]bool)
+	for k := range outputs.TLSRouteStatuses {
+		allTLSRouteKeys[k] = true
+	}
+	if prevTLSRouteStatuses != nil {
+		for k := range prevTLSRouteStatuses {
+			allTLSRouteKeys[k] = true
+		}
+	}
+	for k := range allTLSRouteKeys {
+		cur, curOk := outputs.TLSRouteStatuses[k]
+		old, oldOk := prevTLSRouteStatuses[k]
+		if curOk != oldOk || (curOk && !TLSRouteStatusesEqual(cur, old)) {
+			s.tlsRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -662,6 +712,16 @@ func (s *State) GetDesiredHTTPRouteStatus(key types.NamespacedName) (gatewayv1.H
 		return gatewayv1.HTTPRouteStatus{}, false
 	}
 	st, ok := s.previousOutputs.HTTPRouteStatuses[key]
+	return st, ok
+}
+
+func (s *State) GetDesiredTLSRouteStatus(key types.NamespacedName) (gatewayv1.TLSRouteStatus, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.previousOutputs == nil {
+		return gatewayv1.TLSRouteStatus{}, false
+	}
+	st, ok := s.previousOutputs.TLSRouteStatuses[key]
 	return st, ok
 }
 
@@ -1102,6 +1162,44 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 	}
 }
 
+func (s *State) UpsertTLSRoute(route *gatewayv1.TLSRoute) {
+	if route == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+	old := s.tlsRoutes[key]
+	if old != nil && old.TLSRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
+		return
+	}
+
+	s.tlsRoutes[key] = &TLSRouteState{
+		TLSRoute: route.DeepCopy(),
+	}
+	s.revision++
+	s.markDirtyLocked()
+}
+
+func (s *State) GetTLSRoute(name types.NamespacedName) *TLSRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.tlsRoutes[name]
+}
+
+func (s *State) DeleteTLSRoute(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.tlsRoutes[name]; ok {
+		delete(s.tlsRoutes, name)
+		s.revision++
+		s.markDirtyLocked()
+	}
+}
+
 func (s *State) UpsertBackendTLSPolicy(policy *gatewayv1.BackendTLSPolicy) {
 	if policy == nil {
 		return
@@ -1148,6 +1246,31 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 
 	var routes []*HTTPRouteState
 	for _, route := range s.httpRoutes {
+		routes = append(routes, route)
+	}
+
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(routes, func(i, j int) bool {
+		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
+			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
+		}
+		if routes[i].Namespace != routes[j].Namespace {
+			return routes[i].Namespace < routes[j].Namespace
+		}
+		return routes[i].Name < routes[j].Name
+	})
+
+	return routes
+}
+
+func (s *State) GetTLSRoutes() []*TLSRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var routes []*TLSRouteState
+	for _, route := range s.tlsRoutes {
 		routes = append(routes, route)
 	}
 

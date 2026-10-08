@@ -183,6 +183,9 @@ func TestConformance(t *testing.T) {
 		tests.ListenerSetProtocolConflict,
 		tests.ListenerSetReferenceGrant,
 		tests.ListenerSetRouteStatusScopedToParentRef,
+		tests.TLSRouteHostnameIntersection,
+		tests.TLSRouteListenerPassthroughSupportedKinds,
+		tests.TLSRouteSimpleSameNamespace,
 	}
 
 	cSuite.Setup(t, selectedTests)

@@ -1,0 +1,311 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package proxy
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+func TestSNIListener_PassthroughAndHTTPSAndFailClosed(t *testing.T) {
+	// 1. Backend TLS server for passthrough route
+	backendCAPEM, backendTLSCert := generateTestCAAndCert(t, []string{"passthrough.example.com"}, nil)
+	backendServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-passthrough-response"))
+	}))
+	backendServer.TLS = &tls.Config{Certificates: []tls.Certificate{backendTLSCert}}
+	backendServer.StartTLS()
+	defer backendServer.Close()
+
+	backendURL, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend server URL: %v", err)
+	}
+	backendHost, backendPortStr, err := net.SplitHostPort(backendURL.Host)
+	if err != nil {
+		t.Fatalf("failed to split backend host port: %v", err)
+	}
+
+	// 2. HTTPS terminating backend for proxy HTTPRoute
+	httpsTermBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("https-terminated-response"))
+	}))
+	defer httpsTermBackend.Close()
+
+	termURL, err := url.Parse(httpsTermBackend.URL)
+	if err != nil {
+		t.Fatalf("failed to parse term backend URL: %v", err)
+	}
+	termHost, termPortStr, _ := net.SplitHostPort(termURL.Host)
+	termPort, _ := strconv.Atoi(termPortStr)
+
+	// 3. Proxy certificates
+	proxyCAPEM, proxyTLSCert := generateTestCAAndCert(t, []string{"https.example.com"}, nil)
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"https.example.com": &proxyTLSCert,
+	}, &proxyTLSCert)
+
+	// 4. Configure listeners on proxy:
+	// - One TLS Passthrough listener for passthrough.example.com
+	// - One HTTPS listener for https.example.com
+	passthroughMode := gatewayv1.TLSModePassthrough
+	httpsRoutes := []state.InternalRoute{
+		{
+			Hostnames: []string{"https.example.com"},
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchPathPrefix,
+								Value: "/",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:   termHost,
+							Port:   int32(termPort),
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p.UpdateConfig(
+		[]state.InternalListener{
+			{
+				Name:        "tls-passthrough",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        443,
+				Hostname:    "passthrough.example.com",
+				TLSMode:     &passthroughMode,
+				TLSBackends: map[string][]string{"passthrough.example.com": {net.JoinHostPort(backendHost, backendPortStr)}},
+			},
+			{
+				Name:     "https-terminating",
+				Protocol: gatewayv1.HTTPSProtocolType,
+				Port:     443,
+				Hostname: "https.example.com",
+				Routes:   httpsRoutes,
+			},
+		},
+		httpsRoutes,
+	)
+
+	// 5. Start raw TCP listener with SNI front
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	tlsConfig := &tls.Config{
+		GetCertificate: p.GetCertificate,
+	}
+	httpsSrv := &http.Server{
+		Handler:   p,
+		TLSConfig: tlsConfig,
+	}
+	tlsLis := tls.NewListener(sniLis, tlsConfig)
+	go func() {
+		_ = httpsSrv.Serve(tlsLis)
+	}()
+	defer httpsSrv.Close()
+
+	addr := rawLis.Addr().String()
+
+	// 6. Test Passthrough Route
+	t.Run("Passthrough route presents backend cert unterminated", func(t *testing.T) {
+		backendCertPool := x509.NewCertPool()
+		backendCertPool.AppendCertsFromPEM(backendCAPEM)
+
+		conn, err := tls.Dial("tcp", addr, &tls.Config{
+			ServerName: "passthrough.example.com",
+			RootCAs:    backendCertPool,
+		})
+		if err != nil {
+			t.Fatalf("failed to connect to passthrough SNI: %v", err)
+		}
+		defer conn.Close()
+
+		// Verify backend's certificate was presented
+		state := conn.ConnectionState()
+		if len(state.PeerCertificates) == 0 {
+			t.Fatal("expected peer certificates from backend")
+		}
+		leaf := state.PeerCertificates[0]
+		foundDNS := false
+		for _, dns := range leaf.DNSNames {
+			if dns == "passthrough.example.com" {
+				foundDNS = true
+				break
+			}
+		}
+		if !foundDNS {
+			t.Errorf("expected peer cert to have DNS passthrough.example.com, got %v", leaf.DNSNames)
+		}
+
+		// Make HTTP request over the connection
+		req := "GET / HTTP/1.1\r\nHost: passthrough.example.com\r\nConnection: close\r\n\r\n"
+		if _, err := conn.Write([]byte(req)); err != nil {
+			t.Fatalf("failed to write HTTP request: %v", err)
+		}
+		respBytes, err := io.ReadAll(conn)
+		if err != nil {
+			t.Fatalf("failed to read HTTP response: %v", err)
+		}
+		if !strings.Contains(string(respBytes), "backend-passthrough-response") {
+			t.Errorf("expected response from passthrough backend, got %q", string(respBytes))
+		}
+	})
+
+	// 7. Test HTTPS Terminating Route
+	t.Run("HTTPS route terminates and serves with proxy cert", func(t *testing.T) {
+		proxyCertPool := x509.NewCertPool()
+		proxyCertPool.AppendCertsFromPEM(proxyCAPEM)
+
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					ServerName: "https.example.com",
+					RootCAs:    proxyCertPool,
+				},
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					var d net.Dialer
+					return d.DialContext(ctx, "tcp", addr)
+				},
+			},
+			Timeout: 2 * time.Second,
+		}
+
+		resp, err := client.Get("https://https.example.com/")
+		if err != nil {
+			t.Fatalf("failed to GET from HTTPS listener: %v", err)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if string(body) != "https-terminated-response" {
+			t.Errorf("expected response %q, got %q", "https-terminated-response", string(body))
+		}
+	})
+
+	// 8. Test Non-matching SNI is closed without response (Fail closed)
+	t.Run("Non-matching SNI is closed without response", func(t *testing.T) {
+		dialer := &net.Dialer{Timeout: 2 * time.Second}
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			ServerName:         "unknown.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err == nil {
+			conn.Close()
+			t.Fatal("expected connection rejection for unknown SNI, but connection succeeded")
+		}
+	})
+}
+
+func TestSNIListener_ShutdownMidHandshakeRace(t *testing.T) {
+	_, proxyTLSCert := generateTestCAAndCert(t, []string{"https.example.com"}, nil)
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"https.example.com": &proxyTLSCert,
+	}, &proxyTLSCert)
+
+	p.UpdateConfig(
+		[]state.InternalListener{
+			{
+				Name:     "https",
+				Protocol: gatewayv1.HTTPSProtocolType,
+				Port:     443,
+				Hostname: "https.example.com",
+			},
+		},
+		nil,
+	)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	sniLis := p.NewSNIListener(rawLis)
+	addr := rawLis.Addr().String()
+
+	var wg sync.WaitGroup
+
+	// Background worker accepting connections from sniLis
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := sniLis.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	// Spawn multiple clients that initiate TLS handshakes concurrently
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dialer := &net.Dialer{Timeout: 1 * time.Second}
+			conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+				ServerName:         "https.example.com",
+				InsecureSkipVerify: true,
+			})
+			if err == nil {
+				_ = conn.Close()
+			}
+		}()
+	}
+
+	// Close the listener while handshakes are mid-flight
+	time.Sleep(2 * time.Millisecond)
+	_ = sniLis.Close()
+
+	wg.Wait()
+	<-acceptDone
+}
