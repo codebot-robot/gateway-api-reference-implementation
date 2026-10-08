@@ -17,32 +17,36 @@ package singlepod
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // ssaNoOpInterceptor adjusts controller-runtime's fake client for Server-Side Apply:
-// 1. It models Kubernetes SSA no-op behavior: when an apply configuration produces no changes on an existing object, no write is issued and resourceVersion is not incremented.
-// 2. It models controller ownerReference replacement: when applying a controller ownerReference for a Gateway with a new UID, any stale controller ownerReference for that same Gateway is replaced rather than kept as a duplicate.
+// It models Kubernetes SSA no-op behavior: when an apply configuration produces no changes on an existing object, no write is issued and resourceVersion is not incremented.
 func ssaNoOpInterceptor() interceptor.Funcs {
 	return interceptor.Funcs{
 		Apply: func(ctx context.Context, cl client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
@@ -54,9 +58,8 @@ func ssaNoOpInterceptor() interceptor.Funcs {
 				APIVersion string `json:"apiVersion"`
 				Kind       string `json:"kind"`
 				Metadata   struct {
-					Name            string           `json:"name"`
-					Namespace       string           `json:"namespace"`
-					OwnerReferences []map[string]any `json:"ownerReferences"`
+					Name      string `json:"name"`
+					Namespace string `json:"namespace"`
 				} `json:"metadata"`
 			}
 			if err := json.Unmarshal(data, &tm); err != nil {
@@ -69,35 +72,6 @@ func ssaNoOpInterceptor() interceptor.Funcs {
 			key := types.NamespacedName{Namespace: tm.Metadata.Namespace, Name: tm.Metadata.Name}
 			if err := cl.Get(ctx, key, u); err != nil {
 				return cl.Apply(ctx, obj, opts...)
-			}
-
-			// In Kubernetes, an object can have at most one controller ownerReference.
-			// When applying a controller ownerReference for a Gateway with a new UID,
-			// prune any stale controller ownerReference for the same Gateway from the fake client tracker.
-			for _, newRef := range tm.Metadata.OwnerReferences {
-				if ctrl, ok := newRef["controller"].(bool); ok && ctrl {
-					gwName, _ := newRef["name"].(string)
-					gwUID, _ := newRef["uid"].(string)
-					gwKind, _ := newRef["kind"].(string)
-					if gwKind == "Gateway" && gwName != "" {
-						existingRefs := u.GetOwnerReferences()
-						var updatedRefs []metav1.OwnerReference
-						staleFound := false
-						for _, ref := range existingRefs {
-							if ref.Kind == "Gateway" && ref.Name == gwName && ref.Controller != nil && *ref.Controller && string(ref.UID) != gwUID {
-								staleFound = true
-								continue
-							}
-							updatedRefs = append(updatedRefs, ref)
-						}
-						if staleFound {
-							u.SetOwnerReferences(updatedRefs)
-							if err := cl.Update(ctx, u); err != nil {
-								return err
-							}
-						}
-					}
-				}
 			}
 
 			probeClient := fake.NewClientBuilder().
@@ -332,25 +306,11 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Errorf("expected updated pod template labels to include updated-label")
 	}
 
-	// 4. Delete Gateway -> cleans up Service, Deployment, ServiceAccount, and removes CRB subject
+	// 4. Delete Gateway -> cleans up ClusterRoleBinding subject
+	// (Namespaced resources have controller ownerReferences verified in step 1 and are deleted by k8s garbage collector)
 	gwKey := types.NamespacedName{Namespace: "my-ns", Name: "my-gw"}
 	if err := p.OnGatewayDeleted(ctx, gwKey); err != nil {
 		t.Fatalf("OnGatewayDeleted failed: %v", err)
-	}
-	var deletedSvc corev1.Service
-	err = client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &deletedSvc)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected Service to be deleted, got err: %v", err)
-	}
-	var deletedDeploy appsv1.Deployment
-	err = client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &deletedDeploy)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected Deployment to be deleted, got err: %v", err)
-	}
-	var deletedSA corev1.ServiceAccount
-	err = client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &deletedSA)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("expected ServiceAccount to be deleted, got err: %v", err)
 	}
 	_ = client.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb)
 	if len(crb.Subjects) != 0 {
@@ -384,11 +344,11 @@ func TestSinglePodAddressProvider_ClusterRoleBindingSubjects(t *testing.T) {
 	ctx := t.Context()
 
 	gw1 := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: "gw-1", Namespace: "ns-1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-1", Namespace: "ns-1", UID: types.UID("gw-1-uid")},
 		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}}},
 	}
 	gw2 := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: "gw-2", Namespace: "ns-2"},
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-2", Namespace: "ns-2", UID: types.UID("gw-2-uid")},
 		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType}}},
 	}
 
@@ -429,25 +389,6 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
-	// Existing service not created by GARI
-	foreignSvc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ResourceNameForGateway("conflict-gw"),
-			Namespace: "default",
-		},
-	}
-	sharedCRB := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: DataplaneClusterRoleBindingName,
-		},
-	}
-
-	client := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(foreignSvc, sharedCRB).
-		Build()
-
-	ctx := t.Context()
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "conflict-gw",
@@ -460,13 +401,137 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 			},
 		},
 	}
+	resName := ResourceNameForGateway("conflict-gw")
 
-	p := NewAddressProvider(client)
+	trueVal := true
+	diffOwnerRef := metav1.OwnerReference{
+		APIVersion: gatewayv1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       "conflict-gw",
+		UID:        types.UID("other-uid-11111"),
+		Controller: &trueVal,
+	}
 
-	// GatewayAddresses should fail with conflict error and not overwrite the foreign service
-	_, _, err := p.GatewayAddresses(ctx, gw, nil)
-	if err == nil || !strings.Contains(err.Error(), "conflict") {
-		t.Fatalf("expected conflict error, got: %v", err)
+	tests := []struct {
+		name   string
+		object client.Object
+	}{
+		{
+			name: "foreign service with no labels and no ownerRef",
+			object: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+				},
+			},
+		},
+		{
+			name: "service with managed labels but no ownerRef",
+			object: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelGatewayName: "conflict-gw",
+						LabelManagedBy:   ManagedByValue,
+					},
+				},
+			},
+		},
+		{
+			name: "service with managed labels and ownerRef with different UID",
+			object: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelGatewayName: "conflict-gw",
+						LabelManagedBy:   ManagedByValue,
+					},
+					OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
+				},
+			},
+		},
+		{
+			name: "deployment with managed labels but no ownerRef",
+			object: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelGatewayName: "conflict-gw",
+						LabelManagedBy:   ManagedByValue,
+					},
+				},
+			},
+		},
+		{
+			name: "deployment with managed labels and ownerRef with different UID",
+			object: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelGatewayName: "conflict-gw",
+						LabelManagedBy:   ManagedByValue,
+					},
+					OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
+				},
+			},
+		},
+		{
+			name: "serviceaccount with managed labels but no ownerRef",
+			object: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelGatewayName: "conflict-gw",
+						LabelManagedBy:   ManagedByValue,
+					},
+				},
+			},
+		},
+		{
+			name: "serviceaccount with managed labels and ownerRef with different UID",
+			object: &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resName,
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelGatewayName: "conflict-gw",
+						LabelManagedBy:   ManagedByValue,
+					},
+					OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sharedCRB := &rbacv1.ClusterRoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: DataplaneClusterRoleBindingName,
+				},
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tc.object, sharedCRB).
+				Build()
+
+			p := NewAddressProvider(cl)
+			ctx := t.Context()
+
+			_, _, err := p.GatewayAddresses(ctx, gw, nil)
+			if err == nil {
+				t.Fatalf("expected ownership conflict error, got nil")
+			}
+			var conflictErr *controller.OwnershipConflictError
+			if !errors.As(err, &conflictErr) {
+				t.Fatalf("expected OwnershipConflictError, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -481,9 +546,8 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 			Name:      orphanName,
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				LabelGatewayNamespace: "test-ns",
-				LabelGatewayName:      "deleted-gw",
-				LabelManagedBy:        ManagedByValue,
+				LabelGatewayName: "deleted-gw",
+				LabelManagedBy:   ManagedByValue,
 			},
 		},
 	}
@@ -492,9 +556,8 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 			Name:      orphanName,
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				LabelGatewayNamespace: "test-ns",
-				LabelGatewayName:      "deleted-gw",
-				LabelManagedBy:        ManagedByValue,
+				LabelGatewayName: "deleted-gw",
+				LabelManagedBy:   ManagedByValue,
 			},
 		},
 	}
@@ -503,9 +566,8 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 			Name:      orphanName,
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				LabelGatewayNamespace: "test-ns",
-				LabelGatewayName:      "deleted-gw",
-				LabelManagedBy:        ManagedByValue,
+				LabelGatewayName: "deleted-gw",
+				LabelManagedBy:   ManagedByValue,
 			},
 		},
 	}
@@ -531,6 +593,7 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "active-gw",
 			Namespace: "test-ns",
+			UID:       types.UID("active-gw-uid"),
 		},
 	}
 	activeName := ResourceNameForGateway("active-gw")
@@ -539,9 +602,8 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 			Name:      activeName,
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				LabelGatewayNamespace: "test-ns",
-				LabelGatewayName:      "active-gw",
-				LabelManagedBy:        ManagedByValue,
+				LabelGatewayName: "active-gw",
+				LabelManagedBy:   ManagedByValue,
 			},
 		},
 	}
@@ -550,9 +612,8 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 			Name:      activeName,
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				LabelGatewayNamespace: "test-ns",
-				LabelGatewayName:      "active-gw",
-				LabelManagedBy:        ManagedByValue,
+				LabelGatewayName: "active-gw",
+				LabelManagedBy:   ManagedByValue,
 			},
 		},
 	}
@@ -569,19 +630,7 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 		t.Fatalf("SweepOrphans failed: %v", err)
 	}
 
-	// Orphan resources should be deleted
-	var checkSvc corev1.Service
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkSvc); !apierrors.IsNotFound(err) {
-		t.Errorf("expected orphan Service to be deleted, got err: %v", err)
-	}
-	var checkDeploy appsv1.Deployment
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkDeploy); !apierrors.IsNotFound(err) {
-		t.Errorf("expected orphan Deployment to be deleted, got err: %v", err)
-	}
-	var checkSA corev1.ServiceAccount
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkSA); !apierrors.IsNotFound(err) {
-		t.Errorf("expected orphan ServiceAccount to be deleted, got err: %v", err)
-	}
+	// CRB stale subject must be pruned; active subject must remain
 	var checkCRB rbacv1.ClusterRoleBinding
 	if err := client.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &checkCRB); err != nil {
 		t.Fatalf("failed to get CRB: %v", err)
@@ -590,7 +639,21 @@ func TestSinglePodAddressProvider_SweepOrphans(t *testing.T) {
 		t.Errorf("expected only active-gw in CRB subjects, got %+v", checkCRB.Subjects)
 	}
 
-	// Active gateway resources should remain
+	// Namespaced objects are not listed or deleted by SweepOrphans (delegated to GC)
+	var checkSvc corev1.Service
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkSvc); err != nil {
+		t.Errorf("expected orphan Service to remain untouched by SweepOrphans, got err: %v", err)
+	}
+	var checkDeploy appsv1.Deployment
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkDeploy); err != nil {
+		t.Errorf("expected orphan Deployment to remain untouched by SweepOrphans, got err: %v", err)
+	}
+	var checkSA corev1.ServiceAccount
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: orphanName}, &checkSA); err != nil {
+		t.Errorf("expected orphan ServiceAccount to remain untouched by SweepOrphans, got err: %v", err)
+	}
+
+	// Active gateway resources should also remain
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: activeName}, &checkSvc); err != nil {
 		t.Errorf("expected active Service to remain, got err: %v", err)
 	}
@@ -606,6 +669,7 @@ func TestSinglePodAddressProvider_SweepOrphans_APIReaderServiceAccount(t *testin
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "active-gw",
 			Namespace: "test-ns",
+			UID:       types.UID("active-gw-uid"),
 		},
 	}
 	activeSA := &corev1.ServiceAccount{
@@ -613,9 +677,8 @@ func TestSinglePodAddressProvider_SweepOrphans_APIReaderServiceAccount(t *testin
 			Name:      activeName,
 			Namespace: "test-ns",
 			Labels: map[string]string{
-				LabelGatewayNamespace: "test-ns",
-				LabelGatewayName:      "active-gw",
-				LabelManagedBy:        ManagedByValue,
+				LabelGatewayName: "active-gw",
+				LabelManagedBy:   ManagedByValue,
 			},
 		},
 	}
@@ -666,58 +729,151 @@ func TestSinglePodAddressProvider_Watches(t *testing.T) {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = gatewayv1.AddToScheme(scheme)
 
-	p := NewAddressProvider(nil)
-	_ = p
+	gwGV := schema.GroupVersion{Group: gatewayv1.GroupName, Version: "v1"}
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{gwGV})
+	mapper.Add(gwGV.WithKind("Gateway"), meta.RESTScopeNamespace)
+	pred := managedByPredicate()
+	ownerHandler := handler.EnqueueRequestForOwner(scheme, mapper, &gatewayv1.Gateway{}, handler.OnlyControllerOwner())
 
-	// Managed service
-	managedSvc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ResourceNameForGateway("gw-1"),
-			Namespace: "custom-ns",
-			Labels: map[string]string{
-				LabelGatewayNamespace: "custom-ns",
-				LabelGatewayName:      "gw-1",
-				LabelManagedBy:        ManagedByValue,
-			},
-		},
+	trueVal := true
+	falseVal := false
+	ownerRef := metav1.OwnerReference{
+		APIVersion: gatewayv1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       "gw-1",
+		UID:        types.UID("gw-uid-1"),
+		Controller: &trueVal,
 	}
-	// Non-managed service
-	unmanagedSvc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "other-service",
-			Namespace: "custom-ns",
-		},
-	}
-
-	mapFunc := func(ctx context.Context, obj client.Object) []ctrl.Request {
-		labels := obj.GetLabels()
-		if labels == nil || labels[LabelManagedBy] != ManagedByValue {
-			return nil
-		}
-		gwName := labels[LabelGatewayName]
-		gwNs := labels[LabelGatewayNamespace]
-		if gwName == "" || gwNs == "" {
-			return nil
-		}
-		return []ctrl.Request{
-			{
-				NamespacedName: types.NamespacedName{
-					Namespace: gwNs,
-					Name:      gwName,
-				},
-			},
-		}
+	nonControllerOwnerRef := metav1.OwnerReference{
+		APIVersion: gatewayv1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       "gw-1",
+		UID:        types.UID("gw-uid-1"),
+		Controller: &falseVal,
 	}
 
 	ctx := t.Context()
-	reqs := mapFunc(ctx, managedSvc)
-	if len(reqs) != 1 || reqs[0].NamespacedName != (types.NamespacedName{Namespace: "custom-ns", Name: "gw-1"}) {
-		t.Errorf("expected 1 request for custom-ns/gw-1, got %+v", reqs)
+	processCreate := func(obj client.Object) []reconcile.Request {
+		evt := event.CreateEvent{Object: obj}
+		if !pred.Create(evt) {
+			return nil
+		}
+		q := workqueue.NewTypedRateLimitingQueue[reconcile.Request](workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request]())
+		defer q.ShutDown()
+		ownerHandler.Create(ctx, evt, q)
+		var reqs []reconcile.Request
+		for q.Len() > 0 {
+			item, _ := q.Get()
+			reqs = append(reqs, item)
+			q.Done(item)
+		}
+		return reqs
 	}
 
-	reqsOther := mapFunc(ctx, unmanagedSvc)
-	if len(reqsOther) != 0 {
-		t.Errorf("expected 0 requests for unmanaged service, got %+v", reqsOther)
+	processUpdate := func(oldObj, newObj client.Object) []reconcile.Request {
+		evt := event.UpdateEvent{ObjectOld: oldObj, ObjectNew: newObj}
+		if !pred.Update(evt) {
+			return nil
+		}
+		q := workqueue.NewTypedRateLimitingQueue[reconcile.Request](workqueue.DefaultTypedItemBasedRateLimiter[reconcile.Request]())
+		defer q.ShutDown()
+		ownerHandler.Update(ctx, evt, q)
+		var reqs []reconcile.Request
+		for q.Len() > 0 {
+			item, _ := q.Get()
+			reqs = append(reqs, item)
+			q.Done(item)
+		}
+		return reqs
+	}
+
+	// 1. Service with managed label and controller ownerReference -> enqueues owning Gateway
+	ownedSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            ResourceNameForGateway("gw-1"),
+			Namespace:       "custom-ns",
+			Labels:          map[string]string{LabelManagedBy: ManagedByValue},
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+	}
+	reqs := processCreate(ownedSvc)
+	if len(reqs) != 1 || reqs[0].NamespacedName != (types.NamespacedName{Namespace: "custom-ns", Name: "gw-1"}) {
+		t.Errorf("expected 1 request for custom-ns/gw-1 from owned Service, got %+v", reqs)
+	}
+
+	// 2. Deployment with managed label and controller ownerReference -> enqueues owning Gateway
+	ownedDeploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            ResourceNameForGateway("gw-1"),
+			Namespace:       "custom-ns",
+			Labels:          map[string]string{LabelManagedBy: ManagedByValue},
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+	}
+	reqs = processCreate(ownedDeploy)
+	if len(reqs) != 1 || reqs[0].NamespacedName != (types.NamespacedName{Namespace: "custom-ns", Name: "gw-1"}) {
+		t.Errorf("expected 1 request for custom-ns/gw-1 from owned Deployment, got %+v", reqs)
+	}
+
+	// 3. Non-owned Service with managed labels (no ownerRef) -> does not enqueue
+	nonOwnedSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ResourceNameForGateway("gw-1"),
+			Namespace: "custom-ns",
+			Labels:    map[string]string{LabelManagedBy: ManagedByValue, LabelGatewayName: "gw-1"},
+		},
+	}
+	reqs = processCreate(nonOwnedSvc)
+	if len(reqs) != 0 {
+		t.Errorf("expected 0 requests for non-owned Service with managed labels, got %+v", reqs)
+	}
+
+	// 4. Non-owned Deployment with managed labels (no ownerRef) -> does not enqueue
+	nonOwnedDeploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ResourceNameForGateway("gw-1"),
+			Namespace: "custom-ns",
+			Labels:    map[string]string{LabelManagedBy: ManagedByValue, LabelGatewayName: "gw-1"},
+		},
+	}
+	reqs = processCreate(nonOwnedDeploy)
+	if len(reqs) != 0 {
+		t.Errorf("expected 0 requests for non-owned Deployment with managed labels, got %+v", reqs)
+	}
+
+	// 5. Service with managed labels and non-controller ownerRef -> does not enqueue
+	nonCtrlSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            ResourceNameForGateway("gw-1"),
+			Namespace:       "custom-ns",
+			Labels:          map[string]string{LabelManagedBy: ManagedByValue},
+			OwnerReferences: []metav1.OwnerReference{nonControllerOwnerRef},
+		},
+	}
+	reqs = processCreate(nonCtrlSvc)
+	if len(reqs) != 0 {
+		t.Errorf("expected 0 requests for Service with non-controller ownerRef, got %+v", reqs)
+	}
+
+	// 6. Unmanaged Service (without managed-by label) -> predicate filters out
+	unmanagedSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "unmanaged",
+			Namespace:       "custom-ns",
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+	}
+	reqs = processCreate(unmanagedSvc)
+	if len(reqs) != 0 {
+		t.Errorf("expected 0 requests for unmanaged Service, got %+v", reqs)
+	}
+
+	// 7. Update event on owned Service -> enqueues owning Gateway
+	updatedSvc := ownedSvc.DeepCopy()
+	updatedSvc.Annotations = map[string]string{"foo": "bar"}
+	reqs = processUpdate(ownedSvc, updatedSvc)
+	if len(reqs) != 1 || reqs[0].NamespacedName != (types.NamespacedName{Namespace: "custom-ns", Name: "gw-1"}) {
+		t.Errorf("expected 1 request for custom-ns/gw-1 from updated owned Service, got %+v", reqs)
 	}
 }
 
@@ -1090,8 +1246,8 @@ func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLa
 		if h.labels[LabelGatewayName] != "test-gw" {
 			t.Errorf("%s: LabelGatewayName was overridden: got %q, want %q", h.name, h.labels[LabelGatewayName], "test-gw")
 		}
-		if h.labels[LabelGatewayNamespace] != "test-ns" {
-			t.Errorf("%s: LabelGatewayNamespace was overridden: got %q, want %q", h.name, h.labels[LabelGatewayNamespace], "test-ns")
+		if _, ok := h.labels["gateway.networking.k8s.io/gateway-namespace"]; ok {
+			t.Errorf("%s: contains dropped gateway.networking.k8s.io/gateway-namespace label: got %q", h.name, h.labels["gateway.networking.k8s.io/gateway-namespace"])
 		}
 		if h.labels[LabelManagedBy] != ManagedByValue {
 			t.Errorf("%s: LabelManagedBy was overridden: got %q, want %q", h.name, h.labels[LabelManagedBy], ManagedByValue)
@@ -1274,102 +1430,6 @@ func TestSinglePodAddressProvider_PreservesForeignLabelsAndAnnotations(t *testin
 	}
 	if _, ok := svc.Annotations["remove-anno"]; ok {
 		t.Errorf("Service still has removed annotation: got %+v", svc.Annotations)
-	}
-}
-
-func TestSinglePodAddressProvider_StaleControllerOwnerRefUIDUpdated(t *testing.T) {
-	c := setupTestClient(t)
-	ctx := t.Context()
-	p := NewAddressProvider(c)
-
-	initialGW := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-gw",
-			Namespace: "test-ns",
-			UID:       types.UID("gw-uid-original"),
-		},
-		Spec: gatewayv1.GatewaySpec{
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-	}
-
-	_, _, err := p.GatewayAddresses(ctx, initialGW, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on initial reconcile: %v", err)
-	}
-
-	resName := ResourceNameForGateway("test-gw")
-
-	// Simulate objects retaining stale UID (e.g. Gateway was deleted and recreated with a new UID)
-	staleUID := types.UID("stale-uid-12345")
-	var sa corev1.ServiceAccount
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
-		t.Fatalf("failed to get ServiceAccount: %v", err)
-	}
-	sa.OwnerReferences[0].UID = staleUID
-	if err := c.Update(ctx, &sa); err != nil {
-		t.Fatalf("failed to set stale UID on ServiceAccount: %v", err)
-	}
-
-	var deploy appsv1.Deployment
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
-		t.Fatalf("failed to get Deployment: %v", err)
-	}
-	deploy.OwnerReferences[0].UID = staleUID
-	if err := c.Update(ctx, &deploy); err != nil {
-		t.Fatalf("failed to set stale UID on Deployment: %v", err)
-	}
-
-	var svc corev1.Service
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
-		t.Fatalf("failed to get Service: %v", err)
-	}
-	svc.OwnerReferences[0].UID = staleUID
-	if err := c.Update(ctx, &svc); err != nil {
-		t.Fatalf("failed to set stale UID on Service: %v", err)
-	}
-
-	// Reconcile with new Gateway having new UID
-	newGW := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-gw",
-			Namespace: "test-ns",
-			UID:       types.UID("gw-uid-new"),
-		},
-		Spec: gatewayv1.GatewaySpec{
-			Listeners: []gatewayv1.Listener{
-				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
-			},
-		},
-	}
-
-	_, _, err = p.GatewayAddresses(ctx, newGW, nil)
-	if err != nil {
-		t.Fatalf("unexpected error on reconcile with new Gateway UID: %v", err)
-	}
-
-	// Verify all three objects have their controller ownerRef updated to newGW.UID
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
-		t.Fatalf("failed to get ServiceAccount: %v", err)
-	}
-	if len(sa.OwnerReferences) == 0 || sa.OwnerReferences[0].UID != "gw-uid-new" {
-		t.Errorf("ServiceAccount ownerRef UID not updated: got %+v, want gw-uid-new", sa.OwnerReferences)
-	}
-
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
-		t.Fatalf("failed to get Deployment: %v", err)
-	}
-	if len(deploy.OwnerReferences) == 0 || deploy.OwnerReferences[0].UID != "gw-uid-new" {
-		t.Errorf("Deployment ownerRef UID not updated: got %+v, want gw-uid-new", deploy.OwnerReferences)
-	}
-
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
-		t.Fatalf("failed to get Service: %v", err)
-	}
-	if len(svc.OwnerReferences) == 0 || svc.OwnerReferences[0].UID != "gw-uid-new" {
-		t.Errorf("Service ownerRef UID not updated: got %+v, want gw-uid-new", svc.OwnerReferences)
 	}
 }
 
