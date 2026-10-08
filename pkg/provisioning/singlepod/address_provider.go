@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -33,6 +32,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -45,6 +47,9 @@ import (
 const (
 	// DefaultDataplaneImage is the default container image for per-Gateway data-plane deployments.
 	DefaultDataplaneImage = "gari-controller:latest"
+
+	// FieldManager is the field manager name used for server-side apply of per-Gateway resources.
+	FieldManager = "gari-provisioner"
 
 	// LabelGatewayName is the label identifying the Gateway name on provisioned resources.
 	LabelGatewayName = "gateway.networking.k8s.io/gateway-name"
@@ -63,12 +68,6 @@ const (
 
 	// AppNameValue is the value for LabelAppName on data-plane components.
 	AppNameValue = "gari-dataplane"
-
-	// AnnotationTemplateHash is the annotation recording the SHA256 hash of the desired pod template spec.
-	AnnotationTemplateHash = "gari.networking.k8s.io/template-hash"
-
-	// AnnotationManagedKeys is the annotation recording previously applied infrastructure label and annotation keys.
-	AnnotationManagedKeys = "gari.networking.k8s.io/managed-keys"
 
 	// DataplaneClusterRoleName is the name of the ClusterRole for per-Gateway data-plane instances.
 	DataplaneClusterRoleName = "gari-dataplane"
@@ -148,11 +147,9 @@ func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
 	return false
 }
 
-func buildLabelsAndAnnotations(gw *gatewayv1.Gateway, name string) (map[string]string, map[string]string, []string, []string) {
+func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[string]string) {
 	labels := make(map[string]string)
 	var annotations map[string]string
-	var infraLabelKeys []string
-	var infraAnnoKeys []string
 
 	if gw.Spec.Infrastructure != nil {
 		if gw.Spec.Infrastructure.Labels != nil {
@@ -164,18 +161,14 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway, name string) (map[string]s
 					continue
 				}
 				labels[keyStr] = string(v)
-				infraLabelKeys = append(infraLabelKeys, keyStr)
 			}
-			sort.Strings(infraLabelKeys)
 		}
 		if gw.Spec.Infrastructure.Annotations != nil {
 			annotations = make(map[string]string)
 			for k, v := range gw.Spec.Infrastructure.Annotations {
 				keyStr := string(k)
 				annotations[keyStr] = string(v)
-				infraAnnoKeys = append(infraAnnoKeys, keyStr)
 			}
-			sort.Strings(infraAnnoKeys)
 		}
 	}
 
@@ -185,13 +178,7 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway, name string) (map[string]s
 	labels[LabelManagedBy] = ManagedByValue
 	labels[LabelAppName] = AppNameValue
 
-	return labels, annotations, infraLabelKeys, infraAnnoKeys
-}
-
-func computeTemplateHash(template *corev1.PodTemplateSpec) string {
-	b, _ := json.Marshal(template)
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:8])
+	return labels, annotations
 }
 
 // ensureClusterRoleBindingSubject ensures that the given ServiceAccount is listed as a subject in the shared gari-dataplane ClusterRoleBinding.
@@ -295,99 +282,37 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	name := ResourceNameForGateway(gw.Name)
 	gwNamespace := gw.Namespace
 
-	labels, annotations, infraLabelKeys, infraAnnoKeys := buildLabelsAndAnnotations(gw, name)
-	managedKeysJSON := encodeManagedKeys(infraLabelKeys, infraAnnoKeys)
+	labels, annotations := buildLabelsAndAnnotations(gw)
 
-	ownerRef := metav1.OwnerReference{
-		APIVersion: gatewayv1.GroupVersion.String(),
-		Kind:       "Gateway",
-		Name:       gw.Name,
-		UID:        gw.UID,
-		Controller: state.Ptr(true),
-	}
+	ownerRef := metav1ac.OwnerReference().
+		WithAPIVersion(gatewayv1.GroupVersion.String()).
+		WithKind("Gateway").
+		WithName(gw.Name).
+		WithUID(gw.UID).
+		WithController(true).
+		WithBlockOwnerDeletion(true)
 
 	// 1. Reconcile per-Gateway ServiceAccount in Gateway namespace
-	desiredSAAnnotations := make(map[string]string, len(annotations)+1)
-	for k, v := range annotations {
-		desiredSAAnnotations[k] = v
-	}
-	desiredSAAnnotations[AnnotationManagedKeys] = managedKeysJSON
-
-	desiredSA := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       gwNamespace,
-			Labels:          labels,
-			Annotations:     desiredSAAnnotations,
-			OwnerReferences: []metav1.OwnerReference{ownerRef},
-		},
-	}
 	var existingSA corev1.ServiceAccount
 	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			if createErr := p.client.Create(ctx, desiredSA); createErr != nil {
-				return nil, false, fmt.Errorf("failed to create ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, createErr)
-			}
-		} else {
-			return nil, false, err
-		}
-	} else {
+	if err == nil {
 		if !isOwnedByGateway(&existingSA, gw) {
 			return nil, false, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
-		var prevManaged managedKeysRecord
-		if existingSA.Annotations != nil {
-			prevManaged = decodeManagedKeys(existingSA.Annotations[AnnotationManagedKeys])
-		}
-		needsSAUpdate := false
-		if existingSA.Labels == nil {
-			existingSA.Labels = make(map[string]string)
-		}
-		if reconcileLabels(existingSA.Labels, labels, prevManaged.Labels) {
-			needsSAUpdate = true
-		}
-		if existingSA.Annotations == nil {
-			existingSA.Annotations = make(map[string]string)
-		}
-		if reconcileAnnotations(existingSA.Annotations, desiredSAAnnotations, prevManaged.Annotations) {
-			needsSAUpdate = true
-		}
-		if needsOwnerReferenceUpdate(&existingSA, gw) {
-			updateControllerOwnerReference(&existingSA, gw, ownerRef)
-			needsSAUpdate = true
-		}
-		if needsSAUpdate {
-			if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				var latestSA corev1.ServiceAccount
-				if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &latestSA); err != nil {
-					return err
-				}
-				if !isOwnedByGateway(&latestSA, gw) {
-					return &controller.OwnershipConflictError{
-						Message: fmt.Sprintf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-					}
-				}
-				var latestPrev managedKeysRecord
-				if latestSA.Annotations != nil {
-					latestPrev = decodeManagedKeys(latestSA.Annotations[AnnotationManagedKeys])
-				}
-				if latestSA.Labels == nil {
-					latestSA.Labels = make(map[string]string)
-				}
-				reconcileLabels(latestSA.Labels, labels, latestPrev.Labels)
-				if latestSA.Annotations == nil {
-					latestSA.Annotations = make(map[string]string)
-				}
-				reconcileAnnotations(latestSA.Annotations, desiredSAAnnotations, latestPrev.Annotations)
-				updateControllerOwnerReference(&latestSA, gw, ownerRef)
-				return p.client.Update(ctx, &latestSA)
-			}); updateErr != nil {
-				return nil, false, fmt.Errorf("failed to update ServiceAccount %s/%s: %w", existingSA.Namespace, existingSA.Name, updateErr)
-			}
-		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
+	}
+
+	saApply := corev1ac.ServiceAccount(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels)
+	if len(annotations) > 0 {
+		saApply.WithAnnotations(annotations)
+	}
+	if err := p.client.Apply(ctx, saApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return nil, false, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 2. Ensure ServiceAccount is in shared gari-dataplane ClusterRoleBinding
@@ -396,6 +321,18 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	// 3. Reconcile per-Gateway Deployment in Gateway namespace
+	var existingDeploy appsv1.Deployment
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy)
+	if err == nil {
+		if !isOwnedByGateway(&existingDeploy, gw) {
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
+	}
+
 	args := []string{
 		"--dataplane-mode",
 		fmt.Sprintf("--gateway-namespace=%s", gw.Namespace),
@@ -417,153 +354,76 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		image = DefaultDataplaneImage
 	}
 
-	podTemplate := corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels:      labels,
-			Annotations: annotations,
-		},
-		Spec: corev1.PodSpec{
-			ServiceAccountName: name,
-			Containers: []corev1.Container{
-				{
-					Name:            "dataplane",
-					Image:           image,
-					ImagePullPolicy: corev1.PullIfNotPresent,
-					Args:            args,
-					Ports: []corev1.ContainerPort{
-						{
-							Name:          "http",
-							ContainerPort: 8000,
-							Protocol:      corev1.ProtocolTCP,
-						},
-						{
-							Name:          "https",
-							ContainerPort: 8443,
-							Protocol:      corev1.ProtocolTCP,
-						},
-						{
-							Name:          "http3",
-							ContainerPort: 8443,
-							Protocol:      corev1.ProtocolUDP,
-						},
-					},
-					ReadinessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{
-								Path: "/readyz",
-								Port: intstr.FromInt32(8081),
-							},
-						},
-						InitialDelaySeconds: 1,
-						PeriodSeconds:       2,
-					},
-				},
-			},
-		},
+	podTemplate := corev1ac.PodTemplateSpec().
+		WithLabels(labels).
+		WithSpec(corev1ac.PodSpec().
+			WithServiceAccountName(name).
+			WithContainers(corev1ac.Container().
+				WithName("dataplane").
+				WithImage(image).
+				WithImagePullPolicy(corev1.PullIfNotPresent).
+				WithArgs(args...).
+				WithPorts(
+					corev1ac.ContainerPort().
+						WithName("http").
+						WithContainerPort(8000).
+						WithProtocol(corev1.ProtocolTCP),
+					corev1ac.ContainerPort().
+						WithName("https").
+						WithContainerPort(8443).
+						WithProtocol(corev1.ProtocolTCP),
+					corev1ac.ContainerPort().
+						WithName("http3").
+						WithContainerPort(8443).
+						WithProtocol(corev1.ProtocolUDP),
+				).
+				WithReadinessProbe(corev1ac.Probe().
+					WithHTTPGet(corev1ac.HTTPGetAction().
+						WithPath("/readyz").
+						WithPort(intstr.FromInt32(8081)),
+					).
+					WithInitialDelaySeconds(1).
+					WithPeriodSeconds(2),
+				),
+			),
+		)
+	if len(annotations) > 0 {
+		podTemplate.WithAnnotations(annotations)
 	}
 
-	templateHash := computeTemplateHash(&podTemplate)
-	deployAnnotations := make(map[string]string, len(annotations)+2)
-	for k, v := range annotations {
-		deployAnnotations[k] = v
-	}
-	deployAnnotations[AnnotationTemplateHash] = templateHash
-	deployAnnotations[AnnotationManagedKeys] = managedKeysJSON
-
-	desiredDeploy := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       gwNamespace,
-			Labels:          labels,
-			Annotations:     deployAnnotations,
-			OwnerReferences: []metav1.OwnerReference{ownerRef},
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: state.Ptr(int32(1)),
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
+	deployApply := appsv1ac.Deployment(name, gwNamespace).
+		WithOwnerReferences(ownerRef).
+		WithLabels(labels).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(1).
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(map[string]string{
 					LabelGatewayName: gw.Name,
 					LabelAppName:     AppNameValue,
-				},
-			},
-			Template: podTemplate,
-		},
+				}),
+			).
+			WithTemplate(podTemplate),
+		)
+	if len(annotations) > 0 {
+		deployApply.WithAnnotations(annotations)
 	}
-
-	var existingDeploy appsv1.Deployment
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			if createErr := p.client.Create(ctx, desiredDeploy); createErr != nil {
-				return nil, false, fmt.Errorf("failed to create Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, createErr)
-			}
-		} else {
-			return nil, false, err
-		}
-	} else {
-		if !isOwnedByGateway(&existingDeploy, gw) {
-			return nil, false, &controller.OwnershipConflictError{
-				Message: fmt.Sprintf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-			}
-		}
-		var prevManaged managedKeysRecord
-		if existingDeploy.Annotations != nil {
-			prevManaged = decodeManagedKeys(existingDeploy.Annotations[AnnotationManagedKeys])
-		}
-		needsUpdate := false
-		if existingDeploy.Annotations == nil || existingDeploy.Annotations[AnnotationTemplateHash] != templateHash {
-			existingDeploy.Spec.Template = desiredDeploy.Spec.Template
-			needsUpdate = true
-		}
-		if existingDeploy.Labels == nil {
-			existingDeploy.Labels = make(map[string]string)
-		}
-		if reconcileLabels(existingDeploy.Labels, labels, prevManaged.Labels) {
-			needsUpdate = true
-		}
-		if existingDeploy.Annotations == nil {
-			existingDeploy.Annotations = make(map[string]string)
-		}
-		if reconcileAnnotations(existingDeploy.Annotations, deployAnnotations, prevManaged.Annotations) {
-			needsUpdate = true
-		}
-		if needsOwnerReferenceUpdate(&existingDeploy, gw) {
-			updateControllerOwnerReference(&existingDeploy, gw, ownerRef)
-			needsUpdate = true
-		}
-		if needsUpdate {
-			if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				var latestDeploy appsv1.Deployment
-				if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &latestDeploy); err != nil {
-					return err
-				}
-				if !isOwnedByGateway(&latestDeploy, gw) {
-					return &controller.OwnershipConflictError{
-						Message: fmt.Sprintf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-					}
-				}
-				var latestPrev managedKeysRecord
-				if latestDeploy.Annotations != nil {
-					latestPrev = decodeManagedKeys(latestDeploy.Annotations[AnnotationManagedKeys])
-				}
-				if latestDeploy.Labels == nil {
-					latestDeploy.Labels = make(map[string]string)
-				}
-				reconcileLabels(latestDeploy.Labels, labels, latestPrev.Labels)
-				if latestDeploy.Annotations == nil {
-					latestDeploy.Annotations = make(map[string]string)
-				}
-				reconcileAnnotations(latestDeploy.Annotations, deployAnnotations, latestPrev.Annotations)
-				latestDeploy.Spec.Template = desiredDeploy.Spec.Template
-				updateControllerOwnerReference(&latestDeploy, gw, ownerRef)
-				return p.client.Update(ctx, &latestDeploy)
-			}); updateErr != nil {
-				return nil, false, fmt.Errorf("failed to update Deployment %s/%s: %w", existingDeploy.Namespace, existingDeploy.Name, updateErr)
-			}
-		}
+	if err := p.client.Apply(ctx, deployApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+		return nil, false, fmt.Errorf("failed to apply Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 4. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
+	var existingSvc corev1.Service
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
+	if err == nil {
+		if !isOwnedByGateway(&existingSvc, gw) {
+			return nil, false, &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
+	}
+
 	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
 	if len(effectiveListeners) > 0 {
 		for _, el := range effectiveListeners {
@@ -585,135 +445,51 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 	sort.Ints(sortedPorts)
 
-	var svcPorts []corev1.ServicePort
+	var svcPorts []*corev1ac.ServicePortApplyConfiguration
 	for _, portInt := range sortedPorts {
 		port := gatewayv1.PortNumber(portInt)
 		proto := uniquePorts[port]
 		if proto == gatewayv1.HTTPSProtocolType {
-			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       fmt.Sprintf("https-%d", port),
-				Port:       int32(port),
-				TargetPort: intstr.FromInt32(8443),
-				Protocol:   corev1.ProtocolTCP,
-			})
-			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       fmt.Sprintf("http3-%d", port),
-				Port:       int32(port),
-				TargetPort: intstr.FromInt32(8443),
-				Protocol:   corev1.ProtocolUDP,
-			})
+			svcPorts = append(svcPorts,
+				corev1ac.ServicePort().
+					WithName(fmt.Sprintf("https-%d", port)).
+					WithPort(int32(port)).
+					WithTargetPort(intstr.FromInt32(8443)).
+					WithProtocol(corev1.ProtocolTCP),
+				corev1ac.ServicePort().
+					WithName(fmt.Sprintf("http3-%d", port)).
+					WithPort(int32(port)).
+					WithTargetPort(intstr.FromInt32(8443)).
+					WithProtocol(corev1.ProtocolUDP),
+			)
 		} else {
-			svcPorts = append(svcPorts, corev1.ServicePort{
-				Name:       fmt.Sprintf("http-%d", port),
-				Port:       int32(port),
-				TargetPort: intstr.FromInt32(8000),
-				Protocol:   corev1.ProtocolTCP,
-			})
+			svcPorts = append(svcPorts,
+				corev1ac.ServicePort().
+					WithName(fmt.Sprintf("http-%d", port)).
+					WithPort(int32(port)).
+					WithTargetPort(intstr.FromInt32(8000)).
+					WithProtocol(corev1.ProtocolTCP),
+			)
 		}
 	}
 
-	desiredSvcAnnotations := make(map[string]string, len(annotations)+1)
-	for k, v := range annotations {
-		desiredSvcAnnotations[k] = v
-	}
-	desiredSvcAnnotations[AnnotationManagedKeys] = managedKeysJSON
-
-	desiredSvc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       gwNamespace,
-			Labels:          labels,
-			Annotations:     desiredSvcAnnotations,
-			OwnerReferences: []metav1.OwnerReference{ownerRef},
-		},
-		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeLoadBalancer,
-			Selector: map[string]string{
-				LabelGatewayName: gw.Name,
-				LabelAppName:     AppNameValue,
-			},
-			Ports: svcPorts,
-		},
-	}
-
-	var existingSvc corev1.Service
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			if len(svcPorts) > 0 {
-				if createErr := p.client.Create(ctx, desiredSvc); createErr != nil {
-					return nil, false, fmt.Errorf("failed to create Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, createErr)
-				}
-			}
-			return nil, false, nil
+	if len(svcPorts) > 0 {
+		svcApply := corev1ac.Service(name, gwNamespace).
+			WithOwnerReferences(ownerRef).
+			WithLabels(labels).
+			WithSpec(corev1ac.ServiceSpec().
+				WithType(corev1.ServiceTypeLoadBalancer).
+				WithSelector(map[string]string{
+					LabelGatewayName: gw.Name,
+					LabelAppName:     AppNameValue,
+				}).
+				WithPorts(svcPorts...),
+			)
+		if len(annotations) > 0 {
+			svcApply.WithAnnotations(annotations)
 		}
-		return nil, false, err
-	}
-
-	if !isOwnedByGateway(&existingSvc, gw) {
-		return nil, false, &controller.OwnershipConflictError{
-			Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-		}
-	}
-
-	var prevSvcManaged managedKeysRecord
-	if existingSvc.Annotations != nil {
-		prevSvcManaged = decodeManagedKeys(existingSvc.Annotations[AnnotationManagedKeys])
-	}
-	needsSvcUpdate := false
-	if !reflectPortsEqual(existingSvc.Spec.Ports, desiredSvc.Spec.Ports) {
-		existingSvc.Spec.Ports = desiredSvc.Spec.Ports
-		needsSvcUpdate = true
-	}
-	if !reflectMapEqual(existingSvc.Spec.Selector, desiredSvc.Spec.Selector) {
-		existingSvc.Spec.Selector = desiredSvc.Spec.Selector
-		needsSvcUpdate = true
-	}
-	if existingSvc.Labels == nil {
-		existingSvc.Labels = make(map[string]string)
-	}
-	if reconcileLabels(existingSvc.Labels, labels, prevSvcManaged.Labels) {
-		needsSvcUpdate = true
-	}
-	if existingSvc.Annotations == nil {
-		existingSvc.Annotations = make(map[string]string)
-	}
-	if reconcileAnnotations(existingSvc.Annotations, desiredSvcAnnotations, prevSvcManaged.Annotations) {
-		needsSvcUpdate = true
-	}
-	if needsOwnerReferenceUpdate(&existingSvc, gw) {
-		updateControllerOwnerReference(&existingSvc, gw, ownerRef)
-		needsSvcUpdate = true
-	}
-	if needsSvcUpdate {
-		if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			var latestSvc corev1.Service
-			if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &latestSvc); err != nil {
-				return err
-			}
-			if !isOwnedByGateway(&latestSvc, gw) {
-				return &controller.OwnershipConflictError{
-					Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
-				}
-			}
-			var latestPrev managedKeysRecord
-			if latestSvc.Annotations != nil {
-				latestPrev = decodeManagedKeys(latestSvc.Annotations[AnnotationManagedKeys])
-			}
-			latestSvc.Spec.Ports = desiredSvc.Spec.Ports
-			latestSvc.Spec.Selector = desiredSvc.Spec.Selector
-			if latestSvc.Labels == nil {
-				latestSvc.Labels = make(map[string]string)
-			}
-			reconcileLabels(latestSvc.Labels, labels, latestPrev.Labels)
-			if latestSvc.Annotations == nil {
-				latestSvc.Annotations = make(map[string]string)
-			}
-			reconcileAnnotations(latestSvc.Annotations, desiredSvcAnnotations, latestPrev.Annotations)
-			updateControllerOwnerReference(&latestSvc, gw, ownerRef)
-			return p.client.Update(ctx, &latestSvc)
-		}); updateErr != nil {
-			return nil, false, fmt.Errorf("failed to update Service %s/%s: %w", existingSvc.Namespace, existingSvc.Name, updateErr)
+		if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
+			return nil, false, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 		}
 	}
 
@@ -726,18 +502,20 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
-	for _, ingress := range existingSvc.Status.LoadBalancer.Ingress {
-		if ingress.IP != "" {
-			addresses = append(addresses, gatewayv1.GatewayStatusAddress{
-				Type:  state.Ptr(gatewayv1.IPAddressType),
-				Value: ingress.IP,
-			})
-		}
-		if ingress.Hostname != "" {
-			addresses = append(addresses, gatewayv1.GatewayStatusAddress{
-				Type:  state.Ptr(gatewayv1.HostnameAddressType),
-				Value: ingress.Hostname,
-			})
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err == nil {
+		for _, ingress := range existingSvc.Status.LoadBalancer.Ingress {
+			if ingress.IP != "" {
+				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
+					Type:  state.Ptr(gatewayv1.IPAddressType),
+					Value: ingress.IP,
+				})
+			}
+			if ingress.Hostname != "" {
+				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
+					Type:  state.Ptr(gatewayv1.HostnameAddressType),
+					Value: ingress.Hostname,
+				})
+			}
 		}
 	}
 
@@ -962,132 +740,3 @@ var (
 	_ controller.GatewayDeleteHandler = (*AddressProvider)(nil)
 	_ controller.AddressWatcher       = (*AddressProvider)(nil)
 )
-
-func reflectPortsEqual(a, b []corev1.ServicePort) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Name != b[i].Name || a[i].Port != b[i].Port || a[i].Protocol != b[i].Protocol || a[i].TargetPort != b[i].TargetPort {
-			return false
-		}
-	}
-	return true
-}
-
-func reflectMapEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
-type managedKeysRecord struct {
-	Labels      []string `json:"labels,omitempty"`
-	Annotations []string `json:"annotations,omitempty"`
-}
-
-func encodeManagedKeys(labelKeys, annoKeys []string) string {
-	rec := managedKeysRecord{
-		Labels:      labelKeys,
-		Annotations: annoKeys,
-	}
-	b, _ := json.Marshal(rec)
-	return string(b)
-}
-
-func decodeManagedKeys(raw string) managedKeysRecord {
-	var rec managedKeysRecord
-	if raw != "" {
-		_ = json.Unmarshal([]byte(raw), &rec)
-	}
-	return rec
-}
-
-// reconcileLabels updates existingLabels in-place to match desiredLabels while removing previously managed keys that are no longer desired.
-// Foreign labels (not previously managed by GARI) are preserved.
-// Returns true if existingLabels was modified.
-func reconcileLabels(existingLabels, desiredLabels map[string]string, prevManagedKeys []string) bool {
-	changed := false
-
-	// Remove previously managed label keys that are no longer in desiredLabels
-	for _, key := range prevManagedKeys {
-		if _, ok := desiredLabels[key]; !ok {
-			if _, exists := existingLabels[key]; exists {
-				delete(existingLabels, key)
-				changed = true
-			}
-		}
-	}
-
-	// Add or update all desired labels
-	for k, v := range desiredLabels {
-		if existingLabels[k] != v {
-			existingLabels[k] = v
-			changed = true
-		}
-	}
-
-	return changed
-}
-
-// reconcileAnnotations updates existingAnnotations in-place to match desiredAnnotations while removing previously managed keys that are no longer desired.
-// Foreign annotations (not previously managed by GARI) are preserved.
-// Returns true if existingAnnotations was modified.
-func reconcileAnnotations(existingAnnotations, desiredAnnotations map[string]string, prevManagedKeys []string) bool {
-	changed := false
-
-	// Remove previously managed annotation keys that are no longer in desiredAnnotations
-	for _, key := range prevManagedKeys {
-		if _, ok := desiredAnnotations[key]; !ok {
-			if _, exists := existingAnnotations[key]; exists {
-				delete(existingAnnotations, key)
-				changed = true
-			}
-		}
-	}
-
-	// Add or update all desired annotations
-	for k, v := range desiredAnnotations {
-		if existingAnnotations[k] != v {
-			existingAnnotations[k] = v
-			changed = true
-		}
-	}
-
-	return changed
-}
-
-// needsOwnerReferenceUpdate checks if the object's controller ownerReference to the Gateway needs an update.
-// It compares Kind, Name, and UID, ignoring fields like BlockOwnerDeletion that the API server defaults.
-func needsOwnerReferenceUpdate(obj metav1.Object, gw *gatewayv1.Gateway) bool {
-	for _, ref := range obj.GetOwnerReferences() {
-		if ref.Controller != nil && *ref.Controller && ref.Kind == "Gateway" && ref.Name == gw.Name {
-			return ref.UID != gw.UID
-		}
-	}
-	return true
-}
-
-// updateControllerOwnerReference updates or sets the controller ownerReference for the Gateway on obj.
-func updateControllerOwnerReference(obj metav1.Object, gw *gatewayv1.Gateway, desiredRef metav1.OwnerReference) {
-	refs := obj.GetOwnerReferences()
-	found := false
-	for i := range refs {
-		if refs[i].Controller != nil && *refs[i].Controller && refs[i].Kind == "Gateway" && refs[i].Name == gw.Name {
-			refs[i].UID = gw.UID
-			refs[i].APIVersion = desiredRef.APIVersion
-			found = true
-			break
-		}
-	}
-	if !found {
-		refs = append(refs, desiredRef)
-	}
-	obj.SetOwnerReferences(refs)
-}

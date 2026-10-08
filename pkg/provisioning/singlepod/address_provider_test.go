@@ -16,6 +16,9 @@ package singlepod
 
 import (
 	"context"
+	"encoding/json"
+	"maps"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -26,14 +29,117 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+// ssaNoOpInterceptor adjusts controller-runtime's fake client for Server-Side Apply:
+// 1. It models Kubernetes SSA no-op behavior: when an apply configuration produces no changes on an existing object, no write is issued and resourceVersion is not incremented.
+// 2. It models controller ownerReference replacement: when applying a controller ownerReference for a Gateway with a new UID, any stale controller ownerReference for that same Gateway is replaced rather than kept as a duplicate.
+func ssaNoOpInterceptor() interceptor.Funcs {
+	return interceptor.Funcs{
+		Apply: func(ctx context.Context, cl client.WithWatch, obj runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
+			data, err := json.Marshal(obj)
+			if err != nil {
+				return err
+			}
+			var tm struct {
+				APIVersion string `json:"apiVersion"`
+				Kind       string `json:"kind"`
+				Metadata   struct {
+					Name            string           `json:"name"`
+					Namespace       string           `json:"namespace"`
+					OwnerReferences []map[string]any `json:"ownerReferences"`
+				} `json:"metadata"`
+			}
+			if err := json.Unmarshal(data, &tm); err != nil {
+				return err
+			}
+
+			u := &unstructured.Unstructured{}
+			u.SetAPIVersion(tm.APIVersion)
+			u.SetKind(tm.Kind)
+			key := types.NamespacedName{Namespace: tm.Metadata.Namespace, Name: tm.Metadata.Name}
+			if err := cl.Get(ctx, key, u); err != nil {
+				return cl.Apply(ctx, obj, opts...)
+			}
+
+			// In Kubernetes, an object can have at most one controller ownerReference.
+			// When applying a controller ownerReference for a Gateway with a new UID,
+			// prune any stale controller ownerReference for the same Gateway from the fake client tracker.
+			for _, newRef := range tm.Metadata.OwnerReferences {
+				if ctrl, ok := newRef["controller"].(bool); ok && ctrl {
+					gwName, _ := newRef["name"].(string)
+					gwUID, _ := newRef["uid"].(string)
+					gwKind, _ := newRef["kind"].(string)
+					if gwKind == "Gateway" && gwName != "" {
+						existingRefs := u.GetOwnerReferences()
+						var updatedRefs []metav1.OwnerReference
+						staleFound := false
+						for _, ref := range existingRefs {
+							if ref.Kind == "Gateway" && ref.Name == gwName && ref.Controller != nil && *ref.Controller && string(ref.UID) != gwUID {
+								staleFound = true
+								continue
+							}
+							updatedRefs = append(updatedRefs, ref)
+						}
+						if staleFound {
+							u.SetOwnerReferences(updatedRefs)
+							if err := cl.Update(ctx, u); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+
+			probeClient := fake.NewClientBuilder().
+				WithScheme(cl.Scheme()).
+				WithReturnManagedFields().
+				WithObjects(u.DeepCopy()).
+				Build()
+
+			probeObj := &unstructured.Unstructured{}
+			if err := json.Unmarshal(data, probeObj); err != nil {
+				return err
+			}
+			unstructured.RemoveNestedField(probeObj.Object, "metadata", "resourceVersion")
+			probeAC := client.ApplyConfigurationFromUnstructured(probeObj)
+
+			if err := probeClient.Apply(ctx, probeAC, opts...); err != nil {
+				return err
+			}
+
+			probed := &unstructured.Unstructured{}
+			probed.SetAPIVersion(tm.APIVersion)
+			probed.SetKind(tm.Kind)
+			if err := probeClient.Get(ctx, key, probed); err != nil {
+				return cl.Apply(ctx, obj, opts...)
+			}
+
+			clean := func(item *unstructured.Unstructured) map[string]any {
+				m := item.DeepCopy().Object
+				unstructured.RemoveNestedField(m, "metadata", "resourceVersion")
+				unstructured.RemoveNestedField(m, "metadata", "managedFields")
+				return m
+			}
+
+			if reflect.DeepEqual(clean(u), clean(probed)) {
+				// No fields changed; SSA is a no-op so avoid writing and bumping resourceVersion.
+				return nil
+			}
+
+			return cl.Apply(ctx, obj, opts...)
+		},
+	}
+}
 
 func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -55,7 +161,9 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithReturnManagedFields().
 		WithObjects(sharedCRB).
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
 	ctx := t.Context()
@@ -185,10 +293,6 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	if deploy.Spec.Template.Spec.ServiceAccountName != name {
 		t.Errorf("expected ServiceAccountName %s, got %s", name, deploy.Spec.Template.Spec.ServiceAccountName)
 	}
-	initialHash := deploy.Annotations[AnnotationTemplateHash]
-	if initialHash == "" {
-		t.Errorf("expected template hash annotation on Deployment")
-	}
 
 	// 2. Simulate MetalLB assigning LB Ingress IP and Deployment replicas becoming available
 	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
@@ -223,9 +327,6 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 	}
 	if err := client.Get(ctx, types.NamespacedName{Namespace: "my-ns", Name: name}, &deploy); err != nil {
 		t.Fatalf("failed to get updated deployment: %v", err)
-	}
-	if deploy.Annotations[AnnotationTemplateHash] == initialHash {
-		t.Errorf("expected template hash to change when infrastructure labels change")
 	}
 	if deploy.Spec.Template.Labels["updated-label"] != "updated-val" {
 		t.Errorf("expected updated pod template labels to include updated-label")
@@ -640,7 +741,9 @@ func setupTestClient(t *testing.T) client.Client {
 
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
+		WithReturnManagedFields().
 		WithObjects(sharedCRB).
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 }
 
@@ -702,9 +805,6 @@ func TestSinglePodAddressProvider_InfrastructureLabelsAndAnnotationsLandOnAllFou
 	if deploy.Annotations["example.com/cost-center"] != "12345" || deploy.Annotations["custom-anno"] != "anno-val-1" {
 		t.Errorf("Deployment missing infrastructure annotations: got %+v", deploy.Annotations)
 	}
-	if deploy.Annotations[AnnotationTemplateHash] == "" {
-		t.Errorf("Deployment missing template hash annotation")
-	}
 
 	// 3. Pod Template
 	if deploy.Spec.Template.Labels["example.com/tier"] != "frontend" || deploy.Spec.Template.Labels["custom-label"] != "value-1" {
@@ -759,11 +859,6 @@ func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 	}
 
 	resName := ResourceNameForGateway("test-gw")
-	var initialDeploy appsv1.Deployment
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &initialDeploy); err != nil {
-		t.Fatalf("failed to get initial Deployment: %v", err)
-	}
-	initialHash := initialDeploy.Annotations[AnnotationTemplateHash]
 
 	// Update label and annotation values in Gateway infrastructure
 	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
@@ -796,9 +891,6 @@ func TestSinglePodAddressProvider_InfrastructureValueUpdate(t *testing.T) {
 	}
 	if deploy.Annotations["cost-center"] != "2000" {
 		t.Errorf("Deployment annotation not updated: got %s, want 2000", deploy.Annotations["cost-center"])
-	}
-	if deploy.Annotations[AnnotationTemplateHash] == initialHash {
-		t.Errorf("Deployment template hash did not change after updating infrastructure values")
 	}
 
 	// 3. Pod Template (ensures pods are rolled)
@@ -856,11 +948,6 @@ func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 	}
 
 	resName := ResourceNameForGateway("test-gw")
-	var initialDeploy appsv1.Deployment
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &initialDeploy); err != nil {
-		t.Fatalf("failed to get initial Deployment: %v", err)
-	}
-	initialHash := initialDeploy.Annotations[AnnotationTemplateHash]
 
 	// Remove keys from Gateway infrastructure
 	delete(gw.Spec.Infrastructure.Labels, "remove-me")
@@ -905,9 +992,6 @@ func TestSinglePodAddressProvider_InfrastructureKeyRemoval(t *testing.T) {
 	}
 	if deploy.Annotations["cost-center"] != "1000" {
 		t.Errorf("Deployment lost retained annotation 'cost-center'")
-	}
-	if deploy.Annotations[AnnotationTemplateHash] == initialHash {
-		t.Errorf("Deployment template hash did not change after removing infrastructure keys")
 	}
 
 	// 3. Pod Template
@@ -1028,12 +1112,12 @@ func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLa
 		LabelGatewayName: "test-gw",
 		LabelAppName:     AppNameValue,
 	}
-	if !reflectMapEqual(deploy.Spec.Selector.MatchLabels, expectedDeploySelector) {
+	if !maps.Equal(deploy.Spec.Selector.MatchLabels, expectedDeploySelector) {
 		t.Errorf("Deployment selector was modified: got %+v, want %+v", deploy.Spec.Selector.MatchLabels, expectedDeploySelector)
 	}
 
 	// Verify Service selector is not overridden
-	if !reflectMapEqual(svc.Spec.Selector, expectedDeploySelector) {
+	if !maps.Equal(svc.Spec.Selector, expectedDeploySelector) {
 		t.Errorf("Service selector was modified: got %+v, want %+v", svc.Spec.Selector, expectedDeploySelector)
 	}
 }
@@ -1286,5 +1370,113 @@ func TestSinglePodAddressProvider_StaleControllerOwnerRefUIDUpdated(t *testing.T
 	}
 	if len(svc.OwnerReferences) == 0 || svc.OwnerReferences[0].UID != "gw-uid-new" {
 		t.Errorf("Service ownerRef UID not updated: got %+v, want gw-uid-new", svc.OwnerReferences)
+	}
+}
+
+func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
+					"tier": "frontend",
+				},
+				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					"cost-center": "1000",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+
+	// 1. Initial reconcile creates resources
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on initial reconcile: %v", err)
+	}
+
+	var sa corev1.ServiceAccount
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	saRV := sa.ResourceVersion
+
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deployRV := deploy.ResourceVersion
+
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	svcRV := svc.ResourceVersion
+
+	// 2. Second reconcile with identical configuration: no writes issued, resourceVersion unchanged
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on no-op reconcile: %v", err)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if sa.ResourceVersion != saRV {
+		t.Errorf("ServiceAccount resourceVersion changed on no-op reconcile: got %s, want %s", sa.ResourceVersion, saRV)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if deploy.ResourceVersion != deployRV {
+		t.Errorf("Deployment resourceVersion changed on no-op reconcile: got %s, want %s", deploy.ResourceVersion, deployRV)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.ResourceVersion != svcRV {
+		t.Errorf("Service resourceVersion changed on no-op reconcile: got %s, want %s", svc.ResourceVersion, svcRV)
+	}
+
+	// 3. Third reconcile with changed infrastructure metadata: resourceVersion must change
+	gw.Spec.Infrastructure.Labels["tier"] = "frontend-v2"
+	_, _, err = p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on update reconcile: %v", err)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &sa); err != nil {
+		t.Fatalf("failed to get ServiceAccount: %v", err)
+	}
+	if sa.ResourceVersion == saRV {
+		t.Errorf("ServiceAccount resourceVersion expected to change on update, but stayed %s", sa.ResourceVersion)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if deploy.ResourceVersion == deployRV {
+		t.Errorf("Deployment resourceVersion expected to change on update, but stayed %s", deploy.ResourceVersion)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.ResourceVersion == svcRV {
+		t.Errorf("Service resourceVersion expected to change on update, but stayed %s", svc.ResourceVersion)
 	}
 }
