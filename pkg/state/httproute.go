@@ -811,53 +811,83 @@ func resolveBackendTarget(
 	// BackendTLSPolicy resolution
 	var tlsConfig *InternalTLSConfig
 	var backendErr *ErrorState
-	for _, policy := range sortedTLSPolicies {
-		if tlsConfig != nil || backendErr != nil {
-			break
-		}
-		for _, targetRef := range policy.Spec.TargetRefs {
-			if string(targetRef.Group) == "" &&
-				string(targetRef.Kind) == "Service" &&
-				string(targetRef.Name) == string(backendRef.Name) &&
-				policy.Namespace == svcNamespace {
 
-				if targetRef.SectionName != nil && *targetRef.SectionName != "" {
-					matchesSection := false
-					if svc != nil {
-						for _, p := range svc.Spec.Ports {
-							if p.Port == port && p.Name == string(*targetRef.SectionName) {
-								matchesSection = true
-								break
-							}
-						}
-					}
-					if !matchesSection {
-						continue
+	var selectedPolicy *gatewayv1.BackendTLSPolicy
+	if svc != nil {
+		var portName string
+		for _, p := range svc.Spec.Ports {
+			if p.Port == port {
+				portName = p.Name
+				break
+			}
+		}
+		if portName != "" {
+			for _, policy := range sortedTLSPolicies {
+				if policy.Namespace != svcNamespace {
+					continue
+				}
+				matched := false
+				for _, targetRef := range policy.Spec.TargetRefs {
+					if string(targetRef.Group) == "" &&
+						string(targetRef.Kind) == "Service" &&
+						string(targetRef.Name) == string(backendRef.Name) &&
+						targetRef.SectionName != nil &&
+						string(*targetRef.SectionName) == portName {
+						matched = true
+						break
 					}
 				}
-
-				https := "https"
-				appProtocol = &https
-
-				caCerts, isValid := validateBackendTLSPolicy(policy, configMaps)
-				if !isValid {
-					tlsConfig = &InternalTLSConfig{
-						Hostname: string(policy.Spec.Validation.Hostname),
-						CACerts:  nil,
-					}
-					backendErr = &ErrorState{
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    "Invalid or unresolvable BackendTLSPolicy",
-					}
+				if matched {
+					selectedPolicy = policy
 					break
 				}
+			}
+		}
+	}
 
-				tlsConfig = &InternalTLSConfig{
-					Hostname:                string(policy.Spec.Validation.Hostname),
-					CACerts:                 caCerts,
-					WellKnownCACertificates: policy.Spec.Validation.WellKnownCACertificates,
+	if selectedPolicy == nil {
+		for _, policy := range sortedTLSPolicies {
+			if policy.Namespace != svcNamespace {
+				continue
+			}
+			matched := false
+			for _, targetRef := range policy.Spec.TargetRefs {
+				if string(targetRef.Group) == "" &&
+					string(targetRef.Kind) == "Service" &&
+					string(targetRef.Name) == string(backendRef.Name) &&
+					(targetRef.SectionName == nil || *targetRef.SectionName == "") {
+					matched = true
+					break
 				}
+			}
+			if matched {
+				selectedPolicy = policy
 				break
+			}
+		}
+	}
+
+	if selectedPolicy != nil {
+		https := "https"
+		appProtocol = &https
+
+		caCerts, isValid := validateBackendTLSPolicy(selectedPolicy, configMaps)
+		if !isValid {
+			tlsConfig = &InternalTLSConfig{
+				Hostname:        string(selectedPolicy.Spec.Validation.Hostname),
+				CACerts:         nil,
+				SubjectAltNames: selectedPolicy.Spec.Validation.SubjectAltNames,
+			}
+			backendErr = &ErrorState{
+				HTTPStatusCode: http.StatusInternalServerError,
+				HTTPMessage:    "Invalid or unresolvable BackendTLSPolicy",
+			}
+		} else {
+			tlsConfig = &InternalTLSConfig{
+				Hostname:                string(selectedPolicy.Spec.Validation.Hostname),
+				CACerts:                 caCerts,
+				WellKnownCACertificates: selectedPolicy.Spec.Validation.WellKnownCACertificates,
+				SubjectAltNames:         selectedPolicy.Spec.Validation.SubjectAltNames,
 			}
 		}
 	}

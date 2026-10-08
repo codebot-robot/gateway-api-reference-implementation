@@ -1431,6 +1431,7 @@ func ComputeDesiredBackendTLSPolicyStatus(
 
 		targetSvcNamespace := policy.Namespace
 		targetSvcName := string(targetRef.Name)
+		targetSection := ValueOf(targetRef.SectionName)
 
 		for _, p := range allPolicies {
 			if p == nil || (p.Namespace == policy.Namespace && p.Name == policy.Name) {
@@ -1439,7 +1440,7 @@ func ComputeDesiredBackendTLSPolicyStatus(
 
 			for _, t := range p.Spec.TargetRefs {
 				if string(t.Group) == "" && string(t.Kind) == "Service" {
-					if p.Namespace == targetSvcNamespace && string(t.Name) == targetSvcName {
+					if p.Namespace == targetSvcNamespace && string(t.Name) == targetSvcName && ValueOf(t.SectionName) == targetSection {
 						if p.CreationTimestamp.Time.Before(policy.CreationTimestamp.Time) {
 							isConflicted = true
 							conflictingPolicy = fmt.Sprintf("%s/%s", p.Namespace, p.Name)

@@ -98,10 +98,11 @@ func TestConformance(t *testing.T) {
 
 	selectedTests := []suite.ConformanceTest{
 		tests.BackendTLSPolicy,
-		// tests.BackendTLSPolicyConflictResolution, // Fails on section name conflict resolution under v1.5.0
+		tests.BackendTLSPolicyConflictResolution,
 		tests.BackendTLSPolicyInvalidCACertificateRef,
 		tests.BackendTLSPolicyInvalidKind,
 		tests.BackendTLSPolicyObservedGenerationBump,
+		tests.BackendTLSPolicySANValidation,
 		tests.GatewayClassObservedGenerationBump,
 		tests.GatewayHTTPListenerIsolation,
 		tests.GatewayInfrastructure,
