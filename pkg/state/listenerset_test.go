@@ -310,3 +310,114 @@ func TestStateListenerSetOperations(t *testing.T) {
 		t.Errorf("expected 1 ListenerSet [ls-b], got %v", got)
 	}
 }
+
+func TestListenerSet_AllowedRoutesSupportedKinds_TLSInvalidKinds(t *testing.T) {
+	passthroughMode := gatewayv1.TLSModePassthrough
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-allowed-ls",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			AllowedListeners: &gatewayv1.AllowedListeners{
+				Namespaces: &gatewayv1.ListenerNamespaces{
+					From: Ptr(gatewayv1.NamespacesFromAll),
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	ls := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ls-tls-invalid-kind",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "gw-allowed-ls",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "tls-listener",
+					Port:     443,
+					Protocol: gatewayv1.TLSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						Mode: &passthroughMode,
+					},
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Kinds: []gatewayv1.RouteGroupKind{
+							{Kind: "HTTPRoute"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ListenerSets:   []*gatewayv1.ListenerSet{ls},
+		ControllerName: "example.net/gateway-controller",
+	}
+
+	outputs := ComputeOutputs(inputs)
+
+	// Parent Gateway must remain Accepted=True
+	gwStatus, ok := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: "gw-allowed-ls"}]
+	if !ok {
+		t.Fatalf("expected status for gateway")
+	}
+	var gwAcceptedCond *metav1.Condition
+	for _, c := range gwStatus.Conditions {
+		if c.Type == string(gatewayv1.GatewayConditionAccepted) {
+			gwAcceptedCond = &c
+			break
+		}
+	}
+	if gwAcceptedCond == nil || gwAcceptedCond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected Gateway Accepted=True, got %+v", gwAcceptedCond)
+	}
+
+	// ListenerSet listener status must have ResolvedRefs=False with reason InvalidRouteKinds, and supportedKinds empty
+	lsStatus, ok := outputs.ListenerSetStatuses[types.NamespacedName{Namespace: "default", Name: "ls-tls-invalid-kind"}]
+	if !ok {
+		t.Fatalf("expected status for listener set")
+	}
+	if len(lsStatus.Listeners) != 1 {
+		t.Fatalf("expected 1 listener in listener set status, got %d", len(lsStatus.Listeners))
+	}
+	lStatus := lsStatus.Listeners[0]
+	if len(lStatus.SupportedKinds) != 0 {
+		t.Errorf("expected empty supportedKinds, got %v", lStatus.SupportedKinds)
+	}
+
+	var resolvedRefsCond *metav1.Condition
+	for _, c := range lStatus.Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionResolvedRefs) {
+			resolvedRefsCond = &c
+			break
+		}
+	}
+	if resolvedRefsCond == nil {
+		t.Fatal("expected ResolvedRefs condition on listener status")
+	}
+	if resolvedRefsCond.Status != metav1.ConditionFalse {
+		t.Errorf("expected ResolvedRefs status False, got %s", resolvedRefsCond.Status)
+	}
+	if resolvedRefsCond.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+		t.Errorf("expected ResolvedRefs reason InvalidRouteKinds, got %s", resolvedRefsCond.Reason)
+	}
+}
