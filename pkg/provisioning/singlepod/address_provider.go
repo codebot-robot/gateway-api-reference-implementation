@@ -18,7 +18,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,7 +28,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
@@ -41,6 +42,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -53,9 +55,6 @@ const (
 
 	// LabelGatewayName is the label identifying the Gateway name on provisioned resources.
 	LabelGatewayName = "gateway.networking.k8s.io/gateway-name"
-
-	// LabelGatewayNamespace is the label identifying the Gateway namespace on provisioned resources.
-	LabelGatewayNamespace = "gateway.networking.k8s.io/gateway-namespace"
 
 	// LabelManagedBy is the label indicating the resource is managed by the singlepod provisioner.
 	LabelManagedBy = "app.kubernetes.io/managed-by"
@@ -131,20 +130,13 @@ func NewAddressProvider(c client.Client, opts ...Option) *AddressProvider {
 	return p
 }
 
-// isOwnedByGateway checks if the object was created for this Gateway via controller OwnerReference or labels.
+// isOwnedByGateway checks if the object has a controller OwnerReference to this Gateway with a matching UID.
 func isOwnedByGateway(obj metav1.Object, gw *gatewayv1.Gateway) bool {
-	for _, ref := range obj.GetOwnerReferences() {
-		if ref.Kind == "Gateway" && ref.Name == gw.Name && (ref.Controller != nil && *ref.Controller) {
-			return true
-		}
+	ref := metav1.GetControllerOf(obj)
+	if ref == nil {
+		return false
 	}
-	labels := obj.GetLabels()
-	if labels != nil && labels[LabelManagedBy] == ManagedByValue && labels[LabelGatewayName] == gw.Name {
-		if labels[LabelGatewayNamespace] == "" || labels[LabelGatewayNamespace] == gw.Namespace {
-			return true
-		}
-	}
-	return false
+	return ref.Kind == "Gateway" && ref.Name == gw.Name && gw.UID != "" && ref.UID == gw.UID
 }
 
 func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[string]string) {
@@ -174,7 +166,6 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[st
 
 	// GARI-owned labels override user labels
 	labels[LabelGatewayName] = gw.Name
-	labels[LabelGatewayNamespace] = gw.Namespace
 	labels[LabelManagedBy] = ManagedByValue
 	labels[LabelAppName] = AppNameValue
 
@@ -538,54 +529,13 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addresses, deployReady, nil
 }
 
-// OnGatewayDeleted cleans up the ServiceAccount, Deployment, Service, and ClusterRoleBinding subject for the deleted Gateway if they exist and are owned by it.
+// OnGatewayDeleted cleans up the ClusterRoleBinding subject for the deleted Gateway.
 func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.NamespacedName) error {
 	if p.client == nil {
 		return nil
 	}
 
 	name := ResourceNameForGateway(gwKey.Name)
-
-	dummyGW := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      gwKey.Name,
-			Namespace: gwKey.Namespace,
-		},
-	}
-
-	var svc corev1.Service
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &svc); err == nil {
-		if isOwnedByGateway(&svc, dummyGW) {
-			if err := p.client.Delete(ctx, &svc); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete Service %s/%s: %w", gwKey.Namespace, name, err)
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check Service %s/%s: %w", gwKey.Namespace, name, err)
-	}
-
-	var deploy appsv1.Deployment
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &deploy); err == nil {
-		if isOwnedByGateway(&deploy, dummyGW) {
-			if err := p.client.Delete(ctx, &deploy); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete Deployment %s/%s: %w", gwKey.Namespace, name, err)
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check Deployment %s/%s: %w", gwKey.Namespace, name, err)
-	}
-
-	var sa corev1.ServiceAccount
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwKey.Namespace, Name: name}, &sa); err == nil {
-		if isOwnedByGateway(&sa, dummyGW) {
-			if err := p.client.Delete(ctx, &sa); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to check ServiceAccount %s/%s: %w", gwKey.Namespace, name, err)
-	}
-
 	if err := p.removeClusterRoleBindingSubject(ctx, gwKey.Namespace, name); err != nil {
 		return fmt.Errorf("failed to remove subject from ClusterRoleBinding %s: %w", DataplaneClusterRoleBindingName, err)
 	}
@@ -593,72 +543,10 @@ func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.Name
 	return nil
 }
 
-// SweepOrphans garbage-collects provisioned Services, Deployments, ServiceAccounts, and ClusterRoleBinding subjects across all namespaces whose corresponding Gateway no longer exists.
+// SweepOrphans garbage-collects stale ClusterRoleBinding subjects across all namespaces whose corresponding Gateway no longer exists.
 func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 	if p.client == nil {
 		return nil
-	}
-
-	var errs []error
-
-	var svcList corev1.ServiceList
-	if err := p.client.List(ctx, &svcList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
-		errs = append(errs, fmt.Errorf("failed to list managed services: %w", err))
-	} else {
-		for _, svc := range svcList.Items {
-			gwNs := svc.Labels[LabelGatewayNamespace]
-			gwName := svc.Labels[LabelGatewayName]
-			if gwNs == "" || gwName == "" {
-				continue
-			}
-			var gw gatewayv1.Gateway
-			err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNs, Name: gwName}, &gw)
-			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
-				if delErr := p.client.Delete(ctx, &svc); delErr != nil && !apierrors.IsNotFound(delErr) {
-					errs = append(errs, fmt.Errorf("failed to delete orphaned Service %s/%s: %w", svc.Namespace, svc.Name, delErr))
-				}
-			}
-		}
-	}
-
-	var deployList appsv1.DeploymentList
-	if err := p.client.List(ctx, &deployList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
-		errs = append(errs, fmt.Errorf("failed to list managed deployments: %w", err))
-	} else {
-		for _, deploy := range deployList.Items {
-			gwNs := deploy.Labels[LabelGatewayNamespace]
-			gwName := deploy.Labels[LabelGatewayName]
-			if gwNs == "" || gwName == "" {
-				continue
-			}
-			var gw gatewayv1.Gateway
-			err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNs, Name: gwName}, &gw)
-			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
-				if delErr := p.client.Delete(ctx, &deploy); delErr != nil && !apierrors.IsNotFound(delErr) {
-					errs = append(errs, fmt.Errorf("failed to delete orphaned Deployment %s/%s: %w", deploy.Namespace, deploy.Name, delErr))
-				}
-			}
-		}
-	}
-
-	var saList corev1.ServiceAccountList
-	if err := p.client.List(ctx, &saList, client.MatchingLabels{LabelManagedBy: ManagedByValue}); err != nil {
-		errs = append(errs, fmt.Errorf("failed to list managed serviceaccounts: %w", err))
-	} else {
-		for _, sa := range saList.Items {
-			gwNs := sa.Labels[LabelGatewayNamespace]
-			gwName := sa.Labels[LabelGatewayName]
-			if gwNs == "" || gwName == "" {
-				continue
-			}
-			var gw gatewayv1.Gateway
-			err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNs, Name: gwName}, &gw)
-			if apierrors.IsNotFound(err) || (err == nil && gw.DeletionTimestamp != nil) {
-				if delErr := p.client.Delete(ctx, &sa); delErr != nil && !apierrors.IsNotFound(delErr) {
-					errs = append(errs, fmt.Errorf("failed to delete orphaned ServiceAccount %s/%s: %w", sa.Namespace, sa.Name, delErr))
-				}
-			}
-		}
 	}
 
 	// Sweep subjects in shared gari-dataplane ClusterRoleBinding
@@ -667,50 +555,69 @@ func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
 		reader = p.client
 	}
 	var crb rbacv1.ClusterRoleBinding
-	if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err == nil {
-		var validSubjects []rbacv1.Subject
-		changed := false
-		for _, s := range crb.Subjects {
-			if s.Kind != "ServiceAccount" {
-				validSubjects = append(validSubjects, s)
+	if err := reader.Get(ctx, types.NamespacedName{Name: DataplaneClusterRoleBindingName}, &crb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get ClusterRoleBinding %s during orphan sweep: %w", DataplaneClusterRoleBindingName, err)
+	}
+
+	var validSubjects []rbacv1.Subject
+	changed := false
+	for _, s := range crb.Subjects {
+		if s.Kind != "ServiceAccount" {
+			validSubjects = append(validSubjects, s)
+			continue
+		}
+		// Check if ServiceAccount still exists and has managed label
+		var sa corev1.ServiceAccount
+		err := reader.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.Name}, &sa)
+		if apierrors.IsNotFound(err) || (sa.Labels != nil && sa.Labels[LabelManagedBy] == ManagedByValue && sa.Labels[LabelGatewayName] != "") {
+			if apierrors.IsNotFound(err) {
+				changed = true
 				continue
 			}
-			// Check if ServiceAccount still exists and has managed label
-			var sa corev1.ServiceAccount
-			err := reader.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: s.Name}, &sa)
-			if apierrors.IsNotFound(err) || (sa.Labels != nil && sa.Labels[LabelManagedBy] == ManagedByValue && sa.Labels[LabelGatewayName] != "") {
-				if apierrors.IsNotFound(err) {
-					changed = true
-					continue
-				}
-				gwName := sa.Labels[LabelGatewayName]
-				var gw gatewayv1.Gateway
-				if gwErr := p.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: gwName}, &gw); apierrors.IsNotFound(gwErr) || (gwErr == nil && gw.DeletionTimestamp != nil) {
-					changed = true
-					continue
-				}
+			gwName := sa.Labels[LabelGatewayName]
+			var gw gatewayv1.Gateway
+			if gwErr := p.client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: gwName}, &gw); apierrors.IsNotFound(gwErr) || (gwErr == nil && gw.DeletionTimestamp != nil) {
+				changed = true
+				continue
 			}
-			validSubjects = append(validSubjects, s)
 		}
-		if changed {
-			crb.Subjects = validSubjects
-			sortSubjects(crb.Subjects)
-			if updErr := p.client.Update(ctx, &crb); updErr != nil && !apierrors.IsNotFound(updErr) {
-				errs = append(errs, fmt.Errorf("failed to update ClusterRoleBinding %s during orphan sweep: %w", DataplaneClusterRoleBindingName, updErr))
-			}
+		validSubjects = append(validSubjects, s)
+	}
+	if changed {
+		crb.Subjects = validSubjects
+		sortSubjects(crb.Subjects)
+		if updErr := p.client.Update(ctx, &crb); updErr != nil && !apierrors.IsNotFound(updErr) {
+			return fmt.Errorf("failed to update ClusterRoleBinding %s during orphan sweep: %w", DataplaneClusterRoleBindingName, updErr)
 		}
 	}
 
-	return errors.Join(errs...)
+	return nil
+}
+
+func managedByPredicate() predicate.Predicate {
+	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		labels := obj.GetLabels()
+		return labels != nil && labels[LabelManagedBy] == ManagedByValue
+	})
 }
 
 // SetupWatches registers watches on managed Services and Deployments, and starts the orphan sweep runnable.
 func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
+	var scheme *runtime.Scheme
+	var mapper meta.RESTMapper
 	if mgr != nil {
 		if p.client == nil {
 			p.client = mgr.GetClient()
 		}
 		p.apiReader = mgr.GetAPIReader()
+		scheme = mgr.GetScheme()
+		mapper = mgr.GetRESTMapper()
+	} else if p.client != nil {
+		scheme = p.client.Scheme()
+		mapper = p.client.RESTMapper()
 	}
 
 	if mgr != nil {
@@ -725,28 +632,15 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 		}
 	}
 
-	mapFunc := func(ctx context.Context, obj client.Object) []ctrl.Request {
-		labels := obj.GetLabels()
-		if labels == nil || labels[LabelManagedBy] != ManagedByValue {
-			return nil
-		}
-		gwName := labels[LabelGatewayName]
-		gwNs := labels[LabelGatewayNamespace]
-		if gwName == "" || gwNs == "" {
-			return nil
-		}
-		return []ctrl.Request{
-			{
-				NamespacedName: types.NamespacedName{
-					Namespace: gwNs,
-					Name:      gwName,
-				},
-			},
-		}
+	if scheme == nil || mapper == nil {
+		return fmt.Errorf("scheme and RESTMapper are required to setup watches")
 	}
 
-	bldr.Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(mapFunc))
-	bldr.Watches(&appsv1.Deployment{}, handler.EnqueueRequestsFromMapFunc(mapFunc))
+	pred := managedByPredicate()
+	ownerHandler := handler.EnqueueRequestForOwner(scheme, mapper, &gatewayv1.Gateway{}, handler.OnlyControllerOwner())
+
+	bldr.Watches(&corev1.Service{}, ownerHandler, builder.WithPredicates(pred))
+	bldr.Watches(&appsv1.Deployment{}, ownerHandler, builder.WithPredicates(pred))
 
 	return nil
 }
