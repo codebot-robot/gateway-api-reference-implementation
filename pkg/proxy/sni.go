@@ -78,11 +78,14 @@ func (l *sniListener) maybeStartAcceptLoop() {
 }
 
 func (l *sniListener) Accept() (net.Conn, error) {
-	// First check if there are any buffered connections from httpsConnCh.
+	l.mu.Lock()
+	// First check if there are any buffered connections from httpsConnCh while holding l.mu.
 	select {
 	case <-l.done:
+		l.mu.Unlock()
 		return nil, net.ErrClosed
 	case conn := <-l.httpsConnCh:
+		l.mu.Unlock()
 		select {
 		case <-l.done:
 			_ = conn.Close()
@@ -93,7 +96,6 @@ func (l *sniListener) Accept() (net.Conn, error) {
 	default:
 	}
 
-	l.mu.Lock()
 	if !l.p.hasPassthrough.Load() && !l.acceptLoopRunning {
 		l.rawAcceptors++
 		l.mu.Unlock()
@@ -202,14 +204,18 @@ func (l *sniListener) acceptLoop() {
 		l.mu.Lock()
 		hasPT := l.p.hasPassthrough.Load()
 		if !hasPT {
-			l.acceptLoopRunning = false
-			l.mu.Unlock()
-
 			select {
-			case l.httpsConnCh <- conn:
 			case <-l.done:
 				_ = conn.Close()
+			default:
+				select {
+				case l.httpsConnCh <- conn:
+				default:
+					_ = conn.Close()
+				}
 			}
+			l.acceptLoopRunning = false
+			l.mu.Unlock()
 			return
 		}
 		l.mu.Unlock()
