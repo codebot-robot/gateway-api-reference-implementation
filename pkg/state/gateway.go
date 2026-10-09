@@ -14,6 +14,7 @@
 package state
 
 import (
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -71,12 +72,12 @@ type InternalListener struct {
 	GatewayName types.NamespacedName
 	Routes      []InternalRoute
 	TLSMode     *gatewayv1.TLSModeType
-	TLSBackends map[string][]string
+	TLSBackends map[string][]InternalTLSBackend
 }
 
 // SelectTLSBackends finds the backend targets matching the given SNI for a TLS listener.
 // Follows Gateway API precedence: Exact match > longest matching wildcard > catch-all.
-func (l *InternalListener) SelectTLSBackends(sni string) ([]string, bool) {
+func (l *InternalListener) SelectTLSBackends(sni string) ([]InternalTLSBackend, bool) {
 	if l == nil || len(l.TLSBackends) == 0 {
 		return nil, false
 	}
@@ -93,7 +94,7 @@ func (l *InternalListener) SelectTLSBackends(sni string) ([]string, bool) {
 	}
 
 	// 2. Wildcard match (most specific / longest pattern wins)
-	var bestWildcardBackends []string
+	var bestWildcardBackends []InternalTLSBackend
 	bestWildcardLen := -1
 	for pattern, backends := range l.TLSBackends {
 		if strings.HasPrefix(pattern, "*.") && MatchesWildcard(pattern, cleanSNI) {
@@ -118,13 +119,67 @@ func (l *InternalListener) SelectTLSBackends(sni string) ([]string, bool) {
 	return nil, false
 }
 
-// SelectTLSBackend returns the primary backend target matching the given SNI.
+// SelectTLSBackend returns a backend target matching the given SNI selected by weight.
 func (l *InternalListener) SelectTLSBackend(sni string) (string, bool) {
+	return l.SelectTLSBackendWithRand(sni, nil)
+}
+
+// SelectTLSBackendWithRand returns a backend target matching the given SNI using the provided RNG for selection.
+// If r is nil, global rand.Int64N is used.
+func (l *InternalListener) SelectTLSBackendWithRand(sni string, r *rand.Rand) (string, bool) {
 	backends, ok := l.SelectTLSBackends(sni)
 	if !ok || len(backends) == 0 {
 		return "", false
 	}
-	return backends[0], true
+	return PickTLSBackendWithRand(backends, r)
+}
+
+// PickTLSBackend selects a backend target from a slice of InternalTLSBackend based on weight.
+func PickTLSBackend(backends []InternalTLSBackend) (string, bool) {
+	return PickTLSBackendWithRand(backends, nil)
+}
+
+// PickTLSBackendWithRand selects a backend target from a slice of InternalTLSBackend based on weight using the provided RNG.
+func PickTLSBackendWithRand(backends []InternalTLSBackend, r *rand.Rand) (string, bool) {
+	if len(backends) == 0 {
+		return "", false
+	}
+
+	var totalWeight int64
+	for _, b := range backends {
+		if b.Weight > 0 {
+			totalWeight += int64(b.Weight)
+		}
+	}
+
+	if totalWeight <= 0 {
+		return "", false
+	}
+
+	var n int64
+	if r != nil {
+		n = r.Int64N(totalWeight)
+	} else {
+		n = rand.Int64N(totalWeight)
+	}
+
+	for _, b := range backends {
+		if b.Weight <= 0 {
+			continue
+		}
+		if n < int64(b.Weight) {
+			return b.Target, true
+		}
+		n -= int64(b.Weight)
+	}
+
+	for i := len(backends) - 1; i >= 0; i-- {
+		if backends[i].Weight > 0 {
+			return backends[i].Target, true
+		}
+	}
+
+	return "", false
 }
 
 type listenerMatchCandidate struct {

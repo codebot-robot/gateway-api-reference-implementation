@@ -190,8 +190,12 @@ func TestConformance(t *testing.T) {
 		tests.TLSRouteInvalidNoMatchingListener,
 		tests.TLSRouteInvalidNoMatchingListenerHostname,
 		tests.TLSRouteInvalidReferenceGrant,
+		// TLSRouteListenerTerminateNotSupported and TLSRouteListenerMixedTerminationNotSupported are omitted: suite claims TLSRouteModeTerminate and TLSRouteModeMixed.
 		tests.TLSRouteListenerPassthroughSupportedKinds,
+		tests.TLSRouteListenerTerminateSupportedKinds,
+		tests.TLSRouteMixedTerminationSameNamespace,
 		tests.TLSRouteSimpleSameNamespace,
+		tests.TLSRouteTerminateSimpleSameNamespace,
 	}
 
 	cSuite.Setup(t, selectedTests)

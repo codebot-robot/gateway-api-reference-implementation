@@ -25,10 +25,16 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// InternalTLSBackend represents a resolved backend target and weight for a TLSRoute.
+type InternalTLSBackend struct {
+	Target string
+	Weight int32
+}
+
 // InternalTLSRule represents a compiled TLSRoute rule with resolved backend targets.
 type InternalTLSRule struct {
 	Name     *gatewayv1.SectionName
-	Backends []string
+	Backends []InternalTLSBackend
 }
 
 // InternalTLSRoute represents a compiled TLSRoute containing hostnames,
@@ -218,8 +224,19 @@ func CompileTLSRoute(
 				}
 			}
 
+			weight := int32(1)
+			if backendRef.Weight != nil {
+				weight = *backendRef.Weight
+				if weight < 0 {
+					weight = 0
+				}
+			}
+
 			target := fmt.Sprintf("%s.%s.svc.cluster.local:%d", backendRef.Name, svcNamespace, port)
-			iRule.Backends = append(iRule.Backends, target)
+			iRule.Backends = append(iRule.Backends, InternalTLSBackend{
+				Target: target,
+				Weight: weight,
+			})
 		}
 
 		compiledRules = append(compiledRules, iRule)

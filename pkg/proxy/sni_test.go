@@ -113,7 +113,7 @@ func TestSNIListener_PassthroughAndHTTPSAndFailClosed(t *testing.T) {
 				Port:        443,
 				Hostname:    "passthrough.example.com",
 				TLSMode:     &passthroughMode,
-				TLSBackends: map[string][]string{"passthrough.example.com": {net.JoinHostPort(backendHost, backendPortStr)}},
+				TLSBackends: map[string][]state.InternalTLSBackend{"passthrough.example.com": {{Target: net.JoinHostPort(backendHost, backendPortStr), Weight: 1}}},
 			},
 			{
 				Name:     "https-terminating",
@@ -246,12 +246,30 @@ func TestSNIListener_PassthroughAndHTTPSAndFailClosed(t *testing.T) {
 
 func TestSNIListener_ShutdownMidHandshakeRace(t *testing.T) {
 	_, proxyTLSCert := generateTestCAAndCert(t, []string{"https.example.com"}, nil)
+	_, termTLSCert := generateTestCAAndCert(t, []string{"terminate.example.com"}, nil)
 
 	p := NewProxy()
 	p.UpdateCertificates(map[string]*tls.Certificate{
-		"https.example.com": &proxyTLSCert,
+		"https.example.com":     &proxyTLSCert,
+		"terminate.example.com": &termTLSCert,
 	}, &proxyTLSCert)
 
+	echoLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for echo backend: %v", err)
+	}
+	defer echoLis.Close()
+	go func() {
+		for {
+			conn, err := echoLis.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	terminateMode := gatewayv1.TLSModeTerminate
 	p.UpdateConfig(
 		[]state.InternalListener{
 			{
@@ -259,6 +277,14 @@ func TestSNIListener_ShutdownMidHandshakeRace(t *testing.T) {
 				Protocol: gatewayv1.HTTPSProtocolType,
 				Port:     443,
 				Hostname: "https.example.com",
+			},
+			{
+				Name:        "tls-terminate",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        443,
+				Hostname:    "terminate.example.com",
+				TLSMode:     &terminateMode,
+				TLSBackends: map[string][]state.InternalTLSBackend{"terminate.example.com": {{Target: echoLis.Addr().String(), Weight: 1}}},
 			},
 		},
 		nil,
@@ -287,20 +313,24 @@ func TestSNIListener_ShutdownMidHandshakeRace(t *testing.T) {
 		}
 	}()
 
-	// Spawn multiple clients that initiate TLS handshakes concurrently
-	for i := 0; i < 30; i++ {
+	// Spawn multiple clients that initiate TLS handshakes concurrently across both HTTPS and Terminate paths
+	for i := 0; i < 40; i++ {
 		wg.Add(1)
-		go func() {
+		serverName := "https.example.com"
+		if i%2 == 0 {
+			serverName = "terminate.example.com"
+		}
+		go func(sn string) {
 			defer wg.Done()
 			dialer := &net.Dialer{Timeout: 1 * time.Second}
 			conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-				ServerName:         "https.example.com",
+				ServerName:         sn,
 				InsecureSkipVerify: true,
 			})
 			if err == nil {
 				_ = conn.Close()
 			}
-		}()
+		}(serverName)
 	}
 
 	// Close the listener while handshakes are mid-flight
@@ -392,7 +422,7 @@ func TestSNIListener_BypassToggle(t *testing.T) {
 		Port:        443,
 		Hostname:    "passthrough.example.com",
 		TLSMode:     &passthroughMode,
-		TLSBackends: map[string][]string{"passthrough.example.com": {net.JoinHostPort(backendHost, backendPortStr)}},
+		TLSBackends: map[string][]state.InternalTLSBackend{"passthrough.example.com": {{Target: net.JoinHostPort(backendHost, backendPortStr), Weight: 1}}},
 	}
 
 	// 1. Initial config: no Passthrough listeners (HTTPS only)
@@ -597,4 +627,208 @@ func BenchmarkSNIListener_HTTPSOnly(b *testing.B) {
 		_, _ = conn.Write([]byte("x"))
 		_ = conn.Close()
 	}
+}
+
+func TestSNIListener_TerminateAndMixedAndMissingCert(t *testing.T) {
+	// 1. Plain-text TCP echo backend (records bytes received)
+	var plainReceived sync.Map
+	echoLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for echo backend: %v", err)
+	}
+	defer echoLis.Close()
+
+	go func() {
+		for {
+			conn, err := echoLis.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				n, err := c.Read(buf)
+				if err == nil && n > 0 {
+					plainReceived.Store("data", string(buf[:n]))
+					_, _ = c.Write(append([]byte("plain-echo:"), buf[:n]...))
+				}
+			}(conn)
+		}
+	}()
+
+	// 2. Passthrough TLS backend
+	backendCAPEM, backendTLSCert := generateTestCAAndCert(t, []string{"passthrough.example.com"}, nil)
+	tlsBackendLis, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{backendTLSCert},
+	})
+	if err != nil {
+		t.Fatalf("failed to listen for TLS backend: %v", err)
+	}
+	defer tlsBackendLis.Close()
+
+	go func() {
+		for {
+			conn, err := tlsBackendLis.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				n, err := c.Read(buf)
+				if err == nil && n > 0 {
+					_, _ = c.Write(append([]byte("tls-echo:"), buf[:n]...))
+				}
+			}(conn)
+		}
+	}()
+
+	// 3. Certificates for proxy: certificate for terminate.example.com only
+	termCAPEM, termTLSCert := generateTestCAAndCert(t, []string{"terminate.example.com"}, nil)
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"terminate.example.com": &termTLSCert,
+	}, nil)
+
+	// 4. Configure listeners on proxy on the same port (8443):
+	// - Terminate listener for terminate.example.com
+	// - Passthrough listener for passthrough.example.com
+	// - Terminate listener with missing cert for missing-cert.example.com
+	terminateMode := gatewayv1.TLSModeTerminate
+	passthroughMode := gatewayv1.TLSModePassthrough
+
+	p.UpdateConfig(
+		[]state.InternalListener{
+			{
+				Name:        "tls-terminate",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        8443,
+				Hostname:    "terminate.example.com",
+				TLSMode:     &terminateMode,
+				TLSBackends: map[string][]state.InternalTLSBackend{"terminate.example.com": {{Target: echoLis.Addr().String(), Weight: 1}}},
+			},
+			{
+				Name:        "tls-passthrough",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        8443,
+				Hostname:    "passthrough.example.com",
+				TLSMode:     &passthroughMode,
+				TLSBackends: map[string][]state.InternalTLSBackend{"passthrough.example.com": {{Target: tlsBackendLis.Addr().String(), Weight: 1}}},
+			},
+			{
+				Name:        "tls-missing-cert",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        8443,
+				Hostname:    "missing-cert.example.com",
+				TLSMode:     &terminateMode,
+				TLSBackends: map[string][]state.InternalTLSBackend{"missing-cert.example.com": {{Target: echoLis.Addr().String(), Weight: 1}}},
+			},
+		},
+		nil,
+	)
+
+	// 5. Start raw TCP listener with SNI front
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	addr := rawLis.Addr().String()
+
+	t.Run("Terminate listener terminates with listener cert and reaches backend in plain text", func(t *testing.T) {
+		termCertPool := x509.NewCertPool()
+		termCertPool.AppendCertsFromPEM(termCAPEM)
+
+		conn, err := tls.Dial("tcp", addr, &tls.Config{
+			ServerName: "terminate.example.com",
+			RootCAs:    termCertPool,
+		})
+		if err != nil {
+			t.Fatalf("failed to dial terminate listener: %v", err)
+		}
+		defer conn.Close()
+
+		// Verify client verified listener's cert
+		connState := conn.ConnectionState()
+		if len(connState.PeerCertificates) == 0 {
+			t.Fatal("expected peer certificates")
+		}
+		if connState.PeerCertificates[0].DNSNames[0] != "terminate.example.com" {
+			t.Errorf("expected peer cert for terminate.example.com, got %v", connState.PeerCertificates[0].DNSNames)
+		}
+
+		// Send message over TLS
+		msg := "secret payload"
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("failed to write payload: %v", err)
+		}
+
+		reply := make([]byte, 1024)
+		n, err := conn.Read(reply)
+		if err != nil {
+			t.Fatalf("failed to read reply: %v", err)
+		}
+		if string(reply[:n]) != "plain-echo:"+msg {
+			t.Errorf("expected reply plain-echo:%s, got %s", msg, string(reply[:n]))
+		}
+
+		// Verify bytes arrived at backend in plain text
+		received, ok := plainReceived.Load("data")
+		if !ok || received.(string) != msg {
+			t.Errorf("expected plain text %q at echo backend, got %v", msg, received)
+		}
+	})
+
+	t.Run("Mixed mode on one port: passthrough SNI sees backend cert", func(t *testing.T) {
+		backendCertPool := x509.NewCertPool()
+		backendCertPool.AppendCertsFromPEM(backendCAPEM)
+
+		conn, err := tls.Dial("tcp", addr, &tls.Config{
+			ServerName: "passthrough.example.com",
+			RootCAs:    backendCertPool,
+		})
+		if err != nil {
+			t.Fatalf("failed to dial passthrough listener: %v", err)
+		}
+		defer conn.Close()
+
+		// Verify backend's cert was presented
+		connState := conn.ConnectionState()
+		if len(connState.PeerCertificates) == 0 {
+			t.Fatal("expected peer certificates from backend")
+		}
+		if connState.PeerCertificates[0].DNSNames[0] != "passthrough.example.com" {
+			t.Errorf("expected backend cert for passthrough.example.com, got %v", connState.PeerCertificates[0].DNSNames)
+		}
+
+		msg := "passthrough payload"
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("failed to write payload: %v", err)
+		}
+		reply := make([]byte, 1024)
+		n, err := conn.Read(reply)
+		if err != nil {
+			t.Fatalf("failed to read reply: %v", err)
+		}
+		if string(reply[:n]) != "tls-echo:"+msg {
+			t.Errorf("expected reply tls-echo:%s, got %s", msg, string(reply[:n]))
+		}
+	})
+
+	t.Run("Terminate listener with missing cert closes connection (fail closed)", func(t *testing.T) {
+		dialer := &net.Dialer{Timeout: 2 * time.Second}
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			ServerName:         "missing-cert.example.com",
+			InsecureSkipVerify: true,
+		})
+		if err == nil {
+			conn.Close()
+			t.Fatal("expected connection to fail closed when cert is missing, but connection succeeded")
+		}
+	})
 }
