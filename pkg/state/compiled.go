@@ -136,9 +136,11 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		tlsMode = el.TLS.Mode
 	}
 	var tlsBackends map[string][]string
-	if len(el.TLSBackends) > 0 {
-		tlsBackends = make(map[string][]string, len(el.TLSBackends))
-		for k, v := range el.TLSBackends {
+	for k, v := range el.TLSBackends {
+		if len(v) > 0 {
+			if tlsBackends == nil {
+				tlsBackends = make(map[string][]string)
+			}
 			copied := make([]string, len(v))
 			copy(copied, v)
 			tlsBackends[k] = copied
@@ -1163,7 +1165,9 @@ func bindTLSRouteParentRef(
 				for _, eh := range effectiveHostnames {
 					if rs.Internal != nil {
 						for _, rule := range rs.Internal.Rules {
-							el.TLSBackends[eh] = append(el.TLSBackends[eh], rule.Backends...)
+							if len(rule.Backends) > 0 {
+								el.TLSBackends[eh] = append(el.TLSBackends[eh], rule.Backends...)
+							}
 						}
 					}
 				}

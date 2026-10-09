@@ -610,3 +610,366 @@ func TestTLSRoute_HostnameIntersection_SelectedBackendMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestTLSRoute_UnresolvableBackendRef(t *testing.T) {
+	passthroughMode := gatewayv1.TLSModePassthrough
+	port443 := gatewayv1.PortNumber(443)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tls",
+					Port:     443,
+					Protocol: gatewayv1.TLSProtocolType,
+					TLS:      &gatewayv1.ListenerTLSConfig{Mode: &passthroughMode},
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	t.Run("nonexistent backend service", func(t *testing.T) {
+		route := &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-nonexistent", Namespace: "default"},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+				},
+				Hostnames: []gatewayv1.Hostname{"example.com"},
+				Rules: []gatewayv1.TLSRouteRule{
+					{
+						BackendRefs: []gatewayv1.BackendRef{
+							{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "nonexistent",
+									Port: &port443,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			TLSRoutes:      []*gatewayv1.TLSRoute{route},
+			Services:       map[types.NamespacedName]*corev1.Service{},
+			ControllerName: "example.net/gateway-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		if len(outputs.ProxyListeners) != 1 {
+			t.Fatalf("expected 1 proxy listener, got %d", len(outputs.ProxyListeners))
+		}
+		pLis := outputs.ProxyListeners[0]
+
+		// Listener must have NO TLS backend for that hostname
+		if backend, ok := pLis.SelectTLSBackend("example.com"); ok {
+			t.Errorf("expected no TLS backend for example.com, got %q", backend)
+		}
+		if backends, ok := pLis.TLSBackends["example.com"]; ok && len(backends) > 0 {
+			t.Errorf("expected empty or missing TLSBackends for example.com, got %v", backends)
+		}
+
+		// Route status must report ResolvedRefs=False with reason BackendNotFound
+		routeStatus, ok := outputs.TLSRouteStatuses[types.NamespacedName{Namespace: "default", Name: "route-nonexistent"}]
+		if !ok {
+			t.Fatalf("expected status for route")
+		}
+		if len(routeStatus.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(routeStatus.Parents))
+		}
+		var resolvedRefsCond *metav1.Condition
+		for _, c := range routeStatus.Parents[0].Conditions {
+			if c.Type == string(gatewayv1.RouteConditionResolvedRefs) {
+				resolvedRefsCond = &c
+				break
+			}
+		}
+		if resolvedRefsCond == nil {
+			t.Fatal("expected ResolvedRefs condition on parent status")
+		}
+		if resolvedRefsCond.Status != metav1.ConditionFalse {
+			t.Errorf("expected ResolvedRefs status False, got %s", resolvedRefsCond.Status)
+		}
+		if resolvedRefsCond.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
+			t.Errorf("expected ResolvedRefs reason BackendNotFound, got %s", resolvedRefsCond.Reason)
+		}
+	})
+
+	t.Run("unknown backend kind", func(t *testing.T) {
+		unknownGroup := gatewayv1.Group("unknownkind.example.com")
+		unknownKind := gatewayv1.Kind("NonExistent")
+		route := &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-unknown-kind", Namespace: "default"},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "gw"}},
+				},
+				Hostnames: []gatewayv1.Hostname{"example.com"},
+				Rules: []gatewayv1.TLSRouteRule{
+					{
+						BackendRefs: []gatewayv1.BackendRef{
+							{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &unknownGroup,
+									Kind:  &unknownKind,
+									Name:  "tls-backend",
+									Port:  &port443,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			TLSRoutes:      []*gatewayv1.TLSRoute{route},
+			Services:       map[types.NamespacedName]*corev1.Service{},
+			ControllerName: "example.net/gateway-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		if len(outputs.ProxyListeners) != 1 {
+			t.Fatalf("expected 1 proxy listener, got %d", len(outputs.ProxyListeners))
+		}
+		pLis := outputs.ProxyListeners[0]
+
+		// Listener must have NO TLS backend for that hostname
+		if backend, ok := pLis.SelectTLSBackend("example.com"); ok {
+			t.Errorf("expected no TLS backend for example.com, got %q", backend)
+		}
+		if backends, ok := pLis.TLSBackends["example.com"]; ok && len(backends) > 0 {
+			t.Errorf("expected empty or missing TLSBackends for example.com, got %v", backends)
+		}
+
+		// Route status must report ResolvedRefs=False with reason InvalidKind
+		routeStatus, ok := outputs.TLSRouteStatuses[types.NamespacedName{Namespace: "default", Name: "route-unknown-kind"}]
+		if !ok {
+			t.Fatalf("expected status for route")
+		}
+		if len(routeStatus.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(routeStatus.Parents))
+		}
+		var resolvedRefsCond *metav1.Condition
+		for _, c := range routeStatus.Parents[0].Conditions {
+			if c.Type == string(gatewayv1.RouteConditionResolvedRefs) {
+				resolvedRefsCond = &c
+				break
+			}
+		}
+		if resolvedRefsCond == nil {
+			t.Fatal("expected ResolvedRefs condition on parent status")
+		}
+		if resolvedRefsCond.Status != metav1.ConditionFalse {
+			t.Errorf("expected ResolvedRefs status False, got %s", resolvedRefsCond.Status)
+		}
+		if resolvedRefsCond.Reason != string(gatewayv1.RouteReasonInvalidKind) {
+			t.Errorf("expected ResolvedRefs reason InvalidKind, got %s", resolvedRefsCond.Reason)
+		}
+	})
+}
+
+func TestTLSRoute_InvalidNoMatchingListener(t *testing.T) {
+	terminateMode := gatewayv1.TLSModeTerminate
+	passthroughMode := gatewayv1.TLSModePassthrough
+	port80 := gatewayv1.PortNumber(80)
+	port443 := gatewayv1.PortNumber(443)
+
+	gwHTTP := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-http", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	gwHTTPS := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-https", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						Mode: &terminateMode,
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "cert-secret"},
+						},
+					},
+				},
+			},
+		},
+	}
+	gwTLS := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-tls", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tls-passthrough",
+					Port:     443,
+					Protocol: gatewayv1.TLSProtocolType,
+					TLS:      &gatewayv1.ListenerTLSConfig{Mode: &passthroughMode},
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cert-secret", Namespace: "default"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       []byte("dummy-cert"),
+			corev1.TLSPrivateKeyKey: []byte("dummy-key"),
+		},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 443}}},
+		},
+	}
+
+	t.Run("parentRef to HTTP listener yields NotAllowedByListeners", func(t *testing.T) {
+		route := &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-http", Namespace: "default"},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "gw-http"}},
+				},
+				Rules: []gatewayv1.TLSRouteRule{
+					{BackendRefs: []gatewayv1.BackendRef{{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port80}}}},
+				},
+			},
+		}
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gwHTTP},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			TLSRoutes:      []*gatewayv1.TLSRoute{route},
+			Services:       services,
+			ControllerName: "example.net/gateway-controller",
+		}
+		outputs := ComputeOutputs(inputs)
+		routeStatus := outputs.TLSRouteStatuses[types.NamespacedName{Namespace: "default", Name: "route-http"}]
+		if len(routeStatus.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(routeStatus.Parents))
+		}
+		pStatus := routeStatus.Parents[0]
+		var acceptedCond *metav1.Condition
+		for _, c := range pStatus.Conditions {
+			if c.Type == string(gatewayv1.RouteConditionAccepted) {
+				acceptedCond = &c
+				break
+			}
+		}
+		if acceptedCond == nil {
+			t.Fatal("expected Accepted condition")
+		}
+		if acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.RouteReasonNotAllowedByListeners) {
+			t.Errorf("expected Accepted=False Reason=NotAllowedByListeners, got Status=%s Reason=%s", acceptedCond.Status, acceptedCond.Reason)
+		}
+	})
+
+	t.Run("parentRef to HTTPS listener yields NotAllowedByListeners", func(t *testing.T) {
+		route := &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-https", Namespace: "default"},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: "gw-https"}},
+				},
+				Rules: []gatewayv1.TLSRouteRule{
+					{BackendRefs: []gatewayv1.BackendRef{{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port443}}}},
+				},
+			},
+		}
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gwHTTPS},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			TLSRoutes:      []*gatewayv1.TLSRoute{route},
+			Services:       services,
+			Secrets:        map[types.NamespacedName]*corev1.Secret{{Namespace: "default", Name: "cert-secret"}: secret},
+			ControllerName: "example.net/gateway-controller",
+		}
+		outputs := ComputeOutputs(inputs)
+		routeStatus := outputs.TLSRouteStatuses[types.NamespacedName{Namespace: "default", Name: "route-https"}]
+		if len(routeStatus.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(routeStatus.Parents))
+		}
+		pStatus := routeStatus.Parents[0]
+		var acceptedCond *metav1.Condition
+		for _, c := range pStatus.Conditions {
+			if c.Type == string(gatewayv1.RouteConditionAccepted) {
+				acceptedCond = &c
+				break
+			}
+		}
+		if acceptedCond == nil {
+			t.Fatal("expected Accepted condition")
+		}
+		if acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.RouteReasonNotAllowedByListeners) {
+			t.Errorf("expected Accepted=False Reason=NotAllowedByListeners, got Status=%s Reason=%s", acceptedCond.Status, acceptedCond.Reason)
+		}
+	})
+
+	t.Run("parentRef missing sectionName yields NoMatchingParent", func(t *testing.T) {
+		nonexistentSection := gatewayv1.SectionName("nonexistent-listener")
+		route := &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-missing-section", Namespace: "default"},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{Name: "gw-tls", SectionName: &nonexistentSection},
+					},
+				},
+				Rules: []gatewayv1.TLSRouteRule{
+					{BackendRefs: []gatewayv1.BackendRef{{BackendObjectReference: gatewayv1.BackendObjectReference{Name: "backend", Port: &port443}}}},
+				},
+			},
+		}
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gwTLS},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			TLSRoutes:      []*gatewayv1.TLSRoute{route},
+			Services:       services,
+			ControllerName: "example.net/gateway-controller",
+		}
+		outputs := ComputeOutputs(inputs)
+		routeStatus := outputs.TLSRouteStatuses[types.NamespacedName{Namespace: "default", Name: "route-missing-section"}]
+		if len(routeStatus.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(routeStatus.Parents))
+		}
+		pStatus := routeStatus.Parents[0]
+		var acceptedCond *metav1.Condition
+		for _, c := range pStatus.Conditions {
+			if c.Type == string(gatewayv1.RouteConditionAccepted) {
+				acceptedCond = &c
+				break
+			}
+		}
+		if acceptedCond == nil {
+			t.Fatal("expected Accepted condition")
+		}
+		if acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.RouteReasonNoMatchingParent) {
+			t.Errorf("expected Accepted=False Reason=NoMatchingParent, got Status=%s Reason=%s", acceptedCond.Status, acceptedCond.Reason)
+		}
+	})
+}

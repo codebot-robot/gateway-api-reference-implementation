@@ -309,3 +309,44 @@ func TestSNIListener_ShutdownMidHandshakeRace(t *testing.T) {
 	wg.Wait()
 	<-acceptDone
 }
+
+func TestSNIListener_PassthroughNoResolvableBackendClosed(t *testing.T) {
+	passthroughMode := gatewayv1.TLSModePassthrough
+
+	p := NewProxy()
+	p.UpdateConfig(
+		[]state.InternalListener{
+			{
+				Name:        "tls-passthrough",
+				Protocol:    gatewayv1.TLSProtocolType,
+				Port:        443,
+				Hostname:    "passthrough.example.com",
+				TLSMode:     &passthroughMode,
+				TLSBackends: nil, // Passthrough listener with no resolvable backend
+			},
+		},
+		nil,
+	)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	addr := rawLis.Addr().String()
+
+	// Dial TLS with SNI matching the Passthrough listener
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		ServerName:         "passthrough.example.com",
+		InsecureSkipVerify: true,
+	})
+	if err == nil {
+		conn.Close()
+		t.Fatal("expected connection rejection when passthrough listener has no resolvable backend, but connection succeeded")
+	}
+}
