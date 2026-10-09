@@ -926,3 +926,284 @@ func TestSNIListener_TerminateAndMixedAndMissingCert(t *testing.T) {
 		}
 	})
 }
+
+func TestSNIListener_ConsistentConfigSnapshotDuringSwap(t *testing.T) {
+	// Subtest 1: Structural atomicity: flag and candidates can never disagree
+	t.Run("Snapshot flag and candidates never disagree", func(t *testing.T) {
+		p := NewProxy()
+		httpsListener := state.InternalListener{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     443,
+			Hostname: "https.example.com",
+		}
+		ptMode := gatewayv1.TLSModePassthrough
+		passthroughListener := state.InternalListener{
+			Name:     "passthrough",
+			Protocol: gatewayv1.TLSProtocolType,
+			Port:     443,
+			Hostname: "passthrough.example.com",
+			TLSMode:  &ptMode,
+		}
+
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+
+		// Writer swapping back and forth between HTTPS-only and Passthrough+HTTPS
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					if i%2 == 0 {
+						p.UpdateConfig([]state.InternalListener{httpsListener}, nil)
+					} else {
+						p.UpdateConfig([]state.InternalListener{httpsListener, passthroughListener}, nil)
+					}
+				}
+			}
+		}()
+
+		// Multiple concurrent readers inspecting loaded snapshots
+		const readers = 8
+		var readersWg sync.WaitGroup
+		for r := 0; r < readers; r++ {
+			readersWg.Add(1)
+			go func() {
+				defer readersWg.Done()
+				for i := 0; i < 5000; i++ {
+					cfg := p.sniConfig.Load()
+					if cfg == nil {
+						t.Errorf("cfg was nil")
+						return
+					}
+					hasPTInCandidates := false
+					for _, c := range cfg.candidates {
+						if c.Protocol == gatewayv1.TLSProtocolType {
+							hasPTInCandidates = true
+							break
+						}
+					}
+					if cfg.hasPassthrough != hasPTInCandidates {
+						t.Errorf("inconsistent snapshot observed: hasPassthrough=%v but candidates has PT=%v",
+							cfg.hasPassthrough, hasPTInCandidates)
+						return
+					}
+				}
+			}()
+		}
+
+		readersWg.Wait()
+		close(stop)
+		wg.Wait()
+	})
+
+	// Subtest 2: Connection uses single consistent snapshot grabbed on accept
+	t.Run("Connection uses single consistent snapshot grabbed on accept", func(t *testing.T) {
+		backendServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("backend-passthrough-response"))
+		}))
+		backendCAPEM, backendTLSCert := generateTestCAAndCert(t, []string{"passthrough.example.com"}, nil)
+		backendServer.TLS = &tls.Config{Certificates: []tls.Certificate{backendTLSCert}}
+		backendServer.StartTLS()
+		defer backendServer.Close()
+
+		backendURL, err := url.Parse(backendServer.URL)
+		if err != nil {
+			t.Fatalf("failed to parse backend URL: %v", err)
+		}
+		backendHost, backendPortStr, err := net.SplitHostPort(backendURL.Host)
+		if err != nil {
+			t.Fatalf("failed to split backend host port: %v", err)
+		}
+
+		ptMode := gatewayv1.TLSModePassthrough
+		passthroughListener := state.InternalListener{
+			Name:        "passthrough",
+			Protocol:    gatewayv1.TLSProtocolType,
+			Port:        443,
+			Hostname:    "passthrough.example.com",
+			TLSMode:     &ptMode,
+			TLSBackends: map[string][]state.InternalTLSBackend{"passthrough.example.com": {{Target: net.JoinHostPort(backendHost, backendPortStr), Weight: 1}}},
+		}
+		httpsListener := state.InternalListener{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     443,
+			Hostname: "https.example.com",
+		}
+
+		p := NewProxy()
+		// Start with Passthrough configured
+		p.UpdateConfig([]state.InternalListener{passthroughListener, httpsListener}, nil)
+
+		rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer rawLis.Close()
+
+		sniLis := p.NewSNIListener(rawLis)
+		defer sniLis.Close()
+
+		addr := rawLis.Addr().String()
+
+		// 1. Client connects via TCP (acceptLoop accepts and loads Passthrough snapshot cfg)
+		rawConn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("failed to dial raw TCP: %v", err)
+		}
+		defer rawConn.Close()
+
+		// 2. Allow acceptLoop to accept the connection before TLS handshake begins
+		time.Sleep(20 * time.Millisecond)
+
+		// 3. Swap config to HTTPS-only (removing passthroughListener from proxy)
+		p.UpdateConfig([]state.InternalListener{httpsListener}, nil)
+
+		// 4. Now perform the TLS ClientHello on the already-accepted connection.
+		// If handleConn reloaded config or saw inconsistent config, it would fail closed.
+		// Since it uses the captured snapshot from accept time, it routes to passthrough backend.
+		backendCertPool := x509.NewCertPool()
+		backendCertPool.AppendCertsFromPEM(backendCAPEM)
+		tlsClient := tls.Client(rawConn, &tls.Config{
+			ServerName: "passthrough.example.com",
+			RootCAs:    backendCertPool,
+		})
+		defer tlsClient.Close()
+
+		req := "GET / HTTP/1.1\r\nHost: passthrough.example.com\r\nConnection: close\r\n\r\n"
+		if _, err := tlsClient.Write([]byte(req)); err != nil {
+			t.Fatalf("failed to write request: %v", err)
+		}
+		respBytes, err := io.ReadAll(tlsClient)
+		if err != nil {
+			t.Fatalf("failed to read response: %v", err)
+		}
+		if !strings.Contains(string(respBytes), "backend-passthrough-response") {
+			t.Errorf("expected backend-passthrough-response, got %q", string(respBytes))
+		}
+	})
+
+	// Subtest 3: Concurrent connections during rapid config swap never see inconsistent snapshot
+	t.Run("Concurrent connections during rapid config swap never see inconsistent snapshot", func(t *testing.T) {
+		backendServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("backend-passthrough-response"))
+		}))
+		backendCAPEM, backendTLSCert := generateTestCAAndCert(t, []string{"passthrough.example.com"}, nil)
+		backendServer.TLS = &tls.Config{Certificates: []tls.Certificate{backendTLSCert}}
+		backendServer.StartTLS()
+		defer backendServer.Close()
+
+		backendURL, err := url.Parse(backendServer.URL)
+		if err != nil {
+			t.Fatalf("failed to parse backend URL: %v", err)
+		}
+		backendHost, backendPortStr, err := net.SplitHostPort(backendURL.Host)
+		if err != nil {
+			t.Fatalf("failed to split backend host port: %v", err)
+		}
+
+		ptMode := gatewayv1.TLSModePassthrough
+		passthroughListener := state.InternalListener{
+			Name:        "passthrough",
+			Protocol:    gatewayv1.TLSProtocolType,
+			Port:        443,
+			Hostname:    "passthrough.example.com",
+			TLSMode:     &ptMode,
+			TLSBackends: map[string][]state.InternalTLSBackend{"passthrough.example.com": {{Target: net.JoinHostPort(backendHost, backendPortStr), Weight: 1}}},
+		}
+		httpsListener := state.InternalListener{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     443,
+			Hostname: "https.example.com",
+		}
+
+		p := NewProxy()
+		p.UpdateConfig([]state.InternalListener{httpsListener}, nil)
+
+		rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		defer rawLis.Close()
+
+		sniLis := p.NewSNIListener(rawLis)
+		defer sniLis.Close()
+
+		// Drain httpsConnCh so raw connections don't block
+		go func() {
+			for {
+				conn, err := sniLis.Accept()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+			}
+		}()
+
+		addr := rawLis.Addr().String()
+
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+
+		// Writer toggling config
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					if i%2 == 0 {
+						p.UpdateConfig([]state.InternalListener{httpsListener}, nil)
+					} else {
+						p.UpdateConfig([]state.InternalListener{httpsListener, passthroughListener}, nil)
+					}
+					time.Sleep(1 * time.Millisecond)
+				}
+			}
+		}()
+
+		backendCertPool := x509.NewCertPool()
+		backendCertPool.AppendCertsFromPEM(backendCAPEM)
+
+		// Workers dialing with passthrough SNI
+		const workers = 4
+		var clientWg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			clientWg.Add(1)
+			go func() {
+				defer clientWg.Done()
+				for i := 0; i < 25; i++ {
+					dialer := &net.Dialer{Timeout: 1 * time.Second}
+					conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+						ServerName: "passthrough.example.com",
+						RootCAs:    backendCertPool,
+					})
+					if err == nil {
+						_ = conn.SetDeadline(time.Now().Add(1 * time.Second))
+						req := "GET / HTTP/1.1\r\nHost: passthrough.example.com\r\nConnection: close\r\n\r\n"
+						_, _ = conn.Write([]byte(req))
+						resp, _ := io.ReadAll(conn)
+						_ = conn.Close()
+						if len(resp) > 0 && !strings.Contains(string(resp), "backend-passthrough-response") {
+							t.Errorf("unexpected response: %q", string(resp))
+						}
+					}
+				}
+			}()
+		}
+
+		clientWg.Wait()
+		close(stop)
+		wg.Wait()
+	})
+}
