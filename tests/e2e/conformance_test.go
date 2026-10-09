@@ -105,7 +105,7 @@ func TestConformance(t *testing.T) {
 		tests.BackendTLSPolicySANValidation,
 		tests.GatewayClassObservedGenerationBump,
 		tests.GatewayHTTPListenerIsolation,
-		tests.GatewayInfrastructure,
+		tests.GatewayInfrastructureMetadata,
 		tests.GatewayInvalidParametersRef,
 		tests.GatewayInvalidRouteKind,
 		tests.GatewayInvalidTLSConfiguration,
