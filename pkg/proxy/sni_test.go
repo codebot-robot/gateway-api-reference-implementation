@@ -548,6 +548,100 @@ func TestSNIListener_BypassToggle(t *testing.T) {
 	})
 }
 
+func TestSNIListener_SwitchOffHandOffStress(t *testing.T) {
+	passthroughMode := gatewayv1.TLSModePassthrough
+	httpsListener := state.InternalListener{
+		Name:     "https-listener",
+		Protocol: gatewayv1.HTTPSProtocolType,
+		Port:     443,
+		Hostname: "https.example.com",
+	}
+	passthroughListener := state.InternalListener{
+		Name:     "tls-passthrough",
+		Protocol: gatewayv1.TLSProtocolType,
+		Port:     443,
+		Hostname: "passthrough.example.com",
+		TLSMode:  &passthroughMode,
+	}
+
+	p := NewProxy()
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	addr := rawLis.Addr().String()
+
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		// Turn passthrough ON so acceptLoop is active.
+		p.UpdateConfig([]state.InternalListener{httpsListener, passthroughListener}, nil)
+
+		// Switch passthrough OFF.
+		p.UpdateConfig([]state.InternalListener{httpsListener}, nil)
+
+		type acceptResult struct {
+			conn net.Conn
+			err  error
+		}
+		acceptCh := make(chan acceptResult, 1)
+
+		var clientConn net.Conn
+		if i%2 == 0 {
+			// Dial first, then Accept
+			clientConn, err = net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("iteration %d: failed to dial: %v", i, err)
+			}
+			go func() {
+				c, aErr := sniLis.Accept()
+				acceptCh <- acceptResult{conn: c, err: aErr}
+			}()
+		} else {
+			// Accept first, then Dial
+			go func() {
+				c, aErr := sniLis.Accept()
+				acceptCh <- acceptResult{conn: c, err: aErr}
+			}()
+			clientConn, err = net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("iteration %d: failed to dial: %v", i, err)
+			}
+		}
+
+		select {
+		case res := <-acceptCh:
+			if res.err != nil {
+				clientConn.Close()
+				t.Fatalf("iteration %d: Accept failed: %v", i, res.err)
+			}
+			// Verify bidirectional data transfer over the accepted connection.
+			msg := []byte("ping")
+			if _, err := clientConn.Write(msg); err != nil {
+				res.conn.Close()
+				clientConn.Close()
+				t.Fatalf("iteration %d: failed to write ping: %v", i, err)
+			}
+			buf := make([]byte, 4)
+			_ = res.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			if _, err := io.ReadFull(res.conn, buf); err != nil {
+				res.conn.Close()
+				clientConn.Close()
+				t.Fatalf("iteration %d: failed to read ping: %v", i, err)
+			}
+			res.conn.Close()
+			clientConn.Close()
+		case <-time.After(2 * time.Second):
+			clientConn.Close()
+			t.Fatalf("iteration %d: Accept timed out during switch-off hand-off (hung)", i)
+		}
+	}
+}
+
 func BenchmarkSNIListener_HTTPSOnly(b *testing.B) {
 	_, proxyTLSCert := generateTestCAAndCert(b, []string{"https.example.com"}, nil)
 
