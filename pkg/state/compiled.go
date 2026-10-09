@@ -87,7 +87,7 @@ type EffectiveListener struct {
 	Conditions     []metav1.Condition
 	AttachedRoutes int32
 	Routes         []InternalRoute
-	TLSBackends    map[string][]string
+	TLSBackends    map[string][]InternalTLSBackend
 	Generation     int64
 }
 
@@ -132,16 +132,21 @@ func (el *EffectiveListener) QualifiedName() string {
 // ToInternalListener converts the effective listener to an InternalListener for proxy routing.
 func (el *EffectiveListener) ToInternalListener() InternalListener {
 	var tlsMode *gatewayv1.TLSModeType
-	if el.TLS != nil && el.TLS.Mode != nil {
-		tlsMode = el.TLS.Mode
+	if el.TLS != nil {
+		if el.TLS.Mode != nil {
+			tlsMode = el.TLS.Mode
+		} else if el.Protocol == gatewayv1.TLSProtocolType {
+			m := gatewayv1.TLSModeTerminate
+			tlsMode = &m
+		}
 	}
-	var tlsBackends map[string][]string
+	var tlsBackends map[string][]InternalTLSBackend
 	for k, v := range el.TLSBackends {
 		if len(v) > 0 {
 			if tlsBackends == nil {
-				tlsBackends = make(map[string][]string)
+				tlsBackends = make(map[string][]InternalTLSBackend)
 			}
-			copied := make([]string, len(v))
+			copied := make([]InternalTLSBackend, len(v))
 			copy(copied, v)
 			tlsBackends[k] = copied
 		}
@@ -1154,13 +1159,18 @@ func bindTLSRouteParentRef(
 			hostnames:      rs.GetHostnames(),
 			validationCond: valCond,
 			isProtocolCompatible: func(el *EffectiveListener) bool {
-				return el.Protocol == gatewayv1.TLSProtocolType &&
-					el.TLS != nil && el.TLS.Mode != nil && *el.TLS.Mode == gatewayv1.TLSModePassthrough
+				if el.Protocol != gatewayv1.TLSProtocolType || el.TLS == nil {
+					return false
+				}
+				if el.TLS.Mode == nil {
+					return true
+				}
+				return *el.TLS.Mode == gatewayv1.TLSModePassthrough || *el.TLS.Mode == gatewayv1.TLSModeTerminate
 			},
 			isKindAllowed: IsTLSRoute,
 			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
 				if el.TLSBackends == nil {
-					el.TLSBackends = make(map[string][]string)
+					el.TLSBackends = make(map[string][]InternalTLSBackend)
 				}
 				for _, eh := range effectiveHostnames {
 					if rs.Internal != nil {

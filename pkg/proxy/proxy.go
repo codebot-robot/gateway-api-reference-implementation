@@ -95,7 +95,7 @@ func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {
 	hasPassthrough := false
 	var candidates []state.InternalListener
 	for _, lis := range listeners {
-		if lis.Protocol == gatewayv1.TLSProtocolType && lis.TLSMode != nil && *lis.TLSMode == gatewayv1.TLSModePassthrough {
+		if lis.Protocol == gatewayv1.TLSProtocolType {
 			hasPassthrough = true
 		}
 		if lis.Protocol == gatewayv1.HTTPSProtocolType || lis.Protocol == gatewayv1.TLSProtocolType {
@@ -153,6 +153,28 @@ func (p *Proxy) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, er
 		return nil, fmt.Errorf("no certificate found for server name %s", hello.ServerName)
 	}
 	return nil, fmt.Errorf("no default certificate available")
+}
+
+// HasCertificate reports whether a certificate exists in the proxy for the given SNI (exact or wildcard).
+func (p *Proxy) HasCertificate(sni string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if sni == "" {
+		return false
+	}
+	s := strings.ToLower(sni)
+	if _, ok := p.certificates[s]; ok {
+		return true
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) > 1 {
+		wildcard := "*." + strings.Join(parts[1:], ".")
+		if _, ok := p.certificates[wildcard]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

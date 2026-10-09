@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -252,6 +253,16 @@ func (l *sniListener) handleConn(conn net.Conn) {
 			return
 		}
 
+		if selected.Protocol == gatewayv1.TLSProtocolType && (selected.TLSMode == nil || *selected.TLSMode == gatewayv1.TLSModeTerminate) {
+			backend, ok := selected.SelectTLSBackend(sniHostname)
+			if !ok || backend == "" {
+				_ = peekedConn.Close()
+				return
+			}
+			l.terminateTLSToBackend(peekedConn, sniHostname, backend)
+			return
+		}
+
 		if selected.Protocol == gatewayv1.HTTPSProtocolType {
 			select {
 			case l.httpsConnCh <- peekedConn:
@@ -274,6 +285,60 @@ func (l *sniListener) handleConn(conn net.Conn) {
 	case <-l.done:
 		_ = peekedConn.Close()
 	}
+}
+
+func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, backend string) {
+	select {
+	case <-l.done:
+		_ = clientConn.Close()
+		return
+	default:
+	}
+
+	if !l.p.HasCertificate(sniHostname) {
+		_ = clientConn.Close()
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		GetCertificate: l.p.GetCertificate,
+	}
+	tlsConn := tls.Server(clientConn, tlsConfig)
+	_ = clientConn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		_ = clientConn.Close()
+		return
+	}
+	_ = clientConn.SetDeadline(time.Time{})
+
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	backendConn, err := dialer.Dial("tcp", backend)
+	if err != nil {
+		_ = tlsConn.Close()
+		return
+	}
+
+	go func() {
+		defer tlsConn.Close()
+		defer backendConn.Close()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(backendConn, tlsConn)
+			closeWrite(backendConn)
+		}()
+
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(tlsConn, backendConn)
+			closeWrite(tlsConn)
+		}()
+
+		wg.Wait()
+	}()
 }
 
 func spliceToBackend(clientConn net.Conn, backend string) {
