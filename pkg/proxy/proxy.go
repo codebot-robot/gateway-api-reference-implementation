@@ -27,9 +27,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
@@ -45,14 +47,21 @@ type Proxy struct {
 	listeners    []state.InternalListener
 	certificates map[string]*tls.Certificate
 	defaultCert  *tls.Certificate
+
+	hasPassthrough atomic.Bool
+	sniCandidates  atomic.Pointer[[]state.InternalListener]
+	sniListeners   []*sniListener
 }
 
 func NewProxy() *Proxy {
-	return &Proxy{
+	p := &Proxy{
 		routes:       []state.InternalRoute{},
 		listeners:    []state.InternalListener{},
 		certificates: make(map[string]*tls.Certificate),
 	}
+	emptyCandidates := []state.InternalListener{}
+	p.sniCandidates.Store(&emptyCandidates)
+	return p
 }
 
 func (p *Proxy) SetDefaultCertificate(cert *tls.Certificate) {
@@ -71,6 +80,7 @@ func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.listeners = listeners
+	p.updateSNIConfigLocked(listeners)
 }
 
 func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.InternalRoute) {
@@ -78,6 +88,34 @@ func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.
 	defer p.mu.Unlock()
 	p.listeners = listeners
 	p.routes = routes
+	p.updateSNIConfigLocked(listeners)
+}
+
+func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {
+	hasPassthrough := false
+	var candidates []state.InternalListener
+	for _, lis := range listeners {
+		if lis.Protocol == gatewayv1.TLSProtocolType && lis.TLSMode != nil && *lis.TLSMode == gatewayv1.TLSModePassthrough {
+			hasPassthrough = true
+		}
+		if lis.Protocol == gatewayv1.HTTPSProtocolType || lis.Protocol == gatewayv1.TLSProtocolType {
+			candidates = append(candidates, lis)
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Port != candidates[j].Port {
+			return candidates[i].Port < candidates[j].Port
+		}
+		return candidates[i].Name < candidates[j].Name
+	})
+
+	p.hasPassthrough.Store(hasPassthrough)
+	p.sniCandidates.Store(&candidates)
+
+	for _, l := range p.sniListeners {
+		l.updatePassthrough(hasPassthrough)
+	}
 }
 
 func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
