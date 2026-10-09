@@ -2205,7 +2205,7 @@ func TestProxy_BuildTransport_BackendTLSPolicy(t *testing.T) {
 	}
 }
 
-func generateTestCAAndCert(t *testing.T, dnsNames []string, uris []*url.URL) ([]byte, tls.Certificate) {
+func generateTestCAAndCert(t testing.TB, dnsNames []string, uris []*url.URL) ([]byte, tls.Certificate) {
 	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -18,7 +18,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +34,10 @@ type sniListener struct {
 	closed      atomic.Bool
 	closeOnce   sync.Once
 	done        chan struct{}
+
+	mu                sync.Mutex
+	rawAcceptors      int
+	acceptLoopRunning bool
 }
 
 // NewSNIListener creates a net.Listener that wraps rawLis, inspects TLS SNI on incoming connections,
@@ -47,11 +50,91 @@ func (p *Proxy) NewSNIListener(rawLis net.Listener) net.Listener {
 		httpsConnCh: make(chan net.Conn, 128),
 		done:        make(chan struct{}),
 	}
-	go l.acceptLoop()
+	p.mu.Lock()
+	p.sniListeners = append(p.sniListeners, l)
+	p.mu.Unlock()
+
+	if p.hasPassthrough.Load() {
+		l.maybeStartAcceptLoop()
+	}
 	return l
 }
 
+func (l *sniListener) updatePassthrough(hasPassthrough bool) {
+	if hasPassthrough {
+		l.maybeStartAcceptLoop()
+	}
+}
+
+func (l *sniListener) maybeStartAcceptLoop() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.acceptLoopRunning || l.rawAcceptors > 0 || l.closed.Load() {
+		return
+	}
+	l.acceptLoopRunning = true
+	go l.acceptLoop()
+}
+
 func (l *sniListener) Accept() (net.Conn, error) {
+	// First check if there are any buffered connections from httpsConnCh.
+	select {
+	case <-l.done:
+		return nil, net.ErrClosed
+	case conn := <-l.httpsConnCh:
+		select {
+		case <-l.done:
+			_ = conn.Close()
+			return nil, net.ErrClosed
+		default:
+			return conn, nil
+		}
+	default:
+	}
+
+	l.mu.Lock()
+	if !l.p.hasPassthrough.Load() && !l.acceptLoopRunning {
+		l.rawAcceptors++
+		l.mu.Unlock()
+
+		conn, err := l.rawLis.Accept()
+
+		l.mu.Lock()
+		l.rawAcceptors--
+		hasPT := l.p.hasPassthrough.Load()
+		if !hasPT {
+			l.mu.Unlock()
+			if err != nil && l.closed.Load() {
+				return nil, net.ErrClosed
+			}
+			return conn, err
+		}
+
+		// Passthrough was turned on while we were in rawLis.Accept().
+		if err != nil {
+			if l.closed.Load() {
+				l.mu.Unlock()
+				return nil, net.ErrClosed
+			}
+			l.mu.Unlock()
+			return nil, err
+		}
+
+		if !l.acceptLoopRunning && !l.closed.Load() {
+			l.acceptLoopRunning = true
+			go l.acceptLoop()
+		}
+		l.mu.Unlock()
+
+		go l.handleConn(conn)
+	} else {
+		if l.p.hasPassthrough.Load() && !l.acceptLoopRunning && l.rawAcceptors == 0 && !l.closed.Load() {
+			l.acceptLoopRunning = true
+			go l.acceptLoop()
+		}
+		l.mu.Unlock()
+	}
+
 	select {
 	case <-l.done:
 		return nil, net.ErrClosed
@@ -72,6 +155,16 @@ func (l *sniListener) Close() error {
 		l.closed.Store(true)
 		close(l.done)
 		err = l.rawLis.Close()
+
+		l.p.mu.Lock()
+		for i, lis := range l.p.sniListeners {
+			if lis == l {
+				l.p.sniListeners = append(l.p.sniListeners[:i], l.p.sniListeners[i+1:]...)
+				break
+			}
+		}
+		l.p.mu.Unlock()
+
 		// Do not close httpsConnCh; handleConn may still attempt a send during shutdown.
 		// Drain and close any queued connections after closing done.
 		for {
@@ -104,6 +197,22 @@ func (l *sniListener) acceptLoop() {
 			}
 			continue
 		}
+
+		l.mu.Lock()
+		hasPT := l.p.hasPassthrough.Load()
+		if !hasPT {
+			l.acceptLoopRunning = false
+			l.mu.Unlock()
+
+			select {
+			case l.httpsConnCh <- conn:
+			case <-l.done:
+				_ = conn.Close()
+			}
+			return
+		}
+		l.mu.Unlock()
+
 		go l.handleConn(conn)
 	}
 }
@@ -115,24 +224,11 @@ func (l *sniListener) handleConn(conn net.Conn) {
 		return
 	}
 
-	l.p.mu.RLock()
+	candPtr := l.p.sniCandidates.Load()
 	var candidates []state.InternalListener
-	for _, lis := range l.p.listeners {
-		if lis.Protocol == gatewayv1.HTTPSProtocolType || lis.Protocol == gatewayv1.TLSProtocolType {
-			candidates = append(candidates, lis)
-		}
+	if candPtr != nil {
+		candidates = *candPtr
 	}
-	l.p.mu.RUnlock()
-
-	// All HTTPS/TLS listeners are SNI candidates regardless of port, because the Service
-	// collapses them onto targetPort 8443. Sort deterministically by port, then by name
-	// so matched[0] choice is deterministic.
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].Port != candidates[j].Port {
-			return candidates[i].Port < candidates[j].Port
-		}
-		return candidates[i].Name < candidates[j].Name
-	})
 
 	if len(candidates) == 0 {
 		select {
