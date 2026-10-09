@@ -48,9 +48,12 @@ type Proxy struct {
 	certificates map[string]*tls.Certificate
 	defaultCert  *tls.Certificate
 
-	hasPassthrough atomic.Bool
-	sniCandidates  atomic.Pointer[[]state.InternalListener]
-	sniListeners   []*sniListener
+	sniConfig atomic.Pointer[sniConfig]
+}
+
+type sniConfig struct {
+	hasPassthrough bool
+	candidates     []state.InternalListener
 }
 
 func NewProxy() *Proxy {
@@ -59,8 +62,7 @@ func NewProxy() *Proxy {
 		listeners:    []state.InternalListener{},
 		certificates: make(map[string]*tls.Certificate),
 	}
-	emptyCandidates := []state.InternalListener{}
-	p.sniCandidates.Store(&emptyCandidates)
+	p.sniConfig.Store(&sniConfig{})
 	return p
 }
 
@@ -110,12 +112,10 @@ func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {
 		return candidates[i].Name < candidates[j].Name
 	})
 
-	p.hasPassthrough.Store(hasPassthrough)
-	p.sniCandidates.Store(&candidates)
-
-	for _, l := range p.sniListeners {
-		l.updatePassthrough(hasPassthrough)
-	}
+	p.sniConfig.Store(&sniConfig{
+		hasPassthrough: hasPassthrough,
+		candidates:     candidates,
+	})
 }
 
 func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {

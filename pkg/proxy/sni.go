@@ -35,10 +35,6 @@ type sniListener struct {
 	closed      atomic.Bool
 	closeOnce   sync.Once
 	done        chan struct{}
-
-	mu                sync.Mutex
-	rawAcceptors      int
-	acceptLoopRunning bool
 }
 
 // NewSNIListener creates a net.Listener that wraps rawLis, inspects TLS SNI on incoming connections,
@@ -51,93 +47,11 @@ func (p *Proxy) NewSNIListener(rawLis net.Listener) net.Listener {
 		httpsConnCh: make(chan net.Conn, 128),
 		done:        make(chan struct{}),
 	}
-	p.mu.Lock()
-	p.sniListeners = append(p.sniListeners, l)
-	p.mu.Unlock()
-
-	if p.hasPassthrough.Load() {
-		l.maybeStartAcceptLoop()
-	}
+	go l.acceptLoop()
 	return l
 }
 
-func (l *sniListener) updatePassthrough(hasPassthrough bool) {
-	if hasPassthrough {
-		l.maybeStartAcceptLoop()
-	}
-}
-
-func (l *sniListener) maybeStartAcceptLoop() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.acceptLoopRunning || l.rawAcceptors > 0 || l.closed.Load() {
-		return
-	}
-	l.acceptLoopRunning = true
-	go l.acceptLoop()
-}
-
 func (l *sniListener) Accept() (net.Conn, error) {
-	l.mu.Lock()
-	// First check if there are any buffered connections from httpsConnCh while holding l.mu.
-	select {
-	case <-l.done:
-		l.mu.Unlock()
-		return nil, net.ErrClosed
-	case conn := <-l.httpsConnCh:
-		l.mu.Unlock()
-		select {
-		case <-l.done:
-			_ = conn.Close()
-			return nil, net.ErrClosed
-		default:
-			return conn, nil
-		}
-	default:
-	}
-
-	if !l.p.hasPassthrough.Load() && !l.acceptLoopRunning {
-		l.rawAcceptors++
-		l.mu.Unlock()
-
-		conn, err := l.rawLis.Accept()
-
-		l.mu.Lock()
-		l.rawAcceptors--
-		hasPT := l.p.hasPassthrough.Load()
-		if !hasPT {
-			l.mu.Unlock()
-			if err != nil && l.closed.Load() {
-				return nil, net.ErrClosed
-			}
-			return conn, err
-		}
-
-		// Passthrough was turned on while we were in rawLis.Accept().
-		if err != nil {
-			if l.closed.Load() {
-				l.mu.Unlock()
-				return nil, net.ErrClosed
-			}
-			l.mu.Unlock()
-			return nil, err
-		}
-
-		if !l.acceptLoopRunning && !l.closed.Load() {
-			l.acceptLoopRunning = true
-			go l.acceptLoop()
-		}
-		l.mu.Unlock()
-
-		go l.handleConn(conn)
-	} else {
-		if l.p.hasPassthrough.Load() && !l.acceptLoopRunning && l.rawAcceptors == 0 && !l.closed.Load() {
-			l.acceptLoopRunning = true
-			go l.acceptLoop()
-		}
-		l.mu.Unlock()
-	}
-
 	select {
 	case <-l.done:
 		return nil, net.ErrClosed
@@ -159,16 +73,6 @@ func (l *sniListener) Close() error {
 		close(l.done)
 		err = l.rawLis.Close()
 
-		l.p.mu.Lock()
-		for i, lis := range l.p.sniListeners {
-			if lis == l {
-				l.p.sniListeners = append(l.p.sniListeners[:i], l.p.sniListeners[i+1:]...)
-				break
-			}
-		}
-		l.p.mu.Unlock()
-
-		// Do not close httpsConnCh; handleConn may still attempt a send during shutdown.
 		// Drain and close any queued connections after closing done.
 		for {
 			select {
@@ -201,42 +105,28 @@ func (l *sniListener) acceptLoop() {
 			continue
 		}
 
-		l.mu.Lock()
-		hasPT := l.p.hasPassthrough.Load()
-		if !hasPT {
+		cfg := l.p.sniConfig.Load()
+		if cfg == nil || !cfg.hasPassthrough {
 			select {
 			case <-l.done:
 				_ = conn.Close()
-			default:
-				select {
-				case l.httpsConnCh <- conn:
-				default:
-					_ = conn.Close()
-				}
+			case l.httpsConnCh <- conn:
 			}
-			l.acceptLoopRunning = false
-			l.mu.Unlock()
-			return
+			continue
 		}
-		l.mu.Unlock()
 
-		go l.handleConn(conn)
+		go l.handleConn(conn, cfg)
 	}
 }
 
-func (l *sniListener) handleConn(conn net.Conn) {
+func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 	sniHostname, peekedConn, err := sni.SniffSNI(conn, 5*time.Second)
 	if err != nil && !errors.Is(err, sni.ErrNoSNI) {
 		_ = peekedConn.Close()
 		return
 	}
 
-	candPtr := l.p.sniCandidates.Load()
-	var candidates []state.InternalListener
-	if candPtr != nil {
-		candidates = *candPtr
-	}
-
+	candidates := cfg.candidates
 	if len(candidates) == 0 {
 		select {
 		case l.httpsConnCh <- peekedConn:
