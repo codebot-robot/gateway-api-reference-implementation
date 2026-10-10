@@ -14,6 +14,7 @@
 package state
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -187,6 +188,63 @@ func PickTLSBackendWithRand(backends []InternalTLSBackend, r *rand.Rand) (string
 	}
 
 	return "", false
+}
+
+// PickBackend selects an InternalBackend from a slice based on weight.
+// If all backends have weight 0 or the list is empty, an error is returned.
+func PickBackend(backends []InternalBackend) (InternalBackend, error) {
+	return PickBackendWithRand(backends, nil)
+}
+
+// PickBackendWithRand selects an InternalBackend from a slice based on weight using the provided RNG.
+// If all backends have weight 0 or the list is empty, an error is returned.
+func PickBackendWithRand(backends []InternalBackend, r *rand.Rand) (InternalBackend, error) {
+	if len(backends) == 0 {
+		return InternalBackend{}, fmt.Errorf("no backends configured")
+	}
+
+	if len(backends) == 1 {
+		if backends[0].Weight <= 0 {
+			return InternalBackend{}, fmt.Errorf("all backends have zero weight")
+		}
+		return backends[0], nil
+	}
+
+	var totalWeight int64
+	for _, b := range backends {
+		if b.Weight > 0 {
+			totalWeight += int64(b.Weight)
+		}
+	}
+
+	if totalWeight <= 0 {
+		return InternalBackend{}, fmt.Errorf("all backends have zero weight")
+	}
+
+	var n int64
+	if r != nil {
+		n = r.Int64N(totalWeight)
+	} else {
+		n = rand.Int64N(totalWeight)
+	}
+
+	for _, b := range backends {
+		if b.Weight <= 0 {
+			continue
+		}
+		if n < int64(b.Weight) {
+			return b, nil
+		}
+		n -= int64(b.Weight)
+	}
+
+	for i := len(backends) - 1; i >= 0; i-- {
+		if backends[i].Weight > 0 {
+			return backends[i], nil
+		}
+	}
+
+	return InternalBackend{}, fmt.Errorf("no backend selected")
 }
 
 type listenerMatchCandidate struct {

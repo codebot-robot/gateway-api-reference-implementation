@@ -121,6 +121,8 @@ func TestConformance(t *testing.T) {
 		tests.GRPCExactMethodMatching,
 		tests.GRPCRouteHeaderMatching,
 		tests.GRPCRouteListenerHostnameMatching,
+		tests.GRPCRouteNamedRule,
+		tests.GRPCRouteWeight,
 		tests.HTTPRoute303Redirect,
 		tests.HTTPRoute307Redirect,
 		tests.HTTPRoute308Redirect,

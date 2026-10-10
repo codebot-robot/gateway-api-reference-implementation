@@ -252,6 +252,9 @@ func CompileGRPCRoute(
 				weight := int32(1)
 				if backendRef.Weight != nil {
 					weight = *backendRef.Weight
+					if weight < 0 {
+						weight = 0
+					}
 				}
 
 				backend.Weight = weight
