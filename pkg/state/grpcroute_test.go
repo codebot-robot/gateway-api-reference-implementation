@@ -15,6 +15,7 @@
 package state
 
 import (
+	"math/rand/v2"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -454,5 +455,309 @@ func TestGRPCRoute_Status_Conditions(t *testing.T) {
 	}
 	if resolvedRefsCond.Status != metav1.ConditionTrue {
 		t.Errorf("expected ResolvedRefs=True, got %s", resolvedRefsCond.Status)
+	}
+}
+
+func TestGRPCRoute_NamedRules(t *testing.T) {
+	ruleName1 := gatewayv1.SectionName("named-rule")
+	ruleName2 := gatewayv1.SectionName("second-rule")
+	svc := "my.package.MyService"
+	method1 := "Echo"
+	method2 := "EchoTwo"
+
+	validRoute := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "valid-named-rules",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					Name: &ruleName1,
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Service: &svc,
+								Method:  &method1,
+							},
+						},
+					},
+				},
+				{
+					Name: &ruleName2,
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Service: &svc,
+								Method:  &method2,
+							},
+						},
+					},
+				},
+				{
+					// Unnamed rule alongside named rules is valid
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Service: &svc,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	internalValid := CompileGRPCRoute(validRoute, nil, nil, nil, nil)
+	if internalValid == nil {
+		t.Fatalf("expected compiled GRPCRoute")
+	}
+	if internalValid.ValidationCondition.Status != metav1.ConditionTrue {
+		t.Fatalf("expected valid named route ValidationCondition True, got %v", internalValid.ValidationCondition.Status)
+	}
+	if len(internalValid.Rules) != 3 {
+		t.Fatalf("expected 3 rules, got %d", len(internalValid.Rules))
+	}
+	if internalValid.Rules[0].Name == nil || *internalValid.Rules[0].Name != ruleName1 {
+		t.Errorf("expected rule 0 name %q, got %v", ruleName1, internalValid.Rules[0].Name)
+	}
+	if internalValid.Rules[1].Name == nil || *internalValid.Rules[1].Name != ruleName2 {
+		t.Errorf("expected rule 1 name %q, got %v", ruleName2, internalValid.Rules[1].Name)
+	}
+	if internalValid.Rules[2].Name != nil {
+		t.Errorf("expected rule 2 name nil, got %v", internalValid.Rules[2].Name)
+	}
+
+	// Duplicate rule names
+	duplicateRoute := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "duplicate-named-rules",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					Name: &ruleName1,
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Service: &svc,
+								Method:  &method1,
+							},
+						},
+					},
+				},
+				{
+					Name: &ruleName1, // duplicate name
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Service: &svc,
+								Method:  &method2,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	internalDup := CompileGRPCRoute(duplicateRoute, nil, nil, nil, nil)
+	if internalDup.ValidationCondition.Status != metav1.ConditionFalse {
+		t.Errorf("expected duplicate rule names ValidationCondition False, got %v", internalDup.ValidationCondition.Status)
+	}
+	if internalDup.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Errorf("expected Reason UnsupportedValue, got %s", internalDup.ValidationCondition.Reason)
+	}
+
+	// Verify duplicate rule name causes Accepted=False in ComputeOutputs
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	duplicateRoute.Spec.ParentRefs = []gatewayv1.ParentReference{{Name: "gw"}}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GRPCRoutes:     []*gatewayv1.GRPCRoute{duplicateRoute},
+		ControllerName: "example.net/gateway-controller",
+	}
+	outputs := ComputeOutputs(inputs)
+	dupStatus := outputs.GRPCRouteStatuses[types.NamespacedName{Namespace: "default", Name: "duplicate-named-rules"}]
+	if len(dupStatus.Parents) != 1 {
+		t.Fatalf("expected 1 parent status, got %d", len(dupStatus.Parents))
+	}
+	var acceptedCond *metav1.Condition
+	for _, c := range dupStatus.Parents[0].Conditions {
+		if c.Type == string(gatewayv1.RouteConditionAccepted) {
+			acceptedCond = &c
+			break
+		}
+	}
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Errorf("expected Accepted=False with UnsupportedValue, got %+v", acceptedCond)
+	}
+}
+
+func TestGRPCRoute_WeightedBackends(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-weight", Namespace: "default"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	w70 := int32(70)
+	w30 := int32(30)
+	w0 := int32(0)
+	port8080 := gatewayv1.PortNumber(8080)
+
+	route := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "weighted-grpcroute", Namespace: "default"},
+		Spec: gatewayv1.GRPCRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{Name: "gw-weight"}},
+			},
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend-v1",
+									Port: &port8080,
+								},
+								Weight: &w70,
+							},
+						},
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend-v2",
+									Port: &port8080,
+								},
+								Weight: &w30,
+							},
+						},
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend-v3",
+									Port: &port8080,
+								},
+								Weight: &w0,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-v1"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend-v1", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+		{Namespace: "default", Name: "backend-v2"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend-v2", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+		{Namespace: "default", Name: "backend-v3"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend-v3", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		GRPCRoutes:     []*gatewayv1.GRPCRoute{route},
+		Services:       services,
+		ControllerName: "example.net/gateway-controller",
+	}
+
+	outputs := ComputeOutputs(inputs)
+	if len(outputs.ProxyListeners) != 1 {
+		t.Fatalf("expected 1 proxy listener, got %d", len(outputs.ProxyListeners))
+	}
+	pLis := outputs.ProxyListeners[0]
+	if len(pLis.Routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(pLis.Routes))
+	}
+	r := pLis.Routes[0]
+	if len(r.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(r.Rules))
+	}
+	backends := r.Rules[0].Backends
+	if len(backends) != 3 {
+		t.Fatalf("expected 3 backends, got %d", len(backends))
+	}
+
+	// Verify weights are carried through
+	if backends[0].Weight != 70 || backends[0].Host != "backend-v1.default.svc.cluster.local" {
+		t.Errorf("backend 0 unexpected: %+v", backends[0])
+	}
+	if backends[1].Weight != 30 || backends[1].Host != "backend-v2.default.svc.cluster.local" {
+		t.Errorf("backend 1 unexpected: %+v", backends[1])
+	}
+	if backends[2].Weight != 0 || backends[2].Host != "backend-v3.default.svc.cluster.local" {
+		t.Errorf("backend 2 unexpected: %+v", backends[2])
+	}
+
+	// Draw many times with seeded RNG and verify 70/30 distribution and 0 draws for weight 0
+	rng := rand.New(rand.NewPCG(42, 1024))
+	counts := make(map[string]int)
+	totalDraws := 10000
+
+	for i := 0; i < totalDraws; i++ {
+		b, err := PickBackendWithRand(backends, rng)
+		if err != nil {
+			t.Fatalf("draw %d failed to select backend: %v", i, err)
+		}
+		counts[b.Host]++
+	}
+
+	host1 := "backend-v1.default.svc.cluster.local"
+	host2 := "backend-v2.default.svc.cluster.local"
+	host3 := "backend-v3.default.svc.cluster.local"
+
+	if counts[host3] != 0 {
+		t.Errorf("expected 0 selections for weight-0 backend, got %d", counts[host3])
+	}
+
+	ratio1 := float64(counts[host1]) / float64(totalDraws)
+	ratio2 := float64(counts[host2]) / float64(totalDraws)
+
+	if ratio1 < 0.65 || ratio1 > 0.75 {
+		t.Errorf("expected host1 proportion ~0.70, got %f (%d/%d)", ratio1, counts[host1], totalDraws)
+	}
+	if ratio2 < 0.25 || ratio2 > 0.35 {
+		t.Errorf("expected host2 proportion ~0.30, got %f (%d/%d)", ratio2, counts[host2], totalDraws)
 	}
 }

@@ -1468,40 +1468,7 @@ func applyCORSHeaders(header http.Header, r *http.Request, cors *gatewayv1.HTTPC
 // pickBackend selects a backend from the list based on their weights.
 // If all backends have weight 0 or the list is empty, an error is returned.
 func pickBackend(backends []state.InternalBackend) (state.InternalBackend, error) {
-	if len(backends) == 0 {
-		return state.InternalBackend{}, fmt.Errorf("no backends configured")
-	}
-
-	if len(backends) == 1 {
-		if backends[0].Weight <= 0 {
-			return state.InternalBackend{}, fmt.Errorf("all backends have zero weight")
-		}
-		return backends[0], nil
-	}
-
-	var totalWeight int64
-	for _, b := range backends {
-		if b.Weight > 0 {
-			totalWeight += int64(b.Weight)
-		}
-	}
-
-	if totalWeight <= 0 {
-		return state.InternalBackend{}, fmt.Errorf("all backends have zero weight")
-	}
-
-	n := rand.Int64N(totalWeight)
-	for _, b := range backends {
-		if b.Weight <= 0 {
-			continue
-		}
-		if n < int64(b.Weight) {
-			return b, nil
-		}
-		n -= int64(b.Weight)
-	}
-
-	return backends[len(backends)-1], nil
+	return state.PickBackend(backends)
 }
 
 func (p *Proxy) mirror(r *http.Request, bodyBytes []byte, backend state.InternalBackend, timeouts *state.InternalTimeouts) {
