@@ -17,6 +17,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -39,6 +40,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -2384,4 +2387,149 @@ func TestBackendTLSPolicy_SubjectAltNamesVerification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProxy_H2C_GRPC(t *testing.T) {
+	// 1. Setup h2c backend
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/grpc")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("grpc-reply"))
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+		w.Header().Set(http.TrailerPrefix+"Grpc-Message", "ok")
+	})
+	backendH2cHandler := h2c.NewHandler(backendHandler, &http2.Server{})
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for backend: %v", err)
+	}
+	defer backendLn.Close()
+	backendSrv := &http.Server{Handler: backendH2cHandler}
+	go backendSrv.Serve(backendLn)
+	defer backendSrv.Close()
+
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendLn.Addr().String())
+	backendPort, _ := strconv.Atoi(backendPortStr)
+
+	// 2. Setup Proxy with a matching route to the h2c backend
+	p := NewProxy()
+	h2cProto := "kubernetes.io/h2c"
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Hostnames: []string{"example.com"},
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{
+							Path: &state.InternalPathMatch{
+								Type:  gatewayv1.PathMatchExact,
+								Value: "/my.service/Echo",
+							},
+						},
+					},
+					Backends: []state.InternalBackend{
+						{
+							Host:        backendHost,
+							Port:        int32(backendPort),
+							AppProtocol: &h2cProto,
+							Weight:      1,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	// 3. Run Proxy over h2c
+	proxyH2cHandler := h2c.NewHandler(p, &http2.Server{})
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for proxy: %v", err)
+	}
+	defer proxyLn.Close()
+	proxySrv := &http.Server{Handler: proxyH2cHandler}
+	go proxySrv.Serve(proxyLn)
+	defer proxySrv.Close()
+
+	proxyAddr := proxyLn.Addr().String()
+
+	// 4. HTTP/2 Client using h2c (prior knowledge)
+	client := &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+	}
+
+	// Subtest 1: Plain HTTP request matching no route -> HTTP 404
+	t.Run("plain HTTP unmatched gets 404", func(t *testing.T) {
+		req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/non-existent", proxyAddr), nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Host = "example.com"
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("failed to send request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
+		}
+	})
+
+	// Subtest 2: gRPC request matching no route -> HTTP 200 with grpc-status: 12 (Unimplemented)
+	t.Run("gRPC unmatched gets 200 with grpc-status 12", func(t *testing.T) {
+		req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/non-existent", proxyAddr), nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Host = "example.com"
+		req.Header.Set("Content-Type", "application/grpc")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("failed to send request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/grpc" {
+			t.Errorf("expected Content-Type application/grpc, got %q", ct)
+		}
+		if gs := resp.Header.Get("Grpc-Status"); gs != "12" {
+			t.Errorf("expected Grpc-Status 12, got %q", gs)
+		}
+	})
+
+	// Subtest 3: Matching gRPC request reaches h2c backend
+	t.Run("matching gRPC reaches h2c backend", func(t *testing.T) {
+		req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/my.service/Echo", proxyAddr), nil)
+		if err != nil {
+			t.Fatalf("failed to create request: %v", err)
+		}
+		req.Host = "example.com"
+		req.Header.Set("Content-Type", "application/grpc")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("failed to send request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read response body: %v", err)
+		}
+		if string(body) != "grpc-reply" {
+			t.Errorf("expected body 'grpc-reply', got %q", string(body))
+		}
+		if gs := resp.Trailer.Get("Grpc-Status"); gs != "0" {
+			t.Errorf("expected trailer Grpc-Status 0, got %q", gs)
+		}
+	})
 }

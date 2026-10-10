@@ -214,7 +214,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				sni := strings.ToLower(r.TLS.ServerName)
 				connListeners, connMatchType := state.MatchListeners(httpsListeners, sni)
 				if len(connListeners) == 0 {
-					http.Error(w, fmt.Sprintf("No listener for server name %s", sni), http.StatusNotFound)
+					p.respondNotFound(w, r, fmt.Sprintf("No listener for server name %s", sni))
 					return
 				}
 
@@ -237,7 +237,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						if len(reqHostListeners) > 0 {
 							http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
 						} else {
-							http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+							p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
 						}
 						return
 					}
@@ -257,7 +257,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						if len(reqHostListeners) > 0 {
 							http.Error(w, "Misdirected Request", http.StatusMisdirectedRequest)
 						} else {
-							http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+							p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
 						}
 						return
 					}
@@ -285,7 +285,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if len(httpListeners) > 0 {
 				reqHostListeners, _ := state.MatchListeners(httpListeners, reqHost)
 				if len(reqHostListeners) == 0 {
-					http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+					p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
 					return
 				}
 				var matchedRoutes []state.InternalRoute
@@ -444,7 +444,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
+	p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
+}
+
+func (p *Proxy) respondNotFound(w http.ResponseWriter, r *http.Request, msg string) {
+	if isGRPCRequest(r) {
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Grpc-Status", "12")
+		w.Header().Set("Grpc-Message", msg)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Error(w, msg, http.StatusNotFound)
+}
+
+func isGRPCRequest(r *http.Request) bool {
+	ct := strings.TrimSpace(strings.ToLower(r.Header.Get("Content-Type")))
+	return ct == "application/grpc" || strings.HasPrefix(ct, "application/grpc+") || strings.HasPrefix(ct, "application/grpc;")
 }
 
 // modifyHeaders modifies the request headers in place before forwarding.
@@ -1249,6 +1265,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 				log.Log.Error(err, "Failed to copy response body")
 			}
 			panic(http.ErrAbortHandler)
+		}
+		closeConn(resp.Body)
+
+		for k, vv := range resp.Trailer {
+			for _, v := range vv {
+				w.Header().Add(http.TrailerPrefix+k, v)
+			}
 		}
 		return
 	}

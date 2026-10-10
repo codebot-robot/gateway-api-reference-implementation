@@ -13,7 +13,7 @@ rules:
   resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets"]
   verbs: ["get", "list", "watch", "update", "patch"]
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["tlsroutes"]
+  resources: ["tlsroutes", "grpcroutes"]
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["services", "serviceaccounts"]
@@ -36,7 +36,7 @@ rules:
   resources: ["endpointslices"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status"]
+  resources: ["gateways/status", "gatewayclasses/status", "httproutes/status", "backendtlspolicies/status", "listenersets/status", "tlsroutes/status", "grpcroutes/status"]
   verbs: ["update", "patch"]
 ---
 # Security notice: each per-Gateway data-plane pod currently runs state computation
@@ -49,7 +49,7 @@ metadata:
   name: gari-dataplane
 rules:
 - apiGroups: ["gateway.networking.k8s.io"]
-  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets", "tlsroutes"]
+  resources: ["httproutes", "gateways", "gatewayclasses", "backendtlspolicies", "referencegrants", "listenersets", "tlsroutes", "grpcroutes"]
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["services", "configmaps", "secrets", "namespaces", "endpoints"]

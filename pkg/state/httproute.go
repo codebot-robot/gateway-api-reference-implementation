@@ -94,23 +94,7 @@ func CompileHTTPRoute(
 	}
 
 	// Deterministically sort a copy of BackendTLSPolicies by creation timestamp, then by namespaced name.
-	var sortedTLSPolicies []*gatewayv1.BackendTLSPolicy
-	if len(backendTLSPolicies) > 0 {
-		sortedTLSPolicies = make([]*gatewayv1.BackendTLSPolicy, len(backendTLSPolicies))
-		copy(sortedTLSPolicies, backendTLSPolicies)
-		sort.SliceStable(sortedTLSPolicies, func(i, j int) bool {
-			if sortedTLSPolicies[i].CreationTimestamp.Time.Before(sortedTLSPolicies[j].CreationTimestamp.Time) {
-				return true
-			}
-			if sortedTLSPolicies[i].CreationTimestamp.Time.After(sortedTLSPolicies[j].CreationTimestamp.Time) {
-				return false
-			}
-			if sortedTLSPolicies[i].Namespace != sortedTLSPolicies[j].Namespace {
-				return sortedTLSPolicies[i].Namespace < sortedTLSPolicies[j].Namespace
-			}
-			return sortedTLSPolicies[i].Name < sortedTLSPolicies[j].Name
-		})
-	}
+	sortedTLSPolicies := sortBackendTLSPolicies(backendTLSPolicies)
 
 	var compiledRules []InternalRule
 	seenRuleNames := make(map[gatewayv1.SectionName]bool)
@@ -472,7 +456,9 @@ func CompileHTTPRoute(
 			for _, backendRef := range rule.BackendRefs {
 				backend, refErr := resolveBackendTarget(
 					backendRef.BackendObjectReference,
-					route,
+					"HTTPRoute",
+					route.Namespace,
+					route.Generation,
 					services,
 					sortedTLSPolicies,
 					configMaps,
@@ -694,12 +680,36 @@ func (s *HTTPRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 	return false
 }
 
+// sortBackendTLSPolicies deterministically sorts BackendTLSPolicies by creation timestamp, then by namespaced name.
+func sortBackendTLSPolicies(backendTLSPolicies []*gatewayv1.BackendTLSPolicy) []*gatewayv1.BackendTLSPolicy {
+	if len(backendTLSPolicies) == 0 {
+		return nil
+	}
+	sortedTLSPolicies := make([]*gatewayv1.BackendTLSPolicy, len(backendTLSPolicies))
+	copy(sortedTLSPolicies, backendTLSPolicies)
+	sort.SliceStable(sortedTLSPolicies, func(i, j int) bool {
+		if sortedTLSPolicies[i].CreationTimestamp.Time.Before(sortedTLSPolicies[j].CreationTimestamp.Time) {
+			return true
+		}
+		if sortedTLSPolicies[i].CreationTimestamp.Time.After(sortedTLSPolicies[j].CreationTimestamp.Time) {
+			return false
+		}
+		if sortedTLSPolicies[i].Namespace != sortedTLSPolicies[j].Namespace {
+			return sortedTLSPolicies[i].Namespace < sortedTLSPolicies[j].Namespace
+		}
+		return sortedTLSPolicies[i].Name < sortedTLSPolicies[j].Name
+	})
+	return sortedTLSPolicies
+}
+
 // resolveBackendTarget resolves a BackendObjectReference to an InternalBackend,
 // performing kind/group checks, cross-namespace ReferenceGrant validation, Service resolution,
 // and BackendTLSPolicy matching.
 func resolveBackendTarget(
 	backendRef gatewayv1.BackendObjectReference,
-	route *gatewayv1.HTTPRoute,
+	routeKind string,
+	routeNamespace string,
+	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
 	sortedTLSPolicies []*gatewayv1.BackendTLSPolicy,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
@@ -723,7 +733,7 @@ func resolveBackendTarget(
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonInvalidKind),
 			msg,
-			route.Generation,
+			routeGeneration,
 		)
 		return nil, &ErrorState{
 			Condition:      errCond,
@@ -732,16 +742,16 @@ func resolveBackendTarget(
 		}
 	}
 
-	svcNamespace := route.Namespace
+	svcNamespace := routeNamespace
 	if backendRef.Namespace != nil && string(*backendRef.Namespace) != "" {
 		svcNamespace = string(*backendRef.Namespace)
 	}
 
 	// Cross-namespace ReferenceGrant check
-	if svcNamespace != route.Namespace {
+	if svcNamespace != routeNamespace {
 		from := Reference{
-			GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
-			Namespace: route.Namespace,
+			GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: routeKind},
+			Namespace: routeNamespace,
 		}
 		to := Reference{
 			GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
@@ -755,7 +765,7 @@ func resolveBackendTarget(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonRefNotPermitted),
 				msg,
-				route.Generation,
+				routeGeneration,
 			)
 			return nil, &ErrorState{
 				Condition:      errCond,
@@ -788,7 +798,7 @@ func resolveBackendTarget(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonBackendNotFound),
 				msg,
-				route.Generation,
+				routeGeneration,
 			)
 			return nil, &ErrorState{
 				Condition:      errCond,
@@ -1017,7 +1027,9 @@ func compileRequestMirrorFilter(
 
 	backend, refErr := resolveBackendTarget(
 		m.BackendRef,
-		route,
+		"HTTPRoute",
+		route.Namespace,
+		route.Generation,
 		services,
 		sortedTLSPolicies,
 		configMaps,
