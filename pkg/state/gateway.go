@@ -75,15 +75,22 @@ type InternalListener struct {
 	TLSBackends map[string][]InternalTLSBackend
 }
 
+// hostWithoutPort returns s with the port stripped if present, or s unchanged if not.
+func hostWithoutPort(s string) string {
+	h, _, err := net.SplitHostPort(s)
+	if err != nil {
+		return s
+	}
+	return h
+}
+
 // SelectTLSBackends finds the backend targets matching the given SNI for a TLS listener.
 // Follows Gateway API precedence: Exact match > longest matching wildcard > catch-all.
 func (l *InternalListener) SelectTLSBackends(sni string) ([]InternalTLSBackend, bool) {
 	if l == nil || len(l.TLSBackends) == 0 {
 		return nil, false
 	}
-	if h, _, err := net.SplitHostPort(sni); err == nil {
-		sni = h
-	}
+	sni = hostWithoutPort(sni)
 	cleanSNI := strings.ToLower(sni)
 
 	// 1. Exact match
@@ -190,9 +197,7 @@ type listenerMatchCandidate struct {
 
 // MatchesWildcard reports whether a hostname matches a wildcard pattern (e.g. *.example.com).
 func MatchesWildcard(pattern, host string) bool {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host = hostWithoutPort(host)
 	cleanHost := strings.ToLower(host)
 	cleanPattern := strings.ToLower(pattern)
 	if !strings.HasPrefix(cleanPattern, "*.") {
@@ -204,9 +209,7 @@ func MatchesWildcard(pattern, host string) bool {
 
 // MatchListeners finds all listeners that match a given host with the highest specificity (Exact > Wildcard > CatchAll).
 func MatchListeners(listeners []InternalListener, host string) ([]InternalListener, MatchType) {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host = hostWithoutPort(host)
 	cleanHost := strings.ToLower(host)
 
 	var (
@@ -320,10 +323,7 @@ func (ir *InternalRoute) MatchHostname(host string) bool {
 // MatchHostnameScore computes whether the host matches any of the route's hostnames,
 // and returns the number of characters in the matching non-wildcard hostname and total matching hostname.
 func (ir *InternalRoute) MatchHostnameScore(host string) (bool, int, int) {
-	// Strip port if present
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host = hostWithoutPort(host)
 	cleanHost := strings.ToLower(host)
 
 	if len(ir.Hostnames) == 0 {

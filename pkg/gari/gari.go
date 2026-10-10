@@ -37,6 +37,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -313,6 +314,14 @@ func (s *Server) newTLSConfig() *tls.Config {
 	}
 }
 
+func parsePort(addr string) (int, error) {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(portStr)
+}
+
 // StartProxyServers starts the HTTP and HTTPS proxy servers and blocks until ctx is canceled.
 func (s *Server) StartProxyServers(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
@@ -353,7 +362,9 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				setupLog.Info("shutting down proxy server")
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				_ = srv.Shutdown(shutdownCtx)
+				if err := srv.Shutdown(shutdownCtx); err != nil {
+					klog.Warningf("failed to shut down proxy server: %v", err)
+				}
 			}()
 			if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy server failed: %w", err)
@@ -381,11 +392,12 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			if udpAddr, ok := h3Conn.LocalAddr().(*net.UDPAddr); ok {
 				advertisedH3Port = udpAddr.Port
 			} else {
-				_, portStr, err := net.SplitHostPort(h3Conn.LocalAddr().String())
-				if err == nil {
-					if p, err := strconv.Atoi(portStr); err == nil {
-						advertisedH3Port = p
-					}
+				p, err := parsePort(h3Conn.LocalAddr().String())
+				if err != nil {
+					return fmt.Errorf("failed to parse port from HTTP/3 connection address %q: %w", h3Conn.LocalAddr().String(), err)
+				}
+				if p > 0 {
+					advertisedH3Port = p
 				}
 			}
 		}
@@ -431,8 +443,12 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				setupLog.Info("shutting down proxy HTTPS server")
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				_ = srv.Shutdown(shutdownCtx)
-				_ = sniLis.Close()
+				if err := srv.Shutdown(shutdownCtx); err != nil {
+					klog.Warningf("failed to shut down proxy HTTPS server: %v", err)
+				}
+				if err := sniLis.Close(); err != nil {
+					klog.Warningf("failed to close HTTPS SNI listener: %v", err)
+				}
 			}()
 			if err := srv.Serve(tlsLis); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy HTTPS server failed: %w", err)
@@ -459,8 +475,12 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				setupLog.Info("shutting down proxy HTTP/3 server")
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				_ = h3Server.Shutdown(shutdownCtx)
-				_ = h3Conn.Close()
+				if err := h3Server.Shutdown(shutdownCtx); err != nil {
+					klog.Warningf("failed to shut down proxy HTTP/3 server: %v", err)
+				}
+				if err := h3Conn.Close(); err != nil {
+					klog.Warningf("failed to close HTTP/3 packet connection: %v", err)
+				}
 			}()
 
 			if err := h3Server.Serve(h3Conn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, quic.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {

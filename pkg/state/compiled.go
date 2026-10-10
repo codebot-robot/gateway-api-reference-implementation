@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
@@ -1267,7 +1268,9 @@ func ExtractCertificates(
 				certCopy := tlsCert
 				if len(certCopy.Certificate) > 0 {
 					leaf, err := x509.ParseCertificate(certCopy.Certificate[0])
-					if err == nil {
+					if err != nil {
+						klog.V(2).Infof("failed to parse certificate for secret %s: %v", secretKey, err)
+					} else {
 						certCopy.Leaf = leaf
 						if leaf.Subject.CommonName != "" {
 							certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy

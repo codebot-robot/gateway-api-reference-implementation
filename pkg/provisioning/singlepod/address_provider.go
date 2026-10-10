@@ -502,14 +502,22 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 
 	// 5. Check Readiness and LB Addresses
 	deployReady := false
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy); err == nil {
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, false, fmt.Errorf("getting Deployment %s/%s for readiness check: %w", gwNamespace, name, err)
+		}
+	} else {
 		if existingDeploy.Status.AvailableReplicas > 0 || existingDeploy.Status.ReadyReplicas > 0 {
 			deployReady = true
 		}
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
-	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err == nil {
+	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, false, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
+		}
+	} else {
 		for _, ingress := range existingSvc.Status.LoadBalancer.Ingress {
 			if ingress.IP != "" {
 				addresses = append(addresses, gatewayv1.GatewayStatusAddress{

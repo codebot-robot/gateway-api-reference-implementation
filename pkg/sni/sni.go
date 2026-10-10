@@ -22,6 +22,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -75,9 +77,13 @@ func NewPeekedConn(conn net.Conn, peeked []byte) *PeekedConn {
 // It returns the SNI hostname, a PeekedConn that preserves all original bytes, and any error encountered.
 func SniffSNI(conn net.Conn, readTimeout time.Duration) (string, net.Conn, error) {
 	if readTimeout > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			return "", conn, fmt.Errorf("setting read deadline: %w", err)
+		}
 		defer func() {
-			_ = conn.SetReadDeadline(time.Time{})
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				klog.V(2).Infof("failed to clear read deadline: %v", err)
+			}
 		}()
 	}
 

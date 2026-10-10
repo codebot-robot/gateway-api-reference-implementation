@@ -50,6 +50,23 @@ func main() {
 	}
 }
 
+func parseHostname(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+func closeBody(c io.Closer) {
+	if c == nil {
+		return
+	}
+	if err := c.Close(); err != nil {
+		log.Printf("Failed to close body: %v", err)
+	}
+}
+
 func runServer() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -65,7 +82,12 @@ func runServer() {
 			headers[k] = v
 		}
 
-		body, _ := io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("Failed to read body: %v", err)
+			http.Error(w, "Failed to read body", http.StatusInternalServerError)
+			return
+		}
 
 		resp := map[string]any{
 			"headers":  headers,
@@ -77,6 +99,7 @@ func runServer() {
 
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			log.Printf("Failed to encode response: %v", err)
+			return
 		}
 	})
 
@@ -131,10 +154,7 @@ func runClientCLI(args []string) {
 	if *http3Flag {
 		serverName := *sni
 		if serverName == "" {
-			u, err := url.Parse(targetURL)
-			if err == nil {
-				serverName = u.Hostname()
-			}
+			serverName = parseHostname(targetURL)
 		}
 		tlsConfig := &tls.Config{
 			ServerName:         serverName,
@@ -159,10 +179,7 @@ func runClientCLI(args []string) {
 				}
 				serverName := *sni
 				if serverName == "" {
-					u, err := url.Parse(targetURL)
-					if err == nil {
-						serverName = u.Hostname()
-					}
+					serverName = parseHostname(targetURL)
 				}
 				tlsConfig := &tls.Config{
 					ServerName:         serverName,
@@ -225,7 +242,7 @@ func runClientCLI(args []string) {
 				fmt.Printf("Connection rejected as expected: %v\n", err)
 				return
 			}
-			defer resp.Body.Close()
+			defer closeBody(resp.Body)
 			log.Fatalf("Expected connection to fail, but request succeeded with status %s", resp.Status)
 		}
 
@@ -236,7 +253,7 @@ func runClientCLI(args []string) {
 			}
 			// If not 200 and we have attempts remaining, retry
 			if attempt < maxAttempts {
-				resp.Body.Close()
+				closeBody(resp.Body)
 				lastErr = fmt.Errorf("unexpected status: %s", resp.Status)
 				continue
 			}
@@ -250,7 +267,7 @@ func runClientCLI(args []string) {
 	if lastErr != nil {
 		log.Fatalf("Request failed: %v", lastErr)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp.Body)
 
 	if *expectFail {
 		log.Fatalf("Expected connection to fail, but request succeeded with status %s", resp.Status)

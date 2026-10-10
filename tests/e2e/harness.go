@@ -188,7 +188,9 @@ func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Dur
 		}
 
 		out, err := exec.Command("kubectl", "get", "gateway", name, "--namespace", namespace, "-o", "jsonpath={.status.addresses[0].value}").Output()
-		if err == nil {
+		if err != nil {
+			h.t.Logf("waiting for gateway %s/%s address: %v", namespace, name, err)
+		} else {
 			addr := strings.TrimSpace(string(out))
 			if addr != "" {
 				h.t.Logf("Gateway %s/%s assigned address: %s", namespace, name, addr)
@@ -217,7 +219,9 @@ func (h *Harness) WaitForResourceDeletion(kind, name, namespace string, timeout 
 
 func (h *Harness) DeletePod(name string) {
 	h.t.Logf("Deleting pod %s", name)
-	exec.Command("kubectl", "delete", "pod", name, "--namespace", "default", "--ignore-not-found").Run()
+	if err := exec.Command("kubectl", "delete", "pod", name, "--namespace", "default", "--ignore-not-found").Run(); err != nil {
+		h.t.Logf("failed to delete pod %s: %v", name, err)
+	}
 }
 
 func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
@@ -229,7 +233,9 @@ func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
 		}
 
 		out, err := exec.Command("kubectl", "get", "pod", name, "--namespace", "default", "-o", "jsonpath={.status.phase}").Output()
-		if err == nil {
+		if err != nil {
+			h.t.Logf("waiting for pod %s phase: %v", name, err)
+		} else {
 			phase := strings.TrimSpace(string(out))
 			if phase == "Succeeded" {
 				return
@@ -449,7 +455,10 @@ func (h *Harness) ClientManifest(url string, host string) string {
 }
 
 func (h *Harness) ClientManifestWithArgs(name string, args ...string) string {
-	argsJSON, _ := json.Marshal(args)
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		h.t.Fatalf("failed to marshal args: %v", err)
+	}
 	return fmt.Sprintf(`
 apiVersion: v1
 kind: Pod

@@ -19,12 +19,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -51,6 +53,33 @@ func (p *Proxy) NewSNIListener(rawLis net.Listener) net.Listener {
 	return l
 }
 
+func closeConn(c io.Closer) {
+	if c == nil {
+		return
+	}
+	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		klog.V(2).Infof("failed to close connection: %v", err)
+	}
+}
+
+func isNormalClose(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+func copyAndCloseWrite(dst, src net.Conn) error {
+	var errs []error
+	if _, err := io.Copy(dst, src); err != nil && !isNormalClose(err) {
+		errs = append(errs, err)
+	}
+	if err := closeWrite(dst); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
 func (l *sniListener) Accept() (net.Conn, error) {
 	select {
 	case <-l.done:
@@ -58,7 +87,7 @@ func (l *sniListener) Accept() (net.Conn, error) {
 	case conn := <-l.httpsConnCh:
 		select {
 		case <-l.done:
-			_ = conn.Close()
+			closeConn(conn)
 			return nil, net.ErrClosed
 		default:
 			return conn, nil
@@ -77,7 +106,7 @@ func (l *sniListener) Close() error {
 		for {
 			select {
 			case c := <-l.httpsConnCh:
-				_ = c.Close()
+				closeConn(c)
 			default:
 				return
 			}
@@ -109,7 +138,7 @@ func (l *sniListener) acceptLoop() {
 		if cfg == nil || !cfg.hasPassthrough {
 			select {
 			case <-l.done:
-				_ = conn.Close()
+				closeConn(conn)
 			case l.httpsConnCh <- conn:
 			}
 			continue
@@ -121,18 +150,31 @@ func (l *sniListener) acceptLoop() {
 
 func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 	sniHostname, peekedConn, err := sni.SniffSNI(conn, 5*time.Second)
+	if peekedConn == nil {
+		peekedConn = conn
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			closeConn(peekedConn)
+		}
+	}()
+
 	if err != nil && !errors.Is(err, sni.ErrNoSNI) {
-		_ = peekedConn.Close()
 		return
+	}
+
+	handOffToHTTPS := func() {
+		select {
+		case l.httpsConnCh <- peekedConn:
+			handedOff = true
+		case <-l.done:
+		}
 	}
 
 	candidates := cfg.candidates
 	if len(candidates) == 0 {
-		select {
-		case l.httpsConnCh <- peekedConn:
-		case <-l.done:
-			_ = peekedConn.Close()
-		}
+		handOffToHTTPS()
 		return
 	}
 
@@ -142,9 +184,9 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 		if selected.Protocol == gatewayv1.TLSProtocolType && selected.TLSMode != nil && *selected.TLSMode == gatewayv1.TLSModePassthrough {
 			backend, ok := selected.SelectTLSBackend(sniHostname)
 			if !ok || backend == "" {
-				_ = peekedConn.Close()
 				return
 			}
+			handedOff = true
 			spliceToBackend(peekedConn, backend)
 			return
 		}
@@ -152,47 +194,38 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 		if selected.Protocol == gatewayv1.TLSProtocolType && (selected.TLSMode == nil || *selected.TLSMode == gatewayv1.TLSModeTerminate) {
 			backend, ok := selected.SelectTLSBackend(sniHostname)
 			if !ok || backend == "" {
-				_ = peekedConn.Close()
 				return
 			}
+			handedOff = true
 			l.terminateTLSToBackend(peekedConn, sniHostname, backend)
 			return
 		}
 
 		if selected.Protocol == gatewayv1.HTTPSProtocolType {
-			select {
-			case l.httpsConnCh <- peekedConn:
-			case <-l.done:
-				_ = peekedConn.Close()
-			}
+			handOffToHTTPS()
 			return
 		}
 	}
 
 	// If an SNI was provided and matched no listener: fail closed.
 	if sniHostname != "" {
-		_ = peekedConn.Close()
 		return
 	}
 
 	// No SNI provided (e.g. direct IP connection): hand to HTTPS server
-	select {
-	case l.httpsConnCh <- peekedConn:
-	case <-l.done:
-		_ = peekedConn.Close()
-	}
+	handOffToHTTPS()
 }
 
 func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, backend string) {
 	select {
 	case <-l.done:
-		_ = clientConn.Close()
+		closeConn(clientConn)
 		return
 	default:
 	}
 
 	if !l.p.HasCertificate(sniHostname) {
-		_ = clientConn.Close()
+		closeConn(clientConn)
 		return
 	}
 
@@ -200,37 +233,47 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 		GetCertificate: l.p.GetCertificate,
 	}
 	tlsConn := tls.Server(clientConn, tlsConfig)
-	_ = clientConn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := tlsConn.Handshake(); err != nil {
-		_ = clientConn.Close()
+	if err := clientConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		klog.V(2).Infof("failed to set deadline for TLS handshake: %v", err)
+		closeConn(clientConn)
 		return
 	}
-	_ = clientConn.SetDeadline(time.Time{})
+	if err := tlsConn.Handshake(); err != nil {
+		closeConn(clientConn)
+		return
+	}
+	if err := clientConn.SetDeadline(time.Time{}); err != nil {
+		klog.V(2).Infof("failed to clear deadline after TLS handshake: %v", err)
+		closeConn(tlsConn)
+		return
+	}
 
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	backendConn, err := dialer.Dial("tcp", backend)
 	if err != nil {
-		_ = tlsConn.Close()
+		closeConn(tlsConn)
 		return
 	}
 
 	go func() {
-		defer tlsConn.Close()
-		defer backendConn.Close()
+		defer closeConn(tlsConn)
+		defer closeConn(backendConn)
 
 		var wg sync.WaitGroup
 		wg.Add(2)
 
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(backendConn, tlsConn)
-			closeWrite(backendConn)
+			if err := copyAndCloseWrite(backendConn, tlsConn); err != nil {
+				klog.V(2).Infof("splice copy error: %v", err)
+			}
 		}()
 
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(tlsConn, backendConn)
-			closeWrite(tlsConn)
+			if err := copyAndCloseWrite(tlsConn, backendConn); err != nil {
+				klog.V(2).Infof("splice copy error: %v", err)
+			}
 		}()
 
 		wg.Wait()
@@ -241,42 +284,51 @@ func spliceToBackend(clientConn net.Conn, backend string) {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	backendConn, err := dialer.Dial("tcp", backend)
 	if err != nil {
-		_ = clientConn.Close()
+		closeConn(clientConn)
 		return
 	}
 
 	go func() {
-		defer clientConn.Close()
-		defer backendConn.Close()
+		defer closeConn(clientConn)
+		defer closeConn(backendConn)
 
 		var wg sync.WaitGroup
 		wg.Add(2)
 
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(backendConn, clientConn)
-			closeWrite(backendConn)
+			if err := copyAndCloseWrite(backendConn, clientConn); err != nil {
+				klog.V(2).Infof("splice copy error: %v", err)
+			}
 		}()
 
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(clientConn, backendConn)
-			closeWrite(clientConn)
+			if err := copyAndCloseWrite(clientConn, backendConn); err != nil {
+				klog.V(2).Infof("splice copy error: %v", err)
+			}
 		}()
 
 		wg.Wait()
 	}()
 }
 
-func closeWrite(conn net.Conn) {
+func closeWrite(conn net.Conn) error {
 	type closeWriter interface {
 		CloseWrite() error
 	}
 	if cw, ok := conn.(closeWriter); ok {
-		_ = cw.CloseWrite()
+		if err := cw.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
+			klog.V(2).Infof("failed to close write: %v", err)
+			return err
+		}
 	} else if pc, ok := conn.(*sni.PeekedConn); ok {
 		if cw, ok := pc.RawConn().(closeWriter); ok {
-			_ = cw.CloseWrite()
+			if err := cw.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
+				klog.V(2).Infof("failed to close write: %v", err)
+				return err
+			}
 		}
 	}
+	return nil
 }
