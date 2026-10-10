@@ -99,6 +99,15 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		return fmt.Errorf("error creating TLSRoute controller: %w", err)
 	}
 
+	if err := (&GRPCRouteReconciler{
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		State:          st,
+		ControllerName: controllerName,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("error creating GRPCRoute controller: %w", err)
+	}
+
 	if err := (&GatewayClassReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
@@ -250,6 +259,27 @@ func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.S
 				}
 				if r, ok := obj.(*gatewayv1.TLSRoute); ok {
 					st.DeleteTLSRoute(types.NamespacedName{Namespace: r.Namespace, Name: r.Name})
+				}
+			},
+		},
+		{
+			obj: &gatewayv1.GRPCRoute{},
+			add: func(obj any) {
+				if r, ok := obj.(*gatewayv1.GRPCRoute); ok {
+					st.UpsertGRPCRoute(r)
+				}
+			},
+			update: func(oldObj, newObj any) {
+				if r, ok := newObj.(*gatewayv1.GRPCRoute); ok {
+					st.UpsertGRPCRoute(r)
+				}
+			},
+			delete: func(obj any) {
+				if tombstone, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+					obj = tombstone.Obj
+				}
+				if r, ok := obj.(*gatewayv1.GRPCRoute); ok {
+					st.DeleteGRPCRoute(types.NamespacedName{Namespace: r.Namespace, Name: r.Name})
 				}
 			},
 		},

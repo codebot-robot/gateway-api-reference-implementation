@@ -32,6 +32,12 @@ func IsTLSRoute(group *gatewayv1.Group, kind gatewayv1.Kind) bool {
 	return (g == "" || g == gatewayv1.GroupName) && kind == "TLSRoute"
 }
 
+// IsGRPCRoute returns true if the group and kind represent a GRPCRoute in Gateway API.
+func IsGRPCRoute(group *gatewayv1.Group, kind gatewayv1.Kind) bool {
+	g := ValueOf(group)
+	return (g == "" || g == gatewayv1.GroupName) && kind == "GRPCRoute"
+}
+
 // IntersectHostnames calculates the intersection of route hostnames and a listener hostname.
 func IntersectHostnames(routeHostnames []string, listenerHostname string) []string {
 	if listenerHostname == "" || listenerHostname == "*" {
