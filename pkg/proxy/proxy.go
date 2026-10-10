@@ -36,6 +36,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -177,6 +178,18 @@ func (p *Proxy) HasCertificate(sni string) bool {
 	return false
 }
 
+func splitHostPort(hostPort string, defaultPort int32) (string, int32) {
+	h, pStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return hostPort, defaultPort
+	}
+	p, err := strconv.Atoi(pStr)
+	if err != nil {
+		return h, defaultPort
+	}
+	return h, int32(p)
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.RLock()
 	routes := p.routes
@@ -185,14 +198,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if len(listeners) > 0 {
 		if r.TLS != nil {
-			reqHost := r.Host
-			reqPort := int32(443)
-			if h, pStr, err := net.SplitHostPort(reqHost); err == nil {
-				reqHost = h
-				if p, err := strconv.Atoi(pStr); err == nil {
-					reqPort = int32(p)
-				}
-			}
+			reqHost, reqPort := splitHostPort(r.Host, 443)
 			reqHost = strings.ToLower(reqHost)
 
 			var httpsListeners []state.InternalListener
@@ -264,14 +270,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				routes = connRoutes
 			}
 		} else {
-			reqHost := r.Host
-			reqPort := int32(80)
-			if h, pStr, err := net.SplitHostPort(reqHost); err == nil {
-				reqHost = h
-				if p, err := strconv.Atoi(pStr); err == nil {
-					reqPort = int32(p)
-				}
-			}
+			reqHost, reqPort := splitHostPort(r.Host, 80)
 			reqHost = strings.ToLower(reqHost)
 
 			var httpListeners []state.InternalListener
@@ -381,11 +380,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if len(bestRule.Mirrors) > 0 && r.Body != nil && r.Body != http.NoBody {
 				const maxMirrorBodySize = 8 * 1024 * 1024 // 8MB limit to avoid OOM
 				limitedReader := io.LimitReader(r.Body, maxMirrorBodySize+1)
+				var errs []error
 				var readErr error
 				bodyBytes, readErr = io.ReadAll(limitedReader)
-				r.Body.Close()
 				if readErr != nil {
-					log.Log.Error(readErr, "Failed to read request body for mirroring", "path", r.URL.Path)
+					errs = append(errs, readErr)
+				}
+				if closeErr := r.Body.Close(); closeErr != nil {
+					errs = append(errs, closeErr)
+				}
+				if len(errs) > 0 {
+					joinedErr := errors.Join(errs...)
+					log.Log.Error(joinedErr, "Failed to read request body for mirroring", "path", r.URL.Path)
 					if backend.ResponseHeaderModifier != nil {
 						modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
 					}
@@ -728,8 +734,8 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 					return fmt.Errorf("certificate verification failed: %w", err)
 				}
 
-				if !verifySubjectAltNames(leaf, sans) {
-					return fmt.Errorf("certificate does not match any configured SubjectAltNames")
+				if err := verifySubjectAltNames(leaf, sans); err != nil {
+					return err
 				}
 				return nil
 			},
@@ -743,40 +749,53 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 	}
 }
 
-func verifySubjectAltNames(cert *x509.Certificate, sans []gatewayv1.SubjectAltName) bool {
+func verifySubjectAltNames(cert *x509.Certificate, sans []gatewayv1.SubjectAltName) error {
+	if cert == nil {
+		return fmt.Errorf("no peer certificate found")
+	}
+	var lastErr error
 	for _, san := range sans {
 		switch san.Type {
 		case gatewayv1.HostnameSubjectAltNameType:
 			expectedHost := string(san.Hostname)
 			if err := cert.VerifyHostname(expectedHost); err == nil {
-				return true
-			}
-			for _, dns := range cert.DNSNames {
-				if strings.EqualFold(dns, expectedHost) {
-					return true
+				return nil
+			} else {
+				lastErr = err
+				for _, dns := range cert.DNSNames {
+					if strings.EqualFold(dns, expectedHost) {
+						return nil
+					}
 				}
 			}
 		case gatewayv1.URISubjectAltNameType:
 			expectedURI := string(san.URI)
 			parsedExpected, err := url.Parse(expectedURI)
+			if err != nil {
+				lastErr = fmt.Errorf("invalid expected URI %q: %w", expectedURI, err)
+				continue
+			}
 			for _, u := range cert.URIs {
 				if u == nil {
 					continue
 				}
 				if u.String() == expectedURI {
-					return true
+					return nil
 				}
-				if err == nil &&
-					strings.EqualFold(u.Scheme, parsedExpected.Scheme) &&
+				if strings.EqualFold(u.Scheme, parsedExpected.Scheme) &&
 					strings.EqualFold(u.Host, parsedExpected.Host) &&
 					u.Path == parsedExpected.Path &&
 					u.RawQuery == parsedExpected.RawQuery {
-					return true
+					return nil
 				}
 			}
+			lastErr = fmt.Errorf("certificate URIs do not match expected URI %q", expectedURI)
 		}
 	}
-	return false
+	if lastErr != nil {
+		return fmt.Errorf("certificate does not match configured SubjectAltNames: %w", lastErr)
+	}
+	return fmt.Errorf("certificate does not match configured SubjectAltNames")
 }
 
 func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
@@ -862,7 +881,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
-	defer backendConn.Close()
+	defer closeConn(backendConn)
 
 	outReq, err := http.NewRequestWithContext(backendCtx, r.Method, targetURL.String(), nil)
 	if err != nil {
@@ -928,7 +947,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer closeConn(resp.Body)
 
 	resp.Header.Del("Alt-Svc")
 
@@ -947,7 +966,12 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			if !isNormalClose(err) {
+				log.Log.Error(err, "Failed to copy websocket response body")
+			}
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 
@@ -956,19 +980,37 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 		http.Error(w, "Hijack failed", http.StatusInternalServerError)
 		return
 	}
-	defer clientConn.Close()
+	defer closeConn(clientConn)
 
 	if err := resp.Write(clientConn); err != nil {
 		return
 	}
 
 	if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
-		bufferedBytes, _ := io.ReadAll(io.LimitReader(clientBuf, int64(clientBuf.Reader.Buffered())))
-		backendConn.Write(bufferedBytes)
+		bufferedBytes, err := io.ReadAll(io.LimitReader(clientBuf, int64(clientBuf.Reader.Buffered())))
+		if err != nil {
+			log.Log.Error(err, "Failed to read buffered websocket client data")
+			return
+		}
+		if len(bufferedBytes) > 0 {
+			if _, err := backendConn.Write(bufferedBytes); err != nil {
+				log.Log.Error(err, "Failed to write buffered bytes to websocket backend")
+				return
+			}
+		}
 	}
 	if br.Buffered() > 0 {
-		bufferedBytes, _ := io.ReadAll(io.LimitReader(br, int64(br.Buffered())))
-		clientConn.Write(bufferedBytes)
+		bufferedBytes, err := io.ReadAll(io.LimitReader(br, int64(br.Buffered())))
+		if err != nil {
+			log.Log.Error(err, "Failed to read buffered websocket backend data")
+			return
+		}
+		if len(bufferedBytes) > 0 {
+			if _, err := clientConn.Write(bufferedBytes); err != nil {
+				log.Log.Error(err, "Failed to write buffered bytes to websocket client")
+				return
+			}
+		}
 	}
 
 	errc := make(chan error, 2)
@@ -1168,12 +1210,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		}
 
 		if shouldRetry {
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 1024*1024))
-			resp.Body.Close()
+			if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1024*1024)); err != nil && !isNormalClose(err) {
+				klog.V(2).Infof("failed to drain retry response body: %v", err)
+			}
+			closeConn(resp.Body)
 			continue
 		}
 
-		defer resp.Body.Close()
+		defer closeConn(resp.Body)
 
 		resp.Header.Del("Alt-Svc")
 
@@ -1200,7 +1244,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			if !isNormalClose(err) {
+				log.Log.Error(err, "Failed to copy response body")
+			}
+			panic(http.ErrAbortHandler)
+		}
 		return
 	}
 }
@@ -1461,7 +1510,9 @@ func (p *Proxy) mirror(r *http.Request, bodyBytes []byte, backend state.Internal
 			log.Log.Error(err, "Failed to send mirrored request", "target", targetURL.String())
 			return
 		}
-		defer resp.Body.Close()
-		io.Copy(io.Discard, resp.Body)
+		defer closeConn(resp.Body)
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil && !isNormalClose(err) {
+			klog.V(2).Infof("failed to discard mirrored response body: %v", err)
+		}
 	}()
 }
