@@ -16,3 +16,7 @@ gofmt:
   enabled: true
 govet:
   enabled: true
+lint:
+  droppedErrors:
+    baseline: .ap/droppederrors-baseline.txt
+
