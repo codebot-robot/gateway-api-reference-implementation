@@ -784,9 +784,14 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 
 	var dialedConn net.Conn = rawConn
 	if rw != nil && rw.Reader.Buffered() > 0 {
+		buffered := make([]byte, rw.Reader.Buffered())
+		if _, err := io.ReadFull(rw.Reader, buffered); err != nil {
+			closeCloser(rawConn)
+			return
+		}
 		dialedConn = &bufferedConn{
-			Conn:   rawConn,
-			reader: rw.Reader,
+			Conn:     rawConn,
+			buffered: buffered,
 		}
 	}
 
@@ -798,11 +803,20 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 
 type bufferedConn struct {
 	net.Conn
-	reader *bufio.Reader
+	buffered  []byte
+	bufOffset int
 }
 
 func (c *bufferedConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+	if c.buffered != nil {
+		n := copy(b, c.buffered[c.bufOffset:])
+		c.bufOffset += n
+		if c.bufOffset >= len(c.buffered) {
+			c.buffered = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 // chanListener implements net.Listener over an in-memory channel.

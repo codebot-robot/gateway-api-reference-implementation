@@ -295,9 +295,14 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 	}
 
 	if bufReader.Buffered() > 0 {
+		buffered := make([]byte, bufReader.Buffered())
+		if _, err := io.ReadFull(bufReader, buffered); err != nil {
+			closeConn(tlsConn)
+			return nil, fmt.Errorf("reading buffered handshake bytes: %w", err)
+		}
 		return &bufferedClientConn{
-			Conn:   tlsConn,
-			reader: bufReader,
+			Conn:     tlsConn,
+			buffered: buffered,
 		}, nil
 	}
 
@@ -306,11 +311,20 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 
 type bufferedClientConn struct {
 	net.Conn
-	reader *bufio.Reader
+	buffered  []byte
+	bufOffset int
 }
 
 func (c *bufferedClientConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+	if c.buffered != nil {
+		n := copy(b, c.buffered[c.bufOffset:])
+		c.bufOffset += n
+		if c.bufOffset >= len(c.buffered) {
+			c.buffered = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 // DialQUIC dials an mTLS QUIC connection to the frontend server.

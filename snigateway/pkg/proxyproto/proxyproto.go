@@ -247,7 +247,8 @@ type Conn struct {
 	net.Conn
 	remoteAddr net.Addr
 	localAddr  net.Addr
-	r          io.Reader
+	buffered   []byte
+	bufOffset  int
 }
 
 // NewConn creates a new Conn wrapping conn.
@@ -258,9 +259,7 @@ func NewConn(conn net.Conn, remoteAddr, localAddr net.Addr, buffered []byte) *Co
 		localAddr:  localAddr,
 	}
 	if len(buffered) > 0 {
-		c.r = io.MultiReader(bytes.NewReader(buffered), conn)
-	} else {
-		c.r = conn
+		c.buffered = buffered
 	}
 	return c
 }
@@ -280,5 +279,39 @@ func (c *Conn) LocalAddr() net.Addr {
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
-	return c.r.Read(b)
+	if c.buffered != nil {
+		n := copy(b, c.buffered[c.bufOffset:])
+		c.bufOffset += n
+		if c.bufOffset >= len(c.buffered) {
+			c.buffered = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *Conn) WriteTo(w io.Writer) (int64, error) {
+	var n int64
+	if c.buffered != nil {
+		rem := c.buffered[c.bufOffset:]
+		c.buffered = nil
+		nw, err := w.Write(rem)
+		n += int64(nw)
+		if err != nil {
+			return n, err
+		}
+	}
+	if wt, ok := c.Conn.(io.WriterTo); ok {
+		nw, err := wt.WriteTo(w)
+		return n + nw, err
+	}
+	nw, err := io.Copy(w, c.Conn)
+	return n + nw, err
+}
+
+func (c *Conn) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.Conn.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(c.Conn, r)
 }
