@@ -63,13 +63,14 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 
 	if st != nil {
 		st.SetControllerName(controllerName)
-		st.SetProxy(p)
 		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
 		st.SetGatewayFilter(opts.GatewayFilter)
 		st.SetSynced(false)
 
 		if publisher, ok := opts.AddressProvider.(state.DataplanePublisher); ok {
 			st.SetDataplanePublisher(publisher)
+		} else if p != nil {
+			st.SetProxy(p)
 		}
 
 		if err := registerInformerHandlers(context.Background(), mgr, st); err != nil {

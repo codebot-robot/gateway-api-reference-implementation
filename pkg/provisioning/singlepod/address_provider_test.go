@@ -326,12 +326,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 		t.Errorf("expected updated pod template labels to include updated-label")
 	}
 
-	// 4. Delete Gateway -> cleans up resources
-	// (Namespaced resources have controller ownerReferences verified in step 1 and are deleted by k8s garbage collector)
-	gwKey := types.NamespacedName{Namespace: "my-ns", Name: "my-gw"}
-	if err := p.OnGatewayDeleted(ctx, gwKey); err != nil {
-		t.Fatalf("OnGatewayDeleted failed: %v", err)
-	}
+	// 4. (Namespaced resources have controller ownerReferences verified in step 1 and are deleted by k8s garbage collector)
 }
 
 func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {

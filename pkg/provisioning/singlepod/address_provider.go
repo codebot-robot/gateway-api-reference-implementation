@@ -42,7 +42,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -514,16 +513,6 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	return addresses, deployReady, nil
 }
 
-// OnGatewayDeleted cleans up any resources for the deleted Gateway.
-func (p *AddressProvider) OnGatewayDeleted(ctx context.Context, gwKey types.NamespacedName) error {
-	return nil
-}
-
-// SweepOrphans garbage-collects stale resources across all namespaces whose corresponding Gateway no longer exists.
-func (p *AddressProvider) SweepOrphans(ctx context.Context) error {
-	return nil
-}
-
 func managedByPredicate() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		labels := obj.GetLabels()
@@ -531,7 +520,7 @@ func managedByPredicate() predicate.Predicate {
 	})
 }
 
-// SetupWatches registers watches on managed Services and Deployments, and starts the orphan sweep runnable.
+// SetupWatches registers watches on managed Services and Deployments.
 func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error {
 	var scheme *runtime.Scheme
 	var mapper meta.RESTMapper
@@ -545,18 +534,6 @@ func (p *AddressProvider) SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) 
 	} else if p.client != nil {
 		scheme = p.client.Scheme()
 		mapper = p.client.RESTMapper()
-	}
-
-	if mgr != nil {
-		err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			if !mgr.GetCache().WaitForCacheSync(ctx) {
-				return fmt.Errorf("failed to wait for cache sync in address provider")
-			}
-			return p.SweepOrphans(ctx)
-		}))
-		if err != nil {
-			return fmt.Errorf("failed to register orphan sweep runnable: %w", err)
-		}
 	}
 
 	if scheme == nil || mapper == nil {
@@ -609,9 +586,18 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	return nil
 }
 
+// Begin implements state.DataplanePublisher.
+func (p *AddressProvider) Begin(ctx context.Context) error {
+	return nil
+}
+
+// Commit implements state.DataplanePublisher.
+func (p *AddressProvider) Commit(ctx context.Context) error {
+	return nil
+}
+
 var (
-	_ controller.AddressProvider      = (*AddressProvider)(nil)
-	_ controller.GatewayDeleteHandler = (*AddressProvider)(nil)
-	_ controller.AddressWatcher       = (*AddressProvider)(nil)
-	_ state.DataplanePublisher        = (*AddressProvider)(nil)
+	_ controller.AddressProvider = (*AddressProvider)(nil)
+	_ controller.AddressWatcher  = (*AddressProvider)(nil)
+	_ state.DataplanePublisher   = (*AddressProvider)(nil)
 )

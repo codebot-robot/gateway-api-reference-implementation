@@ -15,6 +15,7 @@
 package gari
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -1242,5 +1243,197 @@ func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.
 
 	if server.proxySynced.Load() {
 		t.Errorf("expected proxySynced to be false when Secret is missing")
+	}
+}
+
+func TestInProcessDataplanePublisher_RoutesAndCertificates(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend ok"))
+	}))
+	defer backend.Close()
+
+	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split backend addr: %v", err)
+	}
+	var backendPort int
+	_, _ = fmt.Sscanf(backendPortStr, "%d", &backendPort)
+
+	cert, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate cert: %v", err)
+	}
+
+	p := proxy.NewProxy()
+	publisher := state.NewInProcessDataplanePublisher(p)
+
+	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      "test-gw",
+		},
+	}
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: backendHost, Port: int32(backendPort), Weight: 1},
+				},
+			},
+		},
+	}
+	listeners := []state.InternalListener{
+		{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
+		{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+	}
+	certsMap := map[string]*tls.Certificate{
+		"https.example.com": &cert,
+	}
+
+	dpConfig, err := state.BuildDataplaneConfig(gwKey, listeners, []state.InternalRoute{route}, certsMap, &cert)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig failed: %v", err)
+	}
+
+	ctx := t.Context()
+	// Full in-process path: publisher.PublishDataplaneConfig -> serialize -> ApplyDataplaneConfig -> proxy
+	if err := publisher.PublishDataplaneConfig(ctx, gw, dpConfig); err != nil {
+		t.Fatalf("PublishDataplaneConfig failed: %v", err)
+	}
+
+	// 1. Assert proxy serves the compiled route
+	reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.com/ok", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, reqHTTP)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK from proxy, got %d", rec.Code)
+	}
+	if rec.Body.String() != "backend ok" {
+		t.Errorf("expected 'backend ok' body, got %q", rec.Body.String())
+	}
+
+	// 2. Assert proxy serves the compiled certificates
+	gotCert, err := p.GetCertificate(&tls.ClientHelloInfo{ServerName: "https.example.com"})
+	if err != nil {
+		t.Fatalf("GetCertificate failed: %v", err)
+	}
+	if gotCert == nil || len(gotCert.Certificate) == 0 {
+		t.Fatalf("expected non-nil certificate for https.example.com")
+	}
+	if len(gotCert.Certificate[0]) != len(cert.Certificate[0]) {
+		t.Errorf("certificate length mismatch: got %d, want %d", len(gotCert.Certificate[0]), len(cert.Certificate[0]))
+	}
+
+	// 3. Assert default certificate fallback
+	defaultCert, err := p.GetCertificate(&tls.ClientHelloInfo{ServerName: "unrecognized.example.com"})
+	if err != nil {
+		t.Fatalf("GetCertificate for default cert failed: %v", err)
+	}
+	if defaultCert == nil {
+		t.Errorf("expected default certificate fallback, got nil")
+	}
+}
+
+func TestInProcessDataplanePublisher_MultipleGatewaysDistinctCertificates(t *testing.T) {
+	// Generate distinct self-signed certificates
+	certA, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate certA: %v", err)
+	}
+	certB, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate certB: %v", err)
+	}
+
+	if bytes.Equal(certA.Certificate[0], certB.Certificate[0]) {
+		t.Fatalf("expected distinct certificates for certA and certB")
+	}
+
+	p := proxy.NewProxy()
+	publisher := state.NewInProcessDataplanePublisher(p)
+
+	gwA := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "gw-a",
+		},
+	}
+	gwB := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "gw-b",
+		},
+	}
+
+	listenersA := []state.InternalListener{
+		{Name: "https-a", Port: 443, Protocol: gatewayv1.HTTPSProtocolType, Hostname: "a.example.com"},
+	}
+	certsMapA := map[string]*tls.Certificate{
+		"a.example.com": &certA,
+	}
+	dpConfigA, err := state.BuildDataplaneConfig(
+		types.NamespacedName{Namespace: gwA.Namespace, Name: gwA.Name},
+		listenersA, nil, certsMapA, &certA,
+	)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig gwA failed: %v", err)
+	}
+
+	listenersB := []state.InternalListener{
+		{Name: "https-b", Port: 443, Protocol: gatewayv1.HTTPSProtocolType, Hostname: "b.example.com"},
+	}
+	certsMapB := map[string]*tls.Certificate{
+		"b.example.com": &certB,
+	}
+	dpConfigB, err := state.BuildDataplaneConfig(
+		types.NamespacedName{Namespace: gwB.Namespace, Name: gwB.Name},
+		listenersB, nil, certsMapB, &certB,
+	)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig gwB failed: %v", err)
+	}
+
+	ctx := t.Context()
+	if err := publisher.Begin(ctx); err != nil {
+		t.Fatalf("Begin failed: %v", err)
+	}
+	if err := publisher.PublishDataplaneConfig(ctx, gwA, dpConfigA); err != nil {
+		t.Fatalf("PublishDataplaneConfig gwA failed: %v", err)
+	}
+	if err := publisher.PublishDataplaneConfig(ctx, gwB, dpConfigB); err != nil {
+		t.Fatalf("PublishDataplaneConfig gwB failed: %v", err)
+	}
+	if err := publisher.Commit(ctx); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// Assert each hostname resolves to its own distinct certificate
+	gotA, err := p.GetCertificate(&tls.ClientHelloInfo{ServerName: "a.example.com"})
+	if err != nil {
+		t.Fatalf("GetCertificate for a.example.com failed: %v", err)
+	}
+	if gotA == nil || !bytes.Equal(gotA.Certificate[0], certA.Certificate[0]) {
+		t.Errorf("a.example.com did not resolve to certA")
+	}
+
+	gotB, err := p.GetCertificate(&tls.ClientHelloInfo{ServerName: "b.example.com"})
+	if err != nil {
+		t.Fatalf("GetCertificate for b.example.com failed: %v", err)
+	}
+	if gotB == nil || !bytes.Equal(gotB.Certificate[0], certB.Certificate[0]) {
+		t.Errorf("b.example.com did not resolve to certB")
+	}
+
+	if bytes.Equal(gotA.Certificate[0], gotB.Certificate[0]) {
+		t.Errorf("expected distinct certificates for a.example.com and b.example.com, but got identical certificates")
 	}
 }
