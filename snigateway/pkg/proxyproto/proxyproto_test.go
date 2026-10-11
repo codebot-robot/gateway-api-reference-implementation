@@ -16,6 +16,7 @@ package proxyproto
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"testing"
 )
@@ -37,7 +38,10 @@ func TestProxyProtocolV2_IPv4(t *testing.T) {
 		Authority: "echo.example.com",
 	}
 
-	data := orig.Format()
+	data, err := orig.Format()
+	if err != nil {
+		t.Fatalf("Format failed: %v", err)
+	}
 
 	parsed, err := Decode(bytes.NewReader(data))
 	if err != nil {
@@ -78,7 +82,10 @@ func TestProxyProtocolV2_IPv6(t *testing.T) {
 		Authority: "ipv6.example.org",
 	}
 
-	data := orig.Format()
+	data, err := orig.Format()
+	if err != nil {
+		t.Fatalf("Format failed: %v", err)
+	}
 
 	parsed, err := Decode(bytes.NewReader(data))
 	if err != nil {
@@ -102,7 +109,10 @@ func TestProxyProtocolV2_Unspec(t *testing.T) {
 		Authority: "sni.only.com",
 	}
 
-	data := orig.Format()
+	data, err := orig.Format()
+	if err != nil {
+		t.Fatalf("Format failed: %v", err)
+	}
 
 	parsed, err := Decode(bytes.NewReader(data))
 	if err != nil {
@@ -119,5 +129,35 @@ func TestProxyProtocolV2_InvalidSignature(t *testing.T) {
 	_, err := Decode(bytes.NewReader(invalid))
 	if err == nil {
 		t.Fatalf("expected error for invalid signature, got nil")
+	}
+}
+
+type failingWriter struct {
+	failAfter int
+	written   int
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	if w.written >= w.failAfter {
+		return 0, errors.New("writer failure")
+	}
+	remaining := w.failAfter - w.written
+	if len(p) > remaining {
+		w.written += remaining
+		return remaining, errors.New("writer failure")
+	}
+	w.written += len(p)
+	return len(p), nil
+}
+
+func TestProxyProtocolV2_EncodeError(t *testing.T) {
+	orig := &Header{
+		Command:   CommandProxy,
+		Authority: "echo.example.com",
+	}
+
+	fw := &failingWriter{failAfter: 5}
+	if err := Encode(fw, orig); err == nil {
+		t.Fatalf("expected error from Encode with failing writer, got nil")
 	}
 }

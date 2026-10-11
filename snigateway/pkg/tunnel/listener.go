@@ -79,7 +79,7 @@ func (l *Listener) Close() error {
 	for {
 		select {
 		case c := <-l.connCh:
-			_ = c.Close()
+			closeConn(c)
 		default:
 			return nil
 		}
@@ -99,13 +99,13 @@ func (l *Listener) Enqueue(conn net.Conn) error {
 	l.mu.Unlock()
 
 	if closed {
-		_ = conn.Close()
+		closeConn(conn)
 		return net.ErrClosed
 	}
 
 	select {
 	case <-l.closeCh:
-		_ = conn.Close()
+		closeConn(conn)
 		return net.ErrClosed
 	case l.connCh <- conn:
 		return nil

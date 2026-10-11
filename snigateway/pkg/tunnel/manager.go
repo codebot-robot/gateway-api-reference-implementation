@@ -224,7 +224,7 @@ func (m *Manager) triggerRegistration() {
 // Run starts the session, transport, and registration loops, maintaining connectivity to the frontend
 // and feeding connections into the tunnel Listener until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
-	defer m.listener.Close()
+	defer closeConn(m.listener)
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -817,7 +817,7 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 			activeIdleMu.Unlock()
 
 			if err != nil {
-				_ = conn.Close()
+				closeConn(conn)
 				if ctx.Err() == nil {
 					triggerRefill()
 				}
@@ -830,12 +830,15 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 			var remaining []byte
 			if bufReader.Buffered() > 0 {
 				remaining = make([]byte, bufReader.Buffered())
-				_, _ = io.ReadFull(bufReader, remaining)
+				if _, err := io.ReadFull(bufReader, remaining); err != nil {
+					closeConn(conn)
+					return
+				}
 			}
 
 			proxyConn := proxyproto.NewConn(conn, hdr.SrcAddr, hdr.DstAddr, remaining)
 			if err := m.listener.Enqueue(proxyConn); err != nil {
-				_ = conn.Close()
+				closeConn(conn)
 			}
 		}()
 	}

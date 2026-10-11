@@ -67,10 +67,12 @@ type Header struct {
 }
 
 // Format serializes the Header into PROXY protocol v2 binary format.
-func (h *Header) Format() []byte {
+func (h *Header) Format() ([]byte, error) {
 	buf := new(bytes.Buffer)
-	_ = Encode(buf, h)
-	return buf.Bytes()
+	if err := Encode(buf, h); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Encode writes a PROXY protocol v2 header to w.
@@ -95,8 +97,12 @@ func Encode(w io.Writer, h *Header) error {
 			famProto = FamilyIPv4 | ProtocolStream
 			body.Write(src4)
 			body.Write(dst4)
-			_ = binary.Write(&body, binary.BigEndian, uint16(srcTCP.Port))
-			_ = binary.Write(&body, binary.BigEndian, uint16(dstTCP.Port))
+			if err := binary.Write(&body, binary.BigEndian, uint16(srcTCP.Port)); err != nil {
+				return fmt.Errorf("writing source port: %w", err)
+			}
+			if err := binary.Write(&body, binary.BigEndian, uint16(dstTCP.Port)); err != nil {
+				return fmt.Errorf("writing dest port: %w", err)
+			}
 		} else {
 			src16 := srcTCP.IP.To16()
 			dst16 := dstTCP.IP.To16()
@@ -104,8 +110,12 @@ func Encode(w io.Writer, h *Header) error {
 				famProto = FamilyIPv6 | ProtocolStream
 				body.Write(src16)
 				body.Write(dst16)
-				_ = binary.Write(&body, binary.BigEndian, uint16(srcTCP.Port))
-				_ = binary.Write(&body, binary.BigEndian, uint16(dstTCP.Port))
+				if err := binary.Write(&body, binary.BigEndian, uint16(srcTCP.Port)); err != nil {
+					return fmt.Errorf("writing source port: %w", err)
+				}
+				if err := binary.Write(&body, binary.BigEndian, uint16(dstTCP.Port)); err != nil {
+					return fmt.Errorf("writing dest port: %w", err)
+				}
 			}
 		}
 	}
@@ -114,7 +124,9 @@ func Encode(w io.Writer, h *Header) error {
 	if h.Authority != "" {
 		authBytes := []byte(h.Authority)
 		body.WriteByte(TypeAuthority)
-		_ = binary.Write(&body, binary.BigEndian, uint16(len(authBytes)))
+		if err := binary.Write(&body, binary.BigEndian, uint16(len(authBytes))); err != nil {
+			return fmt.Errorf("writing authority TLV length: %w", err)
+		}
 		body.Write(authBytes)
 	}
 
