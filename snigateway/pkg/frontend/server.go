@@ -438,13 +438,22 @@ func isNormalClose(err error) bool {
 	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
+var spliceBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
 func spliceConnections(c1, c2 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(c2, c1); err != nil && !isNormalClose(err) {
+		bufPtr := spliceBufPool.Get().(*[]byte)
+		defer spliceBufPool.Put(bufPtr)
+		if _, err := io.CopyBuffer(c2, c1, *bufPtr); err != nil && !isNormalClose(err) {
 			klog.V(2).Infof("Frontend: splice error copying c1 to c2: %v", err)
 		}
 		closeCloser(c2)
@@ -453,7 +462,9 @@ func spliceConnections(c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(c1, c2); err != nil && !isNormalClose(err) {
+		bufPtr := spliceBufPool.Get().(*[]byte)
+		defer spliceBufPool.Put(bufPtr)
+		if _, err := io.CopyBuffer(c1, c2, *bufPtr); err != nil && !isNormalClose(err) {
 			klog.V(2).Infof("Frontend: splice error copying c2 to c1: %v", err)
 		}
 		closeCloser(c1)
