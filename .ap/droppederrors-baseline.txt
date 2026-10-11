@@ -16,10 +16,6 @@ snigateway/pkg/client/client.go:(*Client).StartSession:(io.Closer).Close
 snigateway/pkg/client/client.go:(*Client).StartSession:(io.Closer).Close
 snigateway/pkg/client/client.go:(*Client).StartSession:(io.Closer).Close
 snigateway/pkg/client/client.go:(*Client).StartSession:io.ReadAll
-snigateway/pkg/frontend/server.go:(*Server).Close:(*github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend.PoolTransport).Close
-snigateway/pkg/frontend/server.go:(*Server).Close:(*github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend.chanListener).Close
-snigateway/pkg/frontend/server.go:(*Server).Close:(net.Listener).Close
-snigateway/pkg/frontend/server.go:(*Server).ListenAndServe:(net.Listener).Close
 snigateway/pkg/frontend/server.go:(*Server).handleConnection:(*crypto/tls.Conn).Close
 snigateway/pkg/frontend/server.go:(*Server).handleConnection:(net.Conn).Close
 snigateway/pkg/frontend/server.go:(*Server).handleConnection:(net.Conn).Close
