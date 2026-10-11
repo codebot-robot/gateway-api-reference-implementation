@@ -392,18 +392,9 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	cfg, err := state.UnmarshalDataplaneConfig(data)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	if err := state.ApplyDataplaneConfig(r.proxy, data); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
 	}
-
-	certsMap, defaultCert, err := cfg.ExtractCertificates()
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to extract certificates: %w", err)
-	}
-
-	r.proxy.UpdateConfig(cfg.Listeners, cfg.Routes)
-	r.proxy.UpdateCertificates(certsMap, defaultCert)
 	r.proxySynced.Store(true)
 
 	return ctrl.Result{}, nil

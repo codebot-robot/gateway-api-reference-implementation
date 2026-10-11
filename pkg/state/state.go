@@ -17,7 +17,6 @@ package state
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"reflect"
 	"sort"
@@ -25,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -35,12 +35,6 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
-
-// ProxyConfigUpdater defines the interface needed by State to update the proxy.
-type ProxyConfigUpdater interface {
-	UpdateConfig(listeners []InternalListener, routes []InternalRoute)
-	UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate)
-}
 
 // EventSource implements source.TypedSource[reconcile.Request].
 // It delivers reconcile requests directly to controller workqueues without dropping events.
@@ -124,7 +118,6 @@ type State struct {
 	namespaces         map[string]*corev1.Namespace
 
 	controllerName   string
-	proxy            ProxyConfigUpdater
 	onGatewaysUpdate func([]*gatewayv1.Gateway)
 	gatewayFilter    func(gw *gatewayv1.Gateway) bool
 
@@ -186,9 +179,11 @@ func (s *State) SetControllerName(name string) {
 }
 
 func (s *State) SetProxy(p ProxyConfigUpdater) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.proxy = p
+	if p == nil {
+		s.SetDataplanePublisher(nil)
+		return
+	}
+	s.SetDataplanePublisher(NewInProcessDataplanePublisher(p))
 }
 
 func (s *State) SetOnGatewaysUpdate(fn func([]*gatewayv1.Gateway)) {
@@ -358,15 +353,8 @@ func (s *State) Recompute() *Outputs {
 	s.diffAndEmitLocked(outputs)
 
 	prev := s.previousOutputs
-	proxyChanged := prev == nil ||
-		!reflect.DeepEqual(outputs.ProxyListeners, prev.ProxyListeners) ||
-		!reflect.DeepEqual(outputs.ProxyRoutes, prev.ProxyRoutes) ||
-		!certsMapEqual(outputs.CertificatesMap, prev.CertificatesMap) ||
-		!defaultCertEqual(outputs.DefaultCert, prev.DefaultCert)
-
 	gatewaysChanged := prev == nil || !reflectGatewaysEqual(outputs.ResolvedGateways, prev.ResolvedGateways)
 
-	p := s.proxy
 	onGatewaysUpdate := s.onGatewaysUpdate
 	dpPublisher := s.dataplanePublisher
 
@@ -374,11 +362,6 @@ func (s *State) Recompute() *Outputs {
 	s.mu.Unlock()
 
 	// Run callbacks outside the lock to prevent deadlocks and avoid blocking state mutations.
-	if proxyChanged && p != nil {
-		p.UpdateConfig(outputs.ProxyListeners, outputs.ProxyRoutes)
-		p.UpdateCertificates(outputs.CertificatesMap, outputs.DefaultCert)
-	}
-
 	if gatewaysChanged && onGatewaysUpdate != nil {
 		onGatewaysUpdate(outputs.ResolvedGateways)
 	}
@@ -396,6 +379,11 @@ func (s *State) Recompute() *Outputs {
 func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePublisher) {
 	if outputs == nil || publisher == nil {
 		return
+	}
+
+	ctx := context.Background()
+	if err := publisher.Begin(ctx); err != nil {
+		klog.Errorf("failed to begin dataplane publish batch: %v", err)
 	}
 
 	for gwKey, dpConfig := range outputs.DataplaneConfigs {
@@ -425,7 +413,7 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 			continue
 		}
 
-		if err := publisher.PublishDataplaneConfig(context.Background(), cg.Gateway, dpConfig); err != nil {
+		if err := publisher.PublishDataplaneConfig(ctx, cg.Gateway, dpConfig); err != nil {
 			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
 			continue
 		}
@@ -435,13 +423,31 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 		s.mu.Unlock()
 	}
 
+	var removedKeys []types.NamespacedName
 	s.mu.Lock()
 	for gwKey := range s.lastWrittenConfigs {
 		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
 			delete(s.lastWrittenConfigs, gwKey)
+			removedKeys = append(removedKeys, gwKey)
 		}
 	}
 	s.mu.Unlock()
+
+	for _, gwKey := range removedKeys {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: gwKey.Namespace,
+				Name:      gwKey.Name,
+			},
+		}
+		if err := publisher.PublishDataplaneConfig(ctx, gw, nil); err != nil {
+			klog.Errorf("failed to publish deletion of dataplane config for %s: %v", gwKey, err)
+		}
+	}
+
+	if err := publisher.Commit(ctx); err != nil {
+		klog.Errorf("failed to commit dataplane publish batch: %v", err)
+	}
 }
 
 func (s *State) snapshotInputsLocked() ModelInputs {
@@ -780,37 +786,6 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 			s.gatewayClassSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
-}
-
-func certsMapEqual(a, b map[string]*tls.Certificate) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, vA := range a {
-		vB, ok := b[k]
-		if !ok || !defaultCertEqual(vA, vB) {
-			return false
-		}
-	}
-	return true
-}
-
-func defaultCertEqual(a, b *tls.Certificate) bool {
-	if (a == nil) != (b == nil) {
-		return false
-	}
-	if a == nil {
-		return true
-	}
-	if len(a.Certificate) != len(b.Certificate) {
-		return false
-	}
-	for i := range a.Certificate {
-		if !reflect.DeepEqual(a.Certificate[i], b.Certificate[i]) {
-			return false
-		}
-	}
-	return true
 }
 
 func reflectGatewaysEqual(a, b []*gatewayv1.Gateway) bool {

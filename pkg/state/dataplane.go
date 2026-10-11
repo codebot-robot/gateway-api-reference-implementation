@@ -16,11 +16,14 @@ package state
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -62,7 +65,9 @@ type DataplaneConfig struct {
 
 // DataplanePublisher defines the interface for publishing a Gateway's compiled data-plane configuration.
 type DataplanePublisher interface {
+	Begin(ctx context.Context) error
 	PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error
+	Commit(ctx context.Context) error
 }
 
 func tlsCertToData(cert *tls.Certificate) (CertificateData, error) {
@@ -118,7 +123,6 @@ func BuildDataplaneConfig(
 	}
 
 	certIDMap := make(map[*tls.Certificate]string)
-	idCounter := 0
 	getCertID := func(c *tls.Certificate) (string, error) {
 		if c == nil {
 			return "", nil
@@ -126,11 +130,17 @@ func BuildDataplaneConfig(
 		if id, ok := certIDMap[c]; ok {
 			return id, nil
 		}
-		idCounter++
-		id := fmt.Sprintf("cert-%d", idCounter)
 		data, err := tlsCertToData(c)
 		if err != nil {
 			return "", err
+		}
+		var id string
+		if len(c.Certificate) > 0 {
+			h := sha256.Sum256(c.Certificate[0])
+			id = hex.EncodeToString(h[:])
+		} else {
+			h := sha256.Sum256(data.PrivateKey)
+			id = hex.EncodeToString(h[:])
 		}
 		certIDMap[c] = id
 		cfg.Certificates[id] = data
@@ -224,3 +234,165 @@ func UnmarshalDataplaneConfig(data []byte) (*DataplaneConfig, error) {
 	}
 	return &cfg, nil
 }
+
+// ProxyConfigUpdater defines the interface needed to apply configuration and certificates to a proxy.
+type ProxyConfigUpdater interface {
+	UpdateConfig(listeners []InternalListener, routes []InternalRoute)
+	UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate)
+}
+
+// ApplyDataplaneConfig deserializes JSON-encoded DataplaneConfig, extracts certificates,
+// and applies the configuration and certificates to the proxy updater.
+func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
+	if updater == nil {
+		return nil
+	}
+	cfg, err := UnmarshalDataplaneConfig(data)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+	}
+	certsMap, defaultCert, err := cfg.ExtractCertificates()
+	if err != nil {
+		return fmt.Errorf("failed to extract certificates: %w", err)
+	}
+	updater.UpdateConfig(cfg.Listeners, cfg.Routes)
+	updater.UpdateCertificates(certsMap, defaultCert)
+	return nil
+}
+
+// InProcessDataplanePublisher is a DataplanePublisher that serializes DataplaneConfig
+// to JSON and applies it to an in-process proxy using ApplyDataplaneConfig.
+type InProcessDataplanePublisher struct {
+	mu      sync.Mutex
+	updater ProxyConfigUpdater
+	configs map[types.NamespacedName]*DataplaneConfig
+	inBatch bool
+	dirty   bool
+}
+
+// NewInProcessDataplanePublisher creates a new in-process DataplanePublisher for the given proxy updater.
+func NewInProcessDataplanePublisher(updater ProxyConfigUpdater) *InProcessDataplanePublisher {
+	return &InProcessDataplanePublisher{
+		updater: updater,
+		configs: make(map[types.NamespacedName]*DataplaneConfig),
+	}
+}
+
+// Begin starts a batch of config updates. When in a batch, updates to the proxy
+// are deferred until Commit is called.
+func (p *InProcessDataplanePublisher) Begin(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inBatch = true
+	p.dirty = false
+	return nil
+}
+
+// PublishDataplaneConfig records the config for a Gateway. If inside a Begin/Commit batch,
+// the proxy update is deferred until Commit. Otherwise, it is applied immediately.
+func (p *InProcessDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	if p == nil || p.updater == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.dirty = true
+
+	if gw == nil || config == nil {
+		if gw != nil {
+			delete(p.configs, types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		} else {
+			p.configs = make(map[types.NamespacedName]*DataplaneConfig)
+		}
+	} else {
+		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		if p.configs == nil {
+			p.configs = make(map[types.NamespacedName]*DataplaneConfig)
+		}
+		p.configs[gwKey] = config
+	}
+
+	if !p.inBatch {
+		return p.applyLocked()
+	}
+	return nil
+}
+
+// Commit finalizes the batch and applies the merged configuration to the proxy if modified.
+func (p *InProcessDataplanePublisher) Commit(ctx context.Context) error {
+	if p == nil || p.updater == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inBatch = false
+	if !p.dirty {
+		return nil
+	}
+	p.dirty = false
+	return p.applyLocked()
+}
+
+func (p *InProcessDataplanePublisher) applyLocked() error {
+	if len(p.configs) == 0 {
+		emptyData, err := (&DataplaneConfig{}).Marshal()
+		if err != nil {
+			return err
+		}
+		return ApplyDataplaneConfig(p.updater, emptyData)
+	}
+
+	if len(p.configs) == 1 {
+		var singleCfg *DataplaneConfig
+		for _, cfg := range p.configs {
+			singleCfg = cfg
+		}
+		data, err := singleCfg.Marshal()
+		if err != nil {
+			return fmt.Errorf("failed to marshal dataplane config: %w", err)
+		}
+		return ApplyDataplaneConfig(p.updater, data)
+	}
+
+	// Sort Gateway keys for deterministic merging.
+	keys := make([]types.NamespacedName, 0, len(p.configs))
+	for k := range p.configs {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Namespace != keys[j].Namespace {
+			return keys[i].Namespace < keys[j].Namespace
+		}
+		return keys[i].Name < keys[j].Name
+	})
+
+	combined := &DataplaneConfig{
+		Certificates:     make(map[string]CertificateData),
+		HostCertificates: make(map[string]string),
+	}
+	for _, k := range keys {
+		cfg := p.configs[k]
+		combined.Listeners = append(combined.Listeners, cfg.Listeners...)
+		combined.Routes = append(combined.Routes, cfg.Routes...)
+		for certID, certData := range cfg.Certificates {
+			combined.Certificates[certID] = certData
+		}
+		for host, certID := range cfg.HostCertificates {
+			combined.HostCertificates[host] = certID
+		}
+		if combined.DefaultCertID == "" {
+			combined.DefaultCertID = cfg.DefaultCertID
+		}
+	}
+	data, err := combined.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal combined dataplane config: %w", err)
+	}
+	return ApplyDataplaneConfig(p.updater, data)
+}
+
+var _ DataplanePublisher = (*InProcessDataplanePublisher)(nil)
