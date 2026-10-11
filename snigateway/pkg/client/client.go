@@ -30,7 +30,17 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/quic-go/quic-go"
+	"k8s.io/klog/v2"
 )
+
+func closeConn(c io.Closer) {
+	if c == nil {
+		return
+	}
+	if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		klog.V(2).Infof("failed to close: %v", err)
+	}
+}
 
 // Client is a client for communicating with the snigateway frontend mTLS API and reverse tunnels.
 type Client struct {
@@ -100,32 +110,35 @@ func (c *Client) StartSession(ctx context.Context) (string, <-chan error, error)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		closeConn(resp.Body)
+		if err != nil {
+			return "", nil, fmt.Errorf("session failed with status %d (failed to read body: %w)", resp.StatusCode, err)
+		}
 		return "", nil, fmt.Errorf("session failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	reader := bufio.NewReader(resp.Body)
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
-		_ = resp.Body.Close()
+		closeConn(resp.Body)
 		return "", nil, fmt.Errorf("reading session response: %w", err)
 	}
 
 	var sessResp api.SessionResponse
 	if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
-		_ = resp.Body.Close()
+		closeConn(resp.Body)
 		return "", nil, fmt.Errorf("decoding session response: %w", err)
 	}
 
 	if sessResp.SessionID == "" {
-		_ = resp.Body.Close()
+		closeConn(resp.Body)
 		return "", nil, errors.New("empty session ID received from frontend")
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		defer resp.Body.Close()
+		defer closeConn(resp.Body)
 		buf := make([]byte, 1024)
 		for {
 			_, err := resp.Body.Read(buf)
@@ -164,10 +177,13 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 	if err != nil {
 		return nil, fmt.Errorf("performing registration request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer closeConn(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("registration failed with status %d (failed to read body: %w)", resp.StatusCode, err)
+		}
 		return nil, fmt.Errorf("registration failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -196,7 +212,7 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 	urlPath := "/v1/tunnel"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlPath, nil)
 	if err != nil {
-		_ = tlsConn.Close()
+		closeConn(tlsConn)
 		return nil, fmt.Errorf("creating tunnel upgrade request: %w", err)
 	}
 	req.Host = c.internalHostname
@@ -205,25 +221,28 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 	req.Header.Set(api.HeaderSessionID, sessionID)
 
 	if err := req.Write(tlsConn); err != nil {
-		_ = tlsConn.Close()
+		closeConn(tlsConn)
 		return nil, fmt.Errorf("writing upgrade request: %w", err)
 	}
 
 	bufReader := bufio.NewReader(tlsConn)
 	resp, err := http.ReadResponse(bufReader, req)
 	if err != nil {
-		_ = tlsConn.Close()
+		closeConn(tlsConn)
 		return nil, fmt.Errorf("reading upgrade response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		body, _ := io.ReadAll(resp.Body)
-		_ = tlsConn.Close()
+		body, err := io.ReadAll(resp.Body)
+		closeConn(tlsConn)
+		if err != nil {
+			return nil, fmt.Errorf("unexpected upgrade status %d (failed to read body: %w)", resp.StatusCode, err)
+		}
 		return nil, fmt.Errorf("unexpected upgrade status %d: %s", resp.StatusCode, string(body))
 	}
 
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), api.UpgradeProtocol) && !strings.Contains(strings.ToLower(resp.Header.Get("Connection")), "upgrade") {
-		_ = tlsConn.Close()
+		closeConn(tlsConn)
 		return nil, fmt.Errorf("invalid upgrade response headers: Upgrade=%s", resp.Header.Get("Upgrade"))
 	}
 

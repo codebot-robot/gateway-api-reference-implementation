@@ -36,6 +36,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/quic-go/quic-go"
+	"k8s.io/klog/v2"
 )
 
 // ServerConfig holds configuration options for the frontend server.
@@ -296,8 +297,12 @@ func (s *Server) Close() error {
 
 func setTCPKeepAlive(conn net.Conn) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+		if err := tcp.SetKeepAlive(true); err != nil {
+			klog.V(2).Infof("Frontend: failed to set TCP keepalive: %v", err)
+		}
+		if err := tcp.SetKeepAlivePeriod(15 * time.Second); err != nil {
+			klog.V(2).Infof("Frontend: failed to set TCP keepalive period: %v", err)
+		}
 	}
 }
 
@@ -306,7 +311,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	sniHostname, peekedConn, err := sni.SniffSNI(conn, s.config.ReadSNITimeout)
 	if err != nil {
-		_ = peekedConn.Close()
+		closeCloser(peekedConn)
 		return
 	}
 
@@ -317,7 +322,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if cleanSNI == cleanInternal {
 		tlsConn := tls.Server(peekedConn, s.config.ServerTLSConfig)
 		if err := s.internalListener.SendConn(tlsConn); err != nil {
-			_ = tlsConn.Close()
+			closeCloser(tlsConn)
 		}
 		return
 	}
@@ -336,7 +341,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 		DstAddr:   peekedConn.LocalAddr(),
 		Authority: sniHostname,
 	}
-	proxyBytes := proxyHdr.Format()
+	proxyBytes, err := proxyHdr.Format()
+	if err != nil {
+		klog.V(2).Infof("Frontend: failed to format proxy header: %v", err)
+		closeCloser(peekedConn)
+		return
+	}
 
 	deadline := time.Now().Add(s.config.ConnectTimeout)
 	var committedTunnel net.Conn
@@ -346,7 +356,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		now := time.Now()
 		if now.After(deadline) {
 			log.Printf("Frontend: connect timeout reached for SNI %q", sniHostname)
-			_ = peekedConn.Close()
+			closeCloser(peekedConn)
 			return
 		}
 
@@ -359,7 +369,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		sessions := s.table.MatchSessions(cleanSNI)
 		if len(sessions) == 0 {
 			log.Printf("Frontend: rejecting connection with SNI %q (clean: %q): not registered", sniHostname, cleanSNI)
-			_ = peekedConn.Close()
+			closeCloser(peekedConn)
 			return
 		}
 
@@ -375,28 +385,37 @@ func (s *Server) handleConnection(conn net.Conn) {
 		setTCPKeepAlive(tunnelConn)
 
 		// Set write deadline for PROXY header + peeked ClientHello
-		_ = tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout))
+		if err := tunnelConn.SetWriteDeadline(time.Now().Add(attemptTimeout)); err != nil {
+			closeCloser(tunnelConn)
+			continue
+		}
 		if _, err := tunnelConn.Write(proxyBytes); err != nil {
-			_ = tunnelConn.Close()
+			closeCloser(tunnelConn)
 			continue
 		}
 		if _, err := tunnelConn.Write(peekedBytes); err != nil {
-			_ = tunnelConn.Close()
+			closeCloser(tunnelConn)
 			continue
 		}
 
 		// Set read deadline to wait for the first byte from the backend
-		_ = tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout))
+		if err := tunnelConn.SetReadDeadline(time.Now().Add(attemptTimeout)); err != nil {
+			closeCloser(tunnelConn)
+			continue
+		}
 		buf := make([]byte, 4096)
 		n, err := tunnelConn.Read(buf)
 		if err != nil || n == 0 {
 			// Failed or unresponsive backend/tunnel connection; drop and replay on next attempt
-			_ = tunnelConn.Close()
+			closeCloser(tunnelConn)
 			continue
 		}
 
 		// First byte received from backend! Clear deadlines and commit splice
-		_ = tunnelConn.SetDeadline(time.Time{})
+		if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
+			closeCloser(tunnelConn)
+			continue
+		}
 		committedTunnel = tunnelConn
 		initialBackendBytes = buf[:n]
 		break
@@ -404,12 +423,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// Write initial backend byte(s) to client
 	if _, err := rawClientConn.Write(initialBackendBytes); err != nil {
-		_ = committedTunnel.Close()
-		_ = rawClientConn.Close()
+		closeCloser(committedTunnel)
+		closeCloser(rawClientConn)
 		return
 	}
 
 	spliceConnections(rawClientConn, committedTunnel)
+}
+
+func isNormalClose(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
 func spliceConnections(c1, c2 net.Conn) {
@@ -418,16 +444,20 @@ func spliceConnections(c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(c2, c1)
-		_ = c2.Close()
-		_ = c1.Close()
+		if _, err := io.Copy(c2, c1); err != nil && !isNormalClose(err) {
+			klog.V(2).Infof("Frontend: splice error copying c1 to c2: %v", err)
+		}
+		closeCloser(c2)
+		closeCloser(c1)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(c1, c2)
-		_ = c1.Close()
-		_ = c2.Close()
+		if _, err := io.Copy(c1, c2); err != nil && !isNormalClose(err) {
+			klog.V(2).Infof("Frontend: splice error copying c2 to c1: %v", err)
+		}
+		closeCloser(c1)
+		closeCloser(c2)
 	}()
 
 	wg.Wait()
@@ -612,10 +642,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	_ = json.NewEncoder(w).Encode(api.SessionResponse{
+	if err := json.NewEncoder(w).Encode(api.SessionResponse{
 		SessionID: sessionID,
 		Status:    "connected",
-	})
+	}); err != nil {
+		klog.V(2).Infof("Frontend: failed to encode session response: %v", err)
+		return
+	}
 	flusher.Flush()
 
 	<-r.Context().Done()
@@ -669,10 +702,13 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Frontend: session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(api.RegistrationResponse{
+	if err := json.NewEncoder(w).Encode(api.RegistrationResponse{
 		Status:    "registered",
 		Hostnames: registered,
-	})
+	}); err != nil {
+		klog.V(2).Infof("Frontend: failed to encode registration response: %v", err)
+		return
+	}
 }
 
 func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request) {
@@ -731,7 +767,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 	// Send HTTP 101 Switching Protocols
 	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + api.UpgradeProtocol + "\r\n\r\n"
 	if _, err := rawConn.Write([]byte(resp)); err != nil {
-		_ = rawConn.Close()
+		closeCloser(rawConn)
 		return
 	}
 
@@ -744,7 +780,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
-		_ = dialedConn.Close()
+		closeCloser(dialedConn)
 		return
 	}
 }

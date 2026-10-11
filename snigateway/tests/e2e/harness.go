@@ -167,7 +167,9 @@ func (h *Harness) DeletePod(name string) {
 
 func (h *Harness) DeletePodInNamespace(namespace, name string) {
 	h.t.Logf("Deleting pod %s/%s", namespace, name)
-	exec.Command("kubectl", "delete", "pod", name, "--namespace", namespace, "--ignore-not-found").Run()
+	if err := exec.Command("kubectl", "delete", "pod", name, "--namespace", namespace, "--ignore-not-found").Run(); err != nil {
+		h.t.Logf("failed to delete pod %s/%s: %v", namespace, name, err)
+	}
 }
 
 func (h *Harness) WaitForPodSuccess(name string, timeout time.Duration) {
@@ -183,7 +185,9 @@ func (h *Harness) WaitForPodSuccessInNamespace(namespace, name string, timeout t
 		}
 
 		out, err := exec.Command("kubectl", "get", "pod", name, "--namespace", namespace, "-o", "jsonpath={.status.phase}").Output()
-		if err == nil {
+		if err != nil {
+			h.t.Logf("waiting for pod %s/%s phase: %v", namespace, name, err)
+		} else {
 			phase := strings.TrimSpace(string(out))
 			if phase == "Succeeded" {
 				return

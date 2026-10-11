@@ -78,7 +78,7 @@ func (p *PoolTransport) UnregisterSession(sessionID string) {
 	p.mu.Unlock()
 
 	for _, c := range conns {
-		_ = c.Close()
+		closeCloser(c)
 	}
 }
 
@@ -120,12 +120,12 @@ func (p *PoolTransport) AddConn(sessionID string, conn net.Conn) error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		_ = conn.Close()
+		closeCloser(conn)
 		return net.ErrClosed
 	}
 	if _, exists := p.pools[sessionID]; !exists {
 		p.mu.Unlock()
-		_ = conn.Close()
+		closeCloser(conn)
 		return fmt.Errorf("unknown or closed session: %s", sessionID)
 	}
 	p.pools[sessionID] = append(p.pools[sessionID], conn)
@@ -193,7 +193,7 @@ func (p *PoolTransport) Close() error {
 	p.mu.Unlock()
 
 	for _, c := range allConns {
-		_ = c.Close()
+		closeCloser(c)
 	}
 	return nil
 }

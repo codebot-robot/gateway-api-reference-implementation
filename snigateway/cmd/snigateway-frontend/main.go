@@ -179,7 +179,9 @@ func run(ctx context.Context, args []string) error {
 	go func() {
 		<-ctx.Done()
 		log.Printf("Shutting down snigateway-frontend...")
-		_ = srv.Close()
+		if err := srv.Close(); err != nil {
+			log.Printf("failed to close frontend server: %v", err)
+		}
 	}()
 
 	log.Printf("Starting snigateway-frontend listening on %v (internal SNI: %s)...", listenAddrs, *internalHostname)

@@ -45,11 +45,17 @@ func NewRegistrationTable() *RegistrationTable {
 	}
 }
 
+func stripPort(s string) string {
+	h, _, err := net.SplitHostPort(s)
+	if err != nil {
+		return s
+	}
+	return h
+}
+
 // CleanHostname removes port if present and returns lowercase string.
 func CleanHostname(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host = stripPort(host)
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
