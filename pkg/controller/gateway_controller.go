@@ -94,6 +94,12 @@ type AddressWatcher interface {
 	SetupWatches(mgr ctrl.Manager, bldr *builder.Builder) error
 }
 
+// AddressReadinessProvider is an optional interface that an AddressProvider can implement
+// to report addresses and detailed readiness state (including reason and message) in a single call.
+type AddressReadinessProvider interface {
+	GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
+}
+
 // OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
 type OwnershipConflictError struct {
 	Message string
@@ -133,13 +139,24 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		if r.AddressProvider != nil {
 			effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
-			providedAddresses, ready, err := r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
+			var (
+				providedAddresses []gatewayv1.GatewayStatusAddress
+				readiness         state.GatewayReadiness
+				err               error
+			)
+			if arp, ok := r.AddressProvider.(AddressReadinessProvider); ok {
+				providedAddresses, readiness, err = arp.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+			} else {
+				var ready bool
+				providedAddresses, ready, err = r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
+				readiness = state.GatewayReadiness{Ready: ready}
+			}
 			if err != nil {
 				var conflictErr *OwnershipConflictError
 				if errors.As(err, &conflictErr) {
 					l.Error(err, "ownership conflict provisioning gateway")
 					r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
-					r.State.SetGatewayReadiness(req.NamespacedName, false)
+					r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
 					delay := r.ConflictRequeueDelay
 					if delay == 0 {
 						delay = DefaultConflictRequeueDelay
@@ -152,7 +169,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			} else {
 				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
 				r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
-				r.State.SetGatewayReadiness(req.NamespacedName, ready)
+				r.State.SetGatewayReadiness(req.NamespacedName, readiness)
 			}
 		}
 
