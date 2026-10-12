@@ -63,6 +63,13 @@ type AddressProvider = controller.AddressProvider
 // to register custom watches with the Gateway controller.
 type AddressWatcher = controller.AddressWatcher
 
+// AddressReadinessProvider is an optional interface an AddressProvider can implement
+// to report addresses and detailed readiness state in a single call.
+type AddressReadinessProvider = controller.AddressReadinessProvider
+
+// GatewayReadiness represents the data-plane readiness state of a Gateway.
+type GatewayReadiness = state.GatewayReadiness
+
 // DefaultScheme creates a new runtime.Scheme initialized with client-go and Gateway API schemes.
 func DefaultScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()

@@ -1123,3 +1123,142 @@ func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
 		})
 	}
 }
+
+func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "snigateway-mgr-state-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := certs.GenerateAndWriteCertificates(tempDir, "snigateway.internal", "mgr-client"); err != nil {
+		t.Fatalf("GenerateAndWriteCertificates failed: %v", err)
+	}
+
+	caCertPEM, err := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	if err != nil {
+		t.Fatalf("reading ca.crt: %v", err)
+	}
+	serverCertPEM, err := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	if err != nil {
+		t.Fatalf("reading server.crt: %v", err)
+	}
+	serverKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	if err != nil {
+		t.Fatalf("reading server.key: %v", err)
+	}
+	clientCertPEM, err := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	if err != nil {
+		t.Fatalf("reading client.crt: %v", err)
+	}
+	clientKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "client.key"))
+	if err != nil {
+		t.Fatalf("reading client.key: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer ln.Close()
+
+	srv, err := frontend.NewServer(frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = srv.ServeAll([]net.Listener{ln}, nil)
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+	cli := client.NewClient(ln.Addr().String(), clientTLS)
+
+	mgr := NewManager(cli,
+		WithTransport(TransportModeTCP),
+		WithPoolSize(2),
+		WithBackoff(20*time.Millisecond, 100*time.Millisecond),
+	)
+
+	notifyCh := make(chan struct{}, 100)
+	mgr.AddStateChangeListener(func() {
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+	})
+
+	if mgr.IsConnected() {
+		t.Fatalf("expected IsConnected=false initially")
+	}
+	if mgr.HasRegisteredHostnames([]string{"echo.example.com"}) {
+		t.Fatalf("expected HasRegisteredHostnames=false initially")
+	}
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	mgrDone := make(chan error, 1)
+	go func() {
+		mgrDone <- mgr.Run(runCtx)
+	}()
+
+	// Wait for connection notification
+	deadline := time.Now().Add(5 * time.Second)
+	for !mgr.IsConnected() && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !mgr.IsConnected() {
+		t.Fatalf("timed out waiting for Manager to connect")
+	}
+
+	// Register hostnames
+	mgr.UpdateHostnames([]string{"echo.example.com"})
+
+	deadline = time.Now().Add(5 * time.Second)
+	for !mgr.HasRegisteredHostnames([]string{"echo.example.com"}) && time.Now().Before(deadline) {
+		select {
+		case <-notifyCh:
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !mgr.HasRegisteredHostnames([]string{"echo.example.com"}) {
+		t.Fatalf("expected HasRegisteredHostnames([echo.example.com])=true")
+	}
+
+	// Unregistered hostname must return false
+	if mgr.HasRegisteredHostnames([]string{"other.example.com"}) {
+		t.Fatalf("expected HasRegisteredHostnames([other.example.com])=false")
+	}
+
+	// Cancel session
+	runCancel()
+	<-mgrDone
+
+	if mgr.IsConnected() {
+		t.Fatalf("expected IsConnected=false after cancel")
+	}
+	if mgr.HasRegisteredHostnames([]string{"echo.example.com"}) {
+		t.Fatalf("expected HasRegisteredHostnames=false after cancel")
+	}
+}

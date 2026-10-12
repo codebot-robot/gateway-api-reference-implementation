@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
@@ -29,6 +30,17 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(val string) error {
+	*s = append(*s, val)
+	return nil
+}
 
 const (
 	// DefaultControllerName is the default GatewayClass controller name for snigateway.
@@ -54,9 +66,11 @@ func main() {
 		quicProbeInterval time.Duration
 		leaderElection    bool
 		leaderElectionID  string
+		gatewayAddresses  stringSliceFlag
 	)
 
 	flag.StringVar(&frontendAddr, "frontend", "127.0.0.1:443", "Address of the snigateway-frontend server (<ip-or-host>:<port>).")
+	flag.Var(&gatewayAddresses, "gateway-address", "Address to report in Gateway status (repeatable, IP or hostname). Defaults to host part of --frontend.")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Path to the CA certificate PEM file used to verify snigateway-frontend.")
 	flag.StringVar(&clientCertPath, "client-cert", "", "Path to the client certificate PEM file for mTLS authentication.")
 	flag.StringVar(&clientKeyPath, "client-key", "", "Path to the client private key PEM file for mTLS authentication.")
@@ -123,6 +137,14 @@ func main() {
 		tunnel.WithQUICProbeInterval(quicProbeInterval),
 	)
 
+	addrs := []string(gatewayAddresses)
+	if len(addrs) == 0 {
+		addrs = []string{tunnel.ParseFrontendHost(frontendAddr)}
+	}
+
+	addrProvider := tunnel.NewAddressProvider(tunnelMgr, addrs...)
+	addrProvider.SetControllerName(controllerName)
+
 	gariOpts := gari.DefaultOptions()
 	gariOpts.ControllerName = controllerName
 	gariOpts.MetricsAddr = metricsAddr
@@ -132,6 +154,7 @@ func main() {
 	gariOpts.HTTPSListener = tunnelMgr.Listener()
 	gariOpts.LeaderElection = leaderElection
 	gariOpts.LeaderElectionID = leaderElectionID
+	gariOpts.AddressProvider = addrProvider
 	gariOpts.OnGatewaysUpdate = func(gateways []*gatewayv1.Gateway) {
 		tunnelMgr.UpdateGateways(gateways)
 	}

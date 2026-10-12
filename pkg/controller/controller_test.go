@@ -1181,6 +1181,96 @@ func TestGatewayReconciler_AddressWatcher(t *testing.T) {
 	}
 }
 
+type fakeAddressReadinessProvider struct {
+	fakeAddressProvider
+	readiness state.GatewayReadiness
+}
+
+func (f *fakeAddressReadinessProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
+	return f.addresses, f.readiness, f.err
+}
+
+func TestGatewayReconciler_AddressReadinessProvider(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gwClass)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(&gatewayv1.Gateway{}).
+		Build()
+
+	readinessProvider := &fakeAddressReadinessProvider{
+		fakeAddressProvider: fakeAddressProvider{
+			addresses: []gatewayv1.GatewayStatusAddress{{Value: "1.2.3.4"}},
+		},
+		readiness: state.GatewayReadiness{
+			Ready:   false,
+			Reason:  "Pending",
+			Message: "Tunnel session to frontend is not connected",
+		},
+	}
+
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: readinessProvider,
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	st.Recompute()
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected second reconcile error: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	progCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != "Pending" || progCond.Message != "Tunnel session to frontend is not connected" {
+		t.Fatalf("expected Programmed=False Reason=Pending Message='Tunnel session to frontend is not connected', got: %+v", progCond)
+	}
+}
+
 func containsGateway(gws []*state.GatewayState, key types.NamespacedName) bool {
 	for _, gw := range gws {
 		if gw.Gateway != nil && gw.Gateway.Namespace == key.Namespace && gw.Gateway.Name == key.Name {

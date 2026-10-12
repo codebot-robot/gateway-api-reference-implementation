@@ -256,6 +256,78 @@ func (h *Harness) GetPodIPInNamespace(namespace, name string) string {
 	return strings.TrimSpace(out)
 }
 
+func (h *Harness) WaitForGatewayAddress(name, namespace string, timeout time.Duration) string {
+	h.t.Logf("Waiting for Gateway %s/%s address...", namespace, name)
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("Timeout waiting for Gateway %s/%s address", namespace, name)
+		}
+		cmd := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.addresses[0].value}")
+		out, err := cmd.Output()
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		addr := strings.TrimSpace(string(out))
+		if addr != "" {
+			return addr
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (h *Harness) WaitForGatewayProgrammed(name, namespace string, timeout time.Duration) {
+	h.t.Logf("Waiting for Gateway %s/%s to have Programmed=True condition...", namespace, name)
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("Timeout waiting for Gateway %s/%s to be Programmed=True", namespace, name)
+		}
+		cmd := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].status}")
+		out, err := cmd.Output()
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		status := strings.TrimSpace(string(out))
+		if status == "True" {
+			return
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (h *Harness) WaitForGatewayProgrammedFalse(name, namespace string, timeout time.Duration) (reason string, message string) {
+	h.t.Logf("Waiting for Gateway %s/%s to have Programmed=False condition...", namespace, name)
+	deadline := time.Now().Add(timeout)
+	for {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("Timeout waiting for Gateway %s/%s to be Programmed=False", namespace, name)
+		}
+		cmdStatus := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].status}")
+		outStatus, err := cmdStatus.Output()
+		if err != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		if strings.TrimSpace(string(outStatus)) == "False" {
+			cmdReason := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].reason}")
+			outReason, err := cmdReason.Output()
+			if err != nil {
+				h.t.Logf("Failed getting condition reason: %v", err)
+			}
+			cmdMsg := exec.Command("kubectl", "get", "gateway", name, "--namespace="+namespace, "-o", "jsonpath={.status.conditions[?(@.type==\"Programmed\")].message}")
+			outMsg, err := cmdMsg.Output()
+			if err != nil {
+				h.t.Logf("Failed getting condition message: %v", err)
+			}
+			return strings.TrimSpace(string(outReason)), strings.TrimSpace(string(outMsg))
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func (h *Harness) DumpDeploymentLogs(namespace, name string) {
 	out, err := exec.Command("kubectl", "logs", "deployment/"+name, "--namespace="+namespace, "--all-containers=true").CombinedOutput()
 	if err != nil {

@@ -653,7 +653,7 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 
 	// 1. Initial recompute with ready=false -> Programmed=False, Reason=Pending
-	st.SetGatewayReadiness(gwKey, false)
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: false})
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -675,7 +675,7 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	}
 
 	// 2. Set ready=true -> Programmed=True, Reason=Programmed
-	st.SetGatewayReadiness(gwKey, true)
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
@@ -690,6 +690,25 @@ func TestState_GatewayReadinessGating(t *testing.T) {
 	}
 	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
 		t.Errorf("expected Programmed=True Reason=Programmed when ready=true, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+	}
+
+	// 3. Custom readiness reason and message
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: false, Reason: "Pending", Message: "Waiting for tunnel connection to frontend"})
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	progCond = nil
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != "Pending" || progCond.Message != "Waiting for tunnel connection to frontend" {
+		t.Errorf("expected Programmed=False Reason=Pending Message='Waiting for tunnel connection to frontend', got %+v", progCond)
 	}
 }
 
@@ -715,7 +734,7 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 	st.UpsertGatewayClass(gc)
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
-	st.SetGatewayReadiness(gwKey, true)
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
 	// 1. With provisioning error -> Programmed=False, Message=error
 	provErr := "conflict: existing Service default/my-gw-gari is not owned by Gateway my-gw"

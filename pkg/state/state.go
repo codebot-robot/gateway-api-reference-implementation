@@ -104,7 +104,7 @@ type State struct {
 	gatewayClasses     map[types.NamespacedName]*gatewayv1.GatewayClass
 	gateways           map[types.NamespacedName]*GatewayState
 	gatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	gatewayReadiness   map[types.NamespacedName]bool
+	gatewayReadiness   map[types.NamespacedName]GatewayReadiness
 	provisioningErrors map[types.NamespacedName]string
 	listenerSets       map[types.NamespacedName]*ListenerSetState
 	httpRoutes         map[types.NamespacedName]*HTTPRouteState
@@ -146,7 +146,7 @@ func NewState() *State {
 		gatewayClasses:         make(map[types.NamespacedName]*gatewayv1.GatewayClass),
 		gateways:               make(map[types.NamespacedName]*GatewayState),
 		gatewayAddresses:       make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress),
-		gatewayReadiness:       make(map[types.NamespacedName]bool),
+		gatewayReadiness:       make(map[types.NamespacedName]GatewayReadiness),
 		provisioningErrors:     make(map[types.NamespacedName]string),
 		listenerSets:           make(map[types.NamespacedName]*ListenerSetState),
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
@@ -481,7 +481,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		gwAddrs[k] = copied
 	}
 
-	gwReady := make(map[types.NamespacedName]bool)
+	gwReady := make(map[types.NamespacedName]GatewayReadiness)
 	for k, v := range s.gatewayReadiness {
 		gwReady[k] = v
 	}
@@ -1011,15 +1011,15 @@ func (s *State) GetGatewayAddresses() map[types.NamespacedName][]gatewayv1.Gatew
 	return gwAddrs
 }
 
-func (s *State) SetGatewayReadiness(key types.NamespacedName, ready bool) {
+func (s *State) SetGatewayReadiness(key types.NamespacedName, readiness GatewayReadiness) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if cur, ok := s.gatewayReadiness[key]; ok && cur == ready {
+	if cur, ok := s.gatewayReadiness[key]; ok && cur == readiness {
 		return
 	}
 
-	s.gatewayReadiness[key] = ready
+	s.gatewayReadiness[key] = readiness
 	s.revision++
 	s.markDirtyLocked()
 }

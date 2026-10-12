@@ -234,13 +234,20 @@ func (cm *CompiledModel) ResolvedGateways() []*gatewayv1.Gateway {
 	return res
 }
 
+// GatewayReadiness represents the data-plane readiness state of a Gateway.
+type GatewayReadiness struct {
+	Ready   bool
+	Reason  string
+	Message string
+}
+
 // ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
 	Revision           uint64
 	Gateways           []*gatewayv1.Gateway
 	GatewayClasses     []*gatewayv1.GatewayClass
 	GatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	GatewayReadiness   map[types.NamespacedName]bool
+	GatewayReadiness   map[types.NamespacedName]GatewayReadiness
 	ProvisioningErrors map[types.NamespacedName]string
 	ListenerSets       []*gatewayv1.ListenerSet
 	HTTPRoutes         []*gatewayv1.HTTPRoute
@@ -557,7 +564,7 @@ func BuildEffectiveListener(
 }
 
 // ComputeGatewayConditions computes the top-level conditions for a Gateway.
-func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener, hasAddress bool, infraReady bool, provErr string) []metav1.Condition {
+func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener, hasAddress bool, readiness GatewayReadiness, provErr string) []metav1.Condition {
 	totalListeners := len(gw.Spec.Listeners)
 	acceptedListenersCount := 0
 
@@ -607,10 +614,16 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
 		gwProgrammedMessage = "Waiting for address to be assigned to the Gateway"
-	} else if !infraReady {
+	} else if !readiness.Ready {
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonPending
 		gwProgrammedMessage = "Waiting for data-plane deployment to become available"
+		if readiness.Reason != "" {
+			gwProgrammedReason = gatewayv1.GatewayConditionReason(readiness.Reason)
+		}
+		if readiness.Message != "" {
+			gwProgrammedMessage = readiness.Message
+		}
 	}
 
 	return []metav1.Condition{
@@ -826,7 +839,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if inputs.ProvisioningErrors != nil {
 			provErr = inputs.ProvisioningErrors[gwKey]
 		}
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, true, provErr)
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -1425,17 +1438,17 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			if inputs.GatewayAddresses != nil {
 				addrs = inputs.GatewayAddresses[gwKey]
 			}
-			infraReady := true
+			readiness := GatewayReadiness{Ready: true}
 			if inputs.GatewayReadiness != nil {
 				if r, ok := inputs.GatewayReadiness[gwKey]; ok {
-					infraReady = r
+					readiness = r
 				}
 			}
 			var provErr string
 			if inputs.ProvisioningErrors != nil {
 				provErr = inputs.ProvisioningErrors[gwKey]
 			}
-			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, infraReady, provErr)
+			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, readiness, provErr)
 		}
 	}
 
@@ -1545,7 +1558,7 @@ func ComputeDesiredGatewayStatus(
 	gw *gatewayv1.Gateway,
 	compiledGw *CompiledGateway,
 	providedAddresses []gatewayv1.GatewayStatusAddress,
-	infraReady bool,
+	readiness GatewayReadiness,
 	provErr string,
 ) gatewayv1.GatewayStatus {
 	hasAddress := len(providedAddresses) > 0
@@ -1556,7 +1569,7 @@ func ComputeDesiredGatewayStatus(
 		attachedLSCount = compiledGw.AttachedListenerSets
 	}
 
-	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, infraReady, provErr)
+	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr)
 
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {
