@@ -48,6 +48,8 @@ type Client struct {
 	internalHostname string
 	tlsConfig        *tls.Config
 	httpClient       *http.Client
+	dialFunc         func(ctx context.Context, network, addr string) (net.Conn, error)
+	quicDialFunc     func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error)
 }
 
 // ClientOption configures a Client.
@@ -57,6 +59,20 @@ type ClientOption func(*Client)
 func WithInternalHostname(hostname string) ClientOption {
 	return func(c *Client) {
 		c.internalHostname = hostname
+	}
+}
+
+// WithDialFunc sets a custom network dialer function for establishing TCP connections.
+func WithDialFunc(fn func(ctx context.Context, network, addr string) (net.Conn, error)) ClientOption {
+	return func(c *Client) {
+		c.dialFunc = fn
+	}
+}
+
+// WithQUICDialFunc sets a custom dialer function for establishing QUIC connections.
+func WithQUICDialFunc(fn func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error)) ClientOption {
+	return func(c *Client) {
+		c.quicDialFunc = fn
 	}
 }
 
@@ -78,6 +94,18 @@ func NewClient(serverAddr string, tlsConfig *tls.Config, opts ...ClientOption) *
 	transport := &http.Transport{
 		TLSClientConfig: c.tlsConfig,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if c.dialFunc != nil {
+				rawConn, err := c.dialFunc(ctx, "tcp", c.serverAddr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(rawConn, c.tlsConfig)
+				if err := tlsConn.HandshakeContext(ctx); err != nil {
+					closeConn(rawConn)
+					return nil, err
+				}
+				return tlsConn, nil
+			}
 			dialer := &tls.Dialer{
 				NetDialer: &net.Dialer{
 					KeepAlive: 15 * time.Second,
@@ -197,16 +225,36 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 
 // DialTunnel dials an mTLS pooled tunnel connection to the frontend for the given sessionID.
 func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, error) {
-	dialer := &tls.Dialer{
-		NetDialer: &net.Dialer{
-			KeepAlive: 15 * time.Second,
-		},
-		Config: c.tlsConfig,
-	}
+	var tlsConn *tls.Conn
+	if c.dialFunc != nil {
+		rawConn, err := c.dialFunc(ctx, "tcp", c.serverAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dialing frontend: %w", err)
+		}
+		tlsConn = tls.Client(rawConn, c.tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			closeConn(rawConn)
+			return nil, fmt.Errorf("handshake frontend mTLS: %w", err)
+		}
+	} else {
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{
+				KeepAlive: 15 * time.Second,
+			},
+			Config: c.tlsConfig,
+		}
 
-	tlsConn, err := dialer.DialContext(ctx, "tcp", c.serverAddr)
-	if err != nil {
-		return nil, fmt.Errorf("dialing frontend mTLS: %w", err)
+		conn, err := dialer.DialContext(ctx, "tcp", c.serverAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dialing frontend mTLS: %w", err)
+		}
+
+		var ok bool
+		tlsConn, ok = conn.(*tls.Conn)
+		if !ok {
+			closeConn(conn)
+			return nil, errors.New("expected tls.Conn")
+		}
 	}
 
 	urlPath := "/v1/tunnel"
@@ -247,9 +295,14 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 	}
 
 	if bufReader.Buffered() > 0 {
+		buffered := make([]byte, bufReader.Buffered())
+		if _, err := io.ReadFull(bufReader, buffered); err != nil {
+			closeConn(tlsConn)
+			return nil, fmt.Errorf("reading buffered handshake bytes: %w", err)
+		}
 		return &bufferedClientConn{
-			Conn:   tlsConn,
-			reader: bufReader,
+			Conn:     tlsConn,
+			buffered: buffered,
 		}, nil
 	}
 
@@ -258,11 +311,20 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 
 type bufferedClientConn struct {
 	net.Conn
-	reader *bufio.Reader
+	buffered  []byte
+	bufOffset int
 }
 
 func (c *bufferedClientConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+	if c.buffered != nil {
+		n := copy(b, c.buffered[c.bufOffset:])
+		c.bufOffset += n
+		if c.bufOffset >= len(c.buffered) {
+			c.buffered = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 // DialQUIC dials an mTLS QUIC connection to the frontend server.
@@ -272,5 +334,8 @@ func (c *Client) DialQUIC(ctx context.Context) (*quic.Conn, error) {
 		quicTLS.ServerName = c.internalHostname
 	}
 	quicTLS.NextProtos = []string{api.TunnelALPN}
+	if c.quicDialFunc != nil {
+		return c.quicDialFunc(ctx, c.serverAddr, quicTLS, api.DefaultQUICConfig())
+	}
 	return quic.DialAddr(ctx, c.serverAddr, quicTLS, api.DefaultQUICConfig())
 }

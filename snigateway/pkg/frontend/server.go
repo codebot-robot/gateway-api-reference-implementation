@@ -438,13 +438,22 @@ func isNormalClose(err error) bool {
 	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
+var spliceBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
 func spliceConnections(c1, c2 net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(c2, c1); err != nil && !isNormalClose(err) {
+		bufPtr := spliceBufPool.Get().(*[]byte)
+		defer spliceBufPool.Put(bufPtr)
+		if _, err := io.CopyBuffer(c2, c1, *bufPtr); err != nil && !isNormalClose(err) {
 			klog.V(2).Infof("Frontend: splice error copying c1 to c2: %v", err)
 		}
 		closeCloser(c2)
@@ -453,7 +462,9 @@ func spliceConnections(c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		if _, err := io.Copy(c1, c2); err != nil && !isNormalClose(err) {
+		bufPtr := spliceBufPool.Get().(*[]byte)
+		defer spliceBufPool.Put(bufPtr)
+		if _, err := io.CopyBuffer(c1, c2, *bufPtr); err != nil && !isNormalClose(err) {
 			klog.V(2).Infof("Frontend: splice error copying c2 to c1: %v", err)
 		}
 		closeCloser(c1)
@@ -773,9 +784,14 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 
 	var dialedConn net.Conn = rawConn
 	if rw != nil && rw.Reader.Buffered() > 0 {
+		buffered := make([]byte, rw.Reader.Buffered())
+		if _, err := io.ReadFull(rw.Reader, buffered); err != nil {
+			closeCloser(rawConn)
+			return
+		}
 		dialedConn = &bufferedConn{
-			Conn:   rawConn,
-			reader: rw.Reader,
+			Conn:     rawConn,
+			buffered: buffered,
 		}
 	}
 
@@ -787,11 +803,20 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 
 type bufferedConn struct {
 	net.Conn
-	reader *bufio.Reader
+	buffered  []byte
+	bufOffset int
 }
 
 func (c *bufferedConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+	if c.buffered != nil {
+		n := copy(b, c.buffered[c.bufOffset:])
+		c.bufOffset += n
+		if c.bufOffset >= len(c.buffered) {
+			c.buffered = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 // chanListener implements net.Listener over an in-memory channel.

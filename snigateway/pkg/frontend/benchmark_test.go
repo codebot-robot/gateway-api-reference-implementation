@@ -15,327 +15,663 @@
 package frontend
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 	"github.com/quic-go/quic-go"
 )
 
-func BenchmarkLatency_QUIC(b *testing.B) {
-	srv, serverAddr, generated, cleanup := setupTestServerWithUDPAndClient(&testing.T{})
-	defer cleanup()
+type benchConfig struct {
+	Transport string
+	RTT       time.Duration
+	Loss      float64
+	PoolSize  int
+}
+
+func checkSocketBufferSizes(t testing.TB) {
+	rmem, errR := os.ReadFile("/proc/sys/net/core/rmem_max")
+	wmem, errW := os.ReadFile("/proc/sys/net/core/wmem_max")
+	if errR == nil && errW == nil {
+		rVal, _ := strconv.Atoi(strings.TrimSpace(string(rmem)))
+		wVal, _ := strconv.Atoi(strings.TrimSpace(string(wmem)))
+		warned := rVal < 2500000 || wVal < 2500000
+		t.Logf("UDP Buffer Check: rmem_max=%d (%d kiB), wmem_max=%d (%d kiB), quic-go warning expected: %v",
+			rVal, rVal/1024, wVal, wVal/1024, warned)
+	}
+}
+
+func getCPUTime() (time.Duration, time.Duration) {
+	var ru syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	user := time.Duration(ru.Utime.Sec)*time.Second + time.Duration(ru.Utime.Usec)*time.Microsecond
+	sys := time.Duration(ru.Stime.Sec)*time.Second + time.Duration(ru.Stime.Usec)*time.Microsecond
+	return user, sys
+}
+
+func setupBenchmarkBackend(b testing.TB, srv *Server, serverAddr string, generated *certs.GeneratedCerts, hostname string, cfg benchConfig, payload []byte) (*tunnel.Manager, func()) {
+	b.Helper()
 
 	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
 	if err != nil {
 		b.Fatalf("NewClientTLSConfig: %v", err)
 	}
 
-	backendCert, err := generateTestBackendCert("bench.example.com")
+	backendCert, err := generateTestBackendCert(hostname)
 	if err != nil {
 		b.Fatalf("generateTestBackendCert: %v", err)
 	}
 
-	c := client.NewClient(serverAddr, clientTLS)
-	ctx, cancel := context.WithCancel(b.Context())
-	defer cancel()
-
-	qConn, err := c.DialQUIC(ctx)
-	if err != nil {
-		b.Fatalf("DialQUIC: %v", err)
+	var clientOpts []client.ClientOption
+	if cfg.RTT > 0 || cfg.Loss > 0 {
+		if cfg.Transport == "quic" {
+			clientOpts = append(clientOpts, client.WithQUICDialFunc(func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
+				pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+				if err != nil {
+					return nil, err
+				}
+				simPConn := newSimulatedPacketConn(pconn, cfg.RTT/2, cfg.Loss)
+				udpAddr, err := net.ResolveUDPAddr("udp", addr)
+				if err != nil {
+					return nil, err
+				}
+				return quic.Dial(ctx, simPConn, udpAddr, tlsConf, quicConf)
+			}))
+		} else {
+			clientOpts = append(clientOpts, client.WithDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if cfg.RTT > 0 {
+					time.Sleep(cfg.RTT)
+				}
+				rawConn, err := (&net.Dialer{KeepAlive: 15 * time.Second}).DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return newSimulatedConn(rawConn, cfg.RTT/2, cfg.Loss), nil
+			}))
+		}
 	}
-	defer qConn.CloseWithError(0, "bench done")
 
-	ctrlStream, _ := qConn.OpenStreamSync(ctx)
-	_, _ = ctrlStream.Write([]byte("{\"type\":\"session\"}\n"))
-	reader := bufio.NewReader(ctrlStream)
-	_, _ = reader.ReadBytes('\n')
+	c := client.NewClient(serverAddr, clientTLS, clientOpts...)
+	ctx, cancel := context.WithCancel(b.Context())
 
-	regReq := api.RegistrationRequest{Hostnames: []string{"bench.example.com"}}
-	reqBytes, _ := jsonMarshal(regReq)
-	_, _ = ctrlStream.Write(append(reqBytes, '\n'))
-	_, _ = reader.ReadBytes('\n')
+	mgrOpts := []tunnel.ManagerOption{tunnel.WithTransport(cfg.Transport)}
+	if cfg.PoolSize > 0 {
+		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(cfg.PoolSize))
+	} else if cfg.Transport == "tcp" {
+		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(16))
+	}
+
+	mgr := tunnel.NewManager(c, mgrOpts...)
+	go func() {
+		_ = mgr.Run(ctx)
+	}()
+	mgr.UpdateHostnames([]string{hostname})
+
+	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
+	httpSrv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(payload) > 0 {
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+				_, _ = w.Write(payload)
+			} else {
+				_, _ = w.Write([]byte("OK"))
+			}
+		}),
+	}
 
 	go func() {
-		for {
-			s, err := qConn.AcceptStream(ctx)
-			if err != nil {
-				return
-			}
-			go func(stream *quic.Stream) {
-				streamConn := api.NewQUICStreamConn(stream, qConn)
-				bufReader := bufio.NewReader(streamConn)
-				hdr, err := proxyproto.Decode(bufReader)
-				if err != nil {
-					_ = streamConn.Close()
-					return
-				}
-				var remaining []byte
-				if bufReader.Buffered() > 0 {
-					remaining = make([]byte, bufReader.Buffered())
-					_, _ = io.ReadFull(bufReader, remaining)
-				}
-				proxyConn := proxyproto.NewConn(streamConn, hdr.SrcAddr, hdr.DstAddr, remaining)
-				tlsConn := tls.Server(proxyConn, &tls.Config{Certificates: []tls.Certificate{backendCert}})
-				defer tlsConn.Close()
-
-				buf := make([]byte, 1024)
-				_, _ = tlsConn.Read(buf)
-				_, _ = tlsConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"))
-			}(s)
-		}
+		_ = httpSrv.Serve(tlsLis)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	// Wait for registration in frontend table
+	deadline := time.Now().Add(10 * time.Second)
+	registered := false
+	for time.Now().Before(deadline) {
+		if len(srv.RegistrationTable().MatchSessions(hostname)) > 0 {
+			registered = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !registered {
+		b.Fatalf("backend for %s failed to register within deadline", hostname)
+	}
+
+	cleanup := func() {
+		cancel()
+		_ = httpSrv.Close()
+	}
+
+	return mgr, cleanup
+}
+
+func runLatencyBenchmark(b *testing.B, cfg benchConfig, hostname string) {
+	checkSocketBufferSizes(b)
+
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	defer cleanupSrv()
+
+	_, cleanupBackend := setupBenchmarkBackend(b, srv, serverAddr, generated, hostname, cfg, nil)
+	defer cleanupBackend()
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				ServerName:         "bench.example.com",
+				ServerName:         hostname,
 				InsecureSkipVerify: true,
 			},
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return tls.Dial("tcp", serverAddr, &tls.Config{
-					ServerName:         "bench.example.com",
+					ServerName:         hostname,
 					InsecureSkipVerify: true,
 				})
 			},
 			DisableKeepAlives: true,
 		},
-		Timeout: 5 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
-	_ = srv
+	latencies := make([]time.Duration, 0, b.N)
+	buf := make([]byte, 2)
+
+	var memStart runtime.MemStats
+	runtime.ReadMemStats(&memStart)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		resp, err := httpClient.Get("https://bench.example.com/test")
+		t0 := time.Now()
+		resp, err := httpClient.Get("https://" + hostname + "/test")
 		if err != nil {
 			b.Fatalf("Get failed: %v", err)
 		}
-		_, _ = io.ReadAll(resp.Body)
+		_, _ = resp.Body.Read(buf)
+		lat := time.Since(t0)
+		latencies = append(latencies, lat)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
+	b.StopTimer()
+
+	var memEnd runtime.MemStats
+	runtime.ReadMemStats(&memEnd)
+
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		p50 := latencies[len(latencies)*50/100]
+		p99 := latencies[len(latencies)*99/100]
+		b.ReportMetric(float64(p50.Microseconds())/1000.0, "p50-ms")
+		b.ReportMetric(float64(p99.Microseconds())/1000.0, "p99-ms")
+	}
+
+	allocsPerConn := float64(memEnd.Mallocs-memStart.Mallocs) / float64(b.N)
+	b.ReportMetric(allocsPerConn, "allocs/conn")
+}
+
+func runThroughputBenchmark(b *testing.B, cfg benchConfig, hostname string) {
+	checkSocketBufferSizes(b)
+
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	defer cleanupSrv()
+
+	payload := make([]byte, 10*1024*1024) // 10 MB
+	_, cleanupBackend := setupBenchmarkBackend(b, srv, serverAddr, generated, hostname, cfg, payload)
+	defer cleanupBackend()
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         hostname,
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         hostname,
+					InsecureSkipVerify: true,
+				})
+			},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	b.SetBytes(int64(len(payload)))
+
+	u0, s0 := getCPUTime()
+	var mem0 runtime.MemStats
+	runtime.ReadMemStats(&mem0)
+
+	b.ResetTimer()
+	t0 := time.Now()
+	for i := 0; i < b.N; i++ {
+		resp, err := httpClient.Get("https://" + hostname + "/test")
+		if err != nil {
+			b.Fatalf("Get failed: %v", err)
+		}
+		n, _ := io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if n != int64(len(payload)) {
+			b.Fatalf("expected %d bytes, got %d", len(payload), n)
+		}
+	}
+	b.StopTimer()
+	wallElapsed := time.Since(t0)
+
+	u1, s1 := getCPUTime()
+	var mem1 runtime.MemStats
+	runtime.ReadMemStats(&mem1)
+
+	totalBytes := int64(len(payload)) * int64(b.N)
+	gbTransferred := float64(totalBytes) / (1024 * 1024 * 1024)
+	mbTransferred := float64(totalBytes) / (1024 * 1024)
+	totalCPUSec := (u1 - u0).Seconds() + (s1 - s0).Seconds()
+
+	if gbTransferred > 0 {
+		b.ReportMetric(totalCPUSec/gbTransferred, "CPU-s/GB")
+	}
+	if mbTransferred > 0 {
+		b.ReportMetric(float64(mem1.Mallocs-mem0.Mallocs)/mbTransferred, "allocs/MB")
+		b.ReportMetric(mbTransferred/wallElapsed.Seconds(), "MB/s")
+	}
+}
+
+func runConcurrentThroughputBenchmark(b *testing.B, cfg benchConfig, hostname string, concurrency int) {
+	checkSocketBufferSizes(b)
+
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	defer cleanupSrv()
+
+	payload := make([]byte, 5*1024*1024) // 5 MB per transfer
+	_, cleanupBackend := setupBenchmarkBackend(b, srv, serverAddr, generated, hostname, cfg, payload)
+	defer cleanupBackend()
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         hostname,
+				InsecureSkipVerify: true,
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tls.Dial("tcp", serverAddr, &tls.Config{
+					ServerName:         hostname,
+					InsecureSkipVerify: true,
+				})
+			},
+			MaxIdleConns:        concurrency * 2,
+			MaxIdleConnsPerHost: concurrency * 2,
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	b.SetBytes(int64(len(payload)) * int64(concurrency))
+
+	u0, s0 := getCPUTime()
+	var mem0 runtime.MemStats
+	runtime.ReadMemStats(&mem0)
+
+	b.ResetTimer()
+	t0 := time.Now()
+
+	for i := 0; i < b.N; i++ {
+		var wg sync.WaitGroup
+		wg.Add(concurrency)
+		for c := 0; c < concurrency; c++ {
+			go func() {
+				defer wg.Done()
+				resp, err := httpClient.Get("https://" + hostname + "/test")
+				if err != nil {
+					b.Errorf("Get failed: %v", err)
+					return
+				}
+				n, _ := io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if n != int64(len(payload)) {
+					b.Errorf("expected %d bytes, got %d", len(payload), n)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	b.StopTimer()
+	wallElapsed := time.Since(t0)
+
+	u1, s1 := getCPUTime()
+	var mem1 runtime.MemStats
+	runtime.ReadMemStats(&mem1)
+
+	totalBytes := int64(len(payload)) * int64(concurrency) * int64(b.N)
+	gbTransferred := float64(totalBytes) / (1024 * 1024 * 1024)
+	mbTransferred := float64(totalBytes) / (1024 * 1024)
+	totalCPUSec := (u1 - u0).Seconds() + (s1 - s0).Seconds()
+
+	if gbTransferred > 0 {
+		b.ReportMetric(totalCPUSec/gbTransferred, "CPU-s/GB")
+	}
+	if mbTransferred > 0 {
+		b.ReportMetric(float64(mem1.Mallocs-mem0.Mallocs)/mbTransferred, "allocs/MB")
+		b.ReportMetric(mbTransferred/wallElapsed.Seconds(), "MB/s")
+	}
+}
+
+func BenchmarkLatency_QUIC(b *testing.B) {
+	runLatencyBenchmark(b, benchConfig{Transport: "quic"}, "bench-quic.example.com")
 }
 
 func BenchmarkLatency_TCPPool(b *testing.B) {
-	srv, serverAddr, generated, cleanup := setupTestServerAndClient(&testing.T{})
-	defer cleanup()
+	runLatencyBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "bench-tcp.example.com")
+}
 
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
-	if err != nil {
-		b.Fatalf("NewClientTLSConfig: %v", err)
+func BenchmarkThroughput_QUIC(b *testing.B) {
+	runThroughputBenchmark(b, benchConfig{Transport: "quic"}, "tput-quic.example.com")
+}
+
+func BenchmarkThroughput_TCPPool(b *testing.B) {
+	runThroughputBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "tput-tcp.example.com")
+}
+
+func BenchmarkThroughput_Concurrent_QUIC(b *testing.B) {
+	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "quic"}, "c-tput-quic.example.com", 8)
+}
+
+func BenchmarkThroughput_Concurrent_TCPPool(b *testing.B) {
+	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "tcp", PoolSize: 16}, "c-tput-tcp.example.com", 8)
+}
+
+func BenchmarkMatrix(b *testing.B) {
+	scenarios := []struct {
+		name string
+		cfg  benchConfig
+	}{
+		{"QUIC_RTT0ms_Loss0%", benchConfig{Transport: "quic", RTT: 0, Loss: 0}},
+		{"QUIC_RTT20ms_Loss0%", benchConfig{Transport: "quic", RTT: 20 * time.Millisecond, Loss: 0}},
+		{"QUIC_RTT50ms_Loss0%", benchConfig{Transport: "quic", RTT: 50 * time.Millisecond, Loss: 0}},
+		{"QUIC_RTT20ms_Loss1%", benchConfig{Transport: "quic", RTT: 20 * time.Millisecond, Loss: 0.01}},
+		{"QUIC_RTT50ms_Loss1%", benchConfig{Transport: "quic", RTT: 50 * time.Millisecond, Loss: 0.01}},
+
+		{"TCPPool_RTT0ms_Loss0%", benchConfig{Transport: "tcp", RTT: 0, Loss: 0, PoolSize: 16}},
+		{"TCPPool_RTT20ms_Loss0%", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, Loss: 0, PoolSize: 16}},
+		{"TCPPool_RTT50ms_Loss0%", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, Loss: 0, PoolSize: 16}},
+		{"TCPPool_RTT20ms_Loss1%", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, Loss: 0.01, PoolSize: 16}},
+		{"TCPPool_RTT50ms_Loss1%", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, Loss: 0.01, PoolSize: 16}},
 	}
 
-	backendCert, err := generateTestBackendCert("bench-tcp.example.com")
-	if err != nil {
-		b.Fatalf("generateTestBackendCert: %v", err)
+	for _, sc := range scenarios {
+		b.Run(sc.name+"_Latency", func(subB *testing.B) {
+			runLatencyBenchmark(subB, sc.cfg, "mat-lat.example.com")
+		})
+		b.Run(sc.name+"_Throughput", func(subB *testing.B) {
+			runThroughputBenchmark(subB, sc.cfg, "mat-tput.example.com")
+		})
 	}
+}
 
-	c := client.NewClient(serverAddr, clientTLS)
-	ctx, cancel := context.WithCancel(b.Context())
-	defer cancel()
+func runBurstLatencyBenchmark(b *testing.B, cfg benchConfig, hostname string, burstSize int) {
+	checkSocketBufferSizes(b)
 
-	mgr := tunnel.NewManager(c, tunnel.WithTransport("tcp"), tunnel.WithPoolSize(16))
-	go func() {
-		_ = mgr.Run(ctx)
-	}()
-	mgr.UpdateHostnames([]string{"bench-tcp.example.com"})
+	srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(&testing.T{})
+	defer cleanupSrv()
 
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
-	httpSrv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte("OK"))
-		}),
-	}
-	defer httpSrv.Close()
-	go func() {
-		_ = httpSrv.Serve(tlsLis)
-	}()
-
-	time.Sleep(100 * time.Millisecond)
+	_, cleanupBackend := setupBenchmarkBackend(b, srv, serverAddr, generated, hostname, cfg, nil)
+	defer cleanupBackend()
 
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				ServerName:         "bench-tcp.example.com",
+				ServerName:         hostname,
 				InsecureSkipVerify: true,
 			},
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return tls.Dial("tcp", serverAddr, &tls.Config{
-					ServerName:         "bench-tcp.example.com",
+					ServerName:         hostname,
 					InsecureSkipVerify: true,
 				})
 			},
 			DisableKeepAlives: true,
 		},
-		Timeout: 5 * time.Second,
+		Timeout: 30 * time.Second,
 	}
 
-	_ = srv
+	allLatencies := make([]time.Duration, 0, b.N*burstSize)
+	var mu sync.Mutex
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		resp, err := httpClient.Get("https://bench-tcp.example.com/test")
-		if err != nil {
-			b.Fatalf("Get failed: %v", err)
+		var wg sync.WaitGroup
+		wg.Add(burstSize)
+		for j := 0; j < burstSize; j++ {
+			go func() {
+				defer wg.Done()
+				t0 := time.Now()
+				resp, err := httpClient.Get("https://" + hostname + "/test")
+				if err != nil {
+					b.Errorf("burst Get failed: %v", err)
+					return
+				}
+				buf := make([]byte, 2)
+				_, _ = resp.Body.Read(buf)
+				dur := time.Since(t0)
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+
+				mu.Lock()
+				allLatencies = append(allLatencies, dur)
+				mu.Unlock()
+			}()
 		}
-		_, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
+		wg.Wait()
+	}
+	b.StopTimer()
+
+	if len(allLatencies) > 0 {
+		sort.Slice(allLatencies, func(i, j int) bool { return allLatencies[i] < allLatencies[j] })
+		p50 := allLatencies[len(allLatencies)*50/100]
+		p99 := allLatencies[len(allLatencies)*99/100]
+		b.ReportMetric(float64(p50.Microseconds())/1000.0, "p50-ms")
+		b.ReportMetric(float64(p99.Microseconds())/1000.0, "p99-ms")
 	}
 }
 
-func BenchmarkThroughput_QUIC(b *testing.B) {
-	srv, serverAddr, generated, cleanup := setupTestServerWithUDPAndClient(&testing.T{})
-	defer cleanup()
-
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
-	if err != nil {
-		b.Fatalf("NewClientTLSConfig: %v", err)
+// BenchmarkLatency_Burst measures TTFB for a burst of new connections larger than the pool size,
+// showing the latency advantage of 0-RTT/1-RTT QUIC multiplexing over TCP pool exhaustion under WAN latency.
+func BenchmarkLatency_Burst(b *testing.B) {
+	scenarios := []struct {
+		name string
+		cfg  benchConfig
+	}{
+		{"QUIC_RTT20ms", benchConfig{Transport: "quic", RTT: 20 * time.Millisecond}},
+		{"QUIC_RTT50ms", benchConfig{Transport: "quic", RTT: 50 * time.Millisecond}},
+		{"TCPPool_RTT20ms", benchConfig{Transport: "tcp", RTT: 20 * time.Millisecond, PoolSize: 8}},
+		{"TCPPool_RTT50ms", benchConfig{Transport: "tcp", RTT: 50 * time.Millisecond, PoolSize: 8}},
 	}
 
-	backendCert, err := generateTestBackendCert("tput-quic.example.com")
+	for _, sc := range scenarios {
+		b.Run(sc.name, func(subB *testing.B) {
+			runBurstLatencyBenchmark(subB, sc.cfg, "burst.example.com", 32)
+		})
+	}
+}
+
+// TestBenchmark_SeparateProcessCPU runs backend in a child process and frontend in parent
+// to independently measure frontend CPU per GB and backend CPU per GB at saturation.
+func TestBenchmark_SeparateProcessCPU(t *testing.T) {
+	if os.Getenv("BENCH_CHILD_ROLE") == "backend" {
+		runBenchmarkChildBackend(t)
+		return
+	}
+
+	checkSocketBufferSizes(t)
+
+	for _, transport := range []string{"quic", "tcp"} {
+		t.Run(transport, func(t *testing.T) {
+			srv, serverAddr, generated, cleanupSrv := setupTestServerWithUDPAndClient(t)
+			defer cleanupSrv()
+			_ = srv
+
+			hostname := fmt.Sprintf("subproc-%s.example.com", transport)
+			transferBytes := 50 * 1024 * 1024 // 50 MB
+			concurrency := 4
+
+			// Spawn child process for backend
+			cmd := exec.Command(os.Args[0], "-test.run=^TestBenchmark_SeparateProcessCPU$")
+			cmd.Env = append(os.Environ(),
+				"BENCH_CHILD_ROLE=backend",
+				"BENCH_SERVER_ADDR="+serverAddr,
+				"BENCH_TRANSPORT="+transport,
+				"BENCH_HOSTNAME="+hostname,
+				"BENCH_CA_CERT="+string(generated.CA.CertPEM),
+				"BENCH_CLIENT_CERT="+string(generated.Client.CertPEM),
+				"BENCH_CLIENT_KEY="+string(generated.Client.KeyPEM),
+			)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("Failed to start backend child process: %v", err)
+			}
+
+			// Wait for backend child to register
+			time.Sleep(300 * time.Millisecond)
+
+			httpClient := &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						ServerName:         hostname,
+						InsecureSkipVerify: true,
+					},
+					DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return tls.Dial("tcp", serverAddr, &tls.Config{
+							ServerName:         hostname,
+							InsecureSkipVerify: true,
+						})
+					},
+					MaxIdleConns: concurrency * 2,
+				},
+				Timeout: 30 * time.Second,
+			}
+
+			u0, s0 := getCPUTime()
+			t0 := time.Now()
+
+			var wg sync.WaitGroup
+			bytesPerWorker := transferBytes / concurrency
+			wg.Add(concurrency)
+			for c := 0; c < concurrency; c++ {
+				go func() {
+					defer wg.Done()
+					resp, err := httpClient.Get(fmt.Sprintf("https://%s/bench?size=%d", hostname, bytesPerWorker))
+					if err != nil {
+						t.Errorf("Get failed: %v", err)
+						return
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}()
+			}
+			wg.Wait()
+
+			wallDuration := time.Since(t0)
+			u1, s1 := getCPUTime()
+			feCPUTime := (u1 - u0) + (s1 - s0)
+
+			// Signal child to terminate and get its process CPU time
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			_ = cmd.Wait()
+
+			beUser := cmd.ProcessState.UserTime()
+			beSys := cmd.ProcessState.SystemTime()
+			beCPUTime := beUser + beSys
+
+			gb := float64(transferBytes) / (1024 * 1024 * 1024)
+			feCPUPerGB := feCPUTime.Seconds() / gb
+			beCPUPerGB := beCPUTime.Seconds() / gb
+			mbPerSec := (float64(transferBytes) / (1024 * 1024)) / wallDuration.Seconds()
+
+			t.Logf("[%s] Transferred: %d MB in %v (%.2f MB/s)", transport, transferBytes/1024/1024, wallDuration, mbPerSec)
+			t.Logf("[%s] Frontend Process CPU: %v (%.2f CPU-s/GB)", transport, feCPUTime, feCPUPerGB)
+			t.Logf("[%s] Backend Process CPU:  %v (%.2f CPU-s/GB)", transport, beCPUTime, beCPUPerGB)
+		})
+	}
+}
+
+func runBenchmarkChildBackend(t *testing.T) {
+	serverAddr := os.Getenv("BENCH_SERVER_ADDR")
+	transport := os.Getenv("BENCH_TRANSPORT")
+	hostname := os.Getenv("BENCH_HOSTNAME")
+	caPEM := []byte(os.Getenv("BENCH_CA_CERT"))
+	clientPEM := []byte(os.Getenv("BENCH_CLIENT_CERT"))
+	keyPEM := []byte(os.Getenv("BENCH_CLIENT_KEY"))
+
+	clientTLS, err := certs.NewClientTLSConfig(caPEM, clientPEM, keyPEM, "snigateway.internal")
 	if err != nil {
-		b.Fatalf("generateTestBackendCert: %v", err)
+		os.Exit(1)
+	}
+
+	backendCert, err := generateTestBackendCert(hostname)
+	if err != nil {
+		os.Exit(1)
 	}
 
 	c := client.NewClient(serverAddr, clientTLS)
-	ctx, cancel := context.WithCancel(b.Context())
+	ctx, cancel := signal.NotifyContext(t.Context(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	mgr := tunnel.NewManager(c, tunnel.WithTransport("quic"))
+	mgrOpts := []tunnel.ManagerOption{tunnel.WithTransport(transport)}
+	if transport == "tcp" {
+		mgrOpts = append(mgrOpts, tunnel.WithPoolSize(16))
+	}
+
+	mgr := tunnel.NewManager(c, mgrOpts...)
 	go func() {
 		_ = mgr.Run(ctx)
 	}()
-	mgr.UpdateHostnames([]string{"tput-quic.example.com"})
+	mgr.UpdateHostnames([]string{hostname})
 
-	payload := make([]byte, 10*1024*1024) // 10MB
 	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
 	httpSrv := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Length", "10485760")
-			_, _ = w.Write(payload)
+			sizeStr := r.URL.Query().Get("size")
+			size, _ := strconv.Atoi(sizeStr)
+			if size <= 0 {
+				size = 10 * 1024 * 1024
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(size))
+			chunk := make([]byte, 64*1024)
+			written := 0
+			for written < size {
+				toWrite := len(chunk)
+				if size-written < toWrite {
+					toWrite = size - written
+				}
+				nw, err := w.Write(chunk[:toWrite])
+				if err != nil {
+					return
+				}
+				written += nw
+			}
 		}),
 	}
-	defer httpSrv.Close()
+
 	go func() {
 		_ = httpSrv.Serve(tlsLis)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				ServerName:         "tput-quic.example.com",
-				InsecureSkipVerify: true,
-			},
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return tls.Dial("tcp", serverAddr, &tls.Config{
-					ServerName:         "tput-quic.example.com",
-					InsecureSkipVerify: true,
-				})
-			},
-		},
-		Timeout: 30 * time.Second,
-	}
-
-	_ = srv
-	b.SetBytes(int64(len(payload)))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		resp, err := httpClient.Get("https://tput-quic.example.com/test")
-		if err != nil {
-			b.Fatalf("Get failed: %v", err)
-		}
-		n, _ := io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if n != int64(len(payload)) {
-			b.Fatalf("expected %d bytes, got %d", len(payload), n)
-		}
-	}
-}
-
-func BenchmarkThroughput_TCPPool(b *testing.B) {
-	srv, serverAddr, generated, cleanup := setupTestServerAndClient(&testing.T{})
-	defer cleanup()
-
-	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
-	if err != nil {
-		b.Fatalf("NewClientTLSConfig: %v", err)
-	}
-
-	backendCert, err := generateTestBackendCert("tput-tcp.example.com")
-	if err != nil {
-		b.Fatalf("generateTestBackendCert: %v", err)
-	}
-
-	c := client.NewClient(serverAddr, clientTLS)
-	ctx, cancel := context.WithCancel(b.Context())
-	defer cancel()
-
-	mgr := tunnel.NewManager(c, tunnel.WithTransport("tcp"))
-	go func() {
-		_ = mgr.Run(ctx)
-	}()
-	mgr.UpdateHostnames([]string{"tput-tcp.example.com"})
-
-	payload := make([]byte, 10*1024*1024) // 10MB
-	tlsLis := tls.NewListener(mgr.Listener(), &tls.Config{Certificates: []tls.Certificate{backendCert}})
-	httpSrv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Length", "10485760")
-			_, _ = w.Write(payload)
-		}),
-	}
-	defer httpSrv.Close()
-	go func() {
-		_ = httpSrv.Serve(tlsLis)
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				ServerName:         "tput-tcp.example.com",
-				InsecureSkipVerify: true,
-			},
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return tls.Dial("tcp", serverAddr, &tls.Config{
-					ServerName:         "tput-tcp.example.com",
-					InsecureSkipVerify: true,
-				})
-			},
-		},
-		Timeout: 30 * time.Second,
-	}
-
-	_ = srv
-	b.SetBytes(int64(len(payload)))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		resp, err := httpClient.Get("https://tput-tcp.example.com/test")
-		if err != nil {
-			b.Fatalf("Get failed: %v", err)
-		}
-		n, _ := io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if n != int64(len(payload)) {
-			b.Fatalf("expected %d bytes, got %d", len(payload), n)
-		}
-	}
-}
-
-func jsonMarshal(v any) ([]byte, error) {
-	return json.Marshal(v)
+	<-ctx.Done()
+	_ = httpSrv.Close()
+	os.Exit(0)
 }
