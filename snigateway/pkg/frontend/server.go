@@ -60,6 +60,7 @@ type Server struct {
 	transport  Transport
 	pool       *PoolTransport
 	quic       *QUICTransport
+	h2         *H2Transport
 
 	internalListener *chanListener
 	httpServer       *http.Server
@@ -100,7 +101,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	comp := cfg.CompositeTransport
 	if comp == nil {
-		comp = NewCompositeTransport(NewPoolTransport(), NewQUICTransport())
+		comp = NewCompositeTransport(NewPoolTransport(), NewQUICTransport(), nil)
 	}
 
 	s := &Server{
@@ -110,6 +111,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		transport:        comp,
 		pool:             comp.Pool(),
 		quic:             comp.QUIC(),
+		h2:               comp.H2(),
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 	}
@@ -146,6 +148,11 @@ func (s *Server) PoolTransport() *PoolTransport {
 // QUICTransport returns the server's QUIC transport.
 func (s *Server) QUICTransport() *QUICTransport {
 	return s.quic
+}
+
+// H2Transport returns the server's HTTP/2 transport.
+func (s *Server) H2Transport() *H2Transport {
+	return s.h2
 }
 
 // ListenAndServe starts listening on all configured TCP and UDP addresses and serves traffic.
@@ -640,11 +647,13 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := generateConnID()
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.pool.RegisterSession(sessionID)
+	s.h2.RegisterSession(sessionID)
 	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
 		s.table.Unregister(sessionID)
 		s.pool.UnregisterSession(sessionID)
+		s.h2.UnregisterSession(sessionID)
 		log.Printf("Frontend: session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 
@@ -763,6 +772,12 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	isH2 := strings.EqualFold(r.Header.Get("Upgrade"), api.UpgradeProtocolH2)
+	respProto := api.UpgradeProtocol
+	if isH2 {
+		respProto = api.UpgradeProtocolH2
+	}
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -776,7 +791,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Send HTTP 101 Switching Protocols
-	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + api.UpgradeProtocol + "\r\n\r\n"
+	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + respProto + "\r\n\r\n"
 	if _, err := rawConn.Write([]byte(resp)); err != nil {
 		closeCloser(rawConn)
 		return
@@ -795,9 +810,16 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
-		closeCloser(dialedConn)
-		return
+	if isH2 {
+		if err := s.h2.AddConn(sessionID, dialedConn); err != nil {
+			closeCloser(dialedConn)
+			return
+		}
+	} else {
+		if err := s.pool.AddConn(sessionID, dialedConn); err != nil {
+			closeCloser(dialedConn)
+			return
+		}
 	}
 }
 

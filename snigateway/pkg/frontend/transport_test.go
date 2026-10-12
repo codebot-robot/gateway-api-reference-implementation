@@ -133,7 +133,7 @@ func TestPoolTransport_ConcurrentWaitersBurstNoLostWakeups(t *testing.T) {
 func TestCompositeTransport_ConcurrentBurstMixedSessionsNoLostWakeups(t *testing.T) {
 	pool := NewPoolTransport()
 	quicTr := NewQUICTransport()
-	comp := NewCompositeTransport(pool, quicTr)
+	comp := NewCompositeTransport(pool, quicTr, nil)
 	defer comp.Close()
 
 	// Setup fake QUIC server/client
