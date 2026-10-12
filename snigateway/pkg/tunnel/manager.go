@@ -170,6 +170,10 @@ type Manager struct {
 	generation  uint64
 	updateCh    chan struct{}
 	regWorkerMu sync.Mutex
+
+	registeredHostnames     []string
+	lastRegisteredSessionID string
+	stateChangeListeners    []func()
 }
 
 // NewManager creates a new Manager using the given client.
@@ -205,6 +209,42 @@ func (m *Manager) IsConnected() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.connected
+}
+
+// AddStateChangeListener registers a callback invoked when tunnel connectivity or registration state changes.
+func (m *Manager) AddStateChangeListener(listener func()) {
+	if listener == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stateChangeListeners = append(m.stateChangeListeners, listener)
+}
+
+// HasRegisteredHostnames returns true if the tunnel is currently connected and the most
+// recent registration for the active session includes all specified hostnames.
+func (m *Manager) HasRegisteredHostnames(hostnames []string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.connected || m.sessionID == "" || m.sessionID != m.lastRegisteredSessionID {
+		return false
+	}
+	for _, h := range hostnames {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if !slices.Contains(m.registeredHostnames, h) {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Manager) notifyListeners() {
+	m.mu.Lock()
+	listeners := slices.Clone(m.stateChangeListeners)
+	m.mu.Unlock()
+	for _, l := range listeners {
+		l()
+	}
 }
 
 // IsQUIC returns whether the currently active tunnel session is using QUIC transport.
@@ -357,6 +397,7 @@ func (m *Manager) Run(ctx context.Context) error {
 						if activeQConn != nil {
 							closeQUICConn(activeQConn, 1, regResp.Status)
 						}
+						m.notifyListeners()
 						continue
 					}
 
@@ -365,6 +406,11 @@ func (m *Manager) Run(ctx context.Context) error {
 					lastGen = gen
 					lastSession = sessID
 					hasRegistered = true
+					m.mu.Lock()
+					m.registeredHostnames = slices.Clone(curr)
+					m.lastRegisteredSessionID = sessID
+					m.mu.Unlock()
+					m.notifyListeners()
 				} else if !isQUIC {
 					regCtx, cancel := context.WithTimeout(ctx, m.registerTimeout)
 					resp, err := m.client.Register(regCtx, sessID, curr)
@@ -373,6 +419,7 @@ func (m *Manager) Run(ctx context.Context) error {
 					if err != nil {
 						if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
 							klog.Errorf("Failed to register hostnames %v with frontend (session %s): %v", curr, sessID, err)
+							m.notifyListeners()
 							go func() {
 								select {
 								case <-ctx.Done():
@@ -387,6 +434,11 @@ func (m *Manager) Run(ctx context.Context) error {
 						lastGen = gen
 						lastSession = sessID
 						hasRegistered = true
+						m.mu.Lock()
+						m.registeredHostnames = slices.Clone(curr)
+						m.lastRegisteredSessionID = sessID
+						m.mu.Unlock()
+						m.notifyListeners()
 					}
 				}
 			}
@@ -505,6 +557,7 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 	m.sessionID = sessID
 	m.generation++
 	m.mu.Unlock()
+	m.notifyListeners()
 
 	klog.Infof("Established TCP pool session %s with frontend", sessID)
 	m.triggerRegistration()
@@ -516,6 +569,7 @@ func (m *Manager) runTCPSessionWithBackoff(ctx context.Context, backoff *time.Du
 	m.connected = false
 	m.sessionID = ""
 	m.mu.Unlock()
+	m.notifyListeners()
 
 	if ctx.Err() != nil {
 		return
@@ -556,6 +610,7 @@ func (m *Manager) runTCPFallbackWithQUICProbe(ctx context.Context, backoff *time
 	m.sessionID = sessID
 	m.generation++
 	m.mu.Unlock()
+	m.notifyListeners()
 
 	klog.Infof("Established TCP fallback session %s with frontend", sessID)
 	m.triggerRegistration()
@@ -615,6 +670,9 @@ func (m *Manager) runTCPFallbackWithQUICProbe(ctx context.Context, backoff *time
 		m.sessionID = ""
 	}
 	m.mu.Unlock()
+	if probeSession == nil {
+		m.notifyListeners()
+	}
 
 	klog.Infof("TCP fallback session %s retired", sessID)
 
@@ -630,10 +688,11 @@ func (m *Manager) runTCPFallbackWithQUICProbe(ctx context.Context, backoff *time
 }
 
 type quicSession struct {
-	conn       *quic.Conn
-	sessionID  string
-	ctrlStream *quic.Stream
-	ctrlReader *bufio.Reader
+	conn                *quic.Conn
+	sessionID           string
+	ctrlStream          *quic.Stream
+	ctrlReader          *bufio.Reader
+	registeredHostnames []string
 }
 
 func (m *Manager) handshakeQUICSession(ctx context.Context, qConn *quic.Conn) (*quicSession, error) {
@@ -719,10 +778,11 @@ func (m *Manager) handshakeQUICSession(ctx context.Context, qConn *quic.Conn) (*
 	}
 
 	return &quicSession{
-		conn:       qConn,
-		sessionID:  sessResp.SessionID,
-		ctrlStream: ctrlStream,
-		ctrlReader: reader,
+		conn:                qConn,
+		sessionID:           sessResp.SessionID,
+		ctrlStream:          ctrlStream,
+		ctrlReader:          reader,
+		registeredHostnames: currHostnames,
 	}, nil
 }
 
@@ -738,7 +798,10 @@ func (m *Manager) serveQUICSession(ctx context.Context, sess *quicSession) error
 	m.ctrlReader = sess.ctrlReader
 	m.activeQConn = sess.conn
 	m.generation++
+	m.registeredHostnames = slices.Clone(sess.registeredHostnames)
+	m.lastRegisteredSessionID = sess.sessionID
 	m.mu.Unlock()
+	m.notifyListeners()
 
 	klog.Infof("Established QUIC session %s with frontend", sess.sessionID)
 	m.triggerRegistration()
@@ -754,6 +817,7 @@ func (m *Manager) serveQUICSession(ctx context.Context, sess *quicSession) error
 			m.activeQConn = nil
 		}
 		m.mu.Unlock()
+		m.notifyListeners()
 	}()
 
 	// Accept incoming tunnel streams from frontend
@@ -913,6 +977,7 @@ func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Dur
 	m.sessionID = sessID
 	m.generation++
 	m.mu.Unlock()
+	m.notifyListeners()
 
 	klog.Infof("Established H2 session %s with frontend", sessID)
 	m.triggerRegistration()
@@ -924,6 +989,7 @@ func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Dur
 	m.connected = false
 	m.sessionID = ""
 	m.mu.Unlock()
+	m.notifyListeners()
 
 	if ctx.Err() != nil {
 		return

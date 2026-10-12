@@ -108,6 +108,7 @@ func NewClient(serverAddr string, tlsConfig *tls.Config, opts ...ClientOption) *
 			}
 			dialer := &tls.Dialer{
 				NetDialer: &net.Dialer{
+					Timeout:   5 * time.Second,
 					KeepAlive: 15 * time.Second,
 				},
 				Config: c.tlsConfig,

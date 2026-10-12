@@ -113,6 +113,17 @@ func TestSNIGateway(t *testing.T) {
 	// Wait for controller replicas to reconcile and register
 	time.Sleep(5 * time.Second)
 
+	// Assertion 0: Gateway status shows Programmed=True and reported address matches frontend host
+	t.Run("Gateway reports Programmed=True and frontend address", func(t *testing.T) {
+		t.Cleanup(func() { dumpLogsIfFailed(t) })
+		addr := h.WaitForGatewayAddress("snigateway-test", "default", 30*time.Second)
+		expectedHost := fmt.Sprintf("snigateway-frontend.%s.svc.cluster.local", frontendNS)
+		if addr != expectedHost {
+			t.Errorf("Expected Gateway address %s, got: %s", expectedHost, addr)
+		}
+		h.WaitForGatewayProgrammed("snigateway-test", "default", 30*time.Second)
+	})
+
 	// Assertion 1: Valid SNI request terminates TLS with Gateway cert and reaches backend, carrying client IP
 	t.Run("Valid SNI reaches backend with Gateway TLS cert and real client IP", func(t *testing.T) {
 		t.Cleanup(func() { dumpLogsIfFailed(t) })
@@ -459,5 +470,29 @@ func TestSNIGateway(t *testing.T) {
 		if !strings.Contains(logs, "Status: 200 OK") {
 			t.Errorf("Expected 200 OK for H2 mode, got: %s", logs)
 		}
+	})
+
+	// Assertion 10: Kill frontend session: Gateway goes Programmed=False; restore and it returns to True without restart
+	t.Run("Gateway flips to Programmed=False when frontend drops and restores without restart", func(t *testing.T) {
+		t.Cleanup(func() {
+			h.runCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=1", "-n", frontendNS)
+			h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+frontendNS, "--timeout=2m")
+			dumpLogsIfFailed(t)
+		})
+
+		// Scale frontend down to 0 replicas to drop tunnel session
+		h.runCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=0", "-n", frontendNS)
+		reason, msg := h.WaitForGatewayProgrammedFalse("snigateway-test", "default", 30*time.Second)
+		t.Logf("Gateway unready when frontend is down: reason=%s msg=%s", reason, msg)
+		if !strings.Contains(strings.ToLower(msg), "tunnel") {
+			t.Errorf("Expected tunnel-specific unready message, got: %s (reason: %s)", msg, reason)
+		}
+
+		// Restore frontend to 1 replica
+		h.runCmd("kubectl", "scale", "deployment/snigateway-frontend", "--replicas=1", "-n", frontendNS)
+		h.runCmd("kubectl", "rollout", "status", "deployment/snigateway-frontend", "--namespace="+frontendNS, "--timeout=2m")
+
+		// Gateway returns to Programmed=True without restarting the controller
+		h.WaitForGatewayProgrammed("snigateway-test", "default", 1*time.Minute)
 	})
 }
