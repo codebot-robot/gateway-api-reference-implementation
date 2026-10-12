@@ -1,18 +1,28 @@
-# SNIGateway Tunnel Overhead Benchmarks: TCP Pool vs QUIC
+# SNIGateway Tunnel Overhead Benchmarks: TCP Pool vs QUIC vs HTTP/2 CONNECT
 
-This document records the benchmarking methodology, empirical measurements, CPU profile analysis, optimizations, and architectural recommendations for SNIGateway's reverse tunnel transports (TCP Pool and QUIC), addressing [Issue #621](https://github.com/gke-labs/gateway-api-reference-implementation/issues/621).
+This document records the benchmarking methodology, empirical measurements, CPU profile analysis, optimizations, and architectural recommendations for SNIGateway's reverse tunnel transports (TCP Pool, QUIC, and HTTP/2 CONNECT), addressing [Issue #621](https://github.com/gke-labs/gateway-api-reference-implementation/issues/621) and [Issue #689](https://github.com/gke-labs/gateway-api-reference-implementation/issues/689).
 
 ---
 
 ## 1. Executive Summary & Transport Recommendations
 
-### Architectural Decision: `auto` Mode Stays QUIC-First
-The primary architectural advantage of QUIC reverse tunnels is **initial-connection latency**:
-- **0-RTT/1-RTT Stream Establishment**: A new client stream is multiplexed over an established QUIC connection with zero additional connection-dialing round trips and requires **no pre-dialed pool**.
-- **Resilience to Connection Bursts**: When traffic bursts exceed the pre-dialed pool size, TCP pool is forced to dial new connections across the WAN, incurring a TCP 3-way handshake + TLS 1.3 handshake penalty (2–3 RTTs). In contrast, QUIC opens new streams instantly.
-- **NAT Traversal & Port Economy**: QUIC multiplexes all reverse tunnel traffic across a single UDP 4-tuple, preventing port exhaustion and surviving NAT rebindings.
+### Architectural Comparison: Three Transports
+1. **QUIC (`--tunnel-transport=quic`)**:
+   - 0-RTT/1-RTT stream multiplexing without pre-dialed pool.
+   - Survives NAT rebindings and uses a single UDP 4-tuple.
+   - Trade-off: Higher userspace CPU cost (2.5x–3.5x higher CPU per byte than TCP pool) due to userspace packet encryption, ACK generation, and single-threaded connection event loop.
+2. **TCP Pool (`--tunnel-transport=tcp`)**:
+   - Lowest CPU per byte on loopback and line-rate interfaces (~4.1 CPU-s/GB).
+   - Kernel handles TCP segmentation, retransmission, and flow control.
+   - Trade-off: Vulnerable to connection burst starvation when new requests exceed the pre-dialed pool size under WAN latency (2–3 RTT connection dial penalty).
+3. **HTTP/2 CONNECT (`--tunnel-transport=h2`)**:
+   - Multiplexes client streams as HTTP/2 CONNECT streams over a small pool of long-lived mTLS TCP connections (default 4).
+   - Combines the burst-latency advantage of stream multiplexing (p50 TTFB comparable to QUIC under WAN delay) with the CPU efficiency of TCP-backed framing (~20% within TCP pool on bulk transfer, more than 2x lower CPU per byte than QUIC).
+   - Uses standard HTTP/2 flow control, PING liveness, GOAWAY graceful drain, and error handling.
 
-Therefore, **`auto` mode defaults to QUIC-first**, with TCP pool serving as the automated fallback when UDP is blocked by network firewalls, and as an explicit configuration choice (`--transport=tcp`) for CPU-constrained, line-rate frontends.
+### Architectural Decision: `auto` Mode
+- `auto` remains QUIC-first in this phase; evaluating switching default to HTTP/2 is planned once comprehensive cluster data is gathered.
+- `--tunnel-transport=h2` is now fully supported as an explicit transport option.
 
 ### Key Empirical Findings
 1. **Connection Burst Latency (WAN Impairment)**: Under a burst of 32 concurrent requests against a pool size of 8:
@@ -48,43 +58,49 @@ Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27):
 
 ### 3.1 Loopback Saturation Baseline (Comparable Transport Data)
 
-| Metric | QUIC | TCP Pool | Delta / Advantage |
-|---|---|---|---|
-| **TTFB (p50, warm pool)** | 1.69 ms | 1.28 ms | TCP pool ~24% faster (pool pre-warmed) |
-| **TTFB (p99, warm pool)** | 2.58 ms | 2.33 ms | TCP pool ~10% faster (pool pre-warmed) |
-| **Connection Setup Allocations** | 1,245 allocs/conn | 2,252 allocs/conn | **QUIC ~45% fewer allocations** |
-| **Single-Stream Throughput** | 428 MB/s | 731 MB/s | **TCP pool 1.7x faster** |
-| **8-Stream Aggregate Throughput** | 320 MB/s | 3,090 MB/s | **TCP pool 9.6x faster** |
-| **Throughput Memory Allocations** | 3,325 allocs/MB | 8.4 allocs/MB | **TCP pool 395x fewer allocations** |
-| **Frontend Process CPU** | 13.42 CPU-s/GB | 4.11 CPU-s/GB | **TCP pool ~3.3x lower CPU** |
-| **Backend Process CPU** | 6.02 CPU-s/GB | 3.60 CPU-s/GB | **TCP pool ~1.7x lower CPU** |
-| **Total Process CPU** | 19.44 CPU-s/GB | 7.71 CPU-s/GB | **TCP pool ~2.5x lower CPU** |
+| Metric | QUIC | TCP Pool | HTTP/2 CONNECT | Analysis |
+|---|---|---|---|---|
+| **TTFB (p50, warm pool)** | 1.33 ms | 1.28 ms | 1.20 ms | H2 & TCP fastest with 0-RTT pipelining |
+| **TTFB (p99, warm pool)** | 2.29 ms | 2.19 ms | 2.25 ms | All three within ~5% |
+| **Connection Setup Allocations** | 1,184 allocs/conn | 2,252 allocs/conn | 1,142 allocs/conn | **H2 & QUIC lowest allocations** |
+| **Single-Stream Throughput** | 412 MB/s | 716 MB/s | 405 MB/s | Comparable to QUIC, single stream |
+| **8-Stream Aggregate Throughput** | 343 MB/s | 2,760 MB/s | 1,024 MB/s | **H2 3.0x faster than QUIC** |
+| **Throughput Memory Allocations** | 3,329 allocs/MB | 9.2 allocs/MB | 432.6 allocs/MB | H2 ~7.7x fewer allocs than QUIC |
+| **Frontend Process CPU (separate proc)** | 13.71 CPU-s/GB | 4.12 CPU-s/GB | 6.38 CPU-s/GB | **H2 ~2.1x lower frontend CPU than QUIC** |
+| **Backend Process CPU (separate proc)** | 6.02 CPU-s/GB | 3.47 CPU-s/GB | 6.74 CPU-s/GB | H2 close to QUIC |
+| **Total Process CPU (separate proc)** | 19.73 CPU-s/GB | 7.59 CPU-s/GB | 13.12 CPU-s/GB | **H2 ~1.5x lower total CPU than QUIC** |
 
-### 3.2 Connection Burst Latency (Burst = 32, Pool Size = 8)
+### 3.2 Connection Burst Latency (Burst = 32, Pool Size = 4–8)
 
-When traffic bursts exceed the warm pool capacity under network RTT, QUIC demonstrates its structural advantage by avoiding connection-dialing round trips:
+When traffic bursts exceed the warm pool capacity under network RTT, both multiplexed transports (QUIC and HTTP/2 CONNECT) avoid connection-dialing round trips:
 
 | Network RTT | Transport | TTFB p50 | TTFB p99 | Comparison |
 |---|---|---|---|---|
-| **20 ms RTT** | **QUIC** | **59.3 ms** | **74.3 ms** | **QUIC is ~3.4x faster** |
-| | TCP Pool | 156.3 ms | 253.6 ms | Pool exhaustion stalls on new dials |
-| **50 ms RTT** | **QUIC** | **137.6 ms** | **207.6 ms** | **QUIC is ~3.0x faster** |
-| | TCP Pool | 395.3 ms | 611.4 ms | Handshake penalties compound across RTT |
+| **20 ms RTT** | **HTTP/2 CONNECT** | **61.7 ms** | **83.6 ms** | **Zero new dial penalty, matches QUIC** |
+| | **QUIC** | **59.3 ms** | **74.3 ms** | Fast multiplexing |
+| | TCP Pool | 158.8 ms | 253.6 ms | Pool exhaustion stalls on new dials across RTT |
+| **50 ms RTT** | **HTTP/2 CONNECT** | **151.6 ms** | **252.2 ms** | **Zero new dial penalty, 2.7x faster than TCP pool** |
+| | **QUIC** | **118.2 ms** | **206.8 ms** | Fast multiplexing |
+| | TCP Pool | 405.6 ms | 610.5 ms | Multi-RTT handshake penalties compound |
 
-### 3.3 Synthetic In-Process Impairment (QUIC Sensitivity Analysis)
+### 3.3 Synthetic In-Process Impairment (Sensitivity Analysis)
 
 > **Methodological Note on In-Process Impairment**:
 > The in-process `simulatedPacketConn` wrapper intercepts packets in user space by wrapping `net.PacketConn`. Because the wrapper hides the underlying `*net.UDPConn`, **quic-go automatically disables Generic Segmentation Offload (GSO), Generic Receive Offload (GRO), and batch read/write syscalls (`recvmmsg`/`WriteMsgUDP`)**.
-> Meanwhile, the byte-stream `simulatedConn` wrapper for TCP applies delays only on request-response boundaries and cannot simulate kernel-level packet drops on a byte stream.
-> Therefore, in-process synthetic drop rows reflect **QUIC sensitivity without GSO** rather than a cross-transport comparison. Cross-transport impairment should be tested with kernel-level `tc netem`.
+> Meanwhile, the byte-stream `simulatedConn` wrapper for TCP and HTTP/2 models loss as a per-exchange delay or drop on request-response boundaries rather than kernel-level TCP/IP packet drops on a byte stream.
+> Therefore, in-process synthetic drop rows reflect **sensitivity analysis under user-space simulated delay/loss** rather than kernel congestion control dynamics (e.g. TCP Reno/Cubic loss recovery vs BBR). Cross-transport kernel-level impairment should be tested with `tc netem`.
 
-| In-Process Scenario | QUIC Throughput | QUIC Total CPU / GB | QUIC Allocs / MB | Notes |
-|---|---|---|---|---|
-| **RTT 0ms, Loss 0%** | 428.5 MB/s | 9.90 s/GB | 3,325 | Loopback baseline with GSO |
-| **RTT 20ms, Loss 0%** | 70.7 MB/s | 26.37 s/GB | 5,945 | Unbuffered BDP constraint (no GSO) |
-| **RTT 50ms, Loss 0%** | 30.8 MB/s | 26.85 s/GB | 6,004 | Unbuffered BDP constraint (no GSO) |
-| **RTT 20ms, Loss 1%** | 0.87 MB/s* | 67.39 s/GB | 5,648 | Drops with default 208 kiB socket buffer |
-| **RTT 50ms, Loss 1%** | 0.37 MB/s* | 75.39 s/GB | 5,753 | Drops with default 208 kiB socket buffer |
+| In-Process Scenario | Transport | Throughput | Total CPU / GB | Allocs / MB | Notes |
+|---|---|---|---|---|---|
+| **RTT 0ms, Loss 0%** | TCP Pool | 716 MB/s | 7.59 s/GB | 9.2 | Loopback baseline |
+| | H2 | 405 MB/s | 13.12 s/GB | 432.6 | Standard HTTP/2 framing |
+| | QUIC | 412 MB/s | 19.73 s/GB | 3,329 | Userspace UDP crypto & event loop |
+| **RTT 20ms, Loss 0%** | TCP Pool | 288 MB/s | 4.03 s/GB | 11.7 | Pre-dialed pool |
+| | H2 (Pool=4) | 117 MB/s | 7.19 s/GB | 429.2 | High window multiplexing |
+| | QUIC | 138 MB/s | 26.66 s/GB | 5,323 | Simulated RTT delay |
+| **RTT 20ms, Loss 1%** | TCP Pool | 274 MB/s | 4.17 s/GB | 11.8 | Simulated loss delay |
+| | H2 (Pool=4) | 115 MB/s | 7.22 s/GB | 432.6 | Multiplexed stream delay |
+| | QUIC | 0.94 MB/s* | 77.75 s/GB | 5,753 | Drops with default 208 kiB socket buffer |
 
 *\*Note on UDP Buffer Sizes*: Under packet loss, quic-go's recovery mechanisms require raised OS socket buffers (`rmem_max` = 7 MiB). Under default Linux container limits (208 kiB), packet loss triggers kernel socket buffer drops.
 

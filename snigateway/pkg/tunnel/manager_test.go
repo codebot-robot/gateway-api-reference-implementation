@@ -31,6 +31,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 )
 
 func TestManager_EndToEnd(t *testing.T) {
@@ -235,7 +236,7 @@ func TestManager_EndToEnd(t *testing.T) {
 }
 
 func TestManager_Transports(t *testing.T) {
-	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto} {
+	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto, TransportModeH2} {
 		t.Run("Mode_"+mode, func(t *testing.T) {
 			tempDir, err := os.MkdirTemp("", "snigateway-mgr-transports-*")
 			if err != nil {
@@ -1018,5 +1019,107 @@ func TestManager_TCPConnectionSurvivesSwitchToQUIC(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout waiting for in-flight TCP stream to finish")
+	}
+}
+
+func TestManager_SharedTargetDialingAndProxyHeader(t *testing.T) {
+	mgr := NewManager(nil)
+	defer mgr.Listener().Close()
+
+	// Test with 3 different connection scenarios representing TCP, QUIC, and H2 streams
+	testCases := []struct {
+		name    string
+		srcIP   string
+		dstIP   string
+		srcPort uint16
+		dstPort uint16
+		payload string
+	}{
+		{
+			name:    "TCP_Pool_Stream",
+			srcIP:   "192.0.2.10",
+			dstIP:   "198.51.100.1",
+			srcPort: 54321,
+			dstPort: 443,
+			payload: "ClientHello payload from TCP pool",
+		},
+		{
+			name:    "QUIC_Stream",
+			srcIP:   "203.0.113.42",
+			dstIP:   "198.51.100.1",
+			srcPort: 49152,
+			dstPort: 443,
+			payload: "ClientHello payload from QUIC stream",
+		},
+		{
+			name:    "H2_CONNECT_Stream",
+			srcIP:   "198.51.100.99",
+			dstIP:   "198.51.100.1",
+			srcPort: 60000,
+			dstPort: 443,
+			payload: "ClientHello payload from HTTP/2 CONNECT stream",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+
+			hdr := &proxyproto.Header{
+				Command: proxyproto.CommandProxy,
+				SrcAddr: &net.TCPAddr{IP: net.ParseIP(tc.srcIP), Port: int(tc.srcPort)},
+				DstAddr: &net.TCPAddr{IP: net.ParseIP(tc.dstIP), Port: int(tc.dstPort)},
+			}
+			encodedHdr, err := hdr.Format()
+			if err != nil {
+				t.Fatalf("hdr.Format failed: %v", err)
+			}
+
+			// In a goroutine, write header + payload to c1
+			go func() {
+				_, _ = c1.Write(encodedHdr)
+				_, _ = c1.Write([]byte(tc.payload))
+			}()
+
+			// Call the shared backend method handleTunnelConn
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- mgr.handleTunnelConn(c2)
+			}()
+
+			// Accept from manager listener
+			acceptedConn, err := mgr.Listener().Accept()
+			if err != nil {
+				t.Fatalf("Listener.Accept failed: %v", err)
+			}
+			defer acceptedConn.Close()
+
+			if err := <-errCh; err != nil {
+				t.Fatalf("handleTunnelConn failed: %v", err)
+			}
+
+			// Verify addresses from PROXY header
+			pConn, ok := acceptedConn.(*proxyproto.Conn)
+			if !ok {
+				t.Fatalf("expected *proxyproto.Conn, got %T", acceptedConn)
+			}
+
+			if pConn.RemoteAddr().String() != fmt.Sprintf("%s:%d", tc.srcIP, tc.srcPort) {
+				t.Errorf("expected RemoteAddr %s:%d, got %s", tc.srcIP, tc.srcPort, pConn.RemoteAddr())
+			}
+			if pConn.LocalAddr().String() != fmt.Sprintf("%s:%d", tc.dstIP, tc.dstPort) {
+				t.Errorf("expected LocalAddr %s:%d, got %s", tc.dstIP, tc.dstPort, pConn.LocalAddr())
+			}
+
+			// Verify payload read
+			buf := make([]byte, len(tc.payload))
+			if _, err := io.ReadFull(pConn, buf); err != nil {
+				t.Fatalf("reading payload failed: %v", err)
+			}
+			if string(buf) != tc.payload {
+				t.Errorf("expected payload %q, got %q", tc.payload, string(buf))
+			}
+		})
 	}
 }

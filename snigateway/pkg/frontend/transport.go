@@ -348,25 +348,31 @@ func (q *QUICTransport) Close() error {
 	return nil
 }
 
-// CompositeTransport combines PoolTransport (TCP) and QUICTransport (QUIC) behind the unified Transport interface.
+// CompositeTransport combines PoolTransport (TCP), QUICTransport (QUIC), and H2Transport (HTTP/2)
+// behind the unified Transport interface.
 type CompositeTransport struct {
 	mu     sync.Mutex
 	pool   *PoolTransport
 	quic   *QUICTransport
+	h2     *H2Transport
 	closed bool
 }
 
-// NewCompositeTransport creates a new CompositeTransport wrapping the given pool and quic transports.
-func NewCompositeTransport(pool *PoolTransport, quicTr *QUICTransport) *CompositeTransport {
+// NewCompositeTransport creates a new CompositeTransport wrapping pool, quic, and h2 transports.
+func NewCompositeTransport(pool *PoolTransport, quicTr *QUICTransport, h2Tr *H2Transport) *CompositeTransport {
 	if pool == nil {
 		pool = NewPoolTransport()
 	}
 	if quicTr == nil {
 		quicTr = NewQUICTransport()
 	}
+	if h2Tr == nil {
+		h2Tr = NewH2Transport()
+	}
 	return &CompositeTransport{
 		pool: pool,
 		quic: quicTr,
+		h2:   h2Tr,
 	}
 }
 
@@ -380,14 +386,19 @@ func (c *CompositeTransport) QUIC() *QUICTransport {
 	return c.quic
 }
 
+// H2 returns the underlying H2Transport.
+func (c *CompositeTransport) H2() *H2Transport {
+	return c.h2
+}
+
 // GetConn retrieves a connection for sessionID from whichever transport hosts the session.
 func (c *CompositeTransport) GetConn(ctx context.Context, sessionID string) (net.Conn, error) {
 	conn, _, err := c.GetConnForSessions(ctx, []string{sessionID})
 	return conn, err
 }
 
-// GetConnForSessions searches candidate sessions in order across both QUIC and TCP pool transports.
-// It snapshots both notification channels BEFORE checking sessions to guarantee no lost wakeups.
+// GetConnForSessions searches candidate sessions in order across QUIC, H2, and TCP pool transports.
+// It snapshots all notification channels BEFORE checking sessions to guarantee no lost wakeups.
 func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
 	for {
 		c.mu.Lock()
@@ -397,7 +408,7 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		}
 		c.mu.Unlock()
 
-		// Read both notify channels before scanning to avoid missed notifications / lost wakeups
+		// Read notify channels before scanning to avoid missed notifications / lost wakeups
 		c.pool.mu.Lock()
 		poolNotify := c.pool.notifyCh
 		c.pool.mu.Unlock()
@@ -405,6 +416,10 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		c.quic.mu.Lock()
 		quicNotify := c.quic.notifyCh
 		c.quic.mu.Unlock()
+
+		c.h2.mu.Lock()
+		h2Notify := c.h2.notifyCh
+		c.h2.mu.Unlock()
 
 		for _, sid := range sessionIDs {
 			// Check QUIC transport first with non-blocking TryGetConn
@@ -422,6 +437,19 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 				}
 			}
 
+			// Check H2 transport next with non-blocking TryGetConn
+			if c.h2.HasSession(sid) {
+				conn, err := c.h2.TryGetConn(ctx, sid)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil, "", ctx.Err()
+					}
+					// Error on H2 for this session; continue checking TCP pool for this same session below
+				} else if conn != nil {
+					return conn, sid, nil
+				}
+			}
+
 			// Check TCP pool transport next with non-blocking TryGetConn
 			if conn, err := c.pool.TryGetConn(sid); err != nil {
 				return nil, "", err
@@ -435,11 +463,12 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 			return nil, "", ctx.Err()
 		case <-poolNotify:
 		case <-quicNotify:
+		case <-h2Notify:
 		}
 	}
 }
 
-// Close closes both underlying transports.
+// Close closes all underlying transports.
 func (c *CompositeTransport) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -454,6 +483,9 @@ func (c *CompositeTransport) Close() error {
 		errs = append(errs, err)
 	}
 	if err := c.quic.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.h2.Close(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

@@ -225,6 +225,15 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 
 // DialTunnel dials an mTLS pooled tunnel connection to the frontend for the given sessionID.
 func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, error) {
+	return c.dialTunnelWithProtocol(ctx, sessionID, api.UpgradeProtocol)
+}
+
+// DialH2Tunnel dials an mTLS HTTP/2 reverse tunnel connection to the frontend for the given sessionID.
+func (c *Client) DialH2Tunnel(ctx context.Context, sessionID string) (net.Conn, error) {
+	return c.dialTunnelWithProtocol(ctx, sessionID, api.UpgradeProtocolH2)
+}
+
+func (c *Client) dialTunnelWithProtocol(ctx context.Context, sessionID, upgradeProtocol string) (net.Conn, error) {
 	var tlsConn *tls.Conn
 	if c.dialFunc != nil {
 		rawConn, err := c.dialFunc(ctx, "tcp", c.serverAddr)
@@ -265,7 +274,7 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 	}
 	req.Host = c.internalHostname
 	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", api.UpgradeProtocol)
+	req.Header.Set("Upgrade", upgradeProtocol)
 	req.Header.Set(api.HeaderSessionID, sessionID)
 
 	if err := req.Write(tlsConn); err != nil {
@@ -289,7 +298,9 @@ func (c *Client) DialTunnel(ctx context.Context, sessionID string) (net.Conn, er
 		return nil, fmt.Errorf("unexpected upgrade status %d: %s", resp.StatusCode, string(body))
 	}
 
-	if !strings.EqualFold(resp.Header.Get("Upgrade"), api.UpgradeProtocol) && !strings.Contains(strings.ToLower(resp.Header.Get("Connection")), "upgrade") {
+	if !strings.EqualFold(resp.Header.Get("Upgrade"), upgradeProtocol) &&
+		!strings.EqualFold(resp.Header.Get("Upgrade"), api.UpgradeProtocol) &&
+		!strings.Contains(strings.ToLower(resp.Header.Get("Connection")), "upgrade") {
 		closeConn(tlsConn)
 		return nil, fmt.Errorf("invalid upgrade response headers: Upgrade=%s", resp.Header.Get("Upgrade"))
 	}
