@@ -1262,3 +1262,103 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 		t.Fatalf("expected HasRegisteredHostnames=false after cancel")
 	}
 }
+
+type testResponseWriter struct {
+	header  http.Header
+	buf     []byte
+	flushed int
+}
+
+func (w *testResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *testResponseWriter) Write(b []byte) (int, error) {
+	w.buf = append(w.buf, b...)
+	return len(b), nil
+}
+
+func (w *testResponseWriter) WriteHeader(statusCode int) {}
+
+func (w *testResponseWriter) Flush() {
+	w.flushed++
+}
+
+func TestServerStreamConn_WritingAndDeadlines(t *testing.T) {
+	rw := &testResponseWriter{}
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	_, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	conn := newServerStreamConn(rw, pr, cancel, nil)
+	defer conn.Close()
+
+	// Write smaller than 4096 bytes should be written immediately and flushed
+	smallChunk := []byte("hello 13 byte")
+	n, err := conn.Write(smallChunk)
+	if err != nil || n != len(smallChunk) {
+		t.Fatalf("Write small chunk failed: %v", err)
+	}
+	if string(rw.buf) != "hello 13 byte" {
+		t.Errorf("expected small chunk to be written immediately, got %q", string(rw.buf))
+	}
+	if rw.flushed != 1 {
+		t.Errorf("expected 1 flush for small write, got %d", rw.flushed)
+	}
+
+	// Write >= 4096 bytes should be written immediately without redundant Flush()
+	largeChunk := make([]byte, 8192)
+	n, err = conn.Write(largeChunk)
+	if err != nil || n != len(largeChunk) {
+		t.Fatalf("Write large chunk failed: %v", err)
+	}
+	if len(rw.buf) != len(smallChunk)+len(largeChunk) {
+		t.Errorf("expected %d total bytes, got %d", len(smallChunk)+len(largeChunk), len(rw.buf))
+	}
+	if rw.flushed != 1 {
+		t.Errorf("expected flushes to remain 1 (no extra flush for large write), got %d", rw.flushed)
+	}
+
+	// Test SetReadDeadline non-destructive behavior
+	// Setting deadline in the past should not close the underlying reader
+	aLongTimeAgo := time.Unix(1, 0)
+	if err := conn.SetReadDeadline(aLongTimeAgo); err != nil {
+		t.Fatalf("SetReadDeadline failed: %v", err)
+	}
+	// Clearing deadline should allow reading again
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear SetReadDeadline failed: %v", err)
+	}
+
+	go func() {
+		_, _ = pw.Write([]byte("more-data"))
+	}()
+	moreBuf := make([]byte, 9)
+	nr, err := conn.Read(moreBuf)
+	if err != nil || string(moreBuf[:nr]) != "more-data" {
+		t.Fatalf("Read after clearing deadline failed: %v, got %q", err, string(moreBuf[:nr]))
+	}
+
+	// Test WriteTo
+	go func() {
+		_, _ = pw.Write([]byte("stream-content"))
+		_ = pw.Close()
+	}()
+	var outBuf testResponseWriter
+	wt, ok := any(conn).(io.WriterTo)
+	if !ok {
+		t.Fatalf("expected serverStreamConn to implement io.WriterTo")
+	}
+	written, err := wt.WriteTo(&outBuf)
+	if err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+	if string(outBuf.buf) != "stream-content" || written != int64(len("stream-content")) {
+		t.Errorf("WriteTo output mismatch: got %q, written=%d", string(outBuf.buf), written)
+	}
+}

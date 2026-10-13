@@ -448,12 +448,14 @@ type h2StreamConn struct {
 	remoteAddr   net.Addr
 	onClose      func()
 
-	mu         sync.Mutex
-	resBody    io.ReadCloser
-	closed     bool
-	readTimer  *time.Timer
-	writeTimer *time.Timer
-	closeOnce  sync.Once
+	mu            sync.Mutex
+	resBody       io.ReadCloser
+	closed        bool
+	readDeadline  time.Time
+	writeDeadline time.Time
+	readTimer     *time.Timer
+	writeTimer    *time.Timer
+	closeOnce     sync.Once
 }
 
 func newH2StreamConn(pw *io.PipeWriter, respCh chan rtResult, streamCancel context.CancelFunc, localAddr, remoteAddr net.Addr, onClose func()) *h2StreamConn {
@@ -507,11 +509,141 @@ func (c *h2StreamConn) awaitResponse() (io.ReadCloser, error) {
 	return rb, nil
 }
 
+var h2SpliceBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
+func (c *h2StreamConn) WriteTo(w io.Writer) (int64, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	c.mu.Unlock()
+
+	rb, err := c.awaitResponse()
+	if err != nil {
+		return 0, err
+	}
+
+	var first [4096]byte
+	nr, rerr := rb.Read(first[:])
+	var written int64
+	if nr > 0 {
+		nw, werr := w.Write(first[:nr])
+		if nw > 0 {
+			written += int64(nw)
+		}
+		if werr != nil {
+			return written, werr
+		}
+		if nr != nw {
+			return written, io.ErrShortWrite
+		}
+	}
+	if rerr != nil {
+		if rerr == io.EOF {
+			rerr = nil
+		}
+		return written, rerr
+	}
+
+	bufPtr := h2SpliceBufPool.Get().(*[]byte)
+	defer h2SpliceBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	for {
+		nr, rerr := rb.Read(buf)
+		if nr > 0 {
+			nw, werr := w.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				rerr = nil
+			}
+			return written, rerr
+		}
+	}
+}
+
+func (c *h2StreamConn) ReadFrom(r io.Reader) (int64, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	c.mu.Unlock()
+
+	var first [4096]byte
+	nr, rerr := r.Read(first[:])
+	var written int64
+	if nr > 0 {
+		nw, werr := c.Write(first[:nr])
+		if nw > 0 {
+			written += int64(nw)
+		}
+		if werr != nil {
+			return written, werr
+		}
+		if nr != nw {
+			return written, io.ErrShortWrite
+		}
+	}
+	if rerr != nil {
+		if rerr == io.EOF {
+			rerr = nil
+		}
+		return written, rerr
+	}
+
+	bufPtr := h2SpliceBufPool.Get().(*[]byte)
+	defer h2SpliceBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	for {
+		nr, rerr := r.Read(buf)
+		if nr > 0 {
+			nw, werr := c.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				rerr = nil
+			}
+			return written, rerr
+		}
+	}
+}
+
 func (c *h2StreamConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
+	}
+	if !c.readDeadline.IsZero() && time.Now().After(c.readDeadline) {
+		c.mu.Unlock()
+		return 0, os.ErrDeadlineExceeded
 	}
 	c.mu.Unlock()
 
@@ -529,6 +661,10 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
+	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
+		c.mu.Unlock()
+		return 0, os.ErrDeadlineExceeded
+	}
 	c.mu.Unlock()
 
 	return c.pw.Write(b)
@@ -537,28 +673,21 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 func (c *h2StreamConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.readDeadline = t
 	if c.readTimer != nil {
 		c.readTimer.Stop()
 		c.readTimer = nil
 	}
-	if !t.IsZero() {
-		d := time.Until(t)
-		if d <= 0 {
+	if !t.IsZero() && time.Until(t) > 0 {
+		c.readTimer = time.AfterFunc(time.Until(t), func() {
 			c.streamCancel()
-			if c.resBody != nil {
-				closeCloser(c.resBody)
+			c.mu.Lock()
+			rb := c.resBody
+			c.mu.Unlock()
+			if rb != nil {
+				closeCloser(rb)
 			}
-		} else {
-			c.readTimer = time.AfterFunc(d, func() {
-				c.streamCancel()
-				c.mu.Lock()
-				rb := c.resBody
-				c.mu.Unlock()
-				if rb != nil {
-					closeCloser(rb)
-				}
-			})
-		}
+		})
 	}
 	return nil
 }
@@ -566,23 +695,17 @@ func (c *h2StreamConn) SetReadDeadline(t time.Time) error {
 func (c *h2StreamConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.writeDeadline = t
 	if c.writeTimer != nil {
 		c.writeTimer.Stop()
 		c.writeTimer = nil
 	}
-	if !t.IsZero() {
-		d := time.Until(t)
-		if d <= 0 {
+	if !t.IsZero() && time.Until(t) > 0 {
+		c.writeTimer = time.AfterFunc(time.Until(t), func() {
 			if err := c.pw.CloseWithError(os.ErrDeadlineExceeded); err != nil {
 				klog.V(2).Infof("Error closing pipe with write deadline exceeded: %v", err)
 			}
-		} else {
-			c.writeTimer = time.AfterFunc(d, func() {
-				if err := c.pw.CloseWithError(os.ErrDeadlineExceeded); err != nil {
-					klog.V(2).Infof("Error closing pipe with write deadline exceeded: %v", err)
-				}
-			})
-		}
+		})
 	}
 	return nil
 }

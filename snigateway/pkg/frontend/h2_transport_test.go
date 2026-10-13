@@ -15,6 +15,7 @@
 package frontend
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -437,4 +438,78 @@ func TestH2Transport_IdlePing(t *testing.T) {
 	if !conns[0].CanTakeNewRequest() {
 		t.Errorf("connection should still be healthy and able to take requests")
 	}
+}
+
+func TestH2StreamConn_WriteToAndReadFrom(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() {
+		_, _ = io.Copy(io.Discard, pr)
+	}()
+
+	respCh := make(chan rtResult, 1)
+	prRes, pwRes := io.Pipe()
+
+	respCh <- rtResult{
+		res: &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       prRes,
+		},
+	}
+
+	streamCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	conn := newH2StreamConn(pw, respCh, cancel, &net.TCPAddr{Port: 1234}, &net.TCPAddr{Port: 5678}, nil)
+	defer conn.Close()
+
+	// Verify WriteTo
+	go func() {
+		_, _ = pwRes.Write([]byte("hello from response"))
+		_ = pwRes.Close()
+	}()
+
+	wt, ok := any(conn).(io.WriterTo)
+	if !ok {
+		t.Fatalf("expected h2StreamConn to implement io.WriterTo")
+	}
+	var out bytes.Buffer
+	written, err := wt.WriteTo(&out)
+	if err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+	if out.String() != "hello from response" || written != int64(len("hello from response")) {
+		t.Errorf("WriteTo mismatch: got %q, written=%d", out.String(), written)
+	}
+
+	// Verify ReadFrom
+	rf, ok := any(conn).(io.ReaderFrom)
+	if !ok {
+		t.Fatalf("expected h2StreamConn to implement io.ReaderFrom")
+	}
+
+	pipeReader, pipeWriter := io.Pipe()
+	go func() {
+		_, _ = pipeWriter.Write([]byte("request data"))
+		_ = pipeWriter.Close()
+	}()
+
+	written, err = rf.ReadFrom(pipeReader)
+	if err != nil {
+		t.Fatalf("ReadFrom failed: %v", err)
+	}
+	if written != int64(len("request data")) {
+		t.Errorf("ReadFrom mismatch: written=%d", written)
+	}
+
+	// Verify SetReadDeadline non-destructive behavior
+	aLongTimeAgo := time.Unix(1, 0)
+	if err := conn.SetReadDeadline(aLongTimeAgo); err != nil {
+		t.Fatalf("SetReadDeadline failed: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear SetReadDeadline failed: %v", err)
+	}
+	_ = streamCtx
 }
