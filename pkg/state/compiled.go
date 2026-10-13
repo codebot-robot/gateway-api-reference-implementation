@@ -19,6 +19,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -243,24 +244,25 @@ type GatewayReadiness struct {
 
 // ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
-	Revision           uint64
-	Gateways           []*gatewayv1.Gateway
-	GatewayClasses     []*gatewayv1.GatewayClass
-	GatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	GatewayReadiness   map[types.NamespacedName]GatewayReadiness
-	ProvisioningErrors map[types.NamespacedName]string
-	ListenerSets       []*gatewayv1.ListenerSet
-	HTTPRoutes         []*gatewayv1.HTTPRoute
-	TLSRoutes          []*gatewayv1.TLSRoute
-	GRPCRoutes         []*gatewayv1.GRPCRoute
-	Services           map[types.NamespacedName]*corev1.Service
-	BackendTLSPolicies []*gatewayv1.BackendTLSPolicy
-	ConfigMaps         map[types.NamespacedName]*corev1.ConfigMap
-	Secrets            map[types.NamespacedName]*corev1.Secret
-	Namespaces         map[string]*corev1.Namespace
-	ReferenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
-	RefValidator       ReferenceGrantValidator
-	ControllerName     string
+	Revision              uint64
+	Gateways              []*gatewayv1.Gateway
+	GatewayClasses        []*gatewayv1.GatewayClass
+	GatewayAddresses      map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	GatewayReadiness      map[types.NamespacedName]GatewayReadiness
+	ProvisioningErrors    map[types.NamespacedName]string
+	SupportedAddressTypes []gatewayv1.AddressType
+	ListenerSets          []*gatewayv1.ListenerSet
+	HTTPRoutes            []*gatewayv1.HTTPRoute
+	TLSRoutes             []*gatewayv1.TLSRoute
+	GRPCRoutes            []*gatewayv1.GRPCRoute
+	Services              map[types.NamespacedName]*corev1.Service
+	BackendTLSPolicies    []*gatewayv1.BackendTLSPolicy
+	ConfigMaps            map[types.NamespacedName]*corev1.ConfigMap
+	Secrets               map[types.NamespacedName]*corev1.Secret
+	Namespaces            map[string]*corev1.Namespace
+	ReferenceGrants       map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	RefValidator          ReferenceGrantValidator
+	ControllerName        string
 }
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
@@ -563,8 +565,103 @@ func BuildEffectiveListener(
 	}
 }
 
+// IsAddressTypeSupported returns true if the specified address type is in the supported list.
+func IsAddressTypeSupported(addrType gatewayv1.AddressType, supported []gatewayv1.AddressType) bool {
+	return slices.Contains(supported, addrType)
+}
+
+// HasUnsupportedAddress returns true and the first unsupported address type if any address
+// in the provided slice is not supported by the provider.
+// If addr.Type is nil or empty, it defaults to gatewayv1.IPAddressType.
+func HasUnsupportedAddress(addresses []gatewayv1.GatewaySpecAddress, supported []gatewayv1.AddressType) (bool, gatewayv1.AddressType) {
+	for _, addr := range addresses {
+		addrType := gatewayv1.IPAddressType
+		if addr.Type != nil && *addr.Type != "" {
+			addrType = *addr.Type
+		}
+		if !IsAddressTypeSupported(addrType, supported) {
+			return true, addrType
+		}
+	}
+	return false, ""
+}
+
+// computeDesiredAddresses computes the addresses to report in status.addresses.
+// If specific addresses (with values) are requested in spec.addresses, only bound requested
+// addresses matching the requested type are reported.
+// If {type: IPAddress} with no value is requested, or if no addresses are requested, all provided
+// addresses matching the requested type(s) (or all provided addresses if none requested) are reported.
+func computeDesiredAddresses(specAddresses []gatewayv1.GatewaySpecAddress, providedAddresses []gatewayv1.GatewayStatusAddress) []gatewayv1.GatewayStatusAddress {
+	if len(specAddresses) == 0 {
+		return providedAddresses
+	}
+
+	var requestedWithValues []gatewayv1.GatewaySpecAddress
+	hasEmptyValue := false
+	for _, sa := range specAddresses {
+		if sa.Value != "" {
+			requestedWithValues = append(requestedWithValues, sa)
+		} else {
+			hasEmptyValue = true
+		}
+	}
+
+	if len(requestedWithValues) == 0 {
+		return providedAddresses
+	}
+
+	var result []gatewayv1.GatewayStatusAddress
+	for _, req := range requestedWithValues {
+		reqType := gatewayv1.IPAddressType
+		if req.Type != nil && *req.Type != "" {
+			reqType = *req.Type
+		}
+		for _, prov := range providedAddresses {
+			provType := gatewayv1.IPAddressType
+			if prov.Type != nil && *prov.Type != "" {
+				provType = *prov.Type
+			}
+			if prov.Value == req.Value && provType == reqType {
+				t := req.Type
+				if t == nil {
+					t = Ptr(gatewayv1.IPAddressType)
+				}
+				result = append(result, gatewayv1.GatewayStatusAddress{
+					Type:  t,
+					Value: req.Value,
+				})
+				break
+			}
+		}
+	}
+
+	if hasEmptyValue {
+		for _, prov := range providedAddresses {
+			alreadyPresent := false
+			for _, r := range result {
+				if r.Value == prov.Value {
+					alreadyPresent = true
+					break
+				}
+			}
+			if !alreadyPresent {
+				result = append(result, prov)
+			}
+		}
+	}
+
+	return result
+}
+
 // ComputeGatewayConditions computes the top-level conditions for a Gateway.
-func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener, hasAddress bool, readiness GatewayReadiness, provErr string) []metav1.Condition {
+func ComputeGatewayConditions(
+	gw *gatewayv1.Gateway,
+	effectiveListeners []*EffectiveListener,
+	hasAddress bool,
+	readiness GatewayReadiness,
+	provErr string,
+	supportedAddressTypes []gatewayv1.AddressType,
+) []metav1.Condition {
 	totalListeners := len(gw.Spec.Listeners)
 	acceptedListenersCount := 0
 
@@ -584,6 +681,10 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 		gwAcceptedStatus = metav1.ConditionFalse
 		gwAcceptedReason = gatewayv1.GatewayReasonInvalidParameters
 		gwAcceptedMessage = "Invalid infrastructure parametersRef: parametersRef is not supported"
+	} else if unsupp, unsuppType := HasUnsupportedAddress(gw.Spec.Addresses, supportedAddressTypes); unsupp {
+		gwAcceptedStatus = metav1.ConditionFalse
+		gwAcceptedReason = gatewayv1.GatewayReasonUnsupportedAddress
+		gwAcceptedMessage = fmt.Sprintf("Address type %q is not supported", unsuppType)
 	} else if totalListeners == 0 {
 		gwAcceptedStatus = metav1.ConditionFalse
 		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
@@ -610,6 +711,13 @@ func ComputeGatewayConditions(gw *gatewayv1.Gateway, effectiveListeners []*Effec
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonPending
 		gwProgrammedMessage = provErr
+	} else if !readiness.Ready && readiness.Reason == string(gatewayv1.GatewayReasonAddressNotUsable) {
+		gwProgrammedStatus = metav1.ConditionFalse
+		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotUsable
+		gwProgrammedMessage = "Requested address cannot be used"
+		if readiness.Message != "" {
+			gwProgrammedMessage = readiness.Message
+		}
 	} else if !hasAddress {
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
@@ -839,7 +947,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if inputs.ProvisioningErrors != nil {
 			provErr = inputs.ProvisioningErrors[gwKey]
 		}
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr)
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr, inputs.SupportedAddressTypes)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -1448,7 +1556,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 			if inputs.ProvisioningErrors != nil {
 				provErr = inputs.ProvisioningErrors[gwKey]
 			}
-			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, readiness, provErr)
+			outputs.GatewayStatuses[gwKey] = ComputeDesiredGatewayStatus(gw, cg, addrs, readiness, provErr, inputs.SupportedAddressTypes)
 		}
 	}
 
@@ -1560,8 +1668,10 @@ func ComputeDesiredGatewayStatus(
 	providedAddresses []gatewayv1.GatewayStatusAddress,
 	readiness GatewayReadiness,
 	provErr string,
+	supportedAddressTypes []gatewayv1.AddressType,
 ) gatewayv1.GatewayStatus {
-	hasAddress := len(providedAddresses) > 0
+	desiredAddresses := computeDesiredAddresses(gw.Spec.Addresses, providedAddresses)
+	hasAddress := len(desiredAddresses) > 0
 	var effectiveListeners []*EffectiveListener
 	attachedLSCount := int32(0)
 	if compiledGw != nil {
@@ -1569,7 +1679,7 @@ func ComputeDesiredGatewayStatus(
 		attachedLSCount = compiledGw.AttachedListenerSets
 	}
 
-	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr)
+	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr, supportedAddressTypes)
 
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {
@@ -1607,9 +1717,8 @@ func ComputeDesiredGatewayStatus(
 		}
 	}
 
-	var desiredAddresses []gatewayv1.GatewayStatusAddress
-	if gwAccepted {
-		desiredAddresses = providedAddresses
+	if !gwAccepted {
+		desiredAddresses = nil
 	}
 
 	return gatewayv1.GatewayStatus{

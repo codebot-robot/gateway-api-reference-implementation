@@ -100,6 +100,14 @@ type AddressReadinessProvider interface {
 	GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error)
 }
 
+// AddressTypeProvider is an optional interface that an AddressProvider can implement
+// to declare which address types it supports for requested addresses (spec.addresses).
+// If not implemented, the provider supports no address types, and any Gateway with
+// requested addresses will receive Accepted=False with reason UnsupportedAddress.
+type AddressTypeProvider interface {
+	SupportedAddressTypes() []gatewayv1.AddressType
+}
+
 // OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
 type OwnershipConflictError struct {
 	Message string
@@ -138,38 +146,51 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 
 		if r.AddressProvider != nil {
-			effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
-			var (
-				providedAddresses []gatewayv1.GatewayStatusAddress
-				readiness         state.GatewayReadiness
-				err               error
-			)
-			if arp, ok := r.AddressProvider.(AddressReadinessProvider); ok {
-				providedAddresses, readiness, err = arp.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
-			} else {
-				var ready bool
-				providedAddresses, ready, err = r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
-				readiness = state.GatewayReadiness{Ready: ready}
+			var supportedTypes []gatewayv1.AddressType
+			if atp, ok := r.AddressProvider.(AddressTypeProvider); ok {
+				supportedTypes = atp.SupportedAddressTypes()
+			} else if r.State != nil {
+				supportedTypes = r.State.GetSupportedAddressTypes()
 			}
-			if err != nil {
-				var conflictErr *OwnershipConflictError
-				if errors.As(err, &conflictErr) {
-					l.Error(err, "ownership conflict provisioning gateway")
-					r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
-					r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
-					delay := r.ConflictRequeueDelay
-					if delay == 0 {
-						delay = DefaultConflictRequeueDelay
-					}
-					requeueAfter = delay
-				} else {
-					l.Error(err, "unable to provision or fetch gateway addresses from address provider")
-					return ctrl.Result{}, err
-				}
-			} else {
+
+			if unsupp, _ := state.HasUnsupportedAddress(gw.Spec.Addresses, supportedTypes); unsupp {
 				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
-				r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
-				r.State.SetGatewayReadiness(req.NamespacedName, readiness)
+				r.State.SetGatewayAddresses(req.NamespacedName, nil)
+				r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
+			} else {
+				effectiveListeners := r.State.GetEffectiveListeners(req.NamespacedName)
+				var (
+					providedAddresses []gatewayv1.GatewayStatusAddress
+					readiness         state.GatewayReadiness
+					err               error
+				)
+				if arp, ok := r.AddressProvider.(AddressReadinessProvider); ok {
+					providedAddresses, readiness, err = arp.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+				} else {
+					var ready bool
+					providedAddresses, ready, err = r.AddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
+					readiness = state.GatewayReadiness{Ready: ready}
+				}
+				if err != nil {
+					var conflictErr *OwnershipConflictError
+					if errors.As(err, &conflictErr) {
+						l.Error(err, "ownership conflict provisioning gateway")
+						r.State.SetGatewayProvisioningError(req.NamespacedName, conflictErr.Error())
+						r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
+						delay := r.ConflictRequeueDelay
+						if delay == 0 {
+							delay = DefaultConflictRequeueDelay
+						}
+						requeueAfter = delay
+					} else {
+						l.Error(err, "unable to provision or fetch gateway addresses from address provider")
+						return ctrl.Result{}, err
+					}
+				} else {
+					r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+					r.State.SetGatewayAddresses(req.NamespacedName, providedAddresses)
+					r.State.SetGatewayReadiness(req.NamespacedName, readiness)
+				}
 			}
 		}
 

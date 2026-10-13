@@ -20,6 +20,7 @@ import (
 	"errors"
 	"maps"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1403,5 +1404,227 @@ func TestSinglePodAddressProvider_NoChangesIssuesNoWrite(t *testing.T) {
 	}
 	if svc.ResourceVersion == svcRV {
 		t.Errorf("Service resourceVersion expected to change on update, but stayed %s", svc.ResourceVersion)
+	}
+}
+
+func TestSinglePodAddressProvider_RequestedAddresses_AddRemove(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-uid-1"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  state.Ptr(gatewayv1.IPAddressType),
+					Value: "192.0.2.1",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	// 1. Initial reconcile with requested IP: Service pins loadBalancerIP, readiness is AddressNotUsable
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false when requested address not in ingress")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	if !strings.Contains(readiness.Message, "192.0.2.1") {
+		t.Errorf("expected message mentioning 192.0.2.1, got %s", readiness.Message)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.Spec.LoadBalancerIP != "192.0.2.1" {
+		t.Errorf("expected Service LoadBalancerIP='192.0.2.1', got %q", svc.Spec.LoadBalancerIP)
+	}
+
+	// 2. Mark Deployment ready and Service ingress bound
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deploy.Status.ReadyReplicas = 1
+	if err := c.Status().Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{
+		{IP: "192.0.2.1"},
+	}
+	if err := c.Status().Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to update Service status: %v", err)
+	}
+
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+	if !readiness.Ready {
+		t.Errorf("expected ready=true when requested address is bound in ingress")
+	}
+	if len(addrs) != 1 || addrs[0].Value != "192.0.2.1" {
+		t.Errorf("expected 1 address 192.0.2.1, got %+v", addrs)
+	}
+
+	// 3. Removing requested address from spec.addresses releases it:
+	// Service no longer pins it and status updates on next reconcile without restart.
+	gw.Spec.Addresses = nil
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on remove reconcile: %v", err)
+	}
+	if !readiness.Ready {
+		t.Errorf("expected ready=true after releasing static address")
+	}
+	if len(addrs) != 1 || addrs[0].Value != "192.0.2.1" {
+		t.Errorf("expected reported address to still report ingress address 192.0.2.1, got %+v", addrs)
+	}
+
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.Spec.LoadBalancerIP != "" {
+		t.Errorf("expected Service LoadBalancerIP to be released/empty, got %q", svc.Spec.LoadBalancerIP)
+	}
+}
+
+func TestSinglePodAddressProvider_TwoGatewaysSameIP(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-1",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-1-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Value: "192.0.2.50"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-2",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-2-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Value: "192.0.2.50"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	// Reconcile gw1 and mark bound
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw1, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on gw1: %v", err)
+	}
+	svc1Name := ResourceNameForGateway("gw-1")
+	var svc1 corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: svc1Name}, &svc1); err != nil {
+		t.Fatalf("failed to get svc1: %v", err)
+	}
+	svc1.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.50"}}
+	_ = c.Status().Update(ctx, &svc1)
+	var deploy1 appsv1.Deployment
+	_ = c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: svc1Name}, &deploy1)
+	deploy1.Status.ReadyReplicas = 1
+	_ = c.Status().Update(ctx, &deploy1)
+
+	_, readiness1, _ := p.GatewayAddressesWithReadiness(ctx, gw1, nil)
+	if !readiness1.Ready {
+		t.Fatalf("expected gw1 to be ready")
+	}
+
+	// Reconcile gw2 requesting the same IP: its service does NOT have the ingress IP bound
+	_, readiness2, err := p.GatewayAddressesWithReadiness(ctx, gw2, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on gw2: %v", err)
+	}
+	if readiness2.Ready {
+		t.Errorf("expected gw2 ready=false when requesting already bound IP")
+	}
+	if readiness2.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected gw2 reason=AddressNotUsable, got %s", readiness2.Reason)
+	}
+	if !strings.Contains(readiness2.Message, "192.0.2.50") {
+		t.Errorf("expected message mentioning 192.0.2.50, got %s", readiness2.Message)
+	}
+}
+
+func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-multi",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-multi-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Value: "192.0.2.10"},
+				{Value: "192.0.2.20"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Mock the first IP bound in service ingress
+	resName := ResourceNameForGateway("gw-multi")
+	var svc corev1.Service
+	_ = c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc)
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.10"}}
+	_ = c.Status().Update(ctx, &svc)
+
+	_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if readiness.Ready {
+		t.Errorf("expected ready=false when second requested IP cannot be bound")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Errorf("expected reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+	expectedMsgSub := "singlepod binds at most one requested IP"
+	if !strings.Contains(readiness.Message, expectedMsgSub) {
+		t.Errorf("expected message to contain %q, got %q", expectedMsgSub, readiness.Message)
 	}
 }

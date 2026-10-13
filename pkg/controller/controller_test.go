@@ -1271,6 +1271,97 @@ func TestGatewayReconciler_AddressReadinessProvider(t *testing.T) {
 	}
 }
 
+type fakeAddressTypeProvider struct {
+	fakeAddressProvider
+	supportedTypes []gatewayv1.AddressType
+	called         bool
+}
+
+func (f *fakeAddressTypeProvider) SupportedAddressTypes() []gatewayv1.AddressType {
+	return f.supportedTypes
+}
+
+func (f *fakeAddressTypeProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+	f.called = true
+	return f.fakeAddressProvider.GatewayAddresses(ctx, gw, effectiveListeners)
+}
+
+func TestGatewayReconciler_UnsupportedAddressType_NothingProvisioned(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gwClass)
+
+	invalidType := gatewayv1.AddressType("test/fake-invalid-type")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &invalidType, Value: "fake address"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(&gatewayv1.Gateway{}).
+		Build()
+
+	typeProvider := &fakeAddressTypeProvider{
+		supportedTypes: []gatewayv1.AddressType{gatewayv1.IPAddressType},
+	}
+
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: typeProvider,
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	if typeProvider.called {
+		t.Errorf("expected AddressProvider not to be called for unsupported address type (nothing provisioned)")
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	acceptedCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
+		t.Fatalf("expected Accepted=False Reason=UnsupportedAddress, got: %+v", acceptedCond)
+	}
+}
+
 func containsGateway(gws []*state.GatewayState, key types.NamespacedName) bool {
 	for _, gw := range gws {
 		if gw.Gateway != nil && gw.Gateway.Namespace == key.Namespace && gw.Gateway.Name == key.Name {
