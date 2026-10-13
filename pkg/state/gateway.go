@@ -75,6 +75,7 @@ type InternalListener struct {
 	Routes      []InternalRoute
 	TLSMode     *gatewayv1.TLSModeType
 	TLSBackends map[string][]InternalTLSBackend
+	TCPBackends []InternalTCPBackend
 }
 
 // hostWithoutPort returns s with the port stripped if present, or s unchanged if not.
@@ -150,6 +151,68 @@ func PickTLSBackend(backends []InternalTLSBackend) (string, bool) {
 
 // PickTLSBackendWithRand selects a backend target from a slice of InternalTLSBackend based on weight using the provided RNG.
 func PickTLSBackendWithRand(backends []InternalTLSBackend, r *rand.Rand) (string, bool) {
+	if len(backends) == 0 {
+		return "", false
+	}
+
+	var totalWeight int64
+	for _, b := range backends {
+		if b.Weight > 0 {
+			totalWeight += int64(b.Weight)
+		}
+	}
+
+	if totalWeight <= 0 {
+		return "", false
+	}
+
+	var n int64
+	if r != nil {
+		n = r.Int64N(totalWeight)
+	} else {
+		n = rand.Int64N(totalWeight)
+	}
+
+	for _, b := range backends {
+		if b.Weight <= 0 {
+			continue
+		}
+		if n < int64(b.Weight) {
+			return b.Target, true
+		}
+		n -= int64(b.Weight)
+	}
+
+	for i := len(backends) - 1; i >= 0; i-- {
+		if backends[i].Weight > 0 {
+			return backends[i].Target, true
+		}
+	}
+
+	return "", false
+}
+
+// SelectTCPBackend returns a backend target selected by weight for a TCP listener.
+func (l *InternalListener) SelectTCPBackend() (string, bool) {
+	return l.SelectTCPBackendWithRand(nil)
+}
+
+// SelectTCPBackendWithRand returns a backend target using the provided RNG for selection.
+// If r is nil, global rand.Int64N is used.
+func (l *InternalListener) SelectTCPBackendWithRand(r *rand.Rand) (string, bool) {
+	if l == nil || len(l.TCPBackends) == 0 {
+		return "", false
+	}
+	return PickTCPBackendWithRand(l.TCPBackends, r)
+}
+
+// PickTCPBackend selects a backend target from a slice of InternalTCPBackend based on weight.
+func PickTCPBackend(backends []InternalTCPBackend) (string, bool) {
+	return PickTCPBackendWithRand(backends, nil)
+}
+
+// PickTCPBackendWithRand selects a backend target from a slice of InternalTCPBackend based on weight using the provided RNG.
+func PickTCPBackendWithRand(backends []InternalTCPBackend, r *rand.Rand) (string, bool) {
 	if len(backends) == 0 {
 		return "", false
 	}

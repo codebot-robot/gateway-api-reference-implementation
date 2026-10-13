@@ -253,6 +253,18 @@ func TestReconcilerSetupWithManager_RequiresControllerName(t *testing.T) {
 			setupErr: (&HTTPRouteReconciler{}).SetupWithManager(nil),
 		},
 		{
+			name:     "TLSRouteReconciler",
+			setupErr: (&TLSRouteReconciler{}).SetupWithManager(nil),
+		},
+		{
+			name:     "GRPCRouteReconciler",
+			setupErr: (&GRPCRouteReconciler{}).SetupWithManager(nil),
+		},
+		{
+			name:     "TCPRouteReconciler",
+			setupErr: (&TCPRouteReconciler{}).SetupWithManager(nil),
+		},
+		{
 			name:     "BackendTLSPolicyReconciler",
 			setupErr: (&BackendTLSPolicyReconciler{}).SetupWithManager(nil),
 		},

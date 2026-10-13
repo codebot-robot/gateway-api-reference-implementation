@@ -90,6 +90,7 @@ type EffectiveListener struct {
 	AttachedRoutes int32
 	Routes         []InternalRoute
 	TLSBackends    map[string][]InternalTLSBackend
+	TCPBackends    []InternalTCPBackend
 	Generation     int64
 }
 
@@ -153,6 +154,11 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 			tlsBackends[k] = copied
 		}
 	}
+	var tcpBackends []InternalTCPBackend
+	if len(el.TCPBackends) > 0 {
+		tcpBackends = make([]InternalTCPBackend, len(el.TCPBackends))
+		copy(tcpBackends, el.TCPBackends)
+	}
 	return InternalListener{
 		Name:        el.QualifiedName(),
 		Protocol:    el.Protocol,
@@ -162,6 +168,7 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		Routes:      el.Routes,
 		TLSMode:     tlsMode,
 		TLSBackends: tlsBackends,
+		TCPBackends: tcpBackends,
 	}
 }
 
@@ -196,12 +203,20 @@ type CompiledGRPCRoute struct {
 	ParentConditions []metav1.Condition
 }
 
-// CompiledModel is the complete compiled model of Gateways, ListenerSets, HTTPRoutes, TLSRoutes, and GRPCRoutes.
+// CompiledTCPRoute contains the compiled state for a TCPRoute.
+type CompiledTCPRoute struct {
+	TCPRoute         *gatewayv1.TCPRoute
+	RouteState       *TCPRouteState
+	ParentConditions []metav1.Condition
+}
+
+// CompiledModel is the complete compiled model of Gateways, ListenerSets, HTTPRoutes, TLSRoutes, GRPCRoutes, and TCPRoutes.
 type CompiledModel struct {
 	Gateways     map[types.NamespacedName]*CompiledGateway
 	HTTPRoutes   map[types.NamespacedName]*CompiledRoute
 	TLSRoutes    map[types.NamespacedName]*CompiledTLSRoute
 	GRPCRoutes   map[types.NamespacedName]*CompiledGRPCRoute
+	TCPRoutes    map[types.NamespacedName]*CompiledTCPRoute
 	ListenerSets map[types.NamespacedName]*gatewayv1.ListenerSet
 }
 
@@ -257,6 +272,7 @@ type ModelInputs struct {
 	HTTPRoutes            []*gatewayv1.HTTPRoute
 	TLSRoutes             []*gatewayv1.TLSRoute
 	GRPCRoutes            []*gatewayv1.GRPCRoute
+	TCPRoutes             []*gatewayv1.TCPRoute
 	Services              map[types.NamespacedName]*corev1.Service
 	BackendTLSPolicies    []*gatewayv1.BackendTLSPolicy
 	ConfigMaps            map[types.NamespacedName]*corev1.ConfigMap
@@ -274,6 +290,7 @@ type Outputs struct {
 	HTTPRouteStatuses        map[types.NamespacedName]gatewayv1.HTTPRouteStatus
 	TLSRouteStatuses         map[types.NamespacedName]gatewayv1.TLSRouteStatus
 	GRPCRouteStatuses        map[types.NamespacedName]gatewayv1.GRPCRouteStatus
+	TCPRouteStatuses         map[types.NamespacedName]gatewayv1.TCPRouteStatus
 	ListenerSetStatuses      map[types.NamespacedName]gatewayv1.ListenerSetStatus
 	BackendTLSPolicyStatuses map[types.NamespacedName]gatewayv1.PolicyStatus
 	GatewayClassStatuses     map[types.NamespacedName]gatewayv1.GatewayClassStatus
@@ -939,6 +956,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		HTTPRoutes:   make(map[types.NamespacedName]*CompiledRoute),
 		TLSRoutes:    make(map[types.NamespacedName]*CompiledTLSRoute),
 		GRPCRoutes:   make(map[types.NamespacedName]*CompiledGRPCRoute),
+		TCPRoutes:    make(map[types.NamespacedName]*CompiledTCPRoute),
 		ListenerSets: make(map[types.NamespacedName]*gatewayv1.ListenerSet),
 	}
 
@@ -1172,6 +1190,36 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 
 		cm.GRPCRoutes[routeKey] = &CompiledGRPCRoute{
 			GRPCRoute:        route,
+			RouteState:       rs,
+			ParentConditions: parentConditions,
+		}
+	}
+
+	// 5. Compile TCPRoutes and perform route binding
+	for _, route := range inputs.TCPRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		rs := &TCPRouteState{TCPRoute: route}
+		rs.Compile(inputs.Services, refValidator)
+
+		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
+		boundListenersForRoute := make(map[*EffectiveListener]bool)
+
+		for pIdx, parentRef := range route.Spec.ParentRefs {
+			parentConditions[pIdx] = bindTCPRouteParentRef(
+				route,
+				rs,
+				parentRef,
+				cm,
+				inputs.Namespaces,
+				boundListenersForRoute,
+			)
+		}
+
+		cm.TCPRoutes[routeKey] = &CompiledTCPRoute{
+			TCPRoute:         route,
 			RouteState:       rs,
 			ParentConditions: parentConditions,
 		}
@@ -1527,6 +1575,45 @@ func bindGRPCRouteParentRef(
 	)
 }
 
+func bindTCPRouteParentRef(
+	route *gatewayv1.TCPRoute,
+	rs *TCPRouteState,
+	parentRef gatewayv1.ParentReference,
+	cm *CompiledModel,
+	namespaces map[string]*corev1.Namespace,
+	boundListenersForRoute map[*EffectiveListener]bool,
+) metav1.Condition {
+	var valCond *metav1.Condition
+	if rs.Internal != nil {
+		valCond = &rs.Internal.ValidationCondition
+	}
+	return bindParentRef(
+		routeBindingConfig{
+			namespace:      route.Namespace,
+			generation:     route.Generation,
+			hostnames:      nil,
+			validationCond: valCond,
+			isProtocolCompatible: func(el *EffectiveListener) bool {
+				return el.Protocol == gatewayv1.TCPProtocolType
+			},
+			isKindAllowed: IsTCPRoute,
+			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+				if rs.Internal != nil {
+					for _, rule := range rs.Internal.Rules {
+						if len(rule.Backends) > 0 {
+							el.TCPBackends = append(el.TCPBackends, rule.Backends...)
+						}
+					}
+				}
+			},
+		},
+		parentRef,
+		cm,
+		namespaces,
+		boundListenersForRoute,
+	)
+}
+
 // ExtractCertificates extracts TLS certificates once per effective listener across all compiled gateways.
 func ExtractCertificates(
 	gateways []*CompiledGateway,
@@ -1665,6 +1752,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		HTTPRouteStatuses:        make(map[types.NamespacedName]gatewayv1.HTTPRouteStatus),
 		TLSRouteStatuses:         make(map[types.NamespacedName]gatewayv1.TLSRouteStatus),
 		GRPCRouteStatuses:        make(map[types.NamespacedName]gatewayv1.GRPCRouteStatus),
+		TCPRouteStatuses:         make(map[types.NamespacedName]gatewayv1.TCPRouteStatus),
 		ListenerSetStatuses:      make(map[types.NamespacedName]gatewayv1.ListenerSetStatus),
 		BackendTLSPolicyStatuses: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
 		GatewayClassStatuses:     make(map[types.NamespacedName]gatewayv1.GatewayClassStatus),
@@ -1749,7 +1837,17 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		outputs.GRPCRouteStatuses[routeKey] = ComputeDesiredGRPCRouteStatus(route, compiledRoute, inputs.ControllerName)
 	}
 
-	// 6. BackendTLSPolicy Statuses
+	// 6. TCPRoute Statuses
+	for _, route := range inputs.TCPRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		compiledRoute := compiled.TCPRoutes[routeKey]
+		outputs.TCPRouteStatuses[routeKey] = ComputeDesiredTCPRouteStatus(route, compiledRoute, inputs.ControllerName)
+	}
+
+	// 7. BackendTLSPolicy Statuses
 	for _, policy := range inputs.BackendTLSPolicies {
 		if policy == nil {
 			continue
@@ -2004,6 +2102,37 @@ func ComputeDesiredGRPCRouteStatus(
 	}
 
 	return gatewayv1.GRPCRouteStatus{
+		RouteStatus: gatewayv1.RouteStatus{
+			Parents: desiredParents,
+		},
+	}
+}
+
+// ComputeDesiredTCPRouteStatus computes the desired TCPRouteStatus from the compiled model.
+func ComputeDesiredTCPRouteStatus(
+	route *gatewayv1.TCPRoute,
+	compiledRoute *CompiledTCPRoute,
+	controllerName string,
+) gatewayv1.TCPRouteStatus {
+	var desiredParents []gatewayv1.RouteParentStatus
+	if compiledRoute != nil {
+		for i, parentRef := range route.Spec.ParentRefs {
+			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
+			if i < len(compiledRoute.ParentConditions) {
+				cond = compiledRoute.ParentConditions[i]
+			}
+			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
+				ParentRef:      parentRef,
+				ControllerName: gatewayv1.GatewayController(controllerName),
+				Conditions: []metav1.Condition{
+					cond,
+					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				},
+			})
+		}
+	}
+
+	return gatewayv1.TCPRouteStatus{
 		RouteStatus: gatewayv1.RouteStatus{
 			Parents: desiredParents,
 		},
@@ -2387,6 +2516,14 @@ func MergeGRPCRouteStatus(current *gatewayv1.GRPCRouteStatus, desired gatewayv1.
 	return updated
 }
 
+// MergeTCPRouteStatus merges desired TCPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
+// It returns true if semantic changes occurred that require updating status in the API server.
+func MergeTCPRouteStatus(current *gatewayv1.TCPRouteStatus, desired gatewayv1.TCPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
+	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
+	current.Parents = newParents
+	return updated
+}
+
 // MergeBackendTLSPolicyStatus merges desired PolicyStatus into current, preserving LastTransitionTime and other controllers' ancestors.
 func MergeBackendTLSPolicyStatus(current *gatewayv1.PolicyStatus, desired gatewayv1.PolicyStatus, controllerName gatewayv1.GatewayController) bool {
 	newAncestors, updated := UpdatePolicyAncestors(current.Ancestors, desired.Ancestors, controllerName)
@@ -2450,6 +2587,21 @@ func TLSRouteStatusesEqual(a, b gatewayv1.TLSRouteStatus) bool {
 
 // GRPCRouteStatusesEqual compares two GRPCRouteStatus objects (ignoring LastTransitionTime).
 func GRPCRouteStatusesEqual(a, b gatewayv1.GRPCRouteStatus) bool {
+	if len(a.Parents) != len(b.Parents) {
+		return false
+	}
+	for i := range a.Parents {
+		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
+			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
+			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
+			return false
+		}
+	}
+	return true
+}
+
+// TCPRouteStatusesEqual compares two TCPRouteStatus objects (ignoring LastTransitionTime).
+func TCPRouteStatusesEqual(a, b gatewayv1.TCPRouteStatus) bool {
 	if len(a.Parents) != len(b.Parents) {
 		return false
 	}
