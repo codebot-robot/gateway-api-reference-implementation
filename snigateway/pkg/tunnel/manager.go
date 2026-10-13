@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -1166,6 +1167,13 @@ func (c *notifyFirstByteConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
+var h2CopyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024)
+		return &b
+	},
+}
+
 type serverStreamConn struct {
 	w          http.ResponseWriter
 	flusher    http.Flusher
@@ -1175,12 +1183,14 @@ type serverStreamConn struct {
 	doneCh     chan struct{}
 	closeOnce  sync.Once
 
-	mu         sync.Mutex
-	closed     bool
-	writeMu    sync.Mutex
-	inFlight   sync.WaitGroup
-	readTimer  *time.Timer
-	writeTimer *time.Timer
+	mu            sync.Mutex
+	closed        bool
+	writeMu       sync.Mutex
+	inFlight      sync.WaitGroup
+	readDeadline  time.Time
+	writeDeadline time.Time
+	readTimer     *time.Timer
+	writeTimer    *time.Timer
 }
 
 func newServerStreamConn(w http.ResponseWriter, r io.ReadCloser, cancelCtx context.CancelFunc, underlying net.Conn) *serverStreamConn {
@@ -1199,11 +1209,129 @@ func (s *serverStreamConn) Done() <-chan struct{} {
 	return s.doneCh
 }
 
+func (s *serverStreamConn) WriteTo(w io.Writer) (int64, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	s.mu.Unlock()
+
+	var first [4096]byte
+	nr, rerr := s.Read(first[:])
+	var written int64
+	if nr > 0 {
+		nw, werr := w.Write(first[:nr])
+		if nw > 0 {
+			written += int64(nw)
+		}
+		if werr != nil {
+			return written, werr
+		}
+		if nr != nw {
+			return written, io.ErrShortWrite
+		}
+	}
+	if rerr != nil {
+		if rerr == io.EOF {
+			rerr = nil
+		}
+		return written, rerr
+	}
+
+	bufPtr := h2CopyBufPool.Get().(*[]byte)
+	defer h2CopyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	for {
+		nr, rerr := s.Read(buf)
+		if nr > 0 {
+			nw, werr := w.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				rerr = nil
+			}
+			return written, rerr
+		}
+	}
+}
+
+func (s *serverStreamConn) ReadFrom(r io.Reader) (int64, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	s.mu.Unlock()
+
+	var first [4096]byte
+	nr, rerr := r.Read(first[:])
+	var written int64
+	if nr > 0 {
+		nw, werr := s.Write(first[:nr])
+		if nw > 0 {
+			written += int64(nw)
+		}
+		if werr != nil {
+			return written, werr
+		}
+		if nr != nw {
+			return written, io.ErrShortWrite
+		}
+	}
+	if rerr != nil {
+		if rerr == io.EOF {
+			rerr = nil
+		}
+		return written, rerr
+	}
+
+	bufPtr := h2CopyBufPool.Get().(*[]byte)
+	defer h2CopyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	for {
+		nr, rerr := r.Read(buf)
+		if nr > 0 {
+			nw, werr := s.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return written, werr
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				rerr = nil
+			}
+			return written, rerr
+		}
+	}
+}
+
 func (s *serverStreamConn) Read(b []byte) (int, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return 0, net.ErrClosed
+	}
+	if !s.readDeadline.IsZero() && time.Now().After(s.readDeadline) {
+		s.mu.Unlock()
+		return 0, os.ErrDeadlineExceeded
 	}
 	s.mu.Unlock()
 
@@ -1215,6 +1343,10 @@ func (s *serverStreamConn) Write(b []byte) (int, error) {
 	if s.closed {
 		s.mu.Unlock()
 		return 0, net.ErrClosed
+	}
+	if !s.writeDeadline.IsZero() && time.Now().After(s.writeDeadline) {
+		s.mu.Unlock()
+		return 0, os.ErrDeadlineExceeded
 	}
 	s.inFlight.Add(1)
 	s.mu.Unlock()
@@ -1231,7 +1363,7 @@ func (s *serverStreamConn) Write(b []byte) (int, error) {
 	s.mu.Unlock()
 
 	n, err := s.w.Write(b)
-	if s.flusher != nil {
+	if s.flusher != nil && n < 4096 {
 		s.flusher.Flush()
 	}
 	return n, err
@@ -1240,19 +1372,15 @@ func (s *serverStreamConn) Write(b []byte) (int, error) {
 func (s *serverStreamConn) SetReadDeadline(t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.readDeadline = t
 	if s.readTimer != nil {
 		s.readTimer.Stop()
 		s.readTimer = nil
 	}
-	if !t.IsZero() {
-		d := time.Until(t)
-		if d <= 0 {
+	if !t.IsZero() && time.Until(t) > 0 {
+		s.readTimer = time.AfterFunc(time.Until(t), func() {
 			closeConn(s.r)
-		} else {
-			s.readTimer = time.AfterFunc(d, func() {
-				closeConn(s.r)
-			})
-		}
+		})
 	}
 	return nil
 }
@@ -1260,23 +1388,17 @@ func (s *serverStreamConn) SetReadDeadline(t time.Time) error {
 func (s *serverStreamConn) SetWriteDeadline(t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.writeDeadline = t
 	if s.writeTimer != nil {
 		s.writeTimer.Stop()
 		s.writeTimer = nil
 	}
-	if !t.IsZero() {
-		d := time.Until(t)
-		if d <= 0 {
+	if !t.IsZero() && time.Until(t) > 0 {
+		s.writeTimer = time.AfterFunc(time.Until(t), func() {
 			if s.cancelCtx != nil {
 				s.cancelCtx()
 			}
-		} else {
-			s.writeTimer = time.AfterFunc(d, func() {
-				if s.cancelCtx != nil {
-					s.cancelCtx()
-				}
-			})
-		}
+		})
 	}
 	return nil
 }
