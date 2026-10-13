@@ -169,11 +169,28 @@ func buildLabelsAndAnnotations(gw *gatewayv1.Gateway) (map[string]string, map[st
 	return labels, annotations
 }
 
-// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
-// and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
-func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+func requestedIPAddresses(gw *gatewayv1.Gateway) []string {
+	var ips []string
+	if gw == nil {
+		return nil
+	}
+	for _, addr := range gw.Spec.Addresses {
+		addrType := gatewayv1.IPAddressType
+		if addr.Type != nil && *addr.Type != "" {
+			addrType = *addr.Type
+		}
+		if addrType == gatewayv1.IPAddressType && addr.Value != "" {
+			ips = append(ips, addr.Value)
+		}
+	}
+	return ips
+}
+
+// GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
+// and returns the Service's LoadBalancer ingress addresses and detailed readiness state.
+func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	if p.client == nil {
-		return nil, false, nil
+		return nil, state.GatewayReadiness{}, nil
 	}
 
 	name := ResourceNameForGateway(gw.Name)
@@ -194,12 +211,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
 	if err == nil {
 		if !isOwnedByGateway(&existingSA, gw) {
-			return nil, false, &controller.OwnershipConflictError{
+			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing ServiceAccount %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, false, err
+		return nil, state.GatewayReadiness{}, err
 	}
 
 	saApply := corev1ac.ServiceAccount(name, gwNamespace).
@@ -209,7 +226,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		saApply.WithAnnotations(annotations)
 	}
 	if err := p.client.Apply(ctx, saApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, false, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply ServiceAccount for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 2. Reconcile per-Gateway Role in Gateway namespace
@@ -217,12 +234,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRole)
 	if err == nil {
 		if !isOwnedByGateway(&existingRole, gw) {
-			return nil, false, &controller.OwnershipConflictError{
+			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing Role %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, false, err
+		return nil, state.GatewayReadiness{}, err
 	}
 
 	roleApply := rbacv1ac.Role(name, gwNamespace).
@@ -238,7 +255,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		roleApply.WithAnnotations(annotations)
 	}
 	if err := p.client.Apply(ctx, roleApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, false, fmt.Errorf("failed to apply Role for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Role for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 2b. Reconcile per-Gateway RoleBinding in Gateway namespace
@@ -246,12 +263,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingRB)
 	if err == nil {
 		if !isOwnedByGateway(&existingRB, gw) {
-			return nil, false, &controller.OwnershipConflictError{
+			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing RoleBinding %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, false, err
+		return nil, state.GatewayReadiness{}, err
 	}
 
 	rbApply := rbacv1ac.RoleBinding(name, gwNamespace).
@@ -271,7 +288,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		rbApply.WithAnnotations(annotations)
 	}
 	if err := p.client.Apply(ctx, rbApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, false, fmt.Errorf("failed to apply RoleBinding for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply RoleBinding for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 2c. Verify ownership of existing Secret in Gateway namespace
@@ -279,12 +296,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSecret)
 	if err == nil {
 		if !isOwnedByGateway(&existingSecret, gw) {
-			return nil, false, &controller.OwnershipConflictError{
+			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, false, err
+		return nil, state.GatewayReadiness{}, err
 	}
 
 	// 3. Reconcile per-Gateway Deployment in Gateway namespace
@@ -292,12 +309,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy)
 	if err == nil {
 		if !isOwnedByGateway(&existingDeploy, gw) {
-			return nil, false, &controller.OwnershipConflictError{
+			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing Deployment %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, false, err
+		return nil, state.GatewayReadiness{}, err
 	}
 
 	args := []string{
@@ -375,7 +392,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		deployApply.WithAnnotations(annotations)
 	}
 	if err := p.client.Apply(ctx, deployApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-		return nil, false, fmt.Errorf("failed to apply Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+		return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Deployment for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 	}
 
 	// 4. Reconcile per-Gateway LoadBalancer Service in Gateway namespace
@@ -383,12 +400,12 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc)
 	if err == nil {
 		if !isOwnedByGateway(&existingSvc, gw) {
-			return nil, false, &controller.OwnershipConflictError{
+			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
 				Message: fmt.Sprintf("conflict: existing Service %s/%s is not owned by Gateway %s", gwNamespace, name, gw.Name),
 			}
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return nil, false, err
+		return nil, state.GatewayReadiness{}, err
 	}
 
 	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
@@ -456,23 +473,28 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	}
 
+	requestedIPs := requestedIPAddresses(gw)
+
 	if len(svcPorts) > 0 {
+		svcSpec := corev1ac.ServiceSpec().
+			WithType(corev1.ServiceTypeLoadBalancer).
+			WithSelector(map[string]string{
+				LabelGatewayName: gw.Name,
+				LabelAppName:     AppNameValue,
+			}).
+			WithPorts(svcPorts...)
+		if len(requestedIPs) > 0 {
+			svcSpec.WithLoadBalancerIP(requestedIPs[0])
+		}
 		svcApply := corev1ac.Service(name, gwNamespace).
 			WithOwnerReferences(ownerRef).
 			WithLabels(labels).
-			WithSpec(corev1ac.ServiceSpec().
-				WithType(corev1.ServiceTypeLoadBalancer).
-				WithSelector(map[string]string{
-					LabelGatewayName: gw.Name,
-					LabelAppName:     AppNameValue,
-				}).
-				WithPorts(svcPorts...),
-			)
+			WithSpec(svcSpec)
 		if len(annotations) > 0 {
 			svcApply.WithAnnotations(annotations)
 		}
 		if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
-			return nil, false, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
 		}
 	}
 
@@ -480,7 +502,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	deployReady := false
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingDeploy); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return nil, false, fmt.Errorf("getting Deployment %s/%s for readiness check: %w", gwNamespace, name, err)
+			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Deployment %s/%s for readiness check: %w", gwNamespace, name, err)
 		}
 	} else {
 		if existingDeploy.Status.AvailableReplicas > 0 || existingDeploy.Status.ReadyReplicas > 0 {
@@ -489,13 +511,15 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
+	var ingressIPs []string
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return nil, false, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
+			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
 		}
 	} else {
 		for _, ingress := range existingSvc.Status.LoadBalancer.Ingress {
 			if ingress.IP != "" {
+				ingressIPs = append(ingressIPs, ingress.IP)
 				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
 					Type:  state.Ptr(gatewayv1.IPAddressType),
 					Value: ingress.IP,
@@ -510,7 +534,52 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 		}
 	}
 
-	return addresses, deployReady, nil
+	for i, reqIP := range requestedIPs {
+		bound := false
+		for _, ingressIP := range ingressIPs {
+			if ingressIP == reqIP {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			msg := fmt.Sprintf("Requested address %s could not be bound to Service", reqIP)
+			if i > 0 {
+				msg = fmt.Sprintf("Requested address %s could not be bound to Service: singlepod binds at most one requested IP", reqIP)
+			}
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+				Message: msg,
+			}, nil
+		}
+	}
+
+	if !deployReady {
+		return addresses, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonPending),
+			Message: "Waiting for data-plane deployment to become available",
+		}, nil
+	}
+
+	return addresses, state.GatewayReadiness{
+		Ready:   true,
+		Reason:  string(gatewayv1.GatewayReasonProgrammed),
+		Message: "Gateway programmed by reference implementation",
+	}, nil
+}
+
+// GatewayAddresses reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
+// and returns the Service's LoadBalancer ingress addresses and whether the Deployment is ready.
+func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, bool, error) {
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	return addrs, readiness.Ready, err
+}
+
+// SupportedAddressTypes returns the address types supported by singlepod.
+func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
+	return []gatewayv1.AddressType{gatewayv1.IPAddressType}
 }
 
 func managedByPredicate() predicate.Predicate {
@@ -597,7 +666,9 @@ func (p *AddressProvider) Commit(ctx context.Context) error {
 }
 
 var (
-	_ controller.AddressProvider = (*AddressProvider)(nil)
-	_ controller.AddressWatcher  = (*AddressProvider)(nil)
-	_ state.DataplanePublisher   = (*AddressProvider)(nil)
+	_ controller.AddressProvider          = (*AddressProvider)(nil)
+	_ controller.AddressWatcher           = (*AddressProvider)(nil)
+	_ controller.AddressReadinessProvider = (*AddressProvider)(nil)
+	_ controller.AddressTypeProvider      = (*AddressProvider)(nil)
+	_ state.DataplanePublisher            = (*AddressProvider)(nil)
 )

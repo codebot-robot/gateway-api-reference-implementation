@@ -29,6 +29,8 @@ import (
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
 
 func TestConformance(t *testing.T) {
@@ -89,6 +91,18 @@ func TestConformance(t *testing.T) {
 			CleanupBaseResources:       true,
 			CleanupTestResources:       true,
 			EnableAllSupportedFeatures: true,
+			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  state.Ptr(gatewayv1.IPAddressType),
+					Value: "172.18.255.240",
+				},
+			},
+			UnusableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  state.Ptr(gatewayv1.IPAddressType),
+					Value: "172.18.255.199",
+				},
+			},
 		},
 		ManifestFS: []fs.FS{conformance.Manifests},
 	})
@@ -112,10 +126,12 @@ func TestConformance(t *testing.T) {
 		tests.GatewayListenerUnsupportedProtocol,
 		tests.GatewayModifyListeners,
 		tests.GatewayObservedGenerationBump,
+		tests.GatewayOptionalAddressValue,
 		tests.GatewaySecretInvalidReferenceGrant,
 		tests.GatewaySecretMissingReferenceGrant,
 		tests.GatewaySecretReferenceGrantAllInNamespace,
 		tests.GatewaySecretReferenceGrantSpecific,
+		tests.GatewayStaticAddresses,
 		tests.GatewayWithAttachedRoutes,
 		tests.GatewayWithAttachedRoutesWithPort8080,
 		tests.GRPCExactMethodMatching,

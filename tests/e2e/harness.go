@@ -339,7 +339,18 @@ metadata:
   namespace: metallb-system
 spec:
   addresses:
-  - 172.18.255.200-172.18.255.250
+  - 172.18.255.200-172.18.255.239
+  - 172.18.255.241-172.18.255.250
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: static-address-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 172.18.255.240-172.18.255.240
+  autoAssign: false
 ---
 apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
