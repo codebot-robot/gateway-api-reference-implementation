@@ -67,6 +67,10 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		st.SetGatewayFilter(opts.GatewayFilter)
 		st.SetSynced(false)
 
+		if atp, ok := opts.AddressProvider.(AddressTypeProvider); ok {
+			st.SetSupportedAddressTypes(atp.SupportedAddressTypes())
+		}
+
 		if publisher, ok := opts.AddressProvider.(state.DataplanePublisher); ok {
 			st.SetDataplanePublisher(publisher)
 		} else if p != nil {

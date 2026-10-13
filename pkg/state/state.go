@@ -101,21 +101,22 @@ type State struct {
 	revision   uint64
 	recomputes uint64
 
-	gatewayClasses     map[types.NamespacedName]*gatewayv1.GatewayClass
-	gateways           map[types.NamespacedName]*GatewayState
-	gatewayAddresses   map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	gatewayReadiness   map[types.NamespacedName]GatewayReadiness
-	provisioningErrors map[types.NamespacedName]string
-	listenerSets       map[types.NamespacedName]*ListenerSetState
-	httpRoutes         map[types.NamespacedName]*HTTPRouteState
-	tlsRoutes          map[types.NamespacedName]*TLSRouteState
-	grpcRoutes         map[types.NamespacedName]*GRPCRouteState
-	backendTLSPolicies map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
-	services           map[types.NamespacedName]*corev1.Service
-	configMaps         map[types.NamespacedName]*corev1.ConfigMap
-	secrets            map[types.NamespacedName]*corev1.Secret
-	referenceGrants    map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
-	namespaces         map[string]*corev1.Namespace
+	gatewayClasses        map[types.NamespacedName]*gatewayv1.GatewayClass
+	gateways              map[types.NamespacedName]*GatewayState
+	gatewayAddresses      map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	gatewayReadiness      map[types.NamespacedName]GatewayReadiness
+	provisioningErrors    map[types.NamespacedName]string
+	supportedAddressTypes []gatewayv1.AddressType
+	listenerSets          map[types.NamespacedName]*ListenerSetState
+	httpRoutes            map[types.NamespacedName]*HTTPRouteState
+	tlsRoutes             map[types.NamespacedName]*TLSRouteState
+	grpcRoutes            map[types.NamespacedName]*GRPCRouteState
+	backendTLSPolicies    map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
+	services              map[types.NamespacedName]*corev1.Service
+	configMaps            map[types.NamespacedName]*corev1.ConfigMap
+	secrets               map[types.NamespacedName]*corev1.Secret
+	referenceGrants       map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	namespaces            map[string]*corev1.Namespace
 
 	controllerName   string
 	onGatewaysUpdate func([]*gatewayv1.Gateway)
@@ -608,25 +609,32 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		referenceGrants[k] = v
 	}
 
+	var suppAddrs []gatewayv1.AddressType
+	if s.supportedAddressTypes != nil {
+		suppAddrs = make([]gatewayv1.AddressType, len(s.supportedAddressTypes))
+		copy(suppAddrs, s.supportedAddressTypes)
+	}
+
 	return ModelInputs{
-		Revision:           s.revision,
-		Gateways:           gws,
-		GatewayClasses:     gcs,
-		GatewayAddresses:   gwAddrs,
-		GatewayReadiness:   gwReady,
-		ProvisioningErrors: gwProvErrs,
-		ListenerSets:       listenerSets,
-		HTTPRoutes:         routes,
-		TLSRoutes:          tlsRoutes,
-		GRPCRoutes:         grpcRoutes,
-		Services:           services,
-		BackendTLSPolicies: backendTLSPolicies,
-		ConfigMaps:         configMaps,
-		Secrets:            secrets,
-		Namespaces:         namespaces,
-		ReferenceGrants:    referenceGrants,
-		RefValidator:       mapReferenceValidator{referenceGrants: referenceGrants},
-		ControllerName:     s.controllerName,
+		Revision:              s.revision,
+		Gateways:              gws,
+		GatewayClasses:        gcs,
+		GatewayAddresses:      gwAddrs,
+		GatewayReadiness:      gwReady,
+		ProvisioningErrors:    gwProvErrs,
+		SupportedAddressTypes: suppAddrs,
+		ListenerSets:          listenerSets,
+		HTTPRoutes:            routes,
+		TLSRoutes:             tlsRoutes,
+		GRPCRoutes:            grpcRoutes,
+		Services:              services,
+		BackendTLSPolicies:    backendTLSPolicies,
+		ConfigMaps:            configMaps,
+		Secrets:               secrets,
+		Namespaces:            namespaces,
+		ReferenceGrants:       referenceGrants,
+		RefValidator:          mapReferenceValidator{referenceGrants: referenceGrants},
+		ControllerName:        s.controllerName,
 	}
 }
 
@@ -1039,6 +1047,27 @@ func (s *State) SetGatewayProvisioningError(key types.NamespacedName, provErr st
 	}
 	s.revision++
 	s.markDirtyLocked()
+}
+
+// SetSupportedAddressTypes sets the address types supported by the active provider.
+func (s *State) SetSupportedAddressTypes(types []gatewayv1.AddressType) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.supportedAddressTypes = make([]gatewayv1.AddressType, len(types))
+	copy(s.supportedAddressTypes, types)
+	s.revision++
+	s.markDirtyLocked()
+}
+
+// GetSupportedAddressTypes returns the address types supported by the active provider.
+func (s *State) GetSupportedAddressTypes() []gatewayv1.AddressType {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	res := make([]gatewayv1.AddressType, len(s.supportedAddressTypes))
+	copy(res, s.supportedAddressTypes)
+	return res
 }
 
 func (s *State) GetEffectiveListeners(key types.NamespacedName) []*EffectiveListener {

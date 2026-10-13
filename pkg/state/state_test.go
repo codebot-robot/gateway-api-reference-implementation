@@ -917,3 +917,292 @@ func TestState_StartInitialRecomputeOnce(t *testing.T) {
 		t.Fatalf("Start returned error: %v", err)
 	}
 }
+
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+func TestState_GatewayAddresses_UnsupportedType(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+
+	// Case 1: Provider supports IPAddress, but Gateway requests test/fake-invalid-type
+	st.SetSupportedAddressTypes([]gatewayv1.AddressType{gatewayv1.IPAddressType})
+
+	invalidType := gatewayv1.AddressType("test/fake-invalid-type")
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-invalid"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-invalid"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &invalidType, Value: "fake address"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	acceptedCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
+		t.Errorf("expected Accepted=False Reason=UnsupportedAddress, got %+v", acceptedCond)
+	}
+	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonInvalid) {
+		t.Errorf("expected Programmed=False Reason=Invalid when not accepted, got %+v", progCond)
+	}
+	if len(status.Addresses) != 0 {
+		t.Errorf("expected no status addresses when address type is unsupported, got %+v", status.Addresses)
+	}
+
+	// Case 2: When provider declares NO supported types (default absent), any spec.addresses entry is UnsupportedAddress
+	st2 := NewState()
+	st2.SetControllerName("example.net/gateway-controller")
+	st2.UpsertGatewayClass(gc)
+
+	gwKey2 := types.NamespacedName{Namespace: "default", Name: "gw-default-none"}
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-default-none"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: Ptr(gatewayv1.IPAddressType), Value: "192.0.2.1"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st2.UpsertGateway(gw2)
+	st2.Recompute()
+
+	status2, ok := st2.GetDesiredGatewayStatus(gwKey2)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	acceptedCond2 := findCondition(status2.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond2 == nil || acceptedCond2.Status != metav1.ConditionFalse || acceptedCond2.Reason != string(gatewayv1.GatewayReasonUnsupportedAddress) {
+		t.Errorf("expected Accepted=False Reason=UnsupportedAddress with default absent types, got %+v", acceptedCond2)
+	}
+}
+
+func TestState_GatewayAddresses_AddressNotUsable(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+	st.SetSupportedAddressTypes([]gatewayv1.AddressType{gatewayv1.IPAddressType})
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-unusable"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-unusable"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: Ptr(gatewayv1.IPAddressType), Value: "192.0.2.1"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+
+	// Provider reports AddressNotUsable readiness
+	notUsableMsg := "Requested address 192.0.2.1 could not be bound to Service"
+	st.SetGatewayAddresses(gwKey, nil)
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{
+		Ready:   false,
+		Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+		Message: notUsableMsg,
+	})
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	acceptedCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue || acceptedCond.Reason != string(gatewayv1.GatewayReasonAccepted) {
+		t.Errorf("expected Accepted=True Reason=Accepted, got %+v", acceptedCond)
+	}
+	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) || progCond.Message != notUsableMsg {
+		t.Errorf("expected Programmed=False Reason=AddressNotUsable Message=%q, got %+v", notUsableMsg, progCond)
+	}
+	if len(status.Addresses) != 0 {
+		t.Errorf("expected no status addresses when address is not usable, got %+v", status.Addresses)
+	}
+}
+
+func TestState_GatewayAddresses_BoundProgrammed(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+	st.SetSupportedAddressTypes([]gatewayv1.AddressType{gatewayv1.IPAddressType})
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-bound"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-bound"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: Ptr(gatewayv1.IPAddressType), Value: "192.0.2.1"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+
+	// Provider reports bound address and Ready=true, also includes another unrelated address to test filtering
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
+		{Type: Ptr(gatewayv1.IPAddressType), Value: "192.0.2.1"},
+		{Type: Ptr(gatewayv1.IPAddressType), Value: "10.0.0.99"},
+	})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	acceptedCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %+v", acceptedCond)
+	}
+	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True Reason=Programmed, got %+v", progCond)
+	}
+	// Status addresses should contain exactly the requested bound address, nothing else
+	if len(status.Addresses) != 1 {
+		t.Fatalf("expected exactly 1 status address, got %d: %+v", len(status.Addresses), status.Addresses)
+	}
+	if status.Addresses[0].Value != "192.0.2.1" || *status.Addresses[0].Type != gatewayv1.IPAddressType {
+		t.Errorf("expected status address 192.0.2.1 (IPAddress), got %+v", status.Addresses[0])
+	}
+}
+
+func TestState_GatewayAddresses_EmptyValueNormalAllocation(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+	st.SetSupportedAddressTypes([]gatewayv1.AddressType{gatewayv1.IPAddressType})
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-empty-val"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-empty-val"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: Ptr(gatewayv1.IPAddressType), Value: ""},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+
+	// Normal dynamic allocation assigns an IP
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
+		{Type: Ptr(gatewayv1.IPAddressType), Value: "10.0.0.5"},
+	})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	acceptedCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %+v", acceptedCond)
+	}
+	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True Reason=Programmed, got %+v", progCond)
+	}
+	if len(status.Addresses) != 1 || status.Addresses[0].Value != "10.0.0.5" {
+		t.Errorf("expected status address 10.0.0.5, got %+v", status.Addresses)
+	}
+}
+
+func TestState_GatewayAddresses_NoSpecAddresses(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "gw-no-spec-addrs"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-no-spec-addrs"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{
+		{Type: Ptr(gatewayv1.IPAddressType), Value: "10.0.0.1"},
+	})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	acceptedCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True, got %+v", acceptedCond)
+	}
+	progCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True Reason=Programmed, got %+v", progCond)
+	}
+	if len(status.Addresses) != 1 || status.Addresses[0].Value != "10.0.0.1" {
+		t.Errorf("expected status address 10.0.0.1, got %+v", status.Addresses)
+	}
+}
