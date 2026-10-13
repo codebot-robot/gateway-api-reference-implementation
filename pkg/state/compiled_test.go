@@ -17,6 +17,7 @@ package state
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -1033,8 +1034,8 @@ func TestStatusComputation_PureFunctions(t *testing.T) {
 	// 1. Gateway Status
 	addresses := []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}}
 	gwStatus := ComputeDesiredGatewayStatus(gw, compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw"}], addresses, GatewayReadiness{Ready: true}, "", nil)
-	if len(gwStatus.Conditions) != 2 {
-		t.Errorf("expected 2 Gateway conditions, got %d", len(gwStatus.Conditions))
+	if len(gwStatus.Conditions) != 3 {
+		t.Errorf("expected 3 Gateway conditions, got %d", len(gwStatus.Conditions))
 	}
 	if len(gwStatus.Addresses) != 1 || gwStatus.Addresses[0].Value != "192.0.2.1" {
 		t.Errorf("expected Gateway address 192.0.2.1, got %v", gwStatus.Addresses)
@@ -3708,4 +3709,409 @@ func TestBackendTLSPolicy_CompiledInternalTLSConfig_CarriesSubjectAltNames(t *te
 	if backend.TLSConfig.SubjectAltNames[1].URI != "spiffe://example.com/backend" {
 		t.Errorf("expected second SAN URI 'spiffe://example.com/backend', got %q", backend.TLSConfig.SubjectAltNames[1].URI)
 	}
+}
+
+func TestGatewayBackendClientCertificate_ResolvedRefs(t *testing.T) {
+	certPEM, keyPEM := generateTestCertPEM(t, "client.example.com")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	validSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-secret"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+	crossSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "cross-secret"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+	emptySecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "empty-secret"},
+		Data:       map[string][]byte{},
+	}
+	malformedSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "malformed-secret"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       []byte("corrupt-cert"),
+			corev1.TLSPrivateKeyKey: []byte("corrupt-key"),
+		},
+	}
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "valid-secret"}:     validSecret,
+		{Namespace: "other-ns", Name: "cross-secret"}:    crossSecret,
+		{Namespace: "default", Name: "empty-secret"}:     emptySecret,
+		{Namespace: "default", Name: "malformed-secret"}: malformedSecret,
+	}
+
+	crossGrant := &gatewayv1beta1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "allow-gw-secret"},
+		Spec: gatewayv1beta1.ReferenceGrantSpec{
+			From: []gatewayv1beta1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      "Gateway",
+					Namespace: "default",
+				},
+			},
+			To: []gatewayv1beta1.ReferenceGrantTo{
+				{
+					Group: "",
+					Kind:  "Secret",
+					Name:  Ptr(gatewayv1.ObjectName("cross-secret")),
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name                 string
+		tlsBackend           *gatewayv1.GatewayBackendTLS
+		useGrant             bool
+		expectResolvedRefs   metav1.ConditionStatus
+		expectResolvedReason string
+	}{
+		{
+			name:                 "no clientCertificateRef gains ResolvedRefs=True",
+			tlsBackend:           nil,
+			expectResolvedRefs:   metav1.ConditionTrue,
+			expectResolvedReason: string(gatewayv1.GatewayReasonResolvedRefs),
+		},
+		{
+			name: "valid clientCertificateRef",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group: Ptr(gatewayv1.Group("")),
+					Kind:  Ptr(gatewayv1.Kind("Secret")),
+					Name:  "valid-secret",
+				},
+			},
+			expectResolvedRefs:   metav1.ConditionTrue,
+			expectResolvedReason: string(gatewayv1.GatewayReasonResolvedRefs),
+		},
+		{
+			name: "missing Secret",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group: Ptr(gatewayv1.Group("")),
+					Kind:  Ptr(gatewayv1.Kind("Secret")),
+					Name:  "nonexistent-secret",
+				},
+			},
+			expectResolvedRefs:   metav1.ConditionFalse,
+			expectResolvedReason: string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+		},
+		{
+			name: "wrong group",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group: Ptr(gatewayv1.Group("wrong.group.io")),
+					Kind:  Ptr(gatewayv1.Kind("Secret")),
+					Name:  "valid-secret",
+				},
+			},
+			expectResolvedRefs:   metav1.ConditionFalse,
+			expectResolvedReason: string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+		},
+		{
+			name: "wrong kind",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group: Ptr(gatewayv1.Group("")),
+					Kind:  Ptr(gatewayv1.Kind("ConfigMap")),
+					Name:  "valid-secret",
+				},
+			},
+			expectResolvedRefs:   metav1.ConditionFalse,
+			expectResolvedReason: string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+		},
+		{
+			name: "empty secret without tls.crt and tls.key",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group: Ptr(gatewayv1.Group("")),
+					Kind:  Ptr(gatewayv1.Kind("Secret")),
+					Name:  "empty-secret",
+				},
+			},
+			expectResolvedRefs:   metav1.ConditionFalse,
+			expectResolvedReason: string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+		},
+		{
+			name: "malformed secret with invalid cert/key bytes",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group: Ptr(gatewayv1.Group("")),
+					Kind:  Ptr(gatewayv1.Kind("Secret")),
+					Name:  "malformed-secret",
+				},
+			},
+			expectResolvedRefs:   metav1.ConditionFalse,
+			expectResolvedReason: string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+		},
+		{
+			name: "cross-namespace without ReferenceGrant",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group:     Ptr(gatewayv1.Group("")),
+					Kind:      Ptr(gatewayv1.Kind("Secret")),
+					Name:      "cross-secret",
+					Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+				},
+			},
+			useGrant:             false,
+			expectResolvedRefs:   metav1.ConditionFalse,
+			expectResolvedReason: string(gatewayv1.GatewayReasonRefNotPermitted),
+		},
+		{
+			name: "cross-namespace with ReferenceGrant",
+			tlsBackend: &gatewayv1.GatewayBackendTLS{
+				ClientCertificateRef: &gatewayv1.SecretObjectReference{
+					Group:     Ptr(gatewayv1.Group("")),
+					Kind:      Ptr(gatewayv1.Kind("Secret")),
+					Name:      "cross-secret",
+					Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+				},
+			},
+			useGrant:             true,
+			expectResolvedRefs:   metav1.ConditionTrue,
+			expectResolvedReason: string(gatewayv1.GatewayReasonResolvedRefs),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "ref-class",
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "http",
+							Port:     80,
+							Protocol: gatewayv1.HTTPProtocolType,
+						},
+					},
+				},
+			}
+			if tc.tlsBackend != nil {
+				gw.Spec.TLS = &gatewayv1.GatewayTLSConfig{
+					Backend: tc.tlsBackend,
+				}
+			}
+
+			inputs := ModelInputs{
+				Gateways:       []*gatewayv1.Gateway{gw},
+				GatewayClasses: []*gatewayv1.GatewayClass{gc},
+				Secrets:        secrets,
+				ControllerName: "test-controller",
+			}
+			if tc.useGrant {
+				inputs.ReferenceGrants = map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant{
+					{Namespace: crossGrant.Namespace, Name: crossGrant.Name}: crossGrant,
+				}
+				inputs.RefValidator = mapReferenceValidator{referenceGrants: inputs.ReferenceGrants}
+			}
+
+			outputs := ComputeOutputs(inputs)
+			gwKey := types.NamespacedName{Namespace: "default", Name: "gw"}
+			status, ok := outputs.GatewayStatuses[gwKey]
+			if !ok {
+				t.Fatalf("expected GatewayStatus for gw")
+			}
+
+			// Verify Accepted is always ConditionTrue with Reason Accepted
+			accCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+			if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.GatewayReasonAccepted) {
+				t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
+			}
+
+			// Verify ResolvedRefs
+			resCond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionResolvedRefs))
+			if resCond == nil {
+				t.Fatalf("expected ResolvedRefs condition on Gateway")
+			}
+			if resCond.Status != tc.expectResolvedRefs {
+				t.Errorf("expected ResolvedRefs Status=%s, got %s", tc.expectResolvedRefs, resCond.Status)
+			}
+			if resCond.Reason != tc.expectResolvedReason {
+				t.Errorf("expected ResolvedRefs Reason=%s, got %s", tc.expectResolvedReason, resCond.Reason)
+			}
+		})
+	}
+}
+
+func TestGatewayBackendClientCertificate_DataplaneWiring(t *testing.T) {
+	certPEM, keyPEM := generateTestCertPEM(t, "client.example.com")
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	clientSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "client-cert-secret"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			TLS: &gatewayv1.GatewayTLSConfig{
+				Backend: &gatewayv1.GatewayBackendTLS{
+					ClientCertificateRef: &gatewayv1.SecretObjectReference{
+						Group: Ptr(gatewayv1.Group("")),
+						Kind:  Ptr(gatewayv1.Kind("Secret")),
+						Name:  "client-cert-secret",
+					},
+				},
+			},
+		},
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend-svc"},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{Port: 443, Name: "https"},
+			},
+		},
+	}
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{Name: "my-gw"},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: Ptr(gatewayv1.Group("")),
+									Kind:  Ptr(gatewayv1.Kind("Service")),
+									Name:  "backend-svc",
+									Port:  Ptr(gatewayv1.PortNumber(443)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	caCertPEM, _ := generateTestCertPEM(t, "backend.example.com")
+	caConfigMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend-ca"},
+		Data: map[string]string{
+			"ca.crt": string(caCertPEM),
+		},
+	}
+
+	policy := &gatewayv1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "policy"},
+		Spec: gatewayv1.BackendTLSPolicySpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+				{
+					LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+						Group: "",
+						Kind:  "Service",
+						Name:  "backend-svc",
+					},
+				},
+			},
+			Validation: gatewayv1.BackendTLSPolicyValidation{
+				Hostname: "backend.example.com",
+				CACertificateRefs: []gatewayv1.LocalObjectReference{
+					{Group: "", Kind: "ConfigMap", Name: "backend-ca"},
+				},
+			},
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:           []*gatewayv1.Gateway{gw},
+		GatewayClasses:     []*gatewayv1.GatewayClass{gc},
+		HTTPRoutes:         []*gatewayv1.HTTPRoute{route},
+		BackendTLSPolicies: []*gatewayv1.BackendTLSPolicy{policy},
+		Services:           map[types.NamespacedName]*corev1.Service{{Namespace: "default", Name: "backend-svc"}: svc},
+		ConfigMaps:         map[types.NamespacedName]*corev1.ConfigMap{{Namespace: "default", Name: "backend-ca"}: caConfigMap},
+		Secrets:            map[types.NamespacedName]*corev1.Secret{{Namespace: "default", Name: "client-cert-secret"}: clientSecret},
+		ControllerName:     "test-controller",
+	}
+
+	outputs := ComputeOutputs(inputs)
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	dpConfig, ok := outputs.DataplaneConfigs[gwKey]
+	if !ok || dpConfig == nil {
+		t.Fatalf("expected DataplaneConfig for gateway")
+	}
+
+	if dpConfig.BackendClientCertID == "" {
+		t.Fatalf("expected non-empty BackendClientCertID")
+	}
+	if _, ok := dpConfig.Certificates[dpConfig.BackendClientCertID]; !ok {
+		t.Fatalf("expected certificate %s to be present in Certificates map", dpConfig.BackendClientCertID)
+	}
+
+	// Verify that applying dataplane config wires the client certificate into the backend TLSConfig
+	data, err := dpConfig.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal dataplane config: %v", err)
+	}
+
+	updater := &mockProxyUpdater{}
+	if err := ApplyDataplaneConfig(updater, data); err != nil {
+		t.Fatalf("ApplyDataplaneConfig failed: %v", err)
+	}
+
+	if len(updater.routes) == 0 || len(updater.routes[0].Rules) == 0 || len(updater.routes[0].Rules[0].Backends) == 0 {
+		t.Fatalf("expected updated routes with backends")
+	}
+	backend := updater.routes[0].Rules[0].Backends[0]
+	if backend.TLSConfig == nil {
+		t.Fatalf("expected backend.TLSConfig != nil")
+	}
+	if backend.TLSConfig.ClientCert == nil {
+		t.Fatalf("expected backend.TLSConfig.ClientCert to be wired, got nil")
+	}
+}
+
+type mockProxyUpdater struct {
+	listeners []InternalListener
+	routes    []InternalRoute
+	certs     map[string]*tls.Certificate
+	defCert   *tls.Certificate
+}
+
+func (m *mockProxyUpdater) UpdateConfig(listeners []InternalListener, routes []InternalRoute) {
+	m.listeners = listeners
+	m.routes = routes
+}
+
+func (m *mockProxyUpdater) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
+	m.certs = certs
+	m.defCert = defaultCert
 }

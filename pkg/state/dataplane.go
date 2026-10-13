@@ -55,12 +55,13 @@ const (
 
 // DataplaneConfig represents the serialized proxy configuration for a single Gateway.
 type DataplaneConfig struct {
-	GatewayName      types.NamespacedName       `json:"gatewayName"`
-	Listeners        []InternalListener         `json:"listeners"`
-	Routes           []InternalRoute            `json:"routes"`
-	Certificates     map[string]CertificateData `json:"certificates,omitempty"`     // certID -> CertificateData
-	HostCertificates map[string]string          `json:"hostCertificates,omitempty"` // hostname -> certID
-	DefaultCertID    string                     `json:"defaultCertID,omitempty"`
+	GatewayName         types.NamespacedName       `json:"gatewayName"`
+	Listeners           []InternalListener         `json:"listeners"`
+	Routes              []InternalRoute            `json:"routes"`
+	Certificates        map[string]CertificateData `json:"certificates,omitempty"`     // certID -> CertificateData
+	HostCertificates    map[string]string          `json:"hostCertificates,omitempty"` // hostname -> certID
+	DefaultCertID       string                     `json:"defaultCertID,omitempty"`
+	BackendClientCertID string                     `json:"backendClientCertID,omitempty"`
 }
 
 // DataplanePublisher defines the interface for publishing a Gateway's compiled data-plane configuration.
@@ -106,13 +107,14 @@ func dataToTLSCert(data CertificateData) (*tls.Certificate, error) {
 	return cert, nil
 }
 
-// BuildDataplaneConfig constructs a DataplaneConfig from listeners, routes, certificates, and default certificate.
+// BuildDataplaneConfig constructs a DataplaneConfig from listeners, routes, certificates, default certificate, and backend client certificate.
 func BuildDataplaneConfig(
 	gwKey types.NamespacedName,
 	listeners []InternalListener,
 	routes []InternalRoute,
 	certsMap map[string]*tls.Certificate,
 	defaultCert *tls.Certificate,
+	backendClientCert *tls.Certificate,
 ) (*DataplaneConfig, error) {
 	cfg := &DataplaneConfig{
 		GatewayName:      gwKey,
@@ -155,6 +157,39 @@ func BuildDataplaneConfig(
 		cfg.DefaultCertID = id
 	}
 
+	if backendClientCert != nil {
+		id, err := getCertID(backendClientCert)
+		if err != nil {
+			return nil, err
+		}
+		cfg.BackendClientCertID = id
+	}
+
+	if cfg.BackendClientCertID != "" {
+		for i := range routes {
+			for j := range routes[i].Rules {
+				for k := range routes[i].Rules[j].Backends {
+					backend := &routes[i].Rules[j].Backends[k]
+					if backend.TLSConfig != nil {
+						backend.TLSConfig.ClientCertID = cfg.BackendClientCertID
+					}
+				}
+			}
+		}
+		for i := range listeners {
+			for j := range listeners[i].Routes {
+				for k := range listeners[i].Routes[j].Rules {
+					for l := range listeners[i].Routes[j].Rules[k].Backends {
+						backend := &listeners[i].Routes[j].Rules[k].Backends[l]
+						if backend.TLSConfig != nil {
+							backend.TLSConfig.ClientCertID = cfg.BackendClientCertID
+						}
+					}
+				}
+			}
+		}
+	}
+
 	var hosts []string
 	for host := range certsMap {
 		hosts = append(hosts, host)
@@ -176,18 +211,28 @@ func BuildDataplaneConfig(
 }
 
 // ExtractCertificates reconstructs the certificates map and default certificate from DataplaneConfig.
-func (cfg *DataplaneConfig) ExtractCertificates() (map[string]*tls.Certificate, *tls.Certificate, error) {
+// ExtractParsedCertificates parses all certificates in DataplaneConfig once, keyed by certID.
+func (cfg *DataplaneConfig) ExtractParsedCertificates() (map[string]*tls.Certificate, error) {
 	if cfg == nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 
-	parsedCerts := make(map[string]*tls.Certificate)
+	parsedCerts := make(map[string]*tls.Certificate, len(cfg.Certificates))
 	for id, data := range cfg.Certificates {
 		tlsCert, err := dataToTLSCert(data)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse certificate %s: %w", id, err)
+			return nil, fmt.Errorf("failed to parse certificate %s: %w", id, err)
 		}
 		parsedCerts[id] = tlsCert
+	}
+	return parsedCerts, nil
+}
+
+// ExtractCertificates reconstructs TLS certificates from DataplaneConfig.
+func (cfg *DataplaneConfig) ExtractCertificates() (map[string]*tls.Certificate, *tls.Certificate, error) {
+	parsedCerts, err := cfg.ExtractParsedCertificates()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	certsMap := make(map[string]*tls.Certificate)
@@ -205,6 +250,18 @@ func (cfg *DataplaneConfig) ExtractCertificates() (map[string]*tls.Certificate, 
 	return certsMap, defaultCert, nil
 }
 
+// ExtractBackendClientCertificate reconstructs the backend client certificate from DataplaneConfig.
+func (cfg *DataplaneConfig) ExtractBackendClientCertificate() (*tls.Certificate, error) {
+	if cfg == nil || cfg.BackendClientCertID == "" {
+		return nil, nil
+	}
+	data, ok := cfg.Certificates[cfg.BackendClientCertID]
+	if !ok {
+		return nil, fmt.Errorf("backend client certificate %s not found in certificates map", cfg.BackendClientCertID)
+	}
+	return dataToTLSCert(data)
+}
+
 // BuildGatewayDataplaneConfig builds a DataplaneConfig for a single compiled Gateway.
 func BuildGatewayDataplaneConfig(
 	cg *CompiledGateway,
@@ -217,8 +274,9 @@ func BuildGatewayDataplaneConfig(
 	gwKey := types.NamespacedName{Namespace: cg.Gateway.Namespace, Name: cg.Gateway.Name}
 	listeners, routes := BuildProxyConfig([]*CompiledGateway{cg})
 	certsMap, defaultCert := ExtractCertificates([]*CompiledGateway{cg}, secrets, refValidator)
+	backendClientCert := cg.BackendClientCert
 
-	return BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert)
+	return BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert, backendClientCert)
 }
 
 // Marshal serializes DataplaneConfig to JSON.
@@ -251,10 +309,47 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal dataplane config: %w", err)
 	}
-	certsMap, defaultCert, err := cfg.ExtractCertificates()
+
+	parsedCerts, err := cfg.ExtractParsedCertificates()
 	if err != nil {
 		return fmt.Errorf("failed to extract certificates: %w", err)
 	}
+
+	certsMap := make(map[string]*tls.Certificate)
+	for host, id := range cfg.HostCertificates {
+		if cert, ok := parsedCerts[id]; ok {
+			certsMap[host] = cert
+		}
+	}
+	var defaultCert *tls.Certificate
+	if cfg.DefaultCertID != "" {
+		defaultCert = parsedCerts[cfg.DefaultCertID]
+	}
+
+	for i := range cfg.Routes {
+		for j := range cfg.Routes[i].Rules {
+			for k := range cfg.Routes[i].Rules[j].Backends {
+				backend := &cfg.Routes[i].Rules[j].Backends[k]
+				if backend.TLSConfig != nil && backend.TLSConfig.ClientCertID != "" {
+					backend.TLSConfig.ClientCert = parsedCerts[backend.TLSConfig.ClientCertID]
+				}
+			}
+		}
+	}
+
+	for i := range cfg.Listeners {
+		for j := range cfg.Listeners[i].Routes {
+			for k := range cfg.Listeners[i].Routes[j].Rules {
+				for l := range cfg.Listeners[i].Routes[j].Rules[k].Backends {
+					backend := &cfg.Listeners[i].Routes[j].Rules[k].Backends[l]
+					if backend.TLSConfig != nil && backend.TLSConfig.ClientCertID != "" {
+						backend.TLSConfig.ClientCert = parsedCerts[backend.TLSConfig.ClientCertID]
+					}
+				}
+			}
+		}
+	}
+
 	updater.UpdateConfig(cfg.Listeners, cfg.Routes)
 	updater.UpdateCertificates(certsMap, defaultCert)
 	return nil

@@ -14,6 +14,7 @@
 package state
 
 import (
+	"crypto/tls"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -558,6 +559,8 @@ type InternalTLSConfig struct {
 	CACerts                 [][]byte
 	WellKnownCACertificates *gatewayv1.WellKnownCACertificatesType
 	SubjectAltNames         []gatewayv1.SubjectAltName
+	ClientCert              *tls.Certificate `json:"-"`
+	ClientCertID            string           `json:"clientCertID,omitempty"`
 }
 
 type InternalRedirect struct {
