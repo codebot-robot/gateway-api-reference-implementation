@@ -1143,11 +1143,14 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 				},
 			}
 
-			_, conds := ValidateListener(
+			_, conds, _ := ValidateListener(
 				ListenerToSpec(listener),
 				ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "gw"},
+				"default",
 				1,
 				secrets,
+				nil,
+				nil,
 				nil,
 			)
 
@@ -4114,4 +4117,556 @@ func (m *mockProxyUpdater) UpdateConfig(listeners []InternalListener, routes []I
 func (m *mockProxyUpdater) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
 	m.certs = certs
 	m.defCert = defaultCert
+}
+
+func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
+	certPEMDefault, _ := generateTestCertPEM(t, "default.example.com")
+	certPEMPort, _ := generateTestCertPEM(t, "port.example.com")
+	serverCertPEM, serverKeyPEM := generateTestCertPEM(t, "server.example.com")
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "server-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "server-cert"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       serverCertPEM,
+				corev1.TLSPrivateKeyKey: serverKeyPEM,
+			},
+		},
+	}
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "default-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "default-ca"},
+			Data:       map[string]string{"ca.crt": string(certPEMDefault)},
+		},
+		{Namespace: "default", Name: "port-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "port-ca"},
+			Data:       map[string]string{"ca.crt": string(certPEMPort)},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			TLS: &gatewayv1.GatewayTLSConfig{
+				Frontend: &gatewayv1.FrontendTLSConfig{
+					Default: gatewayv1.TLSConfig{
+						Validation: &gatewayv1.FrontendTLSValidation{
+							CACertificateRefs: []gatewayv1.ObjectReference{
+								{Kind: "ConfigMap", Group: "", Name: "default-ca"},
+							},
+						},
+					},
+					PerPort: []gatewayv1.TLSPortConfig{
+						{
+							Port: 8443,
+							TLS: gatewayv1.TLSConfig{
+								Validation: &gatewayv1.FrontendTLSValidation{
+									CACertificateRefs: []gatewayv1.ObjectReference{
+										{Kind: "ConfigMap", Group: "", Name: "port-ca"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https-default",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Kind: Ptr(gatewayv1.Kind("Secret")), Name: "server-cert"},
+						},
+					},
+				},
+				{
+					Name:     "https-port",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Kind: Ptr(gatewayv1.Kind("Secret")), Name: "server-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gw},
+		Secrets:    secrets,
+		ConfigMaps: configMaps,
+	})
+
+	cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "my-gw"}]
+	if cg == nil {
+		t.Fatalf("expected compiled gateway")
+	}
+
+	var elDefault, elPort *EffectiveListener
+	for _, el := range cg.EffectiveListeners {
+		switch el.Name {
+		case "https-default":
+			elDefault = el
+		case "https-port":
+			elPort = el
+		}
+	}
+
+	if elDefault == nil || elPort == nil {
+		t.Fatalf("expected both listeners to be present")
+	}
+
+	// 1. https-default resolves default-ca
+	if elDefault.ClientValidation == nil {
+		t.Fatalf("expected elDefault.ClientValidation != nil")
+	}
+	if len(elDefault.ClientValidation.CACertPEMs) != 1 || string(elDefault.ClientValidation.CACertPEMs[0]) != string(certPEMDefault) {
+		t.Errorf("elDefault did not resolve default-ca PEM")
+	}
+	if elDefault.ClientValidation.Mode != gatewayv1.AllowValidOnly {
+		t.Errorf("expected default mode AllowValidOnly, got %v", elDefault.ClientValidation.Mode)
+	}
+
+	// 2. https-port resolves port-ca (perPort overrides default)
+	if elPort.ClientValidation == nil {
+		t.Fatalf("expected elPort.ClientValidation != nil")
+	}
+	if len(elPort.ClientValidation.CACertPEMs) != 1 || string(elPort.ClientValidation.CACertPEMs[0]) != string(certPEMPort) {
+		t.Errorf("elPort did not resolve port-ca PEM (perPort override)")
+	}
+
+	// 3. Both are fail closed in part 1: Programmed=False, reason Pending
+	for _, el := range []*EffectiveListener{elDefault, elPort} {
+		var progCond, accCond, refCond *metav1.Condition
+		for i := range el.Conditions {
+			switch el.Conditions[i].Type {
+			case string(gatewayv1.ListenerConditionProgrammed):
+				progCond = &el.Conditions[i]
+			case string(gatewayv1.ListenerConditionAccepted):
+				accCond = &el.Conditions[i]
+			case string(gatewayv1.ListenerConditionResolvedRefs):
+				refCond = &el.Conditions[i]
+			}
+		}
+		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
+			t.Errorf("listener %s: expected Programmed=False/Pending, got %v", el.Name, progCond)
+		}
+		if accCond == nil || accCond.Status != metav1.ConditionTrue {
+			t.Errorf("listener %s: expected Accepted=True, got %v", el.Name, accCond)
+		}
+		if refCond == nil || refCond.Status != metav1.ConditionTrue {
+			t.Errorf("listener %s: expected ResolvedRefs=True, got %v", el.Name, refCond)
+		}
+
+		// InternalListener carries CA PEMs and mode
+		il := el.ToInternalListener()
+		if il.ClientValidation == nil || len(il.ClientValidation.CACertPEMs) == 0 {
+			t.Errorf("listener %s: InternalListener missing ClientValidation or CA PEMs", el.Name)
+		}
+	}
+
+	// 4. Absent from proxy listeners in part 1
+	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
+	if len(proxyListeners) != 0 {
+		t.Errorf("expected 0 proxy listeners (fail closed), got %d", len(proxyListeners))
+	}
+}
+
+func TestFrontendClientCertValidation_PerPortHTTPIgnored(t *testing.T) {
+	certPEM, _ := generateTestCertPEM(t, "example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "ca-cm"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca-cm"},
+			Data:       map[string]string{"ca.crt": string(certPEM)},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-http"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			TLS: &gatewayv1.GatewayTLSConfig{
+				Frontend: &gatewayv1.FrontendTLSConfig{
+					Default: gatewayv1.TLSConfig{
+						Validation: &gatewayv1.FrontendTLSValidation{
+							CACertificateRefs: []gatewayv1.ObjectReference{
+								{Kind: "ConfigMap", Group: "", Name: "ca-cm"},
+							},
+						},
+					},
+					PerPort: []gatewayv1.TLSPortConfig{
+						{
+							Port: 80,
+							TLS: gatewayv1.TLSConfig{
+								Validation: &gatewayv1.FrontendTLSValidation{
+									CACertificateRefs: []gatewayv1.ObjectReference{
+										{Kind: "ConfigMap", Group: "", Name: "ca-cm"},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-80",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gw},
+		ConfigMaps: configMaps,
+	})
+
+	cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-http"}]
+	if cg == nil || len(cg.EffectiveListeners) != 1 {
+		t.Fatalf("expected compiled gateway with 1 listener")
+	}
+
+	el := cg.EffectiveListeners[0]
+	if el.ClientValidation != nil {
+		t.Errorf("expected ClientValidation == nil on HTTP listener, got %v", el.ClientValidation)
+	}
+
+	var progCond, accCond, refCond *metav1.Condition
+	for i := range el.Conditions {
+		switch el.Conditions[i].Type {
+		case string(gatewayv1.ListenerConditionProgrammed):
+			progCond = &el.Conditions[i]
+		case string(gatewayv1.ListenerConditionAccepted):
+			accCond = &el.Conditions[i]
+		case string(gatewayv1.ListenerConditionResolvedRefs):
+			refCond = &el.Conditions[i]
+		}
+	}
+	if progCond == nil || progCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Programmed=True for HTTP listener, got %v", progCond)
+	}
+	if accCond == nil || accCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected Accepted=True for HTTP listener, got %v", accCond)
+	}
+	if refCond == nil || refCond.Status != metav1.ConditionTrue {
+		t.Errorf("expected ResolvedRefs=True for HTTP listener, got %v", refCond)
+	}
+
+	// Must be present in proxy listeners
+	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
+	if len(proxyListeners) != 1 {
+		t.Fatalf("expected HTTP listener present in proxy listeners, got %d", len(proxyListeners))
+	}
+	if proxyListeners[0].ClientValidation != nil {
+		t.Errorf("expected InternalListener ClientValidation == nil for HTTP listener")
+	}
+}
+
+func TestFrontendClientCertValidation_InvalidReasons(t *testing.T) {
+	serverCertPEM, serverKeyPEM := generateTestCertPEM(t, "server.example.com")
+	caCertPEM, _ := generateTestCertPEM(t, "ca.example.com")
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "server-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "server-cert"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       serverCertPEM,
+				corev1.TLSPrivateKeyKey: serverKeyPEM,
+			},
+		},
+	}
+
+	tests := []struct {
+		name               string
+		caRef              gatewayv1.ObjectReference
+		configMaps         map[types.NamespacedName]*corev1.ConfigMap
+		useGrant           bool
+		expectedRefReason  gatewayv1.ListenerConditionReason
+		expectedAccReason  gatewayv1.ListenerConditionReason
+		expectedProgReason gatewayv1.ListenerConditionReason
+		expectedRefStatus  metav1.ConditionStatus
+		expectedAccStatus  metav1.ConditionStatus
+		expectedProgStatus metav1.ConditionStatus
+	}{
+		{
+			name: "nonexistent ConfigMap",
+			caRef: gatewayv1.ObjectReference{
+				Group: "",
+				Kind:  "ConfigMap",
+				Name:  "does-not-exist",
+			},
+			configMaps:         map[types.NamespacedName]*corev1.ConfigMap{},
+			expectedRefReason:  gatewayv1.ListenerReasonInvalidCACertificateRef,
+			expectedAccReason:  gatewayv1.ListenerReasonNoValidCACertificate,
+			expectedProgReason: gatewayv1.ListenerReasonNoValidCACertificate,
+			expectedRefStatus:  metav1.ConditionFalse,
+			expectedAccStatus:  metav1.ConditionFalse,
+			expectedProgStatus: metav1.ConditionFalse,
+		},
+		{
+			name: "non-ConfigMap kind",
+			caRef: gatewayv1.ObjectReference{
+				Group: "",
+				Kind:  "Service",
+				Name:  "my-service",
+			},
+			configMaps:         map[types.NamespacedName]*corev1.ConfigMap{},
+			expectedRefReason:  gatewayv1.ListenerReasonInvalidCACertificateKind,
+			expectedAccReason:  gatewayv1.ListenerReasonNoValidCACertificate,
+			expectedProgReason: gatewayv1.ListenerReasonNoValidCACertificate,
+			expectedRefStatus:  metav1.ConditionFalse,
+			expectedAccStatus:  metav1.ConditionFalse,
+			expectedProgStatus: metav1.ConditionFalse,
+		},
+		{
+			name: "cross-namespace without grant",
+			caRef: gatewayv1.ObjectReference{
+				Group:     "",
+				Kind:      "ConfigMap",
+				Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+				Name:      "remote-ca",
+			},
+			configMaps: map[types.NamespacedName]*corev1.ConfigMap{
+				{Namespace: "other-ns", Name: "remote-ca"}: {
+					ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "remote-ca"},
+					Data:       map[string]string{"ca.crt": string(caCertPEM)},
+				},
+			},
+			useGrant:           false,
+			expectedRefReason:  gatewayv1.ListenerReasonRefNotPermitted,
+			expectedAccReason:  gatewayv1.ListenerReasonNoValidCACertificate,
+			expectedProgReason: gatewayv1.ListenerReasonNoValidCACertificate,
+			expectedRefStatus:  metav1.ConditionFalse,
+			expectedAccStatus:  metav1.ConditionFalse,
+			expectedProgStatus: metav1.ConditionFalse,
+		},
+		{
+			name: "cross-namespace with grant",
+			caRef: gatewayv1.ObjectReference{
+				Group:     "",
+				Kind:      "ConfigMap",
+				Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+				Name:      "remote-ca",
+			},
+			configMaps: map[types.NamespacedName]*corev1.ConfigMap{
+				{Namespace: "other-ns", Name: "remote-ca"}: {
+					ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "remote-ca"},
+					Data:       map[string]string{"ca.crt": string(caCertPEM)},
+				},
+			},
+			useGrant:           true,
+			expectedRefReason:  gatewayv1.ListenerReasonResolvedRefs,
+			expectedAccReason:  gatewayv1.ListenerReasonAccepted,
+			expectedProgReason: gatewayv1.ListenerReasonPending,
+			expectedRefStatus:  metav1.ConditionTrue,
+			expectedAccStatus:  metav1.ConditionTrue,
+			expectedProgStatus: metav1.ConditionFalse,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-test"},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "ref-class",
+					TLS: &gatewayv1.GatewayTLSConfig{
+						Frontend: &gatewayv1.FrontendTLSConfig{
+							Default: gatewayv1.TLSConfig{
+								Validation: &gatewayv1.FrontendTLSValidation{
+									CACertificateRefs: []gatewayv1.ObjectReference{tc.caRef},
+								},
+							},
+						},
+					},
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "https",
+							Port:     443,
+							Protocol: gatewayv1.HTTPSProtocolType,
+							TLS: &gatewayv1.ListenerTLSConfig{
+								CertificateRefs: []gatewayv1.SecretObjectReference{
+									{Kind: Ptr(gatewayv1.Kind("Secret")), Name: "server-cert"},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			inputs := ModelInputs{
+				Gateways:   []*gatewayv1.Gateway{gw},
+				Secrets:    secrets,
+				ConfigMaps: tc.configMaps,
+			}
+
+			if tc.useGrant {
+				grant := &gatewayv1beta1.ReferenceGrant{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "allow-gw"},
+					Spec: gatewayv1beta1.ReferenceGrantSpec{
+						From: []gatewayv1beta1.ReferenceGrantFrom{
+							{
+								Group:     gatewayv1.GroupName,
+								Kind:      "Gateway",
+								Namespace: "default",
+							},
+						},
+						To: []gatewayv1beta1.ReferenceGrantTo{
+							{
+								Group: "",
+								Kind:  "ConfigMap",
+								Name:  Ptr(gatewayv1.ObjectName("remote-ca")),
+							},
+						},
+					},
+				}
+				inputs.ReferenceGrants = map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant{
+					{Namespace: grant.Namespace, Name: grant.Name}: grant,
+				}
+				inputs.RefValidator = mapReferenceValidator{referenceGrants: inputs.ReferenceGrants}
+			}
+
+			compiled := CompileModel(inputs)
+			cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-test"}]
+			if cg == nil || len(cg.EffectiveListeners) != 1 {
+				t.Fatalf("expected 1 effective listener")
+			}
+
+			el := cg.EffectiveListeners[0]
+			var progCond, accCond, refCond *metav1.Condition
+			for i := range el.Conditions {
+				switch el.Conditions[i].Type {
+				case string(gatewayv1.ListenerConditionProgrammed):
+					progCond = &el.Conditions[i]
+				case string(gatewayv1.ListenerConditionAccepted):
+					accCond = &el.Conditions[i]
+				case string(gatewayv1.ListenerConditionResolvedRefs):
+					refCond = &el.Conditions[i]
+				}
+			}
+
+			if refCond == nil || refCond.Status != tc.expectedRefStatus || refCond.Reason != string(tc.expectedRefReason) {
+				t.Errorf("ResolvedRefs condition mismatch: want Status=%v Reason=%v, got %+v", tc.expectedRefStatus, tc.expectedRefReason, refCond)
+			}
+			if accCond == nil || accCond.Status != tc.expectedAccStatus || accCond.Reason != string(tc.expectedAccReason) {
+				t.Errorf("Accepted condition mismatch: want Status=%v Reason=%v, got %+v", tc.expectedAccStatus, tc.expectedAccReason, accCond)
+			}
+			if progCond == nil || progCond.Status != tc.expectedProgStatus || progCond.Reason != string(tc.expectedProgReason) {
+				t.Errorf("Programmed condition mismatch: want Status=%v Reason=%v, got %+v", tc.expectedProgStatus, tc.expectedProgReason, progCond)
+			}
+		})
+	}
+}
+
+func TestFrontendClientCertValidation_ValidFailClosedAndInternalListener(t *testing.T) {
+	caCertPEM, _ := generateTestCertPEM(t, "ca.example.com")
+	serverCertPEM, serverKeyPEM := generateTestCertPEM(t, "server.example.com")
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "server-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "server-cert"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       serverCertPEM,
+				corev1.TLSPrivateKeyKey: serverKeyPEM,
+			},
+		},
+	}
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{"ca.crt": string(caCertPEM)},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-valid"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			TLS: &gatewayv1.GatewayTLSConfig{
+				Frontend: &gatewayv1.FrontendTLSConfig{
+					Default: gatewayv1.TLSConfig{
+						Validation: &gatewayv1.FrontendTLSValidation{
+							CACertificateRefs: []gatewayv1.ObjectReference{
+								{Kind: "ConfigMap", Group: "", Name: "valid-ca"},
+							},
+							Mode: gatewayv1.AllowInsecureFallback,
+						},
+					},
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Kind: Ptr(gatewayv1.Kind("Secret")), Name: "server-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gw},
+		Secrets:    secrets,
+		ConfigMaps: configMaps,
+	})
+
+	cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-valid"}]
+	if cg == nil || len(cg.EffectiveListeners) != 1 {
+		t.Fatalf("expected 1 effective listener")
+	}
+
+	el := cg.EffectiveListeners[0]
+	if el.ClientValidation == nil {
+		t.Fatalf("expected ClientValidation != nil")
+	}
+	if el.ClientValidation.Mode != gatewayv1.AllowInsecureFallback {
+		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowInsecureFallback, el.ClientValidation.Mode)
+	}
+	if len(el.ClientValidation.CACertPEMs) != 1 || string(el.ClientValidation.CACertPEMs[0]) != string(caCertPEM) {
+		t.Errorf("CACertPEMs mismatch")
+	}
+
+	// Verify fail closed status
+	var progCond *metav1.Condition
+	for i := range el.Conditions {
+		if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+			progCond = &el.Conditions[i]
+		}
+	}
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
+		t.Errorf("expected Programmed=False/Pending, got %+v", progCond)
+	}
+	if progCond.Message != "Frontend validation is not yet enforced" {
+		t.Errorf("expected message 'Frontend validation is not yet enforced', got %q", progCond.Message)
+	}
+
+	// Verify compiled InternalListener
+	il := el.ToInternalListener()
+	if il.ClientValidation == nil {
+		t.Fatalf("expected InternalListener.ClientValidation != nil")
+	}
+	if il.ClientValidation.Mode != gatewayv1.AllowInsecureFallback {
+		t.Errorf("expected InternalListener mode %v, got %v", gatewayv1.AllowInsecureFallback, il.ClientValidation.Mode)
+	}
+	if len(il.ClientValidation.CACertPEMs) != 1 || string(il.ClientValidation.CACertPEMs[0]) != string(caCertPEM) {
+		t.Errorf("InternalListener CACertPEMs mismatch")
+	}
+
+	// Absent from proxy listeners
+	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
+	if len(proxyListeners) != 0 {
+		t.Errorf("expected listener absent from proxy listeners, got %d", len(proxyListeners))
+	}
 }
