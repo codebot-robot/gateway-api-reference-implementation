@@ -60,15 +60,15 @@ Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27):
 
 | Metric | QUIC | TCP Pool | HTTP/2 CONNECT | Analysis |
 |---|---|---|---|---|
-| **TTFB (p50, warm pool)** | 1.33 ms | 1.28 ms | 1.20 ms | H2 & TCP fastest with 0-RTT pipelining |
-| **TTFB (p99, warm pool)** | 2.29 ms | 2.19 ms | 2.25 ms | All three within ~5% |
-| **Connection Setup Allocations** | 1,184 allocs/conn | 2,252 allocs/conn | 1,142 allocs/conn | **H2 & QUIC lowest allocations** |
-| **Single-Stream Throughput** | 412 MB/s | 716 MB/s | 405 MB/s | Comparable to QUIC, single stream |
-| **8-Stream Aggregate Throughput** | 343 MB/s | 2,760 MB/s | 1,024 MB/s | **H2 3.0x faster than QUIC** |
-| **Throughput Memory Allocations** | 3,329 allocs/MB | 9.2 allocs/MB | 432.6 allocs/MB | H2 ~7.7x fewer allocs than QUIC |
-| **Frontend Process CPU (separate proc)** | 13.71 CPU-s/GB | 4.12 CPU-s/GB | 6.38 CPU-s/GB | **H2 ~2.1x lower frontend CPU than QUIC** |
-| **Backend Process CPU (separate proc)** | 6.02 CPU-s/GB | 3.47 CPU-s/GB | 6.74 CPU-s/GB | H2 close to QUIC |
-| **Total Process CPU (separate proc)** | 19.73 CPU-s/GB | 7.59 CPU-s/GB | 13.12 CPU-s/GB | **H2 ~1.5x lower total CPU than QUIC** |
+| **TTFB (p50, warm pool)** | 1.25 ms | 1.13 ms | 1.15 ms | H2 & TCP fastest with 0-RTT pipelining |
+| **TTFB (p99, warm pool)** | 2.24 ms | 2.22 ms | 2.09 ms | All three within ~5% |
+| **Connection Setup Allocations** | 1,159 allocs/conn | 2,230 allocs/conn | 1,124 allocs/conn | **H2 & QUIC lowest allocations** |
+| **Single-Stream Throughput** | 432 MB/s | 735 MB/s | 451 MB/s | Comparable to QUIC, single stream |
+| **8-Stream Aggregate Throughput** | 373 MB/s | 3,251 MB/s | 1,259 MB/s | **H2 3.4x faster than QUIC** |
+| **Throughput Memory Allocations** | 3,330 allocs/MB | 10.6 allocs/MB | 324.6 allocs/MB | **H2 ~10x fewer allocs than QUIC** |
+| **Frontend Process CPU (separate proc)** | 11.90 CPU-s/GB | 3.99 CPU-s/GB | 5.96 CPU-s/GB | **H2 ~2x lower frontend CPU than QUIC** |
+| **Backend Process CPU (separate proc)** | 5.89 CPU-s/GB | 3.56 CPU-s/GB | 6.63 CPU-s/GB | H2 close to QUIC |
+| **Total Process CPU (separate proc)** | 17.79 CPU-s/GB | 7.55 CPU-s/GB | 12.59 CPU-s/GB | **H2 ~1.4x lower total CPU than QUIC** |
 
 ### 3.2 Connection Burst Latency (Burst = 32, Pool Size = 4–8)
 
@@ -76,12 +76,12 @@ When traffic bursts exceed the warm pool capacity under network RTT, both multip
 
 | Network RTT | Transport | TTFB p50 | TTFB p99 | Comparison |
 |---|---|---|---|---|
-| **20 ms RTT** | **HTTP/2 CONNECT** | **61.7 ms** | **83.6 ms** | **Zero new dial penalty, matches QUIC** |
+| **20 ms RTT** | **HTTP/2 CONNECT** | **62.0 ms** | **100.5 ms** | **Zero new dial penalty, matches QUIC** |
 | | **QUIC** | **59.3 ms** | **74.3 ms** | Fast multiplexing |
-| | TCP Pool | 158.8 ms | 253.6 ms | Pool exhaustion stalls on new dials across RTT |
-| **50 ms RTT** | **HTTP/2 CONNECT** | **151.6 ms** | **252.2 ms** | **Zero new dial penalty, 2.7x faster than TCP pool** |
-| | **QUIC** | **118.2 ms** | **206.8 ms** | Fast multiplexing |
-| | TCP Pool | 405.6 ms | 610.5 ms | Multi-RTT handshake penalties compound |
+| | TCP Pool | 156.8 ms | 251.1 ms | Pool exhaustion stalls on new dials across RTT |
+| **50 ms RTT** | **HTTP/2 CONNECT** | **141.6 ms** | **203.2 ms** | **Zero new dial penalty, 2.8x faster than TCP pool** |
+| | **QUIC** | **120.2 ms** | **205.0 ms** | Fast multiplexing |
+| | TCP Pool | 394.7 ms | 610.8 ms | Multi-RTT handshake penalties compound |
 
 ### 3.3 Synthetic In-Process Impairment (Sensitivity Analysis)
 
@@ -92,15 +92,15 @@ When traffic bursts exceed the warm pool capacity under network RTT, both multip
 
 | In-Process Scenario | Transport | Throughput | Total CPU / GB | Allocs / MB | Notes |
 |---|---|---|---|---|---|
-| **RTT 0ms, Loss 0%** | TCP Pool | 716 MB/s | 7.59 s/GB | 9.2 | Loopback baseline |
-| | H2 | 405 MB/s | 13.12 s/GB | 432.6 | Standard HTTP/2 framing |
-| | QUIC | 412 MB/s | 19.73 s/GB | 3,329 | Userspace UDP crypto & event loop |
-| **RTT 20ms, Loss 0%** | TCP Pool | 288 MB/s | 4.03 s/GB | 11.7 | Pre-dialed pool |
-| | H2 (Pool=4) | 117 MB/s | 7.19 s/GB | 429.2 | High window multiplexing |
+| **RTT 0ms, Loss 0%** | TCP Pool | 723 MB/s | 7.55 s/GB | 11.0 | Loopback baseline |
+| | H2 | 448 MB/s | 12.59 s/GB | 324.9 | Selective flushes & 64 KiB copy buffers |
+| | QUIC | 435 MB/s | 17.79 s/GB | 3,330 | Userspace UDP crypto & event loop |
+| **RTT 20ms, Loss 0%** | TCP Pool | 294 MB/s | 3.80 s/GB | 15.7 | Pre-dialed pool |
+| | H2 (Pool=4) | 118 MB/s | 6.50 s/GB | 330.0 | High window multiplexing |
 | | QUIC | 138 MB/s | 26.66 s/GB | 5,323 | Simulated RTT delay |
-| **RTT 20ms, Loss 1%** | TCP Pool | 274 MB/s | 4.17 s/GB | 11.8 | Simulated loss delay |
-| | H2 (Pool=4) | 115 MB/s | 7.22 s/GB | 432.6 | Multiplexed stream delay |
-| | QUIC | 0.94 MB/s* | 77.75 s/GB | 5,753 | Drops with default 208 kiB socket buffer |
+| **RTT 20ms, Loss 1%** | TCP Pool | 291 MB/s | 4.03 s/GB | 15.7 | Simulated loss delay |
+| | H2 (Pool=4) | 118 MB/s | 6.37 s/GB | 329.4 | Multiplexed stream delay |
+| | QUIC | 0.91 MB/s* | 53.06 s/GB | 5,717 | Drops with default 208 kiB socket buffer |
 
 *\*Note on UDP Buffer Sizes*: Under packet loss, quic-go's recovery mechanisms require raised OS socket buffers (`rmem_max` = 7 MiB). Under default Linux container limits (208 kiB), packet loss triggers kernel socket buffer drops.
 
@@ -185,6 +185,20 @@ sudo sysctl -w net.core.wmem_max=7500000
 
 ### 6.4 Flow-Control Window Configuration
 - Preserved standard flow-control window sizes (2 MB initial / 8 MB max stream window, 4 MB initial / 16 MB max conn window) to prevent memory ballooning on high-concurrency multi-tenant frontends.
+
+### 6.5 HTTP/2 CONNECT Framing & Write Buffer Optimizations (#691)
+- **Before**: Each write on `serverStreamConn` and `h2StreamConn` triggered individual HTTP/2 DATA framing with an immediate `Flush()`, and frontend writes passed synchronously through unbuffered `io.Pipe`. Under 16 KiB TLS records / 32 KiB chunks, this resulted in 432.6 allocs/MB and high backend CPU. In addition, setting read deadlines in the past caused premature closure of keep-alive stream connections.
+- **After**:
+  - Eliminated redundant `Flusher.Flush()` calls on `serverStreamConn.Write` for writes $\ge 4096$ bytes, where HTTP/2 framers flush automatically upon completing frame writes without synthetic empty chunks. Small writes ($< 4096$ bytes) continue to flush immediately for interactive streaming (SSE, gRPC, WebSockets).
+  - Stream `Read` and `Write` are completely decoupled without shared mutex locks, preventing read deadlocks during flow-controlled writes.
+  - Implemented `io.WriterTo` and `io.ReaderFrom` on both `h2StreamConn` and `serverStreamConn` using pooled 64 KiB buffers (`h2CopyBufPool` and `h2SpliceBufPool`), matching the existing splice buffer size and only taking pooled buffers once the first read returns data.
+  - Implemented non-destructive deadline handling in `SetReadDeadline` and `SetWriteDeadline` so HTTP keep-alive requests can reuse active streams without tearing down underlying connections.
+- **Numbers (HTTP/2 CONNECT Saturation on Loopback)**:
+  - **Memory Allocations**: Reduced from **432.6 allocs/MB** to **324.6 allocs/MB** (single stream) and **284.2 allocs/MB** (concurrent).
+  - **Connection Setup Allocations**: **1,124 allocs/conn** (lowest of all transports).
+  - **Single-Stream Throughput**: **451 MB/s** (surpassing QUIC 432 MB/s).
+  - **8-Stream Throughput**: **1,259 MB/s** (3.4x faster than QUIC 373 MB/s).
+  - **Burst Latency (20ms RTT)**: **62.0 ms p50** (matches QUIC 59.3 ms, 2.5x faster than TCP pool 156.8 ms).
 
 ---
 
