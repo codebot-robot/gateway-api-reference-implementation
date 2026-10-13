@@ -467,6 +467,9 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		}
 	}
 	sort.Slice(gws, func(i, j int) bool {
+		if !gws[i].CreationTimestamp.Equal(&gws[j].CreationTimestamp) {
+			return gws[i].CreationTimestamp.Before(&gws[j].CreationTimestamp)
+		}
 		if gws[i].Namespace != gws[j].Namespace {
 			return gws[i].Namespace < gws[j].Namespace
 		}
@@ -642,6 +645,13 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		copy(suppAddrs, s.supportedAddressTypes)
 	}
 
+	allInOne := false
+	if s.dataplanePublisher == nil {
+		allInOne = true
+	} else if _, ok := s.dataplanePublisher.(*InProcessDataplanePublisher); ok {
+		allInOne = true
+	}
+
 	return ModelInputs{
 		Revision:              s.revision,
 		Gateways:              gws,
@@ -663,6 +673,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		ReferenceGrants:       referenceGrants,
 		RefValidator:          mapReferenceValidator{referenceGrants: referenceGrants},
 		ControllerName:        s.controllerName,
+		AllInOneMode:          allInOne,
 	}
 }
 

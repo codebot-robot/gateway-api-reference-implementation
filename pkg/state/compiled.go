@@ -89,6 +89,7 @@ type EffectiveListener struct {
 	AttachedRoutes   int32
 	Routes           []InternalRoute
 	TLSBackends      map[string][]InternalTLSBackend
+	BoundTCPRoute    *types.NamespacedName
 	TCPBackends      []InternalTCPBackend
 	ClientValidation *InternalClientValidation
 	Generation       int64
@@ -286,6 +287,7 @@ type ModelInputs struct {
 	ReferenceGrants       map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 	RefValidator          ReferenceGrantValidator
 	ControllerName        string
+	AllInOneMode          bool
 }
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
@@ -1108,8 +1110,22 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 	}
 
-	// 1. Compile each Gateway and its effective listeners
-	for _, gw := range inputs.Gateways {
+	// 1. Compile each Gateway and its effective listeners in precedence order
+	sortedGateways := make([]*gatewayv1.Gateway, len(inputs.Gateways))
+	copy(sortedGateways, inputs.Gateways)
+	sort.Slice(sortedGateways, func(i, j int) bool {
+		if !sortedGateways[i].CreationTimestamp.Equal(&sortedGateways[j].CreationTimestamp) {
+			return sortedGateways[i].CreationTimestamp.Before(&sortedGateways[j].CreationTimestamp)
+		}
+		if sortedGateways[i].Namespace != sortedGateways[j].Namespace {
+			return sortedGateways[i].Namespace < sortedGateways[j].Namespace
+		}
+		return sortedGateways[i].Name < sortedGateways[j].Name
+	})
+
+	boundTCPPorts := make(map[gatewayv1.PortNumber]string)
+
+	for _, gw := range sortedGateways {
 		if gw == nil {
 			continue
 		}
@@ -1180,6 +1196,17 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		// Conflict detection pass over all effective listeners on this Gateway in precedence order
 		for i := 0; i < len(cg.EffectiveListeners); i++ {
 			elCur := cg.EffectiveListeners[i]
+			if elCur.IsConflicted() {
+				continue
+			}
+
+			// Port conflicts with reserved proxy ports 8000/8443
+			if elCur.Protocol == gatewayv1.TCPProtocolType && (elCur.Port == 8000 || elCur.Port == 8443) {
+				msg := fmt.Sprintf("TCP listener port %d conflicts with reserved proxy port %d", elCur.Port, elCur.Port)
+				markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
+				continue
+			}
+
 			for j := 0; j < i; j++ {
 				elPrev := cg.EffectiveListeners[j]
 				if elPrev.IsConflicted() {
@@ -1208,6 +1235,25 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 					msg := fmt.Sprintf("Hostname %q conflicts with higher-precedence listener %q on port %d", hCur, elPrev.QualifiedName(), elCur.Port)
 					markListenerConflicted(elCur, gatewayv1.ListenerReasonHostnameConflict, msg)
 					break
+				}
+			}
+		}
+
+		// In all-in-one mode, two Gateways with the same TCP port cannot both bind; first wins and second reports Programmed=False.
+		if inputs.AllInOneMode {
+			for _, el := range cg.EffectiveListeners {
+				if el.Protocol == gatewayv1.TCPProtocolType && el.IsAccepted() && !el.IsConflicted() {
+					if firstGW, exists := boundTCPPorts[el.Port]; exists {
+						SetCondition(&el.Conditions, NewCondition(
+							string(gatewayv1.ListenerConditionProgrammed),
+							metav1.ConditionFalse,
+							string(gatewayv1.ListenerReasonPortUnavailable),
+							fmt.Sprintf("Port %d is already bound by Gateway %s in all-in-one mode", el.Port, firstGW),
+							el.Generation,
+						))
+					} else {
+						boundTCPPorts[el.Port] = gwKey.String()
+					}
 				}
 			}
 		}
@@ -1738,9 +1784,13 @@ func bindTCPRouteParentRef(
 			isKindAllowed: IsTCPRoute,
 			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
 				if rs.Internal != nil {
-					for _, rule := range rs.Internal.Rules {
-						if len(rule.Backends) > 0 {
-							el.TCPBackends = append(el.TCPBackends, rule.Backends...)
+					routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+					if el.BoundTCPRoute == nil || *el.BoundTCPRoute == routeKey {
+						el.BoundTCPRoute = &routeKey
+						for _, rule := range rs.Internal.Rules {
+							if len(rule.Backends) > 0 {
+								el.TCPBackends = append(el.TCPBackends, rule.Backends...)
+							}
 						}
 					}
 				}
@@ -1872,6 +1922,9 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 				continue
 			}
 			if el.ClientValidation != nil {
+				continue
+			}
+			if el.Protocol == gatewayv1.TCPProtocolType && !el.IsProgrammed() {
 				continue
 			}
 			iListener := el.ToInternalListener()

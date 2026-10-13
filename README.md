@@ -33,6 +33,16 @@ HTTP/3 is opt-in and disabled by default.
 
 When HTTP/3 is enabled, HTTPS (TCP) responses automatically include an `Alt-Svc: h3=":<advertised-port>"; ma=86400` header so compatible clients can discover and upgrade to HTTP/3.
 
+### TCP Support (TCPRoute)
+
+GARI supports `TCPRoute` routing raw TCP traffic on dedicated listener ports.
+
+- **Per-Port Listeners & Splicing**: TCP listeners open individual accept sockets per distinct listener port and splice bidirectional TCP traffic to resolved backends immediately upon connection establishment without waiting for client data (safe for backends that speak first).
+- **Weighted Routing**: Traffic is distributed across configured backendRefs according to weight; backends with weight `0` receive no traffic.
+- **Per-Gateway Data Plane (Default / Conformance)**: In standard deployment (`singlepod`), each Gateway runs its own data plane Deployment and LoadBalancer Service mapping TCP listener ports directly to matching container ports without collapsing onto shared proxy ports.
+- **Multiple Attached TCPRoutes**: Because raw TCP has no hostnames or paths to demultiplex on, when multiple TCPRoutes attach to the same TCP listener, only the oldest route's backends receive traffic. Subsequent routes targeting the same listener report `Accepted=True` and contribute to the listener's `attachedRoutes` count, but carry no traffic.
+- **All-in-One Mode Limitation**: In all-in-one mode where multiple Gateways share a single controller and proxy process, two Gateways cannot both bind the same TCP port. The first Gateway (by creation timestamp precedence) wins, and any subsequent Gateway listener requesting the same port reports `Programmed=False` with reason `PortUnavailable`. Per-Gateway data plane mode (`singlepod`) is the recommended and conformance path.
+
 ## Contributing
 
 This project is licensed under the [Apache 2.0 License](LICENSE).

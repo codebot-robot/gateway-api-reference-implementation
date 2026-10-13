@@ -17,6 +17,7 @@ package state
 import (
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -896,8 +897,14 @@ func TestTCPRoute_TwoRoutesOnOneListener(t *testing.T) {
 		}
 	}
 
-	if len(outputs.ProxyListeners[0].TCPBackends) != 2 {
-		t.Fatalf("expected 2 TCPBackends on listener, got %d", len(outputs.ProxyListeners[0].TCPBackends))
+	// In Gateway API conformance (TCPRouteMultipleRoutesAttachment), both routes are
+	// accepted and AttachedRoutes is 2, but only the oldest route is bound to the listener
+	// for traffic routing.
+	if len(outputs.ProxyListeners[0].TCPBackends) != 1 {
+		t.Fatalf("expected 1 TCPBackend on listener (from oldest route), got %d", len(outputs.ProxyListeners[0].TCPBackends))
+	}
+	if outputs.ProxyListeners[0].TCPBackends[0].Target != "svc-1.default.svc.cluster.local:9000" {
+		t.Errorf("expected target from route-1, got %s", outputs.ProxyListeners[0].TCPBackends[0].Target)
 	}
 }
 
@@ -1003,5 +1010,222 @@ func TestPickTCPBackend(t *testing.T) {
 	var nilLis *InternalListener
 	if _, ok := nilLis.SelectTCPBackend(); ok {
 		t.Errorf("expected ok=false on nil listener")
+	}
+}
+
+func TestTCPListener_ConflictReservedPorts(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-reserved-conflict",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tcp-8000",
+					Port:     8000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-8443",
+					Port:     8443,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-valid",
+					Port:     9000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+	}
+
+	outputs := ComputeOutputs(inputs)
+	gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+
+	listenerStatusMap := make(map[gatewayv1.SectionName]gatewayv1.ListenerStatus)
+	for _, ls := range gwStatus.Listeners {
+		listenerStatusMap[ls.Name] = ls
+	}
+
+	for _, name := range []gatewayv1.SectionName{"tcp-8000", "tcp-8443"} {
+		ls, ok := listenerStatusMap[name]
+		if !ok {
+			t.Fatalf("listener %s status not found", name)
+		}
+		var confCond, acceptedCond, progCond *metav1.Condition
+		for _, c := range ls.Conditions {
+			switch c.Type {
+			case string(gatewayv1.ListenerConditionConflicted):
+				confCond = &c
+			case string(gatewayv1.ListenerConditionAccepted):
+				acceptedCond = &c
+			case string(gatewayv1.ListenerConditionProgrammed):
+				progCond = &c
+			}
+		}
+		if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(gatewayv1.ListenerReasonProtocolConflict) {
+			t.Errorf("listener %s expected Conflicted=True ProtocolConflict, got %+v", name, confCond)
+		}
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse {
+			t.Errorf("listener %s expected Accepted=False, got %+v", name, acceptedCond)
+		}
+		if progCond == nil || progCond.Status != metav1.ConditionFalse {
+			t.Errorf("listener %s expected Programmed=False, got %+v", name, progCond)
+		}
+	}
+
+	// tcp-valid must be accepted and programmed
+	validLS, ok := listenerStatusMap["tcp-valid"]
+	if !ok {
+		t.Fatalf("listener tcp-valid status not found")
+	}
+	var validAccepted, validProg *metav1.Condition
+	for _, c := range validLS.Conditions {
+		switch c.Type {
+		case string(gatewayv1.ListenerConditionAccepted):
+			validAccepted = &c
+		case string(gatewayv1.ListenerConditionProgrammed):
+			validProg = &c
+		}
+	}
+	if validAccepted == nil || validAccepted.Status != metav1.ConditionTrue {
+		t.Errorf("listener tcp-valid expected Accepted=True, got %+v", validAccepted)
+	}
+	if validProg == nil || validProg.Status != metav1.ConditionTrue {
+		t.Errorf("listener tcp-valid expected Programmed=True, got %+v", validProg)
+	}
+
+	// In outputs.ProxyListeners, only tcp-valid should appear
+	if len(outputs.ProxyListeners) != 1 || outputs.ProxyListeners[0].Port != 9000 {
+		t.Errorf("expected 1 proxy listener on port 9000, got %+v", outputs.ProxyListeners)
+	}
+}
+
+func TestTCPListener_AllInOneModeConflict(t *testing.T) {
+	now := metav1.Now()
+	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw1-older",
+			Namespace:         "default",
+			CreationTimestamp: olderTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tcp-shared",
+					Port:     9000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+			},
+		},
+	}
+
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw2-newer",
+			Namespace:         "default",
+			CreationTimestamp: newerTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tcp-shared",
+					Port:     9000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	// 1. With AllInOneMode: true
+	inputsAllInOne := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw2, gw1}, // pass in arbitrary order
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputsAllInOne := ComputeOutputs(inputsAllInOne)
+
+	// First gateway (older) wins: Programmed=True
+	gw1Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw1.Name}]
+	var gw1ProgCond *metav1.Condition
+	for _, c := range gw1Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw1ProgCond = &c
+			break
+		}
+	}
+	if gw1ProgCond == nil || gw1ProgCond.Status != metav1.ConditionTrue {
+		t.Errorf("gw1 (older) expected Programmed=True, got %+v", gw1ProgCond)
+	}
+
+	// Second gateway (newer) loses: Programmed=False, reason PortUnavailable
+	gw2Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2ProgCond *metav1.Condition
+	for _, c := range gw2Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2ProgCond = &c
+			break
+		}
+	}
+	if gw2ProgCond == nil || gw2ProgCond.Status != metav1.ConditionFalse || gw2ProgCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+		t.Errorf("gw2 (newer) expected Programmed=False PortUnavailable, got %+v", gw2ProgCond)
+	}
+
+	// Proxy listeners in all-in-one should only include the first (gw1) listener
+	if len(outputsAllInOne.ProxyListeners) != 1 || outputsAllInOne.ProxyListeners[0].GatewayName.String() != "default/gw1-older" {
+		t.Errorf("expected only gw1 proxy listener, got %+v", outputsAllInOne.ProxyListeners)
+	}
+
+	// 2. With AllInOneMode: false (singlepod mode)
+	inputsSinglePod := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw1, gw2},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   false,
+	}
+
+	outputsSinglePod := ComputeOutputs(inputsSinglePod)
+	gw2SinglePodStatus := outputsSinglePod.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2SinglePodProg *metav1.Condition
+	for _, c := range gw2SinglePodStatus.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2SinglePodProg = &c
+			break
+		}
+	}
+	if gw2SinglePodProg == nil || gw2SinglePodProg.Status != metav1.ConditionTrue {
+		t.Errorf("in singlepod mode, gw2 expected Programmed=True, got %+v", gw2SinglePodProg)
 	}
 }

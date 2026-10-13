@@ -50,6 +50,20 @@ type Proxy struct {
 	defaultCert  *tls.Certificate
 
 	sniConfig atomic.Pointer[sniConfig]
+
+	tcpListeners map[gatewayv1.PortNumber]*tcpPortListener
+	tcpBindHost  string
+	listenFunc   func(network, addr string) (net.Listener, error)
+	dialFunc     func(network, addr string) (net.Conn, error)
+	closed       bool
+}
+
+type tcpPortListener struct {
+	port     gatewayv1.PortNumber
+	ln       net.Listener
+	backends atomic.Pointer[[]state.InternalTCPBackend]
+	closed   atomic.Bool
+	done     chan struct{}
 }
 
 type sniConfig struct {
@@ -62,6 +76,7 @@ func NewProxy() *Proxy {
 		routes:       []state.InternalRoute{},
 		listeners:    []state.InternalListener{},
 		certificates: make(map[string]*tls.Certificate),
+		tcpListeners: make(map[gatewayv1.PortNumber]*tcpPortListener),
 	}
 	p.sniConfig.Store(&sniConfig{})
 	return p
@@ -71,6 +86,49 @@ func (p *Proxy) SetDefaultCertificate(cert *tls.Certificate) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.defaultCert = cert
+}
+
+func (p *Proxy) SetTCPBindHost(host string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tcpBindHost = host
+}
+
+func (p *Proxy) SetListenFunc(fn func(network, addr string) (net.Listener, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.listenFunc = fn
+}
+
+func (p *Proxy) SetDialFunc(fn func(network, addr string) (net.Conn, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dialFunc = fn
+}
+
+func (p *Proxy) GetTCPListener(port gatewayv1.PortNumber) net.Listener {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if pl, ok := p.tcpListeners[port]; ok {
+		return pl.ln
+	}
+	return nil
+}
+
+func (p *Proxy) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	var errs []error
+	for port, pl := range p.tcpListeners {
+		pl.closed.Store(true)
+		close(pl.done)
+		if err := pl.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+		delete(p.tcpListeners, port)
+	}
+	return errors.Join(errs...)
 }
 
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
@@ -84,6 +142,7 @@ func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
 	defer p.mu.Unlock()
 	p.listeners = listeners
 	p.updateSNIConfigLocked(listeners)
+	p.updateTCPListenersLocked(listeners)
 }
 
 func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.InternalRoute) {
@@ -92,6 +151,116 @@ func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.
 	p.listeners = listeners
 	p.routes = routes
 	p.updateSNIConfigLocked(listeners)
+	p.updateTCPListenersLocked(listeners)
+}
+
+func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
+	if p.closed {
+		return
+	}
+	if p.tcpListeners == nil {
+		p.tcpListeners = make(map[gatewayv1.PortNumber]*tcpPortListener)
+	}
+
+	desired := make(map[gatewayv1.PortNumber][]state.InternalTCPBackend)
+	for _, lis := range listeners {
+		if lis.Protocol != gatewayv1.TCPProtocolType {
+			continue
+		}
+		if _, exists := desired[lis.Port]; !exists {
+			desired[lis.Port] = lis.TCPBackends
+		}
+	}
+
+	// Remove ports that are no longer present
+	for port, pl := range p.tcpListeners {
+		if _, exists := desired[port]; !exists {
+			pl.closed.Store(true)
+			close(pl.done)
+			if err := pl.ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				klog.V(2).Infof("failed to close TCP listener on port %d: %v", port, err)
+			}
+			delete(p.tcpListeners, port)
+		}
+	}
+
+	// Update existing ports or open new ones
+	for port, backends := range desired {
+		backendsCopy := make([]state.InternalTCPBackend, len(backends))
+		copy(backendsCopy, backends)
+
+		if pl, exists := p.tcpListeners[port]; exists {
+			pl.backends.Store(&backendsCopy)
+		} else {
+			listenFn := p.listenFunc
+			if listenFn == nil {
+				listenFn = net.Listen
+			}
+			addr := net.JoinHostPort(p.tcpBindHost, strconv.Itoa(int(port)))
+			ln, err := listenFn("tcp", addr)
+			if err != nil {
+				klog.Errorf("failed to listen on TCP port %d (%s): %v", port, addr, err)
+				continue
+			}
+			pl := &tcpPortListener{
+				port: port,
+				ln:   ln,
+				done: make(chan struct{}),
+			}
+			pl.backends.Store(&backendsCopy)
+			p.tcpListeners[port] = pl
+			go p.tcpAcceptLoop(pl)
+		}
+	}
+}
+
+func (p *Proxy) tcpAcceptLoop(pl *tcpPortListener) {
+	for {
+		conn, err := pl.ln.Accept()
+		if err != nil {
+			if pl.closed.Load() || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			select {
+			case <-pl.done:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			continue
+		}
+		go p.handleTCPConn(conn, pl)
+	}
+}
+
+func (p *Proxy) getDialFunc() func(network, addr string) (net.Conn, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.dialFunc != nil {
+		return p.dialFunc
+	}
+	return (&net.Dialer{Timeout: 5 * time.Second}).Dial
+}
+
+func (p *Proxy) handleTCPConn(conn net.Conn, pl *tcpPortListener) {
+	bp := pl.backends.Load()
+	if bp == nil || len(*bp) == 0 {
+		closeConn(conn)
+		return
+	}
+	target, ok := state.PickTCPBackend(*bp)
+	if !ok || target == "" {
+		closeConn(conn)
+		return
+	}
+
+	dialFn := p.getDialFunc()
+	backendConn, err := dialFn("tcp", target)
+	if err != nil {
+		closeConn(conn)
+		return
+	}
+
+	go spliceConns(conn, backendConn)
 }
 
 func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {

@@ -1628,3 +1628,158 @@ func TestSinglePodAddressProvider_MultipleRequestedIPs(t *testing.T) {
 		t.Errorf("expected message to contain %q, got %q", expectedMsgSub, readiness.Message)
 	}
 }
+
+func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testing.T) {
+	c := setupTestClient(t)
+	p := NewAddressProvider(c)
+	ctx := t.Context()
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-tcp",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-tcp-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+				{
+					Name:     "tcp-1",
+					Port:     9000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-2",
+					Port:     9001,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-conflicted",
+					Port:     8000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     "http",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+		{
+			Name:     "tcp-1",
+			Port:     9000,
+			Protocol: gatewayv1.TCPProtocolType,
+		},
+		{
+			Name:     "tcp-2",
+			Port:     9001,
+			Protocol: gatewayv1.TCPProtocolType,
+		},
+		{
+			Name:     "tcp-conflicted",
+			Port:     8000,
+			Protocol: gatewayv1.TCPProtocolType,
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(gatewayv1.ListenerConditionConflicted),
+					Status: metav1.ConditionTrue,
+					Reason: string(gatewayv1.ListenerReasonProtocolConflict),
+				},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resName := ResourceNameForGateway("gw-tcp")
+
+	// 1. Verify Service ports
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get created Service: %v", err)
+	}
+
+	svcPortMap := make(map[string]corev1.ServicePort)
+	for _, sp := range svc.Spec.Ports {
+		svcPortMap[sp.Name] = sp
+	}
+
+	// Verify HTTP port remapped to 8000
+	if sp, ok := svcPortMap["http-80"]; !ok {
+		t.Errorf("expected Service port http-80")
+	} else {
+		if sp.Port != 80 || sp.TargetPort.IntValue() != 8000 || sp.Protocol != corev1.ProtocolTCP {
+			t.Errorf("http-80: got port=%d targetPort=%v proto=%s", sp.Port, sp.TargetPort, sp.Protocol)
+		}
+	}
+
+	// Verify TCP ports mapped to matching target ports
+	if sp, ok := svcPortMap["tcp-9000"]; !ok {
+		t.Errorf("expected Service port tcp-9000")
+	} else {
+		if sp.Port != 9000 || sp.TargetPort.IntValue() != 9000 || sp.Protocol != corev1.ProtocolTCP {
+			t.Errorf("tcp-9000: got port=%d targetPort=%v proto=%s, want matching targetPort 9000", sp.Port, sp.TargetPort, sp.Protocol)
+		}
+	}
+
+	if sp, ok := svcPortMap["tcp-9001"]; !ok {
+		t.Errorf("expected Service port tcp-9001")
+	} else {
+		if sp.Port != 9001 || sp.TargetPort.IntValue() != 9001 || sp.Protocol != corev1.ProtocolTCP {
+			t.Errorf("tcp-9001: got port=%d targetPort=%v proto=%s, want matching targetPort 9001", sp.Port, sp.TargetPort, sp.Protocol)
+		}
+	}
+
+	// Verify conflicted TCP listener port 8000 is NOT in Service
+	if _, ok := svcPortMap["tcp-8000"]; ok {
+		t.Errorf("conflicted port 8000 should NOT be exposed on Service")
+	}
+
+	// 2. Verify Deployment container ports
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	containerPorts := deploy.Spec.Template.Spec.Containers[0].Ports
+	cpMap := make(map[string]corev1.ContainerPort)
+	for _, cp := range containerPorts {
+		cpMap[cp.Name] = cp
+	}
+
+	// Verify default container ports
+	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8000 {
+		t.Errorf("expected container port http:8000")
+	}
+	if cp, ok := cpMap["https"]; !ok || cp.ContainerPort != 8443 {
+		t.Errorf("expected container port https:8443")
+	}
+
+	// Verify TCP listener container ports
+	if cp, ok := cpMap["tcp-9000"]; !ok {
+		t.Errorf("expected container port tcp-9000")
+	} else if cp.ContainerPort != 9000 || cp.Protocol != corev1.ProtocolTCP {
+		t.Errorf("tcp-9000: got containerPort=%d proto=%s, want 9000/TCP", cp.ContainerPort, cp.Protocol)
+	}
+
+	if cp, ok := cpMap["tcp-9001"]; !ok {
+		t.Errorf("expected container port tcp-9001")
+	} else if cp.ContainerPort != 9001 || cp.Protocol != corev1.ProtocolTCP {
+		t.Errorf("tcp-9001: got containerPort=%d proto=%s, want 9001/TCP", cp.ContainerPort, cp.Protocol)
+	}
+
+	// Verify conflicted TCP listener port 8000 is NOT in Deployment
+	if _, ok := cpMap["tcp-8000"]; ok {
+		t.Errorf("conflicted port 8000 should NOT be declared on Deployment container ports")
+	}
+}

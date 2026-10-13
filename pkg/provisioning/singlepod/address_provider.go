@@ -338,6 +338,71 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		image = DefaultDataplaneImage
 	}
 
+	// Compute unique listener ports and TCP ports across effective listeners
+	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
+	var tcpPorts []int
+	seenTCPPort := make(map[gatewayv1.PortNumber]bool)
+	if len(effectiveListeners) > 0 {
+		for _, el := range effectiveListeners {
+			if el.IsConflicted() {
+				continue
+			}
+			if el.Protocol == gatewayv1.TCPProtocolType {
+				if !seenTCPPort[el.Port] {
+					seenTCPPort[el.Port] = true
+					tcpPorts = append(tcpPorts, int(el.Port))
+				}
+			}
+			if prev, ok := uniquePorts[el.Port]; !ok {
+				uniquePorts[el.Port] = el.Protocol
+			} else if el.Protocol == gatewayv1.HTTPSProtocolType {
+				uniquePorts[el.Port] = gatewayv1.HTTPSProtocolType
+			} else if el.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
+				uniquePorts[el.Port] = gatewayv1.TLSProtocolType
+			}
+		}
+	} else {
+		for _, l := range gw.Spec.Listeners {
+			if l.Protocol == gatewayv1.TCPProtocolType {
+				if !seenTCPPort[l.Port] {
+					seenTCPPort[l.Port] = true
+					tcpPorts = append(tcpPorts, int(l.Port))
+				}
+			}
+			if prev, ok := uniquePorts[l.Port]; !ok {
+				uniquePorts[l.Port] = l.Protocol
+			} else if l.Protocol == gatewayv1.HTTPSProtocolType {
+				uniquePorts[l.Port] = gatewayv1.HTTPSProtocolType
+			} else if l.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
+				uniquePorts[l.Port] = gatewayv1.TLSProtocolType
+			}
+		}
+	}
+	sort.Ints(tcpPorts)
+
+	containerPorts := []*corev1ac.ContainerPortApplyConfiguration{
+		corev1ac.ContainerPort().
+			WithName("http").
+			WithContainerPort(8000).
+			WithProtocol(corev1.ProtocolTCP),
+		corev1ac.ContainerPort().
+			WithName("https").
+			WithContainerPort(8443).
+			WithProtocol(corev1.ProtocolTCP),
+		corev1ac.ContainerPort().
+			WithName("http3").
+			WithContainerPort(8443).
+			WithProtocol(corev1.ProtocolUDP),
+	}
+	for _, portInt := range tcpPorts {
+		containerPorts = append(containerPorts,
+			corev1ac.ContainerPort().
+				WithName(fmt.Sprintf("tcp-%d", portInt)).
+				WithContainerPort(int32(portInt)).
+				WithProtocol(corev1.ProtocolTCP),
+		)
+	}
+
 	podTemplate := corev1ac.PodTemplateSpec().
 		WithLabels(labels).
 		WithSpec(corev1ac.PodSpec().
@@ -347,20 +412,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				WithImage(image).
 				WithImagePullPolicy(corev1.PullIfNotPresent).
 				WithArgs(args...).
-				WithPorts(
-					corev1ac.ContainerPort().
-						WithName("http").
-						WithContainerPort(8000).
-						WithProtocol(corev1.ProtocolTCP),
-					corev1ac.ContainerPort().
-						WithName("https").
-						WithContainerPort(8443).
-						WithProtocol(corev1.ProtocolTCP),
-					corev1ac.ContainerPort().
-						WithName("http3").
-						WithContainerPort(8443).
-						WithProtocol(corev1.ProtocolUDP),
-				).
+				WithPorts(containerPorts...).
 				WithReadinessProbe(corev1ac.Probe().
 					WithHTTPGet(corev1ac.HTTPGetAction().
 						WithPath("/readyz").
@@ -408,29 +460,6 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		return nil, state.GatewayReadiness{}, err
 	}
 
-	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
-	if len(effectiveListeners) > 0 {
-		for _, el := range effectiveListeners {
-			if prev, ok := uniquePorts[el.Port]; !ok {
-				uniquePorts[el.Port] = el.Protocol
-			} else if el.Protocol == gatewayv1.HTTPSProtocolType {
-				uniquePorts[el.Port] = gatewayv1.HTTPSProtocolType
-			} else if el.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
-				uniquePorts[el.Port] = gatewayv1.TLSProtocolType
-			}
-		}
-	} else {
-		for _, l := range gw.Spec.Listeners {
-			if prev, ok := uniquePorts[l.Port]; !ok {
-				uniquePorts[l.Port] = l.Protocol
-			} else if l.Protocol == gatewayv1.HTTPSProtocolType {
-				uniquePorts[l.Port] = gatewayv1.HTTPSProtocolType
-			} else if l.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
-				uniquePorts[l.Port] = gatewayv1.TLSProtocolType
-			}
-		}
-	}
-
 	var sortedPorts []int
 	for port := range uniquePorts {
 		sortedPorts = append(sortedPorts, int(port))
@@ -460,6 +489,14 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					WithName(fmt.Sprintf("tls-%d", port)).
 					WithPort(int32(port)).
 					WithTargetPort(intstr.FromInt32(8443)).
+					WithProtocol(corev1.ProtocolTCP),
+			)
+		} else if proto == gatewayv1.TCPProtocolType {
+			svcPorts = append(svcPorts,
+				corev1ac.ServicePort().
+					WithName(fmt.Sprintf("tcp-%d", port)).
+					WithPort(int32(port)).
+					WithTargetPort(intstr.FromInt32(int32(port))).
 					WithProtocol(corev1.ProtocolTCP),
 			)
 		} else {
