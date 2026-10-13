@@ -584,3 +584,64 @@ func TestInProcessDataplanePublisher_MultipleGatewaysClientCertIsolation(t *test
 		}
 	}
 }
+
+func TestDataplaneConfig_Roundtrip_ClientValidation(t *testing.T) {
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gateway"}
+	caPEM := []byte("-----BEGIN CERTIFICATE-----\nMIICfakecert\n-----END CERTIFICATE-----\n")
+
+	listeners := []InternalListener{
+		{
+			Name:        "https",
+			Protocol:    gatewayv1.HTTPSProtocolType,
+			Port:        443,
+			Hostname:    "example.com",
+			GatewayName: gwKey,
+			ClientValidation: &InternalClientValidation{
+				CACertPEMs: [][]byte{caPEM},
+				Mode:       gatewayv1.AllowValidOnly,
+			},
+		},
+		{
+			Name:        "http",
+			Protocol:    gatewayv1.HTTPProtocolType,
+			Port:        80,
+			Hostname:    "example.com",
+			GatewayName: gwKey,
+		},
+	}
+
+	cfg, err := BuildDataplaneConfig(gwKey, listeners, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig failed: %v", err)
+	}
+
+	data, err := cfg.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	restored, err := UnmarshalDataplaneConfig(data)
+	if err != nil {
+		t.Fatalf("UnmarshalDataplaneConfig failed: %v", err)
+	}
+
+	if len(restored.Listeners) != 2 {
+		t.Fatalf("expected 2 listeners, got %d", len(restored.Listeners))
+	}
+
+	httpsLis := restored.Listeners[0]
+	if httpsLis.ClientValidation == nil {
+		t.Fatalf("expected ClientValidation to be restored, got nil")
+	}
+	if httpsLis.ClientValidation.Mode != gatewayv1.AllowValidOnly {
+		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowValidOnly, httpsLis.ClientValidation.Mode)
+	}
+	if len(httpsLis.ClientValidation.CACertPEMs) != 1 || string(httpsLis.ClientValidation.CACertPEMs[0]) != string(caPEM) {
+		t.Errorf("expected CACertPEMs to be restored, got %v", httpsLis.ClientValidation.CACertPEMs)
+	}
+
+	httpLis := restored.Listeners[1]
+	if httpLis.ClientValidation != nil {
+		t.Errorf("expected http listener ClientValidation to be nil, got %v", httpLis.ClientValidation)
+	}
+}

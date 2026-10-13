@@ -17,7 +17,6 @@ package state
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"slices"
 	"sort"
@@ -77,21 +76,22 @@ func ListenerEntryToSpec(l gatewayv1.ListenerEntry) ListenerSpec {
 // EffectiveListener represents a single compiled listener on a Gateway,
 // originating either directly from the Gateway spec or attached via an allowed ListenerSet.
 type EffectiveListener struct {
-	Owner          ListenerOwner
-	ParentGateway  types.NamespacedName
-	Name           gatewayv1.SectionName
-	Port           gatewayv1.PortNumber
-	Protocol       gatewayv1.ProtocolType
-	Hostname       *gatewayv1.Hostname
-	TLS            *gatewayv1.ListenerTLSConfig
-	AllowedRoutes  *gatewayv1.AllowedRoutes
-	SupportedKinds []gatewayv1.RouteGroupKind
-	Conditions     []metav1.Condition
-	AttachedRoutes int32
-	Routes         []InternalRoute
-	TLSBackends    map[string][]InternalTLSBackend
-	TCPBackends    []InternalTCPBackend
-	Generation     int64
+	Owner            ListenerOwner
+	ParentGateway    types.NamespacedName
+	Name             gatewayv1.SectionName
+	Port             gatewayv1.PortNumber
+	Protocol         gatewayv1.ProtocolType
+	Hostname         *gatewayv1.Hostname
+	TLS              *gatewayv1.ListenerTLSConfig
+	AllowedRoutes    *gatewayv1.AllowedRoutes
+	SupportedKinds   []gatewayv1.RouteGroupKind
+	Conditions       []metav1.Condition
+	AttachedRoutes   int32
+	Routes           []InternalRoute
+	TLSBackends      map[string][]InternalTLSBackend
+	TCPBackends      []InternalTCPBackend
+	ClientValidation *InternalClientValidation
+	Generation       int64
 }
 
 // IsAccepted returns true if the listener has an Accepted condition with status True.
@@ -159,16 +159,21 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		tcpBackends = make([]InternalTCPBackend, len(el.TCPBackends))
 		copy(tcpBackends, el.TCPBackends)
 	}
+	var clientValidation *InternalClientValidation
+	if el.ClientValidation != nil {
+		clientValidation = el.ClientValidation.DeepCopy()
+	}
 	return InternalListener{
-		Name:        el.QualifiedName(),
-		Protocol:    el.Protocol,
-		Port:        el.Port,
-		Hostname:    string(ValueOf(el.Hostname)),
-		GatewayName: el.ParentGateway,
-		Routes:      el.Routes,
-		TLSMode:     tlsMode,
-		TLSBackends: tlsBackends,
-		TCPBackends: tcpBackends,
+		Name:             el.QualifiedName(),
+		Protocol:         el.Protocol,
+		Port:             el.Port,
+		Hostname:         string(ValueOf(el.Hostname)),
+		GatewayName:      el.ParentGateway,
+		Routes:           el.Routes,
+		TLSMode:          tlsMode,
+		TLSBackends:      tlsBackends,
+		TCPBackends:      tcpBackends,
+		ClientValidation: clientValidation,
 	}
 }
 
@@ -362,14 +367,38 @@ func defaultSupportedKindsForProtocol(protocol gatewayv1.ProtocolType) []gateway
 	}
 }
 
-// ValidateListener validates a listener specification, computing its supported kinds and conditions.
+// EffectiveFrontendValidation returns the effective frontend TLS validation configuration for a listener on a Gateway.
+// Frontend client certificate validation applies to HTTPS listeners only.
+// If a perPort configuration matches the listener port, it overrides the default configuration.
+func EffectiveFrontendValidation(gwTLS *gatewayv1.GatewayTLSConfig, port gatewayv1.PortNumber, protocol gatewayv1.ProtocolType) *gatewayv1.FrontendTLSValidation {
+	if protocol != gatewayv1.HTTPSProtocolType || gwTLS == nil || gwTLS.Frontend == nil {
+		return nil
+	}
+
+	for _, pp := range gwTLS.Frontend.PerPort {
+		if pp.Port == port {
+			return pp.TLS.Validation
+		}
+	}
+
+	return gwTLS.Frontend.Default.Validation
+}
+
+// ValidateListener validates a listener specification, computing its supported kinds, conditions, and client validation.
 func ValidateListener(
 	listener ListenerSpec,
 	owner ListenerOwner,
+	gwNamespace string,
 	generation int64,
 	secrets map[types.NamespacedName]*corev1.Secret,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	frontendValidation *gatewayv1.FrontendTLSValidation,
 	refValidator ReferenceGrantValidator,
-) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition) {
+) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation) {
+	if gwNamespace == "" {
+		gwNamespace = owner.Namespace
+	}
+
 	isSupported := isSupportedProtocol(listener.Protocol)
 
 	if !isSupported {
@@ -390,7 +419,7 @@ func ValidateListener(
 				generation,
 			),
 		}
-		return supportedKinds, conditions
+		return supportedKinds, conditions, nil
 	}
 
 	hasInvalidRouteKind := false
@@ -500,6 +529,71 @@ func ValidateListener(
 		}
 	}
 
+	var caInvalidReason string
+	var caInvalidMessage string
+	var caPEMs [][]byte
+
+	if listener.Protocol == gatewayv1.HTTPSProtocolType && frontendValidation != nil {
+		if len(frontendValidation.CACertificateRefs) == 0 {
+			caInvalidReason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+			caInvalidMessage = "No CA certificate refs specified"
+		} else {
+			for _, caRef := range frontendValidation.CACertificateRefs {
+				group := string(caRef.Group)
+				kind := string(caRef.Kind)
+				if group != "" || kind != "ConfigMap" {
+					caInvalidReason = string(gatewayv1.ListenerReasonInvalidCACertificateKind)
+					caInvalidMessage = fmt.Sprintf("Unsupported CA certificate ref group %q kind %q", group, kind)
+					break
+				}
+
+				targetNs := gwNamespace
+				if caRef.Namespace != nil && string(*caRef.Namespace) != "" {
+					targetNs = string(*caRef.Namespace)
+				}
+
+				if targetNs != gwNamespace {
+					from := Reference{
+						GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+						Namespace: gwNamespace,
+					}
+					to := Reference{
+						GroupKind: schema.GroupKind{Group: "", Kind: "ConfigMap"},
+						Namespace: targetNs,
+						Name:      string(caRef.Name),
+					}
+					if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
+						caInvalidReason = string(gatewayv1.ListenerReasonRefNotPermitted)
+						caInvalidMessage = fmt.Sprintf("Cross-namespace reference to ConfigMap %s/%s is not permitted by any ReferenceGrant", targetNs, caRef.Name)
+						break
+					}
+				}
+
+				cmKey := types.NamespacedName{
+					Namespace: targetNs,
+					Name:      string(caRef.Name),
+				}
+				var cm *corev1.ConfigMap
+				if configMaps != nil {
+					cm = configMaps[cmKey]
+				}
+				if cm == nil {
+					caInvalidReason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+					caInvalidMessage = fmt.Sprintf("ConfigMap %s/%s not found", targetNs, caRef.Name)
+					break
+				}
+
+				data, err := ExtractCACertFromConfigMap(cm)
+				if err != nil {
+					caInvalidReason = string(gatewayv1.ListenerReasonInvalidCACertificateRef)
+					caInvalidMessage = fmt.Sprintf("ConfigMap %s/%s is invalid: %v", targetNs, caRef.Name, err)
+					break
+				}
+				caPEMs = append(caPEMs, data)
+			}
+		}
+	}
+
 	listenerProgrammedStatus := metav1.ConditionTrue
 	listenerProgrammedReason := gatewayv1.ListenerReasonProgrammed
 	listenerProgrammedMessage := "Listener programmed"
@@ -528,6 +622,33 @@ func ValidateListener(
 		listenerProgrammedStatus = metav1.ConditionFalse
 		listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
 		listenerProgrammedMessage = tlsProgrammedMessage
+	} else if caInvalidReason != "" {
+		resolvedRefsStatus = metav1.ConditionFalse
+		resolvedRefsReason = gatewayv1.ListenerConditionReason(caInvalidReason)
+		resolvedRefsMessage = caInvalidMessage
+
+		listenerAcceptedStatus = metav1.ConditionFalse
+		listenerAcceptedReason = gatewayv1.ListenerReasonNoValidCACertificate
+		listenerAcceptedMessage = "No valid CA certificate for client certificate validation"
+
+		listenerProgrammedStatus = metav1.ConditionFalse
+		listenerProgrammedReason = gatewayv1.ListenerReasonNoValidCACertificate
+		listenerProgrammedMessage = "No valid CA certificate for client certificate validation"
+	} else if len(caPEMs) > 0 {
+		mode := frontendValidation.Mode
+		if mode == "" {
+			mode = gatewayv1.AllowValidOnly
+		}
+		clientValidation = &InternalClientValidation{
+			CACertPEMs: caPEMs,
+			Mode:       mode,
+		}
+
+		// Fail closed in part 1: data plane does not enforce client certificates yet.
+		// Report Programmed=False, reason Pending.
+		listenerProgrammedStatus = metav1.ConditionFalse
+		listenerProgrammedReason = gatewayv1.ListenerReasonPending
+		listenerProgrammedMessage = "Frontend validation is not yet enforced"
 	}
 
 	conditions = []metav1.Condition{
@@ -554,7 +675,7 @@ func ValidateListener(
 		),
 	}
 
-	return supportedKinds, conditions
+	return supportedKinds, conditions, clientValidation
 }
 
 // BuildEffectiveListener constructs an EffectiveListener from a listener specification.
@@ -564,23 +685,35 @@ func BuildEffectiveListener(
 	parentGateway types.NamespacedName,
 	generation int64,
 	secrets map[types.NamespacedName]*corev1.Secret,
+	configMaps map[types.NamespacedName]*corev1.ConfigMap,
+	frontendValidation *gatewayv1.FrontendTLSValidation,
 	refValidator ReferenceGrantValidator,
 ) *EffectiveListener {
-	supportedKinds, conditions := ValidateListener(listener, owner, generation, secrets, refValidator)
+	supportedKinds, conditions, clientValidation := ValidateListener(
+		listener,
+		owner,
+		parentGateway.Namespace,
+		generation,
+		secrets,
+		configMaps,
+		frontendValidation,
+		refValidator,
+	)
 	return &EffectiveListener{
-		Owner:          owner,
-		ParentGateway:  parentGateway,
-		Name:           listener.Name,
-		Port:           listener.Port,
-		Protocol:       listener.Protocol,
-		Hostname:       listener.Hostname,
-		TLS:            listener.TLS,
-		AllowedRoutes:  listener.AllowedRoutes,
-		SupportedKinds: supportedKinds,
-		Conditions:     conditions,
-		AttachedRoutes: 0,
-		Routes:         nil,
-		Generation:     generation,
+		Owner:            owner,
+		ParentGateway:    parentGateway,
+		Name:             listener.Name,
+		Port:             listener.Port,
+		Protocol:         listener.Protocol,
+		Hostname:         listener.Hostname,
+		TLS:              listener.TLS,
+		AllowedRoutes:    listener.AllowedRoutes,
+		SupportedKinds:   supportedKinds,
+		Conditions:       conditions,
+		ClientValidation: clientValidation,
+		AttachedRoutes:   0,
+		Routes:           nil,
+		Generation:       generation,
 	}
 }
 
@@ -990,12 +1123,15 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 
 		// Gateway's own listeners (highest precedence)
 		for _, l := range gw.Spec.Listeners {
+			frontendVal := EffectiveFrontendValidation(gw.Spec.TLS, l.Port, l.Protocol)
 			el := BuildEffectiveListener(
 				ListenerToSpec(l),
 				ListenerOwner{Kind: "Gateway", Namespace: gw.Namespace, Name: gw.Name},
 				gwKey,
 				gw.Generation,
 				inputs.Secrets,
+				inputs.ConfigMaps,
+				frontendVal,
 				refValidator,
 			)
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
@@ -1026,12 +1162,15 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 
 		for _, ls := range allowedListenerSets {
 			for _, l := range ls.Spec.Listeners {
+				frontendVal := EffectiveFrontendValidation(gw.Spec.TLS, l.Port, l.Protocol)
 				el := BuildEffectiveListener(
 					ListenerEntryToSpec(l),
 					ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name},
 					gwKey,
 					ls.Generation,
 					inputs.Secrets,
+					inputs.ConfigMaps,
+					frontendVal,
 					refValidator,
 				)
 				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
@@ -1628,7 +1767,10 @@ func ExtractCertificates(
 			continue
 		}
 		for _, el := range cg.EffectiveListeners {
-			if !el.IsAccepted() {
+			if !el.IsAccepted() || !el.IsProgrammed() {
+				continue
+			}
+			if el.ClientValidation != nil {
 				continue
 			}
 			if (el.Protocol != gatewayv1.HTTPSProtocolType && el.Protocol != gatewayv1.TLSProtocolType) || el.TLS == nil {
@@ -1726,7 +1868,10 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 			continue
 		}
 		for _, el := range cg.EffectiveListeners {
-			if !el.IsAccepted() {
+			if !el.IsAccepted() || !el.IsProgrammed() {
+				continue
+			}
+			if el.ClientValidation != nil {
 				continue
 			}
 			iListener := el.ToInternalListener()
@@ -2214,22 +2359,9 @@ func ComputeDesiredBackendTLSPolicyStatus(
 					unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
 					hasInvalidCACertRef = true
 				} else {
-					var data []byte
-					if d, ok := cm.Data["ca.crt"]; ok {
-						data = []byte(d)
-					} else if d, ok := cm.BinaryData["ca.crt"]; ok {
-						data = d
-					}
-
-					if len(data) == 0 {
+					if _, err := ExtractCACertFromConfigMap(cm); err != nil {
 						unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
 						hasInvalidCACertRef = true
-					} else {
-						block, _ := pem.Decode(data)
-						if block == nil || block.Type != "CERTIFICATE" {
-							unresolvedRefs = append(unresolvedRefs, string(caRef.Name))
-							hasInvalidCACertRef = true
-						}
 					}
 				}
 			}

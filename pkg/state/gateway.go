@@ -65,17 +65,42 @@ const (
 	ExactMatch
 )
 
+// InternalClientValidation holds the resolved frontend client certificate validation configuration for an HTTPS listener.
+type InternalClientValidation struct {
+	CACertPEMs [][]byte                             `json:"caCertPEMs,omitempty"`
+	Mode       gatewayv1.FrontendValidationModeType `json:"mode,omitempty"`
+}
+
+// DeepCopy returns a deep copy of InternalClientValidation.
+func (cv *InternalClientValidation) DeepCopy() *InternalClientValidation {
+	if cv == nil {
+		return nil
+	}
+	out := &InternalClientValidation{
+		Mode: cv.Mode,
+	}
+	if cv.CACertPEMs != nil {
+		out.CACertPEMs = make([][]byte, len(cv.CACertPEMs))
+		for i, pem := range cv.CACertPEMs {
+			out.CACertPEMs[i] = make([]byte, len(pem))
+			copy(out.CACertPEMs[i], pem)
+		}
+	}
+	return out
+}
+
 // InternalListener represents the computed configuration of a Gateway listener for the proxy.
 type InternalListener struct {
-	Name        string
-	Protocol    gatewayv1.ProtocolType
-	Port        gatewayv1.PortNumber
-	Hostname    string
-	GatewayName types.NamespacedName
-	Routes      []InternalRoute
-	TLSMode     *gatewayv1.TLSModeType
-	TLSBackends map[string][]InternalTLSBackend
-	TCPBackends []InternalTCPBackend
+	Name             string
+	Protocol         gatewayv1.ProtocolType
+	Port             gatewayv1.PortNumber
+	Hostname         string
+	GatewayName      types.NamespacedName
+	Routes           []InternalRoute
+	TLSMode          *gatewayv1.TLSModeType
+	TLSBackends      map[string][]InternalTLSBackend
+	TCPBackends      []InternalTCPBackend
+	ClientValidation *InternalClientValidation `json:"clientValidation,omitempty"`
 }
 
 // hostWithoutPort returns s with the port stripped if present, or s unchanged if not.

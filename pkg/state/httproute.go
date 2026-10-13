@@ -15,7 +15,6 @@
 package state
 
 import (
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -939,17 +938,8 @@ func validateBackendTLSPolicy(
 		if !ok || cm == nil {
 			return nil, false
 		}
-		var data []byte
-		if d, ok := cm.Data["ca.crt"]; ok {
-			data = []byte(d)
-		} else if d, ok := cm.BinaryData["ca.crt"]; ok {
-			data = d
-		}
-		if len(data) == 0 {
-			return nil, false
-		}
-		block, _ := pem.Decode(data)
-		if block == nil || block.Type != "CERTIFICATE" {
+		data, err := ExtractCACertFromConfigMap(cm)
+		if err != nil {
 			return nil, false
 		}
 		caCerts = append(caCerts, data)

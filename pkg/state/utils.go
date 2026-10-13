@@ -15,8 +15,11 @@
 package state
 
 import (
+	"encoding/pem"
+	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -122,4 +125,26 @@ func ValueOf[T any](t *T) T {
 // Ptr returns a pointer to the given value.
 func Ptr[T any](t T) *T {
 	return &t
+}
+
+// ExtractCACertFromConfigMap extracts and validates PEM-encoded CA certificate data from a ConfigMap's "ca.crt" key.
+// Returns the raw PEM bytes if valid, or an error if missing, empty, or not a valid PEM certificate.
+func ExtractCACertFromConfigMap(cm *corev1.ConfigMap) ([]byte, error) {
+	if cm == nil {
+		return nil, fmt.Errorf("ConfigMap is nil")
+	}
+	var data []byte
+	if d, ok := cm.Data["ca.crt"]; ok {
+		data = []byte(d)
+	} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+		data = d
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("ConfigMap %s/%s does not contain 'ca.crt' key or it is empty", cm.Namespace, cm.Name)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("ConfigMap %s/%s 'ca.crt' does not contain valid PEM-encoded certificate", cm.Namespace, cm.Name)
+	}
+	return data, nil
 }

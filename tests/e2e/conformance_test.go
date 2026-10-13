@@ -94,6 +94,7 @@ func TestConformance(t *testing.T) {
 			EnableAllSupportedFeatures: true,
 			SupportedFeatures: []features.FeatureName{
 				features.SupportGatewayBackendClientCertificate,
+				features.SupportGatewayFrontendClientCertificateValidation,
 				features.SupportTCPRoute,
 			},
 			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
@@ -123,6 +124,7 @@ func TestConformance(t *testing.T) {
 		tests.BackendTLSPolicyObservedGenerationBump,
 		tests.BackendTLSPolicySANValidation,
 		tests.GatewayClassObservedGenerationBump,
+		tests.GatewayFrontendInvalidDefaultClientCertificateValidation,
 		tests.GatewayHTTPListenerIsolation,
 		tests.GatewayInfrastructureMetadata,
 		tests.GatewayInvalidParametersRef,
