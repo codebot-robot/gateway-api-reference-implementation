@@ -147,6 +147,16 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 				"pt.example.com": {{Target: "10.0.0.1:8443", Weight: 1}},
 			},
 		},
+		{
+			Name:        "tcp",
+			Protocol:    gatewayv1.TCPProtocolType,
+			Port:        9000,
+			GatewayName: gwKey,
+			TCPBackends: []InternalTCPBackend{
+				{Target: "backend1.default.svc.cluster.local:9000", Weight: 10},
+				{Target: "backend2.default.svc.cluster.local:9000", Weight: 0},
+			},
+		},
 	}
 
 	routes := []InternalRoute{
@@ -234,6 +244,27 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 	reg := restored.Routes[0].Rules[0].Matches[0].Headers[0].MatchRegularExpressionValue
 	if reg == nil || !reg.MatchString("v2") || reg.MatchString("bad") {
 		t.Errorf("expected regular expression to match v2 and not bad, got %v", reg)
+	}
+
+	// Verify TCP listener with weighted backends
+	var tcpListener *InternalListener
+	for i := range restored.Listeners {
+		if restored.Listeners[i].Protocol == gatewayv1.TCPProtocolType {
+			tcpListener = &restored.Listeners[i]
+			break
+		}
+	}
+	if tcpListener == nil {
+		t.Fatal("expected TCP listener in restored listeners")
+	}
+	if len(tcpListener.TCPBackends) != 2 {
+		t.Fatalf("expected 2 TCPBackends, got %d", len(tcpListener.TCPBackends))
+	}
+	if tcpListener.TCPBackends[0].Target != "backend1.default.svc.cluster.local:9000" || tcpListener.TCPBackends[0].Weight != 10 {
+		t.Errorf("unexpected TCPBackend[0]: %+v", tcpListener.TCPBackends[0])
+	}
+	if tcpListener.TCPBackends[1].Target != "backend2.default.svc.cluster.local:9000" || tcpListener.TCPBackends[1].Weight != 0 {
+		t.Errorf("unexpected TCPBackend[1]: %+v", tcpListener.TCPBackends[1])
 	}
 
 	// Extract certificates

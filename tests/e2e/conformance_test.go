@@ -94,6 +94,7 @@ func TestConformance(t *testing.T) {
 			EnableAllSupportedFeatures: true,
 			SupportedFeatures: []features.FeatureName{
 				features.SupportGatewayBackendClientCertificate,
+				features.SupportTCPRoute,
 			},
 			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
 				{
@@ -223,6 +224,9 @@ func TestConformance(t *testing.T) {
 		tests.TLSRouteMixedTerminationSameNamespace,
 		tests.TLSRouteSimpleSameNamespace,
 		tests.TLSRouteTerminateSimpleSameNamespace,
+		tests.TCPRouteInvalidBackendRefNonexistent,
+		tests.TCPRouteInvalidCrossNamespaceBackendRef,
+		tests.TCPRouteInvalidNonTCPListener,
 	}
 
 	cSuite.Setup(t, selectedTests)

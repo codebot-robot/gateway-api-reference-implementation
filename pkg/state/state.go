@@ -111,6 +111,7 @@ type State struct {
 	httpRoutes            map[types.NamespacedName]*HTTPRouteState
 	tlsRoutes             map[types.NamespacedName]*TLSRouteState
 	grpcRoutes            map[types.NamespacedName]*GRPCRouteState
+	tcpRoutes             map[types.NamespacedName]*TCPRouteState
 	backendTLSPolicies    map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services              map[types.NamespacedName]*corev1.Service
 	configMaps            map[types.NamespacedName]*corev1.ConfigMap
@@ -131,6 +132,7 @@ type State struct {
 	httpRouteSource        *EventSource
 	tlsRouteSource         *EventSource
 	grpcRouteSource        *EventSource
+	tcpRouteSource         *EventSource
 	listenerSetSource      *EventSource
 	backendTLSPolicySource *EventSource
 	gatewayClassSource     *EventSource
@@ -153,6 +155,7 @@ func NewState() *State {
 		httpRoutes:             make(map[types.NamespacedName]*HTTPRouteState),
 		tlsRoutes:              make(map[types.NamespacedName]*TLSRouteState),
 		grpcRoutes:             make(map[types.NamespacedName]*GRPCRouteState),
+		tcpRoutes:              make(map[types.NamespacedName]*TCPRouteState),
 		backendTLSPolicies:     make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:               make(map[types.NamespacedName]*corev1.Service),
 		configMaps:             make(map[types.NamespacedName]*corev1.ConfigMap),
@@ -163,6 +166,7 @@ func NewState() *State {
 		httpRouteSource:        NewEventSource(),
 		tlsRouteSource:         NewEventSource(),
 		grpcRouteSource:        NewEventSource(),
+		tcpRouteSource:         NewEventSource(),
 		listenerSetSource:      NewEventSource(),
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
@@ -252,6 +256,10 @@ func (s *State) TLSRouteSource() *EventSource {
 
 func (s *State) GRPCRouteSource() *EventSource {
 	return s.grpcRouteSource
+}
+
+func (s *State) TCPRouteSource() *EventSource {
+	return s.tcpRouteSource
 }
 
 func (s *State) ListenerSetSource() *EventSource {
@@ -568,6 +576,25 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		return grpcRoutes[i].Name < grpcRoutes[j].Name
 	})
 
+	var tcpRoutes []*gatewayv1.TCPRoute
+	for _, rState := range s.tcpRoutes {
+		if rState != nil && rState.TCPRoute != nil {
+			tcpRoutes = append(tcpRoutes, rState.TCPRoute)
+		}
+	}
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(tcpRoutes, func(i, j int) bool {
+		if !tcpRoutes[i].CreationTimestamp.Equal(&tcpRoutes[j].CreationTimestamp) {
+			return tcpRoutes[i].CreationTimestamp.Before(&tcpRoutes[j].CreationTimestamp)
+		}
+		if tcpRoutes[i].Namespace != tcpRoutes[j].Namespace {
+			return tcpRoutes[i].Namespace < tcpRoutes[j].Namespace
+		}
+		return tcpRoutes[i].Name < tcpRoutes[j].Name
+	})
+
 	var backendTLSPolicies []*gatewayv1.BackendTLSPolicy
 	for _, b := range s.backendTLSPolicies {
 		if b != nil {
@@ -627,6 +654,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		HTTPRoutes:            routes,
 		TLSRoutes:             tlsRoutes,
 		GRPCRoutes:            grpcRoutes,
+		TCPRoutes:             tcpRoutes,
 		Services:              services,
 		BackendTLSPolicies:    backendTLSPolicies,
 		ConfigMaps:            configMaps,
@@ -726,6 +754,28 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		old, oldOk := prevGRPCRouteStatuses[k]
 		if curOk != oldOk || (curOk && !GRPCRouteStatusesEqual(cur, old)) {
 			s.grpcRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
+		}
+	}
+
+	// 2d. TCPRoute diff
+	var prevTCPRouteStatuses map[types.NamespacedName]gatewayv1.TCPRouteStatus
+	if prev != nil {
+		prevTCPRouteStatuses = prev.TCPRouteStatuses
+	}
+	allTCPRouteKeys := make(map[types.NamespacedName]bool)
+	for k := range outputs.TCPRouteStatuses {
+		allTCPRouteKeys[k] = true
+	}
+	if prevTCPRouteStatuses != nil {
+		for k := range prevTCPRouteStatuses {
+			allTCPRouteKeys[k] = true
+		}
+	}
+	for k := range allTCPRouteKeys {
+		cur, curOk := outputs.TCPRouteStatuses[k]
+		old, oldOk := prevTCPRouteStatuses[k]
+		if curOk != oldOk || (curOk && !TCPRouteStatusesEqual(cur, old)) {
+			s.tcpRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -845,6 +895,16 @@ func (s *State) GetDesiredGRPCRouteStatus(key types.NamespacedName) (gatewayv1.G
 		return gatewayv1.GRPCRouteStatus{}, false
 	}
 	st, ok := s.previousOutputs.GRPCRouteStatuses[key]
+	return st, ok
+}
+
+func (s *State) GetDesiredTCPRouteStatus(key types.NamespacedName) (gatewayv1.TCPRouteStatus, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.previousOutputs == nil {
+		return gatewayv1.TCPRouteStatus{}, false
+	}
+	st, ok := s.previousOutputs.TCPRouteStatuses[key]
 	return st, ok
 }
 
@@ -1382,6 +1442,44 @@ func (s *State) DeleteGRPCRoute(name types.NamespacedName) {
 	}
 }
 
+func (s *State) UpsertTCPRoute(route *gatewayv1.TCPRoute) {
+	if route == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+	old := s.tcpRoutes[key]
+	if old != nil && old.TCPRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
+		return
+	}
+
+	s.tcpRoutes[key] = &TCPRouteState{
+		TCPRoute: route.DeepCopy(),
+	}
+	s.revision++
+	s.markDirtyLocked()
+}
+
+func (s *State) GetTCPRoute(name types.NamespacedName) *TCPRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.tcpRoutes[name]
+}
+
+func (s *State) DeleteTCPRoute(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.tcpRoutes[name]; ok {
+		delete(s.tcpRoutes, name)
+		s.revision++
+		s.markDirtyLocked()
+	}
+}
+
 func (s *State) UpsertBackendTLSPolicy(policy *gatewayv1.BackendTLSPolicy) {
 	if policy == nil {
 		return
@@ -1478,6 +1576,31 @@ func (s *State) GetGRPCRoutes() []*GRPCRouteState {
 
 	var routes []*GRPCRouteState
 	for _, route := range s.grpcRoutes {
+		routes = append(routes, route)
+	}
+
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(routes, func(i, j int) bool {
+		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
+			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
+		}
+		if routes[i].Namespace != routes[j].Namespace {
+			return routes[i].Namespace < routes[j].Namespace
+		}
+		return routes[i].Name < routes[j].Name
+	})
+
+	return routes
+}
+
+func (s *State) GetTCPRoutes() []*TCPRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var routes []*TCPRouteState
+	for _, route := range s.tcpRoutes {
 		routes = append(routes, route)
 	}
 
