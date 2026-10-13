@@ -1296,7 +1296,7 @@ func TestInProcessDataplanePublisher_RoutesAndCertificates(t *testing.T) {
 		"https.example.com": &cert,
 	}
 
-	dpConfig, err := state.BuildDataplaneConfig(gwKey, listeners, []state.InternalRoute{route}, certsMap, &cert)
+	dpConfig, err := state.BuildDataplaneConfig(gwKey, listeners, []state.InternalRoute{route}, certsMap, &cert, nil)
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig failed: %v", err)
 	}
@@ -1382,7 +1382,7 @@ func TestInProcessDataplanePublisher_MultipleGatewaysDistinctCertificates(t *tes
 	}
 	dpConfigA, err := state.BuildDataplaneConfig(
 		types.NamespacedName{Namespace: gwA.Namespace, Name: gwA.Name},
-		listenersA, nil, certsMapA, &certA,
+		listenersA, nil, certsMapA, &certA, nil,
 	)
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig gwA failed: %v", err)
@@ -1396,7 +1396,7 @@ func TestInProcessDataplanePublisher_MultipleGatewaysDistinctCertificates(t *tes
 	}
 	dpConfigB, err := state.BuildDataplaneConfig(
 		types.NamespacedName{Namespace: gwB.Namespace, Name: gwB.Name},
-		listenersB, nil, certsMapB, &certB,
+		listenersB, nil, certsMapB, &certB, nil,
 	)
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig gwB failed: %v", err)

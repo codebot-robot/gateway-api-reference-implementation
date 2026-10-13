@@ -19,9 +19,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
 	"regexp"
@@ -116,6 +118,7 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 
 	rsaCert := generateTestTLSCert(t, true, "example.com", []string{"example.com", "www.example.com"})
 	ecdsaCert := generateTestTLSCert(t, false, "api.example.com", []string{"api.example.com"})
+	clientCert := generateTestTLSCert(t, false, "client.example.com", []string{"client.example.com"})
 
 	certsMap := map[string]*tls.Certificate{
 		"example.com":     rsaCert,
@@ -178,14 +181,14 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 		},
 	}
 
-	cfg, err := BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert)
+	cfg, err := BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert, clientCert)
 	if err != nil {
 		t.Fatalf("BuildDataplaneConfig failed: %v", err)
 	}
 
-	// Verify certificate deduplication: 2 certificates total (rsaCert and ecdsaCert)
-	if len(cfg.Certificates) != 2 {
-		t.Fatalf("expected 2 unique certificates in cfg, got %d", len(cfg.Certificates))
+	// Verify certificate deduplication: 3 certificates total (rsaCert, ecdsaCert, clientCert)
+	if len(cfg.Certificates) != 3 {
+		t.Fatalf("expected 3 unique certificates in cfg, got %d", len(cfg.Certificates))
 	}
 	// example.com and www.example.com should point to the same certID
 	if cfg.HostCertificates["example.com"] != cfg.HostCertificates["www.example.com"] {
@@ -195,6 +198,14 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 	// defaultCertID should match example.com's certID
 	if cfg.DefaultCertID != cfg.HostCertificates["example.com"] {
 		t.Errorf("expected DefaultCertID to match example.com certID")
+	}
+	// backendClientCertID should be non-empty and content-addressed by sha256
+	expectedClientCertID := hex.EncodeToString(func() []byte {
+		h := sha256.Sum256(clientCert.Certificate[0])
+		return h[:]
+	}())
+	if cfg.BackendClientCertID != expectedClientCertID {
+		t.Errorf("expected BackendClientCertID %s, got %s", expectedClientCertID, cfg.BackendClientCertID)
 	}
 
 	// Marshal to JSON
@@ -247,6 +258,19 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 	// Verify restored certs can perform TLS handshakes
 	testTLSHandshake(t, restoredCerts["example.com"], "example.com")
 	testTLSHandshake(t, restoredCerts["api.example.com"], "api.example.com")
+
+	// Verify restored backend client certificate
+	if restored.BackendClientCertID != expectedClientCertID {
+		t.Errorf("expected restored BackendClientCertID %s, got %s", expectedClientCertID, restored.BackendClientCertID)
+	}
+	restoredClientCert, err := restored.ExtractBackendClientCertificate()
+	if err != nil {
+		t.Fatalf("ExtractBackendClientCertificate failed: %v", err)
+	}
+	if restoredClientCert == nil {
+		t.Fatalf("expected non-nil restoredClientCert")
+	}
+	testTLSHandshake(t, restoredClientCert, "client.example.com")
 }
 
 func testTLSHandshake(t *testing.T, cert *tls.Certificate, serverName string) {
@@ -374,5 +398,158 @@ func TestBuildGatewayDataplaneConfig_Scoping(t *testing.T) {
 	}
 	if len(cfgA.Certificates) != 1 {
 		t.Errorf("expected exactly 1 certificate in cfgA, got %d", len(cfgA.Certificates))
+	}
+}
+
+func TestInProcessDataplanePublisher_MultipleGatewaysClientCertIsolation(t *testing.T) {
+	ctx := t.Context()
+
+	clientCert := generateTestTLSCert(t, false, "client.example.com", nil)
+	serverCertA := generateTestTLSCert(t, false, "a.example.com", []string{"a.example.com"})
+	serverCertB := generateTestTLSCert(t, false, "b.example.com", []string{"b.example.com"})
+
+	gwA := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-a"},
+	}
+	gwB := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-b"},
+	}
+
+	routeA := InternalRoute{
+		Hostnames: []string{"a.example.com"},
+		Rules: []InternalRule{
+			{
+				Backends: []InternalBackend{
+					{
+						Host: "backend-a",
+						Port: 443,
+						TLSConfig: &InternalTLSConfig{
+							Hostname: "backend-a.local",
+						},
+					},
+				},
+			},
+		},
+	}
+	routeB := InternalRoute{
+		Hostnames: []string{"b.example.com"},
+		Rules: []InternalRule{
+			{
+				Backends: []InternalBackend{
+					{
+						Host: "backend-b",
+						Port: 443,
+						TLSConfig: &InternalTLSConfig{
+							Hostname: "backend-b.local",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	listenersA := []InternalListener{
+		{
+			Name:        "https-a",
+			Port:        443,
+			Protocol:    gatewayv1.HTTPSProtocolType,
+			Hostname:    "a.example.com",
+			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-a"},
+			Routes:      []InternalRoute{routeA},
+		},
+	}
+	listenersB := []InternalListener{
+		{
+			Name:        "https-b",
+			Port:        443,
+			Protocol:    gatewayv1.HTTPSProtocolType,
+			Hostname:    "b.example.com",
+			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-b"},
+			Routes:      []InternalRoute{routeB},
+		},
+	}
+
+	// Gateway A has client certificate configured
+	cfgA, err := BuildDataplaneConfig(
+		types.NamespacedName{Namespace: "default", Name: "gw-a"},
+		listenersA, []InternalRoute{routeA},
+		map[string]*tls.Certificate{"a.example.com": serverCertA},
+		serverCertA, clientCert,
+	)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig gw-a failed: %v", err)
+	}
+
+	// Gateway B has NO client certificate configured
+	cfgB, err := BuildDataplaneConfig(
+		types.NamespacedName{Namespace: "default", Name: "gw-b"},
+		listenersB, []InternalRoute{routeB},
+		map[string]*tls.Certificate{"b.example.com": serverCertB},
+		serverCertB, nil,
+	)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig gw-b failed: %v", err)
+	}
+
+	updater := &mockProxyUpdater{}
+	pub := NewInProcessDataplanePublisher(updater)
+	if err := pub.Begin(ctx); err != nil {
+		t.Fatalf("Begin failed: %v", err)
+	}
+	if err := pub.PublishDataplaneConfig(ctx, gwA, cfgA); err != nil {
+		t.Fatalf("PublishDataplaneConfig gwA failed: %v", err)
+	}
+	if err := pub.PublishDataplaneConfig(ctx, gwB, cfgB); err != nil {
+		t.Fatalf("PublishDataplaneConfig gwB failed: %v", err)
+	}
+	if err := pub.Commit(ctx); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// Check top-level routes applied to proxy
+	var foundA, foundB bool
+	for _, r := range updater.routes {
+		for _, rule := range r.Rules {
+			for _, b := range rule.Backends {
+				if b.Host == "backend-a" {
+					foundA = true
+					if b.TLSConfig == nil || b.TLSConfig.ClientCert == nil {
+						t.Errorf("expected backend-a to carry client cert, got nil")
+					}
+				}
+				if b.Host == "backend-b" {
+					foundB = true
+					if b.TLSConfig != nil && b.TLSConfig.ClientCert != nil {
+						t.Errorf("expected backend-b to carry NO client cert, but got: %v", b.TLSConfig.ClientCert)
+					}
+				}
+			}
+		}
+	}
+	if !foundA {
+		t.Errorf("backend-a not found in updater routes")
+	}
+	if !foundB {
+		t.Errorf("backend-b not found in updater routes")
+	}
+
+	// Check listener routes applied to proxy
+	for _, l := range updater.listeners {
+		for _, r := range l.Routes {
+			for _, rule := range r.Rules {
+				for _, b := range rule.Backends {
+					if b.Host == "backend-a" {
+						if b.TLSConfig == nil || b.TLSConfig.ClientCert == nil {
+							t.Errorf("expected listener backend-a to carry client cert, got nil")
+						}
+					}
+					if b.Host == "backend-b" {
+						if b.TLSConfig != nil && b.TLSConfig.ClientCert != nil {
+							t.Errorf("expected listener backend-b to carry NO client cert, but got: %v", b.TLSConfig.ClientCert)
+						}
+					}
+				}
+			}
+		}
 	}
 }

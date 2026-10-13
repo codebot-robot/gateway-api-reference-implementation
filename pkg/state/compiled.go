@@ -167,10 +167,12 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 
 // CompiledGateway contains the compiled state for a single Gateway.
 type CompiledGateway struct {
-	Gateway              *gatewayv1.Gateway
-	EffectiveListeners   []*EffectiveListener
-	AttachedListenerSets int32
-	Conditions           []metav1.Condition
+	Gateway               *gatewayv1.Gateway
+	EffectiveListeners    []*EffectiveListener
+	AttachedListenerSets  int32
+	Conditions            []metav1.Condition
+	BackendClientCert     *tls.Certificate
+	ResolvedRefsCondition metav1.Condition
 }
 
 // CompiledRoute contains the compiled state for an HTTPRoute.
@@ -653,6 +655,121 @@ func computeDesiredAddresses(specAddresses []gatewayv1.GatewaySpecAddress, provi
 	return result
 }
 
+// resolveGatewayBackendClientCert validates and extracts the client certificate
+// referenced by a Gateway's backend TLS configuration, returning the parsed certificate
+// (if valid) and the ResolvedRefs condition for the Gateway.
+func resolveGatewayBackendClientCert(
+	gw *gatewayv1.Gateway,
+	secrets map[types.NamespacedName]*corev1.Secret,
+	refValidator ReferenceGrantValidator,
+) (*tls.Certificate, metav1.Condition) {
+	if gw == nil || gw.Spec.TLS == nil || gw.Spec.TLS.Backend == nil || gw.Spec.TLS.Backend.ClientCertificateRef == nil {
+		gen := int64(0)
+		if gw != nil {
+			gen = gw.Generation
+		}
+		return nil, NewCondition(
+			string(gatewayv1.GatewayConditionResolvedRefs),
+			metav1.ConditionTrue,
+			string(gatewayv1.GatewayReasonResolvedRefs),
+			"Resolved references",
+			gen,
+		)
+	}
+
+	ref := gw.Spec.TLS.Backend.ClientCertificateRef
+	group := ValueOf(ref.Group)
+	kind := ValueOf(ref.Kind)
+	if kind == "" {
+		kind = "Secret"
+	}
+
+	if group != "" || kind != "Secret" {
+		return nil, NewCondition(
+			string(gatewayv1.GatewayConditionResolvedRefs),
+			metav1.ConditionFalse,
+			string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+			fmt.Sprintf("Unsupported client certificate ref group %q kind %q", group, kind),
+			gw.Generation,
+		)
+	}
+
+	secretNs := gw.Namespace
+	if ref.Namespace != nil && string(*ref.Namespace) != "" {
+		secretNs = string(*ref.Namespace)
+	}
+	secretKey := types.NamespacedName{
+		Namespace: secretNs,
+		Name:      string(ref.Name),
+	}
+
+	if secretKey.Namespace != gw.Namespace {
+		from := Reference{
+			GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+			Namespace: gw.Namespace,
+		}
+		to := Reference{
+			GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+			Namespace: secretKey.Namespace,
+			Name:      secretKey.Name,
+		}
+		if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
+			return nil, NewCondition(
+				string(gatewayv1.GatewayConditionResolvedRefs),
+				metav1.ConditionFalse,
+				string(gatewayv1.GatewayReasonRefNotPermitted),
+				fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name),
+				gw.Generation,
+			)
+		}
+	}
+
+	var secret *corev1.Secret
+	if secrets != nil {
+		secret = secrets[secretKey]
+	}
+	if secret == nil {
+		return nil, NewCondition(
+			string(gatewayv1.GatewayConditionResolvedRefs),
+			metav1.ConditionFalse,
+			string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+			fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name),
+			gw.Generation,
+		)
+	}
+
+	certBytes := secret.Data[corev1.TLSCertKey]
+	keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
+	if len(certBytes) == 0 || len(keyBytes) == 0 {
+		return nil, NewCondition(
+			string(gatewayv1.GatewayConditionResolvedRefs),
+			metav1.ConditionFalse,
+			string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+			fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name),
+			gw.Generation,
+		)
+	}
+
+	tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
+	if err != nil {
+		return nil, NewCondition(
+			string(gatewayv1.GatewayConditionResolvedRefs),
+			metav1.ConditionFalse,
+			string(gatewayv1.GatewayReasonInvalidClientCertificateRef),
+			fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err),
+			gw.Generation,
+		)
+	}
+
+	return &tlsCert, NewCondition(
+		string(gatewayv1.GatewayConditionResolvedRefs),
+		metav1.ConditionTrue,
+		string(gatewayv1.GatewayReasonResolvedRefs),
+		"Resolved references",
+		gw.Generation,
+	)
+}
+
 // ComputeGatewayConditions computes the top-level conditions for a Gateway.
 func ComputeGatewayConditions(
 	gw *gatewayv1.Gateway,
@@ -661,6 +778,7 @@ func ComputeGatewayConditions(
 	readiness GatewayReadiness,
 	provErr string,
 	supportedAddressTypes []gatewayv1.AddressType,
+	resolvedRefsCond metav1.Condition,
 ) []metav1.Condition {
 	totalListeners := len(gw.Spec.Listeners)
 	acceptedListenersCount := 0
@@ -734,6 +852,20 @@ func ComputeGatewayConditions(
 		}
 	}
 
+	if resolvedRefsCond.Type == "" {
+		gen := int64(0)
+		if gw != nil {
+			gen = gw.Generation
+		}
+		resolvedRefsCond = NewCondition(
+			string(gatewayv1.GatewayConditionResolvedRefs),
+			metav1.ConditionTrue,
+			string(gatewayv1.GatewayReasonResolvedRefs),
+			"Resolved references",
+			gen,
+		)
+	}
+
 	return []metav1.Condition{
 		NewCondition(
 			string(gatewayv1.GatewayConditionProgrammed),
@@ -749,6 +881,7 @@ func ComputeGatewayConditions(
 			gwAcceptedMessage,
 			gw.Generation,
 		),
+		resolvedRefsCond,
 	}
 }
 
@@ -947,7 +1080,10 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if inputs.ProvisioningErrors != nil {
 			provErr = inputs.ProvisioningErrors[gwKey]
 		}
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr, inputs.SupportedAddressTypes)
+		clientCert, resolvedRefsCond := resolveGatewayBackendClientCert(gw, inputs.Secrets, refValidator)
+		cg.BackendClientCert = clientCert
+		cg.ResolvedRefsCondition = resolvedRefsCond
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr, inputs.SupportedAddressTypes, resolvedRefsCond)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -1674,12 +1810,14 @@ func ComputeDesiredGatewayStatus(
 	hasAddress := len(desiredAddresses) > 0
 	var effectiveListeners []*EffectiveListener
 	attachedLSCount := int32(0)
+	var resolvedRefsCond metav1.Condition
 	if compiledGw != nil {
 		effectiveListeners = compiledGw.EffectiveListeners
 		attachedLSCount = compiledGw.AttachedListenerSets
+		resolvedRefsCond = compiledGw.ResolvedRefsCondition
 	}
 
-	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr, supportedAddressTypes)
+	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr, supportedAddressTypes, resolvedRefsCond)
 
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {

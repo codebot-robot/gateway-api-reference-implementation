@@ -2533,3 +2533,141 @@ func TestProxy_H2C_GRPC(t *testing.T) {
 		}
 	})
 }
+
+func TestBackendTLSPolicy_ClientCertificateAuth(t *testing.T) {
+	// 1. Generate server CA and server cert
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	// 2. Generate client CA and client cert
+	clientCAKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate client CA key: %v", err)
+	}
+	clientCATemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(10),
+		Subject:               pkix.Name{CommonName: "Client Test CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(1 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+	}
+	clientCABytes, err := x509.CreateCertificate(rand.Reader, clientCATemplate, clientCATemplate, &clientCAKey.PublicKey, clientCAKey)
+	if err != nil {
+		t.Fatalf("failed to create client CA certificate: %v", err)
+	}
+	clientCACert, err := x509.ParseCertificate(clientCABytes)
+	if err != nil {
+		t.Fatalf("failed to parse client CA certificate: %v", err)
+	}
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AddCert(clientCACert)
+
+	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate client key: %v", err)
+	}
+	clientTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(11),
+		Subject:      pkix.Name{CommonName: "my-client"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientBytes, err := x509.CreateCertificate(rand.Reader, clientTemplate, clientCACert, &clientKey.PublicKey, clientCAKey)
+	if err != nil {
+		t.Fatalf("failed to create client certificate: %v", err)
+	}
+	clientPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientBytes})
+	clientKeyBytes, err := x509.MarshalECPrivateKey(clientKey)
+	if err != nil {
+		t.Fatalf("failed to marshal client key: %v", err)
+	}
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: clientKeyBytes})
+	clientTLSCert, err := tls.X509KeyPair(clientPEM, clientKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to create client X509 key pair: %v", err)
+	}
+
+	// 3. Start test TLS server requiring client auth
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "missing client certificate", http.StatusForbidden)
+			return
+		}
+		if r.TLS.PeerCertificates[0].Subject.CommonName != "my-client" {
+			http.Error(w, "wrong client certificate", http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("authenticated"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAPool,
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	httpsProto := "https"
+
+	p := NewProxy()
+
+	// Subtest 1: With ClientCert configured -> presents it and succeeds
+	t.Run("with client cert presents it and succeeds", func(t *testing.T) {
+		backend := state.InternalBackend{
+			Host:        host,
+			Port:        int32(port),
+			AppProtocol: &httpsProto,
+			TLSConfig: &state.InternalTLSConfig{
+				Hostname:   "backend.local",
+				CACerts:    [][]byte{serverCAPEM},
+				ClientCert: &clientTLSCert,
+			},
+		}
+		tr := p.buildTransport(backend)
+		client := &http.Client{Transport: tr}
+		req, _ := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("expected request to succeed, got error: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "authenticated" {
+			t.Errorf("expected body 'authenticated', got %q", string(body))
+		}
+	})
+
+	// Subtest 2: Without ClientCert configured -> fails TLS handshake
+	t.Run("without client cert fails handshake", func(t *testing.T) {
+		backend := state.InternalBackend{
+			Host:        host,
+			Port:        int32(port),
+			AppProtocol: &httpsProto,
+			TLSConfig: &state.InternalTLSConfig{
+				Hostname:   "backend.local",
+				CACerts:    [][]byte{serverCAPEM},
+				ClientCert: nil,
+			},
+		}
+		tr := p.buildTransport(backend)
+		client := &http.Client{Transport: tr}
+		req, _ := http.NewRequest("GET", fmt.Sprintf("https://%s:%d/", host, port), nil)
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			t.Fatalf("expected TLS handshake to fail, but request succeeded with status %d", resp.StatusCode)
+		}
+	})
+}

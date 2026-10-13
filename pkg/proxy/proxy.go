@@ -728,11 +728,17 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 
 	serverName := backend.TLSConfig.Hostname
 
+	var clientCerts []tls.Certificate
+	if backend.TLSConfig.ClientCert != nil {
+		clientCerts = []tls.Certificate{*backend.TLSConfig.ClientCert}
+	}
+
 	if len(backend.TLSConfig.SubjectAltNames) > 0 {
 		sans := backend.TLSConfig.SubjectAltNames
 		return &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: true,
+			Certificates:       clientCerts,
 			VerifyConnection: func(cs tls.ConnectionState) error {
 				if len(cs.PeerCertificates) == 0 {
 					return fmt.Errorf("no peer certificates presented")
@@ -762,6 +768,7 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 		ServerName:         serverName,
 		InsecureSkipVerify: false,
 		RootCAs:            rootCAs,
+		Certificates:       clientCerts,
 	}
 }
 

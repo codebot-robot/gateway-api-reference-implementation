@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
+	"sigs.k8s.io/gateway-api/pkg/features"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
@@ -91,6 +92,9 @@ func TestConformance(t *testing.T) {
 			CleanupBaseResources:       true,
 			CleanupTestResources:       true,
 			EnableAllSupportedFeatures: true,
+			SupportedFeatures: []features.FeatureName{
+				features.SupportGatewayBackendClientCertificate,
+			},
 			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
 				{
 					Type:  state.Ptr(gatewayv1.IPAddressType),
@@ -122,6 +126,7 @@ func TestConformance(t *testing.T) {
 		tests.GatewayInfrastructureMetadata,
 		tests.GatewayInvalidParametersRef,
 		tests.GatewayInvalidRouteKind,
+		tests.GatewayInvalidTLSBackendConfiguration,
 		tests.GatewayInvalidTLSConfiguration,
 		tests.GatewayListenerUnsupportedProtocol,
 		tests.GatewayModifyListeners,
@@ -132,6 +137,7 @@ func TestConformance(t *testing.T) {
 		tests.GatewaySecretReferenceGrantAllInNamespace,
 		tests.GatewaySecretReferenceGrantSpecific,
 		tests.GatewayStaticAddresses,
+		tests.GatewayTLSBackendClientCertificate,
 		tests.GatewayWithAttachedRoutes,
 		tests.GatewayWithAttachedRoutesWithPort8080,
 		tests.GRPCExactMethodMatching,
