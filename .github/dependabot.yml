@@ -22,22 +22,39 @@ updates:
       default-days: 2
 
   - package-ecosystem: "gomod"
-    directory: "/"
+    directories:
+      - "/"
+      - "/snigateway"
     schedule:
       interval: "daily"
     cooldown:
       default-days: 2
+    groups:
+      gomod:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      gomod-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: "docker"
-    directory: "/"
+    directories:
+      - "/images/*"
+      - "/tests/toolbox"
+      - "/.devcontainer"
     schedule:
       interval: "daily"
     cooldown:
       default-days: 2
-
-  - package-ecosystem: "docker"
-    directory: "/tests/toolbox"
-    schedule:
-      interval: "daily"
-    cooldown:
-      default-days: 2
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        group-by: dependency-name
+      docker-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
