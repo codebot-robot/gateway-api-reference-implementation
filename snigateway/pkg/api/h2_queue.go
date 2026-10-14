@@ -106,7 +106,7 @@ func (q *H2ChunkQueue) Wake() {
 // allocChunk copies b into a buffer, taking from 32 KiB or 64 KiB pools when applicable.
 func (q *H2ChunkQueue) allocChunk(b []byte) chunk {
 	n := len(b)
-	if n >= 1024 && n <= 32*1024 {
+	if n >= 16*1024 && n <= 32*1024 {
 		bp := pool32k.Get().(*[]byte)
 		buf := (*bp)[:cap(*bp)]
 		copy(buf, b)
@@ -226,6 +226,7 @@ func (q *H2ChunkQueue) Read(p []byte) (int, error) {
 
 // TakeAll drains all queued bytes into *into, growing it to the backlog size if needed.
 // Used by the backend drainer to coalesce all currently queued writes into one frame.
+// Waits only for data or close so write deadlines on idle streams do not cause teardown.
 func (q *H2ChunkQueue) TakeAll(into *[]byte) (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -236,9 +237,6 @@ func (q *H2ChunkQueue) TakeAll(into *[]byte) (int, error) {
 				return 0, q.closeErr
 			}
 			return 0, io.EOF
-		}
-		if !q.writeDeadline.IsZero() && !time.Now().Before(q.writeDeadline) {
-			return 0, os.ErrDeadlineExceeded
 		}
 		q.cond.Wait()
 	}

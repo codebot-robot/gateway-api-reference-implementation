@@ -1234,12 +1234,12 @@ func (s *serverStreamConn) RunDrainLoop() {
 			}
 			s.inFlight.Done()
 			if werr != nil {
-				s.Close()
+				closeConn(s)
 				return
 			}
 		}
 		if err != nil {
-			s.Close()
+			closeConn(s)
 			return
 		}
 	}
@@ -1444,7 +1444,7 @@ func (s *serverStreamConn) Close() error {
 		if s.cancelCtx != nil {
 			s.cancelCtx()
 		}
-		s.queue.Close()
+		closeConn(s.queue)
 		closeConn(s.r)
 		close(s.doneCh)
 	})

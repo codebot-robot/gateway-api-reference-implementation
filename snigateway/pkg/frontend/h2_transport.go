@@ -726,7 +726,7 @@ func (c *h2StreamConn) Close() error {
 		c.mu.Unlock()
 
 		c.streamCancel()
-		c.queue.Close()
+		closeCloser(c.queue)
 		if rb != nil {
 			closeCloser(rb)
 		}

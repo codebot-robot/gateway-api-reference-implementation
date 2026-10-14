@@ -17,6 +17,7 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -250,5 +251,76 @@ func TestH2ChunkQueue_ConcurrentStreaming(t *testing.T) {
 	wg.Wait()
 	if readBytes != totalBytes {
 		t.Fatalf("expected %d read bytes, got %d", totalBytes, readBytes)
+	}
+}
+
+func TestH2ChunkQueue_TakeAllIdleWithWriteDeadline(t *testing.T) {
+	q := NewH2ChunkQueue(256 * 1024)
+	defer q.Close()
+
+	// Set write deadline in the past on an empty queue
+	q.SetWriteDeadline(time.Now().Add(-1 * time.Second))
+
+	// TakeAll should NOT return ErrDeadlineExceeded when idle
+	drainDone := make(chan error, 1)
+	go func() {
+		var drainBuf []byte
+		n, err := q.TakeAll(&drainBuf)
+		if err != nil {
+			drainDone <- err
+			return
+		}
+		if string(drainBuf[:n]) != "payload" {
+			drainDone <- fmt.Errorf("unexpected payload: %q", string(drainBuf[:n]))
+			return
+		}
+		drainDone <- nil
+	}()
+
+	select {
+	case err := <-drainDone:
+		t.Fatalf("TakeAll should not return on idle with write deadline, got: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// correctly still waiting
+	}
+
+	// Clearing write deadline allows Write to succeed
+	q.SetWriteDeadline(time.Time{})
+	if _, err := q.Write([]byte("payload")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	select {
+	case err := <-drainDone:
+		if err != nil {
+			t.Fatalf("TakeAll failed: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for TakeAll to drain payload")
+	}
+}
+
+func TestH2ChunkQueue_SmallChunkMemoryBound(t *testing.T) {
+	q := NewH2ChunkQueue(256 * 1024)
+	defer q.Close()
+
+	// 1 KiB chunk should allocate exact slice without poolBuf
+	chunk1k := make([]byte, 1024)
+	c := q.allocChunk(chunk1k)
+	if c.poolBuf != nil {
+		t.Errorf("expected 1 KiB chunk to not use pooled buffer, got poolBuf!=nil")
+	}
+	if len(c.data) != 1024 || cap(c.data) != 1024 {
+		t.Errorf("expected 1 KiB chunk cap=1024, got %d", cap(c.data))
+	}
+
+	// 16 KiB chunk (e.g. TLS record) should use pool32k
+	chunk16k := make([]byte, 16*1024)
+	c16 := q.allocChunk(chunk16k)
+	if c16.poolBuf == nil {
+		t.Errorf("expected 16 KiB chunk to use pool32k, got poolBuf=nil")
+	}
+	if c16.poolBuf != nil {
+		q.putPoolBuf(c16.poolBuf)
 	}
 }
