@@ -17,6 +17,7 @@ package state
 import (
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -974,5 +975,165 @@ func TestSelectUDPBackend(t *testing.T) {
 	var nilLis *InternalListener
 	if _, ok := nilLis.SelectUDPBackend(); ok {
 		t.Errorf("expected ok=false on nil listener")
+	}
+}
+
+func TestUDPPort8443Conflict(t *testing.T) {
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-udp-8443",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "udp-8443",
+					Port:     8443,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+	}
+
+	outputs := ComputeOutputs(inputs)
+	gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+
+	var confCond *metav1.Condition
+	for _, c := range gwStatus.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionConflicted) {
+			confCond = &c
+			break
+		}
+	}
+	if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(gatewayv1.ListenerReasonProtocolConflict) {
+		t.Errorf("expected Conflicted=True with ProtocolConflict on UDP 8443, got %+v", confCond)
+	}
+}
+
+func TestUDPListener_AllInOneModeConflict(t *testing.T) {
+	now := metav1.Now()
+	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw1-older",
+			Namespace:         "default",
+			CreationTimestamp: olderTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "udp-shared",
+					Port:     5300,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+			},
+		},
+	}
+
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw2-newer",
+			Namespace:         "default",
+			CreationTimestamp: newerTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "udp-shared",
+					Port:     5300,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	// 1. With AllInOneMode: true
+	inputsAllInOne := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputsAllInOne := ComputeOutputs(inputsAllInOne)
+
+	// First gateway (older) wins: Programmed=True
+	gw1Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw1.Name}]
+	var gw1ProgCond *metav1.Condition
+	for _, c := range gw1Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw1ProgCond = &c
+			break
+		}
+	}
+	if gw1ProgCond == nil || gw1ProgCond.Status != metav1.ConditionTrue {
+		t.Errorf("gw1 (older) expected Programmed=True, got %+v", gw1ProgCond)
+	}
+
+	// Second gateway (newer) loses: Programmed=False, reason PortUnavailable
+	gw2Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2ProgCond *metav1.Condition
+	for _, c := range gw2Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2ProgCond = &c
+			break
+		}
+	}
+	if gw2ProgCond == nil || gw2ProgCond.Status != metav1.ConditionFalse || gw2ProgCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+		t.Errorf("gw2 (newer) expected Programmed=False PortUnavailable, got %+v", gw2ProgCond)
+	}
+
+	// Proxy listeners in all-in-one should only include the first (gw1) listener
+	if len(outputsAllInOne.ProxyListeners) != 1 || outputsAllInOne.ProxyListeners[0].GatewayName.String() != "default/gw1-older" {
+		t.Errorf("expected only gw1 proxy listener, got %+v", outputsAllInOne.ProxyListeners)
+	}
+
+	// 2. With AllInOneMode: false (singlepod mode)
+	inputsSinglePod := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw1, gw2},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   false,
+	}
+
+	outputsSinglePod := ComputeOutputs(inputsSinglePod)
+	gw2SinglePodStatus := outputsSinglePod.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2SinglePodProg *metav1.Condition
+	for _, c := range gw2SinglePodStatus.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2SinglePodProg = &c
+			break
+		}
+	}
+	if gw2SinglePodProg == nil || gw2SinglePodProg.Status != metav1.ConditionTrue {
+		t.Errorf("in singlepod mode, gw2 expected Programmed=True, got %+v", gw2SinglePodProg)
 	}
 }

@@ -1143,6 +1143,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 	})
 
 	boundTCPPorts := make(map[gatewayv1.PortNumber]string)
+	boundUDPPorts := make(map[gatewayv1.PortNumber]string)
 
 	for _, gw := range sortedGateways {
 		if gw == nil {
@@ -1225,6 +1226,11 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
 				continue
 			}
+			if elCur.Protocol == gatewayv1.UDPProtocolType && elCur.Port == 8443 {
+				msg := fmt.Sprintf("UDP listener port %d conflicts with reserved proxy port %d", elCur.Port, elCur.Port)
+				markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
+				continue
+			}
 
 			for j := 0; j < i; j++ {
 				elPrev := cg.EffectiveListeners[j]
@@ -1258,7 +1264,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			}
 		}
 
-		// In all-in-one mode, two Gateways with the same TCP port cannot both bind; first wins and second reports Programmed=False.
+		// In all-in-one mode, two Gateways with the same TCP/UDP port cannot both bind; first wins and second reports Programmed=False.
 		if inputs.AllInOneMode {
 			for _, el := range cg.EffectiveListeners {
 				if el.Protocol == gatewayv1.TCPProtocolType && el.IsAccepted() && !el.IsConflicted() {
@@ -1272,6 +1278,19 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 						))
 					} else {
 						boundTCPPorts[el.Port] = gwKey.String()
+					}
+				}
+				if el.Protocol == gatewayv1.UDPProtocolType && el.IsAccepted() && !el.IsConflicted() {
+					if firstGW, exists := boundUDPPorts[el.Port]; exists {
+						SetCondition(&el.Conditions, NewCondition(
+							string(gatewayv1.ListenerConditionProgrammed),
+							metav1.ConditionFalse,
+							string(gatewayv1.ListenerReasonPortUnavailable),
+							fmt.Sprintf("Port %d is already bound by Gateway %s in all-in-one mode", el.Port, firstGW),
+							el.Generation,
+						))
+					} else {
+						boundUDPPorts[el.Port] = gwKey.String()
 					}
 				}
 			}

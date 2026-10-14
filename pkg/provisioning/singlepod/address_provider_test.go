@@ -1783,3 +1783,161 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		t.Errorf("conflicted port 8000 should NOT be declared on Deployment container ports")
 	}
 }
+
+func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testing.T) {
+	c := setupTestClient(t)
+	p := NewAddressProvider(c)
+	ctx := t.Context()
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-udp",
+			Namespace: "test-ns",
+			UID:       types.UID("gw-udp-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+				{
+					Name:     "udp-dns",
+					Port:     53,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
+					Name:     "udp-custom",
+					Port:     5300,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
+					Name:     "udp-conflicted",
+					Port:     8443,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     "http",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+		{
+			Name:     "udp-dns",
+			Port:     53,
+			Protocol: gatewayv1.UDPProtocolType,
+		},
+		{
+			Name:     "udp-custom",
+			Port:     5300,
+			Protocol: gatewayv1.UDPProtocolType,
+		},
+		{
+			Name:     "udp-conflicted",
+			Port:     8443,
+			Protocol: gatewayv1.UDPProtocolType,
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(gatewayv1.ListenerConditionConflicted),
+					Status: metav1.ConditionTrue,
+					Reason: string(gatewayv1.ListenerReasonProtocolConflict),
+				},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resName := ResourceNameForGateway("gw-udp")
+
+	// 1. Verify Service ports
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get created Service: %v", err)
+	}
+
+	svcPortMap := make(map[string]corev1.ServicePort)
+	for _, sp := range svc.Spec.Ports {
+		svcPortMap[sp.Name] = sp
+	}
+
+	// Verify HTTP port remapped to 8000
+	if sp, ok := svcPortMap["http-80"]; !ok {
+		t.Errorf("expected Service port http-80")
+	} else {
+		if sp.Port != 80 || sp.TargetPort.IntValue() != 8000 || sp.Protocol != corev1.ProtocolTCP {
+			t.Errorf("http-80: got port=%d targetPort=%v proto=%s", sp.Port, sp.TargetPort, sp.Protocol)
+		}
+	}
+
+	// Verify UDP ports mapped to matching target ports
+	if sp, ok := svcPortMap["udp-53"]; !ok {
+		t.Errorf("expected Service port udp-53")
+	} else {
+		if sp.Port != 53 || sp.TargetPort.IntValue() != 53 || sp.Protocol != corev1.ProtocolUDP {
+			t.Errorf("udp-53: got port=%d targetPort=%v proto=%s, want matching targetPort 53", sp.Port, sp.TargetPort, sp.Protocol)
+		}
+	}
+
+	if sp, ok := svcPortMap["udp-5300"]; !ok {
+		t.Errorf("expected Service port udp-5300")
+	} else {
+		if sp.Port != 5300 || sp.TargetPort.IntValue() != 5300 || sp.Protocol != corev1.ProtocolUDP {
+			t.Errorf("udp-5300: got port=%d targetPort=%v proto=%s, want matching targetPort 5300", sp.Port, sp.TargetPort, sp.Protocol)
+		}
+	}
+
+	// Verify conflicted UDP listener port 8443 is NOT in Service as udp-8443
+	if _, ok := svcPortMap["udp-8443"]; ok {
+		t.Errorf("conflicted port 8443 should NOT be exposed on Service as udp-8443")
+	}
+
+	// 2. Verify Deployment container ports
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	containerPorts := deploy.Spec.Template.Spec.Containers[0].Ports
+	cpMap := make(map[string]corev1.ContainerPort)
+	for _, cp := range containerPorts {
+		cpMap[cp.Name] = cp
+	}
+
+	// Verify default container ports
+	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8000 {
+		t.Errorf("expected container port http:8000")
+	}
+	if cp, ok := cpMap["https"]; !ok || cp.ContainerPort != 8443 {
+		t.Errorf("expected container port https:8443")
+	}
+	if cp, ok := cpMap["http3"]; !ok || cp.ContainerPort != 8443 || cp.Protocol != corev1.ProtocolUDP {
+		t.Errorf("expected container port http3:8443/UDP")
+	}
+
+	// Verify UDP listener container ports
+	if cp, ok := cpMap["udp-53"]; !ok {
+		t.Errorf("expected container port udp-53")
+	} else if cp.ContainerPort != 53 || cp.Protocol != corev1.ProtocolUDP {
+		t.Errorf("udp-53: got containerPort=%d proto=%s, want 53/UDP", cp.ContainerPort, cp.Protocol)
+	}
+
+	if cp, ok := cpMap["udp-5300"]; !ok {
+		t.Errorf("expected container port udp-5300")
+	} else if cp.ContainerPort != 5300 || cp.Protocol != corev1.ProtocolUDP {
+		t.Errorf("udp-5300: got containerPort=%d proto=%s, want 5300/UDP", cp.ContainerPort, cp.Protocol)
+	}
+
+	// Verify conflicted UDP listener port 8443 is NOT in Deployment as udp-8443
+	if _, ok := cpMap["udp-8443"]; ok {
+		t.Errorf("conflicted port 8443 should NOT be declared on Deployment container ports as udp-8443")
+	}
+}

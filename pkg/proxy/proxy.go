@@ -55,7 +55,14 @@ type Proxy struct {
 	tcpBindHost  string
 	listenFunc   func(network, addr string) (net.Listener, error)
 	dialFunc     func(network, addr string) (net.Conn, error)
-	closed       bool
+
+	udpListeners     map[gatewayv1.PortNumber]*udpPortListener
+	udpBindHost      string
+	udpIdleTimeout   time.Duration
+	udpMaxSessions   int
+	listenPacketFunc func(network, addr string) (net.PacketConn, error)
+
+	closed bool
 }
 
 type tcpPortListener struct {
@@ -73,10 +80,13 @@ type sniConfig struct {
 
 func NewProxy() *Proxy {
 	p := &Proxy{
-		routes:       []state.InternalRoute{},
-		listeners:    []state.InternalListener{},
-		certificates: make(map[string]*tls.Certificate),
-		tcpListeners: make(map[gatewayv1.PortNumber]*tcpPortListener),
+		routes:         []state.InternalRoute{},
+		listeners:      []state.InternalListener{},
+		certificates:   make(map[string]*tls.Certificate),
+		tcpListeners:   make(map[gatewayv1.PortNumber]*tcpPortListener),
+		udpListeners:   make(map[gatewayv1.PortNumber]*udpPortListener),
+		udpIdleTimeout: DefaultUDPIdleTimeout,
+		udpMaxSessions: DefaultUDPMaxSessions,
 	}
 	p.sniConfig.Store(&sniConfig{})
 	return p
@@ -94,10 +104,22 @@ func (p *Proxy) SetTCPBindHost(host string) {
 	p.tcpBindHost = host
 }
 
+func (p *Proxy) SetUDPBindHost(host string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.udpBindHost = host
+}
+
 func (p *Proxy) SetListenFunc(fn func(network, addr string) (net.Listener, error)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.listenFunc = fn
+}
+
+func (p *Proxy) SetListenPacketFunc(fn func(network, addr string) (net.PacketConn, error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.listenPacketFunc = fn
 }
 
 func (p *Proxy) SetDialFunc(fn func(network, addr string) (net.Conn, error)) {
@@ -106,11 +128,32 @@ func (p *Proxy) SetDialFunc(fn func(network, addr string) (net.Conn, error)) {
 	p.dialFunc = fn
 }
 
+func (p *Proxy) SetUDPIdleTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.udpIdleTimeout = d
+}
+
+func (p *Proxy) SetUDPMaxSessions(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.udpMaxSessions = n
+}
+
 func (p *Proxy) GetTCPListener(port gatewayv1.PortNumber) net.Listener {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if pl, ok := p.tcpListeners[port]; ok {
 		return pl.ln
+	}
+	return nil
+}
+
+func (p *Proxy) GetUDPListener(port gatewayv1.PortNumber) net.PacketConn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if pl, ok := p.udpListeners[port]; ok {
+		return pl.conn
 	}
 	return nil
 }
@@ -128,6 +171,12 @@ func (p *Proxy) Close() error {
 		}
 		delete(p.tcpListeners, port)
 	}
+	for port, pl := range p.udpListeners {
+		if err := pl.close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+		delete(p.udpListeners, port)
+	}
 	return errors.Join(errs...)
 }
 
@@ -143,6 +192,7 @@ func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
 	p.listeners = listeners
 	p.updateSNIConfigLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
+	p.updateUDPListenersLocked(listeners)
 }
 
 func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.InternalRoute) {
@@ -152,6 +202,7 @@ func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.
 	p.routes = routes
 	p.updateSNIConfigLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
+	p.updateUDPListenersLocked(listeners)
 }
 
 func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {

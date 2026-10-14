@@ -338,10 +338,12 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		image = DefaultDataplaneImage
 	}
 
-	// Compute unique listener ports and TCP ports across effective listeners
+	// Compute unique listener ports and TCP/UDP ports across effective listeners
 	uniquePorts := make(map[gatewayv1.PortNumber]gatewayv1.ProtocolType)
 	var tcpPorts []int
 	seenTCPPort := make(map[gatewayv1.PortNumber]bool)
+	var udpPorts []int
+	seenUDPPort := make(map[gatewayv1.PortNumber]bool)
 	if len(effectiveListeners) > 0 {
 		for _, el := range effectiveListeners {
 			if el.IsConflicted() {
@@ -353,12 +355,20 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					tcpPorts = append(tcpPorts, int(el.Port))
 				}
 			}
-			if prev, ok := uniquePorts[el.Port]; !ok {
-				uniquePorts[el.Port] = el.Protocol
-			} else if el.Protocol == gatewayv1.HTTPSProtocolType {
-				uniquePorts[el.Port] = gatewayv1.HTTPSProtocolType
-			} else if el.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
-				uniquePorts[el.Port] = gatewayv1.TLSProtocolType
+			if el.Protocol == gatewayv1.UDPProtocolType && el.Port != 8443 {
+				if !seenUDPPort[el.Port] {
+					seenUDPPort[el.Port] = true
+					udpPorts = append(udpPorts, int(el.Port))
+				}
+			}
+			if el.Protocol != gatewayv1.UDPProtocolType {
+				if prev, ok := uniquePorts[el.Port]; !ok {
+					uniquePorts[el.Port] = el.Protocol
+				} else if el.Protocol == gatewayv1.HTTPSProtocolType {
+					uniquePorts[el.Port] = gatewayv1.HTTPSProtocolType
+				} else if el.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
+					uniquePorts[el.Port] = gatewayv1.TLSProtocolType
+				}
 			}
 		}
 	} else {
@@ -369,16 +379,25 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					tcpPorts = append(tcpPorts, int(l.Port))
 				}
 			}
-			if prev, ok := uniquePorts[l.Port]; !ok {
-				uniquePorts[l.Port] = l.Protocol
-			} else if l.Protocol == gatewayv1.HTTPSProtocolType {
-				uniquePorts[l.Port] = gatewayv1.HTTPSProtocolType
-			} else if l.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType {
-				uniquePorts[l.Port] = gatewayv1.TLSProtocolType
+			if l.Protocol == gatewayv1.UDPProtocolType && l.Port != 8443 {
+				if !seenUDPPort[l.Port] {
+					seenUDPPort[l.Port] = true
+					udpPorts = append(udpPorts, int(l.Port))
+				}
+			}
+			if l.Protocol != gatewayv1.UDPProtocolType {
+				if prev, ok := uniquePorts[l.Port]; !ok {
+					uniquePorts[l.Port] = l.Protocol
+				} else if el := l; prev != gatewayv1.HTTPSProtocolType && el.Protocol == gatewayv1.HTTPSProtocolType {
+					uniquePorts[l.Port] = gatewayv1.HTTPSProtocolType
+				} else if prev, ok := uniquePorts[l.Port]; !ok || (l.Protocol == gatewayv1.TLSProtocolType && prev != gatewayv1.HTTPSProtocolType) {
+					uniquePorts[l.Port] = gatewayv1.TLSProtocolType
+				}
 			}
 		}
 	}
 	sort.Ints(tcpPorts)
+	sort.Ints(udpPorts)
 
 	containerPorts := []*corev1ac.ContainerPortApplyConfiguration{
 		corev1ac.ContainerPort().
@@ -395,11 +414,25 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			WithProtocol(corev1.ProtocolUDP),
 	}
 	for _, portInt := range tcpPorts {
+		if portInt == 8000 || portInt == 8443 {
+			continue
+		}
 		containerPorts = append(containerPorts,
 			corev1ac.ContainerPort().
 				WithName(fmt.Sprintf("tcp-%d", portInt)).
 				WithContainerPort(int32(portInt)).
 				WithProtocol(corev1.ProtocolTCP),
+		)
+	}
+	for _, portInt := range udpPorts {
+		if portInt == 8443 {
+			continue
+		}
+		containerPorts = append(containerPorts,
+			corev1ac.ContainerPort().
+				WithName(fmt.Sprintf("udp-%d", portInt)).
+				WithContainerPort(int32(portInt)).
+				WithProtocol(corev1.ProtocolUDP),
 		)
 	}
 
@@ -508,6 +541,16 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 					WithProtocol(corev1.ProtocolTCP),
 			)
 		}
+	}
+	for _, portInt := range udpPorts {
+		port := gatewayv1.PortNumber(portInt)
+		svcPorts = append(svcPorts,
+			corev1ac.ServicePort().
+				WithName(fmt.Sprintf("udp-%d", port)).
+				WithPort(int32(port)).
+				WithTargetPort(intstr.FromInt32(int32(port))).
+				WithProtocol(corev1.ProtocolUDP),
+		)
 	}
 
 	requestedIPs := requestedIPAddresses(gw)

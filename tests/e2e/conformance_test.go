@@ -238,9 +238,12 @@ func TestConformance(t *testing.T) {
 		tests.UDPRouteInvalidBackendRefNonexistent,
 		tests.UDPRouteInvalidCrossNamespaceBackendRef,
 		tests.UDPRouteNotAllowedByListeners,
-		// UDPRouteMultipleRoutesAttachment includes a data-plane traffic verification step
-		// ("Only the oldest UDPRoute should receive traffic") and is deferred to Part 2 along
-		// with UDP socket listening and provisioning changes, matching TCPRouteMultipleRoutesAttachment.
+		tests.UDPRouteTest,
+		tests.UDPRouteMultipleRoutesAttachment,
+		tests.UDPRouteParentRefAttachAllListeners,
+		tests.UDPRouteParentRefPortAndSectionName,
+		tests.UDPRouteReferenceGrant,
+		tests.UDPRouteWeightedRouting,
 	}
 
 	cSuite.Setup(t, selectedTests)
