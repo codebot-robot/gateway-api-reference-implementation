@@ -1085,11 +1085,13 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 					}
 				}()
 
-				if err := m.handleTunnelConn(streamConn); err != nil {
-					return
-				}
+				go func() {
+					if err := m.handleTunnelConn(streamConn); err != nil {
+						closeConn(streamConn)
+					}
+				}()
 
-				<-streamConn.Done()
+				streamConn.RunDrainLoop()
 			})
 
 			h2Server.ServeConn(conn, &http2.ServeConnOpts{
@@ -1174,7 +1176,8 @@ var h2CopyBufPool = sync.Pool{
 	},
 }
 
-type serverStreamConn struct {
+// ServerStreamConn implements net.Conn over an HTTP/2 CONNECT server stream.
+type ServerStreamConn struct {
 	w          http.ResponseWriter
 	flusher    http.Flusher
 	r          io.ReadCloser
@@ -1182,10 +1185,11 @@ type serverStreamConn struct {
 	underlying net.Conn
 	doneCh     chan struct{}
 	closeOnce  sync.Once
+	queue      *api.H2ChunkQueue
+	drainBuf   []byte
 
 	mu            sync.Mutex
 	closed        bool
-	writeMu       sync.Mutex
 	inFlight      sync.WaitGroup
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -1193,20 +1197,52 @@ type serverStreamConn struct {
 	writeTimer    *time.Timer
 }
 
-func newServerStreamConn(w http.ResponseWriter, r io.ReadCloser, cancelCtx context.CancelFunc, underlying net.Conn) *serverStreamConn {
+type serverStreamConn = ServerStreamConn
+
+// NewServerStreamConn creates a new ServerStreamConn.
+func NewServerStreamConn(w http.ResponseWriter, r io.ReadCloser, cancelCtx context.CancelFunc, underlying net.Conn) *ServerStreamConn {
 	flusher, _ := w.(http.Flusher)
-	return &serverStreamConn{
+	return &ServerStreamConn{
 		w:          w,
 		flusher:    flusher,
 		r:          r,
 		cancelCtx:  cancelCtx,
 		underlying: underlying,
 		doneCh:     make(chan struct{}),
+		queue:      api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound),
 	}
+}
+
+func newServerStreamConn(w http.ResponseWriter, r io.ReadCloser, cancelCtx context.CancelFunc, underlying net.Conn) *ServerStreamConn {
+	return NewServerStreamConn(w, r, cancelCtx, underlying)
 }
 
 func (s *serverStreamConn) Done() <-chan struct{} {
 	return s.doneCh
+}
+
+// RunDrainLoop drains queued writes into w until the stream or queue is closed.
+// It is intended to run directly inside the HTTP/2 stream's handler goroutine.
+func (s *serverStreamConn) RunDrainLoop() {
+	for {
+		n, err := s.queue.TakeAll(&s.drainBuf)
+		if n > 0 {
+			s.inFlight.Add(1)
+			_, werr := s.w.Write(s.drainBuf)
+			if s.flusher != nil && n < 4096 {
+				s.flusher.Flush()
+			}
+			s.inFlight.Done()
+			if werr != nil {
+				closeConn(s)
+				return
+			}
+		}
+		if err != nil {
+			closeConn(s)
+			return
+		}
+	}
 }
 
 func (s *serverStreamConn) WriteTo(w io.Writer) (int64, error) {
@@ -1348,25 +1384,9 @@ func (s *serverStreamConn) Write(b []byte) (int, error) {
 		s.mu.Unlock()
 		return 0, os.ErrDeadlineExceeded
 	}
-	s.inFlight.Add(1)
-	s.mu.Unlock()
-	defer s.inFlight.Done()
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return 0, net.ErrClosed
-	}
 	s.mu.Unlock()
 
-	n, err := s.w.Write(b)
-	if s.flusher != nil && n < 4096 {
-		s.flusher.Flush()
-	}
-	return n, err
+	return s.queue.Write(b)
 }
 
 func (s *serverStreamConn) SetReadDeadline(t time.Time) error {
@@ -1389,15 +1409,14 @@ func (s *serverStreamConn) SetWriteDeadline(t time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writeDeadline = t
+	s.queue.SetWriteDeadline(t)
 	if s.writeTimer != nil {
 		s.writeTimer.Stop()
 		s.writeTimer = nil
 	}
 	if !t.IsZero() && time.Until(t) > 0 {
 		s.writeTimer = time.AfterFunc(time.Until(t), func() {
-			if s.cancelCtx != nil {
-				s.cancelCtx()
-			}
+			s.queue.Wake()
 		})
 	}
 	return nil
@@ -1425,6 +1444,7 @@ func (s *serverStreamConn) Close() error {
 		if s.cancelCtx != nil {
 			s.cancelCtx()
 		}
+		closeConn(s.queue)
 		closeConn(s.r)
 		close(s.doneCh)
 	})

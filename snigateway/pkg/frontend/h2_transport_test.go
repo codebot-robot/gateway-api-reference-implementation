@@ -17,6 +17,7 @@ package frontend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 	"golang.org/x/net/http2"
 )
 
@@ -441,10 +443,9 @@ func TestH2Transport_IdlePing(t *testing.T) {
 }
 
 func TestH2StreamConn_WriteToAndReadFrom(t *testing.T) {
-	pr, pw := io.Pipe()
-	defer pw.Close()
+	queue := api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound)
 	go func() {
-		_, _ = io.Copy(io.Discard, pr)
+		_, _ = io.Copy(io.Discard, queue)
 	}()
 
 	respCh := make(chan rtResult, 1)
@@ -461,7 +462,7 @@ func TestH2StreamConn_WriteToAndReadFrom(t *testing.T) {
 	streamCtx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	conn := newH2StreamConn(pw, respCh, cancel, &net.TCPAddr{Port: 1234}, &net.TCPAddr{Port: 5678}, nil)
+	conn := newH2StreamConn(queue, respCh, cancel, &net.TCPAddr{Port: 1234}, &net.TCPAddr{Port: 5678}, nil)
 	defer conn.Close()
 
 	// Verify WriteTo
@@ -512,4 +513,186 @@ func TestH2StreamConn_WriteToAndReadFrom(t *testing.T) {
 		t.Fatalf("clear SetReadDeadline failed: %v", err)
 	}
 	_ = streamCtx
+}
+
+func TestH2StreamConn_StreamingProbe(t *testing.T) {
+	queue := api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound)
+	respCh := make(chan rtResult, 1)
+
+	_, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	conn := newH2StreamConn(queue, respCh, cancel, nil, nil, nil)
+	defer conn.Close()
+
+	// Probe: a 13-byte Write without concurrent Read is delivered within a few ms
+	probe := []byte("hello 13 byte")
+	t0 := time.Now()
+	n, err := conn.Write(probe)
+	if err != nil || n != len(probe) {
+		t.Fatalf("Write failed: n=%d err=%v", n, err)
+	}
+
+	buf := make([]byte, 1024)
+	nr, err := queue.Read(buf)
+	if err != nil {
+		t.Fatalf("queue.Read failed: %v", err)
+	}
+	if time.Since(t0) > 20*time.Millisecond {
+		t.Fatalf("Probe delivery took too long: %v", time.Since(t0))
+	}
+	if string(buf[:nr]) != string(probe) {
+		t.Fatalf("Probe payload mismatch: got %q", string(buf[:nr]))
+	}
+}
+
+func TestH2StreamConn_BackpressureAndClose(t *testing.T) {
+	bound := 64 * 1024
+	queue := api.NewH2ChunkQueue(bound)
+	respCh := make(chan rtResult, 1)
+
+	_, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	conn := newH2StreamConn(queue, respCh, cancel, nil, nil, nil)
+
+	// Write up to queue bound
+	chunk := make([]byte, 16*1024)
+	for i := 0; i < 4; i++ {
+		n, err := conn.Write(chunk)
+		if err != nil || n != len(chunk) {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+
+	// 5th write against stalled reader must block
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(chunk)
+		writeErrCh <- err
+	}()
+
+	select {
+	case err := <-writeErrCh:
+		t.Fatalf("expected write to block, but returned: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// writer is blocked on backpressure
+	}
+
+	// Close unblocks it
+	_ = conn.Close()
+
+	select {
+	case err := <-writeErrCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("expected net.ErrClosed, got: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timeout waiting for Close to unblock writer")
+	}
+}
+
+func TestH2Transport_ReadsNeverWaitOnWrites(t *testing.T) {
+	writeStalled := make(chan struct{})
+	readDone := make(chan []byte, 1)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		_, cancelReq := context.WithCancel(r.Context())
+		defer cancelReq()
+		sConn := tunnel.NewServerStreamConn(w, r.Body, cancelReq, nil)
+		defer sConn.Close()
+		go sConn.RunDrainLoop()
+
+		// Background writer: continuously write until writes stall (flow-control window + queue filled)
+		go func() {
+			bigChunk := make([]byte, 64*1024)
+			for {
+				_ = sConn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				_, err := sConn.Write(bigChunk)
+				if err != nil {
+					// Write stalled on flow control / deadline!
+					select {
+					case <-writeStalled:
+					default:
+						close(writeStalled)
+					}
+					return
+				}
+			}
+		}()
+
+		// Wait until write has stalled
+		<-writeStalled
+
+		// While write is stalled, read client upload
+		uploadBuf := make([]byte, 1024)
+		_ = sConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		nr, err := sConn.Read(uploadBuf)
+		if err != nil {
+			t.Errorf("Read failed while write stalled: %v", err)
+			return
+		}
+		readDone <- uploadBuf[:nr]
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-flow-control-test"
+	h2Tr.RegisterSession(sessID)
+
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer c1.Close()
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn failed: %v", err)
+	}
+
+	streamConn, err := h2Tr.GetConn(t.Context(), sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer streamConn.Close()
+
+	// Frontend intentionally DOES NOT read from streamConn (non-draining frontend)
+	// Wait for backend writer to stall
+	select {
+	case <-writeStalled:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for backend write to stall")
+	}
+
+	// Now client uploads data to backend while backend write is stalled
+	uploadData := []byte("client upload while write is stalled")
+	t0 := time.Now()
+	nw, err := streamConn.Write(uploadData)
+	if err != nil || nw != len(uploadData) {
+		t.Fatalf("streamConn.Write failed: %v", err)
+	}
+
+	select {
+	case data := <-readDone:
+		if time.Since(t0) > 500*time.Millisecond {
+			t.Fatalf("Read took too long: %v", time.Since(t0))
+		}
+		if string(data) != string(uploadData) {
+			t.Fatalf("Read data mismatch: got %q, want %q", string(data), string(uploadData))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for backend to read upload while write is stalled")
+	}
 }

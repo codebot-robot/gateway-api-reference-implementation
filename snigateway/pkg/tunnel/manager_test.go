@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -1264,12 +1266,15 @@ func TestManager_TunnelStateRegistrationAndNotifications(t *testing.T) {
 }
 
 type testResponseWriter struct {
+	mu      sync.Mutex
 	header  http.Header
 	buf     []byte
 	flushed int
 }
 
 func (w *testResponseWriter) Header() http.Header {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.header == nil {
 		w.header = make(http.Header)
 	}
@@ -1277,6 +1282,8 @@ func (w *testResponseWriter) Header() http.Header {
 }
 
 func (w *testResponseWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.buf = append(w.buf, b...)
 	return len(b), nil
 }
@@ -1284,7 +1291,37 @@ func (w *testResponseWriter) Write(b []byte) (int, error) {
 func (w *testResponseWriter) WriteHeader(statusCode int) {}
 
 func (w *testResponseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.flushed++
+}
+
+func (w *testResponseWriter) bytes() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	res := make([]byte, len(w.buf))
+	copy(res, w.buf)
+	return res
+}
+
+func (w *testResponseWriter) getFlushed() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.flushed
+}
+
+func (w *testResponseWriter) waitForBytes(targetLen int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		w.mu.Lock()
+		curLen := len(w.buf)
+		w.mu.Unlock()
+		if curLen >= targetLen {
+			return true
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	return false
 }
 
 func TestServerStreamConn_WritingAndDeadlines(t *testing.T) {
@@ -1297,6 +1334,7 @@ func TestServerStreamConn_WritingAndDeadlines(t *testing.T) {
 
 	conn := newServerStreamConn(rw, pr, cancel, nil)
 	defer conn.Close()
+	go conn.RunDrainLoop()
 
 	// Write smaller than 4096 bytes should be written immediately and flushed
 	smallChunk := []byte("hello 13 byte")
@@ -1304,11 +1342,14 @@ func TestServerStreamConn_WritingAndDeadlines(t *testing.T) {
 	if err != nil || n != len(smallChunk) {
 		t.Fatalf("Write small chunk failed: %v", err)
 	}
-	if string(rw.buf) != "hello 13 byte" {
-		t.Errorf("expected small chunk to be written immediately, got %q", string(rw.buf))
+	if !rw.waitForBytes(len(smallChunk), 100*time.Millisecond) {
+		t.Fatalf("timed out waiting for small chunk write to be drained")
 	}
-	if rw.flushed != 1 {
-		t.Errorf("expected 1 flush for small write, got %d", rw.flushed)
+	if string(rw.bytes()) != "hello 13 byte" {
+		t.Errorf("expected small chunk to be written immediately, got %q", string(rw.bytes()))
+	}
+	if rw.getFlushed() != 1 {
+		t.Errorf("expected 1 flush for small write, got %d", rw.getFlushed())
 	}
 
 	// Write >= 4096 bytes should be written immediately without redundant Flush()
@@ -1317,11 +1358,15 @@ func TestServerStreamConn_WritingAndDeadlines(t *testing.T) {
 	if err != nil || n != len(largeChunk) {
 		t.Fatalf("Write large chunk failed: %v", err)
 	}
-	if len(rw.buf) != len(smallChunk)+len(largeChunk) {
-		t.Errorf("expected %d total bytes, got %d", len(smallChunk)+len(largeChunk), len(rw.buf))
+	expectedTotal := len(smallChunk) + len(largeChunk)
+	if !rw.waitForBytes(expectedTotal, 100*time.Millisecond) {
+		t.Fatalf("timed out waiting for large chunk write to be drained")
 	}
-	if rw.flushed != 1 {
-		t.Errorf("expected flushes to remain 1 (no extra flush for large write), got %d", rw.flushed)
+	if len(rw.bytes()) != expectedTotal {
+		t.Errorf("expected %d total bytes, got %d", expectedTotal, len(rw.bytes()))
+	}
+	if rw.getFlushed() != 1 {
+		t.Errorf("expected flushes to remain 1 (no extra flush for large write), got %d", rw.getFlushed())
 	}
 
 	// Test SetReadDeadline non-destructive behavior
@@ -1358,7 +1403,78 @@ func TestServerStreamConn_WritingAndDeadlines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteTo failed: %v", err)
 	}
-	if string(outBuf.buf) != "stream-content" || written != int64(len("stream-content")) {
-		t.Errorf("WriteTo output mismatch: got %q, written=%d", string(outBuf.buf), written)
+	if string(outBuf.bytes()) != "stream-content" || written != int64(len("stream-content")) {
+		t.Errorf("WriteTo output mismatch: got %q, written=%d", string(outBuf.bytes()), written)
+	}
+}
+
+func TestServerStreamConn_StreamingProbe(t *testing.T) {
+	rw := &testResponseWriter{}
+	_, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	conn := newServerStreamConn(rw, nil, cancel, nil)
+	defer conn.Close()
+	go conn.RunDrainLoop()
+
+	// Probe: a 13-byte Write without concurrent Read is delivered within a few ms
+	probe := []byte("hello 13 byte")
+	t0 := time.Now()
+	n, err := conn.Write(probe)
+	if err != nil || n != len(probe) {
+		t.Fatalf("Write probe failed: %v", err)
+	}
+	if !rw.waitForBytes(len(probe), 50*time.Millisecond) {
+		t.Fatalf("Probe delivery took too long: %v", time.Since(t0))
+	}
+	if string(rw.bytes()) != string(probe) {
+		t.Fatalf("Probe mismatch: got %q", string(rw.bytes()))
+	}
+	if rw.getFlushed() != 1 {
+		t.Fatalf("expected 1 flush for probe, got %d", rw.getFlushed())
+	}
+}
+
+func TestServerStreamConn_BackpressureAndClose(t *testing.T) {
+	rw := &testResponseWriter{}
+	_, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Construct conn without running drain loop (simulating stalled reader)
+	conn := newServerStreamConn(rw, nil, cancel, nil)
+
+	// Write up to queue bound (256 KiB = 16 x 16 KiB)
+	chunk := make([]byte, 16*1024)
+	for i := 0; i < 16; i++ {
+		n, err := conn.Write(chunk)
+		if err != nil || n != len(chunk) {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+
+	// 17th write must block at queue bound
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(chunk)
+		writeErrCh <- err
+	}()
+
+	select {
+	case err := <-writeErrCh:
+		t.Fatalf("expected write to block, but returned: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// correctly blocked
+	}
+
+	// Close unblocks it
+	_ = conn.Close()
+
+	select {
+	case err := <-writeErrCh:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("expected net.ErrClosed, got: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timeout waiting for Close to unblock writer")
 	}
 }
