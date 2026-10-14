@@ -63,12 +63,12 @@ Tests run on Linux `amd64` (AMD EPYC 9B14 60-core processor, Go 1.27):
 | **TTFB (p50, warm pool)** | 1.25 ms | 1.13 ms | 1.15 ms | H2 & TCP fastest with 0-RTT pipelining |
 | **TTFB (p99, warm pool)** | 2.24 ms | 2.22 ms | 2.09 ms | All three within ~5% |
 | **Connection Setup Allocations** | 1,159 allocs/conn | 2,230 allocs/conn | 1,124 allocs/conn | **H2 & QUIC lowest allocations** |
-| **Single-Stream Throughput** | 432 MB/s | 735 MB/s | 451 MB/s | Comparable to QUIC, single stream |
-| **8-Stream Aggregate Throughput** | 373 MB/s | 3,251 MB/s | 1,259 MB/s | **H2 3.4x faster than QUIC** |
-| **Throughput Memory Allocations** | 3,330 allocs/MB | 10.6 allocs/MB | 324.6 allocs/MB | **H2 ~10x fewer allocs than QUIC** |
-| **Frontend Process CPU (separate proc)** | 11.90 CPU-s/GB | 3.99 CPU-s/GB | 5.96 CPU-s/GB | **H2 ~2x lower frontend CPU than QUIC** |
-| **Backend Process CPU (separate proc)** | 5.89 CPU-s/GB | 3.56 CPU-s/GB | 6.63 CPU-s/GB | H2 close to QUIC |
-| **Total Process CPU (separate proc)** | 17.79 CPU-s/GB | 7.55 CPU-s/GB | 12.59 CPU-s/GB | **H2 ~1.4x lower total CPU than QUIC** |
+| **Single-Stream Throughput** | 436 MB/s | 708 MB/s | **841 MB/s** | **H2 exceeds TCP pool throughput** |
+| **8-Stream Aggregate Throughput** | 337 MB/s | 3,421 MB/s | **2,532 MB/s** | **H2 7.5x faster than QUIC** |
+| **Throughput Memory Allocations** | 3,329 allocs/MB | 10.8 allocs/MB | **57.1 allocs/MB** | **H2 ~58x fewer allocs than QUIC, 5.7x reduction from #705** |
+| **Frontend Process CPU (separate proc)** | 13.94 CPU-s/GB | 4.34 CPU-s/GB | **3.78 CPU-s/GB** | **H2 frontend CPU lower than TCP pool** |
+| **Backend Process CPU (separate proc)** | 6.34 CPU-s/GB | 3.79 CPU-s/GB | 4.81 CPU-s/GB | H2 close to TCP pool |
+| **Total Process CPU (separate proc)** | 20.28 CPU-s/GB | 8.13 CPU-s/GB | **8.59 CPU-s/GB** | **H2 within 5.6% of TCP pool total CPU** |
 
 ### 3.2 Connection Burst Latency (Burst = 32, Pool Size = 4–8)
 
@@ -76,12 +76,12 @@ When traffic bursts exceed the warm pool capacity under network RTT, both multip
 
 | Network RTT | Transport | TTFB p50 | TTFB p99 | Comparison |
 |---|---|---|---|---|
-| **20 ms RTT** | **HTTP/2 CONNECT** | **62.0 ms** | **100.5 ms** | **Zero new dial penalty, matches QUIC** |
-| | **QUIC** | **59.3 ms** | **74.3 ms** | Fast multiplexing |
-| | TCP Pool | 156.8 ms | 251.1 ms | Pool exhaustion stalls on new dials across RTT |
-| **50 ms RTT** | **HTTP/2 CONNECT** | **141.6 ms** | **203.2 ms** | **Zero new dial penalty, 2.8x faster than TCP pool** |
-| | **QUIC** | **120.2 ms** | **205.0 ms** | Fast multiplexing |
-| | TCP Pool | 394.7 ms | 610.8 ms | Multi-RTT handshake penalties compound |
+| **20 ms RTT** | **HTTP/2 CONNECT** | **42.5 ms** | **82.6 ms** | **Zero new dial penalty, ~3.7x faster than TCP pool** |
+| | **QUIC** | **48.2 ms** | **69.8 ms** | Fast multiplexing |
+| | TCP Pool | 157.0 ms | 249.4 ms | Pool exhaustion stalls on new dials across RTT |
+| **50 ms RTT** | **HTTP/2 CONNECT** | **102.2 ms** | **203.2 ms** | **Zero new dial penalty, ~4x faster than TCP pool** |
+| | **QUIC** | **122.4 ms** | **206.7 ms** | Fast multiplexing |
+| | TCP Pool | 405.2 ms | 610.0 ms | Multi-RTT handshake penalties compound |
 
 ### 3.3 Synthetic In-Process Impairment (Sensitivity Analysis)
 
@@ -92,9 +92,9 @@ When traffic bursts exceed the warm pool capacity under network RTT, both multip
 
 | In-Process Scenario | Transport | Throughput | Total CPU / GB | Allocs / MB | Notes |
 |---|---|---|---|---|---|
-| **RTT 0ms, Loss 0%** | TCP Pool | 723 MB/s | 7.55 s/GB | 11.0 | Loopback baseline |
-| | H2 | 448 MB/s | 12.59 s/GB | 324.9 | Selective flushes & 64 KiB copy buffers |
-| | QUIC | 435 MB/s | 17.79 s/GB | 3,330 | Userspace UDP crypto & event loop |
+| **RTT 0ms, Loss 0%** | TCP Pool | 708 MB/s | 8.13 s/GB | 10.8 | Loopback baseline |
+| | H2 | 841 MB/s | 8.59 s/GB | 57.1 | Right-sized framed writes via bounded chunk queues |
+| | QUIC | 436 MB/s | 20.28 s/GB | 3,329 | Userspace UDP crypto & event loop |
 | **RTT 20ms, Loss 0%** | TCP Pool | 294 MB/s | 3.80 s/GB | 15.7 | Pre-dialed pool |
 | | H2 (Pool=4) | 118 MB/s | 6.50 s/GB | 330.0 | High window multiplexing |
 | | QUIC | 138 MB/s | 26.66 s/GB | 5,323 | Simulated RTT delay |
@@ -199,6 +199,21 @@ sudo sysctl -w net.core.wmem_max=7500000
   - **Single-Stream Throughput**: **451 MB/s** (surpassing QUIC 432 MB/s).
   - **8-Stream Throughput**: **1,259 MB/s** (3.4x faster than QUIC 373 MB/s).
   - **Burst Latency (20ms RTT)**: **62.0 ms p50** (matches QUIC 59.3 ms, 2.5x faster than TCP pool 156.8 ms).
+
+### 6.6 Coalescing Queued HTTP/2 Tunnel Writes into Right-Sized Frames (#712)
+- **Problem**: In #705 merged, GARI handed the tunnel 16 KiB TLS records and each became its own HTTP/2 DATA frame with independent framing overhead and window updates, resulting in 324.6 allocs/MB and capping single-stream throughput at ~451 MB/s. Buffering writes on timers or holding data while idle stalled streaming probes and interactive backends.
+- **Design: Coalesce only what is already queued**:
+  - **Frontend (`h2StreamConn`)**: Replaced `io.Pipe` with `api.H2ChunkQueue` used directly as the CONNECT request body (`req.Body`). `Write` appends incoming chunks to a 256 KiB bounded queue using pooled buffers, blocking when the queue bound is reached (backpressure). `Read(p)` drains all queued chunks into `p` up to the scratch frame size in a single pass. Under load, multiple 16 KiB records are coalesced into a single right-sized DATA frame (up to 256 KiB), while idle streaming probes (e.g. 13-byte ping) return immediately without delay.
+  - **Backend (`serverStreamConn`)**: Uses the stream's handler goroutine as the drainer loop (`RunDrainLoop`). `Write` appends to `api.H2ChunkQueue`; the drainer loop waits for data, takes all queued chunks via `TakeAll(&drainBuf)`, copies into a reused contiguous buffer sized to the backlog, and issues one `Write`, flushing immediately only for small writes ($< 4096$ bytes).
+  - **Zero Idle Buffering**: Stream memory is strictly proportional to queued bytes with a hard cap of 256 KiB per direction. Idle streams hold zero queued buffers.
+  - **Reads never wait on writes**: Decoupled reader and writer pipelines ensure that flow-control blocked writes never stall concurrent stream reads.
+- **Numbers (AMD EPYC 9B14 60-core processor, Loopback)**:
+  - **Memory Allocations**: Reduced from **324.6 allocs/MB** to **57.1 allocs/MB** (5.7x reduction).
+  - **Single-Stream Throughput**: Increased from **451 MB/s** to **841 MB/s** (surpassing TCP pool's 708 MB/s).
+  - **8-Stream Aggregate Throughput**: Increased from **1,259 MB/s** to **2,532 MB/s** (2x faster than #705).
+  - **Frontend Process CPU**: Reduced to **3.78 CPU-s/GB** (lower than TCP pool's 4.34 CPU-s/GB).
+  - **Total Process CPU**: **8.59 CPU-s/GB** (within 5.6% of TCP pool's 8.13 CPU-s/GB).
+  - **Burst Latency (20ms RTT)**: **42.5 ms p50** (down from 62.0 ms, ~3.7x faster than TCP pool 157.0 ms).
 
 ---
 

@@ -357,7 +357,7 @@ type rtResult struct {
 }
 
 func (h *H2Transport) openConnectStream(ctx context.Context, hc *h2Conn) (net.Conn, error) {
-	pr, pw := io.Pipe()
+	queue := api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound)
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	headersSent := make(chan struct{})
@@ -367,11 +367,10 @@ func (h *H2Transport) openConnectStream(ctx context.Context, hc *h2Conn) (net.Co
 		},
 	}
 
-	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(streamCtx, trace), http.MethodConnect, "", pr)
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(streamCtx, trace), http.MethodConnect, "", queue)
 	if err != nil {
 		streamCancel()
-		closeCloser(pr)
-		closeCloser(pw)
+		queue.Abort(err)
 		return nil, err
 	}
 	req.Host = h.targetHost
@@ -387,30 +386,27 @@ func (h *H2Transport) openConnectStream(ctx context.Context, hc *h2Conn) (net.Co
 	select {
 	case <-ctx.Done():
 		streamCancel()
-		closeCloser(pr)
-		closeCloser(pw)
+		queue.Abort(ctx.Err())
 		return nil, ctx.Err()
 	case r := <-respCh:
 		// RoundTrip failed or responded before headersSent was selected
 		if r.err != nil {
 			streamCancel()
-			closeCloser(pr)
-			closeCloser(pw)
+			queue.Abort(r.err)
 			return nil, r.err
 		}
 		if r.res.StatusCode != http.StatusOK {
 			streamCancel()
-			closeCloser(pr)
-			closeCloser(pw)
+			queue.Abort(net.ErrClosed)
 			closeCloser(r.res.Body)
 			return nil, fmt.Errorf("unexpected CONNECT response status: %s", r.res.Status)
 		}
-		streamConn := newH2StreamConn(pw, respCh, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast)
+		streamConn := newH2StreamConn(queue, respCh, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast)
 		streamConn.resBody = r.res.Body
 		return streamConn, nil
 	case <-headersSent:
 		// Request HEADERS frame is out on the wire! Return stream immediately for 0-RTT body writes.
-		streamConn := newH2StreamConn(pw, respCh, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast)
+		streamConn := newH2StreamConn(queue, respCh, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast)
 		return streamConn, nil
 	}
 }
@@ -439,9 +435,9 @@ func (h *H2Transport) Close() error {
 }
 
 // h2StreamConn implements net.Conn over an HTTP/2 CONNECT stream.
-// Writes are piped to req.Body and reads are received from res.Body.
+// Writes are queued into req.Body and reads are received from res.Body.
 type h2StreamConn struct {
-	pw           *io.PipeWriter
+	queue        *api.H2ChunkQueue
 	respCh       chan rtResult
 	streamCancel context.CancelFunc
 	localAddr    net.Addr
@@ -458,9 +454,9 @@ type h2StreamConn struct {
 	closeOnce     sync.Once
 }
 
-func newH2StreamConn(pw *io.PipeWriter, respCh chan rtResult, streamCancel context.CancelFunc, localAddr, remoteAddr net.Addr, onClose func()) *h2StreamConn {
+func newH2StreamConn(queue *api.H2ChunkQueue, respCh chan rtResult, streamCancel context.CancelFunc, localAddr, remoteAddr net.Addr, onClose func()) *h2StreamConn {
 	return &h2StreamConn{
-		pw:           pw,
+		queue:        queue,
 		respCh:       respCh,
 		streamCancel: streamCancel,
 		localAddr:    localAddr,
@@ -667,7 +663,7 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 	}
 	c.mu.Unlock()
 
-	return c.pw.Write(b)
+	return c.queue.Write(b)
 }
 
 func (c *h2StreamConn) SetReadDeadline(t time.Time) error {
@@ -696,15 +692,14 @@ func (c *h2StreamConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.writeDeadline = t
+	c.queue.SetWriteDeadline(t)
 	if c.writeTimer != nil {
 		c.writeTimer.Stop()
 		c.writeTimer = nil
 	}
 	if !t.IsZero() && time.Until(t) > 0 {
 		c.writeTimer = time.AfterFunc(time.Until(t), func() {
-			if err := c.pw.CloseWithError(os.ErrDeadlineExceeded); err != nil {
-				klog.V(2).Infof("Error closing pipe with write deadline exceeded: %v", err)
-			}
+			c.queue.Wake()
 		})
 	}
 	return nil
@@ -731,7 +726,7 @@ func (c *h2StreamConn) Close() error {
 		c.mu.Unlock()
 
 		c.streamCancel()
-		closeCloser(c.pw)
+		c.queue.Close()
 		if rb != nil {
 			closeCloser(rb)
 		}
