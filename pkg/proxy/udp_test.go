@@ -452,24 +452,9 @@ func TestProxy_UDPCapEnforced(t *testing.T) {
 
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
 
-	p.mu.RLock()
-	pl := p.udpListeners[gatewayv1.PortNumber(proxyPort)]
-	p.mu.RUnlock()
-	if pl == nil {
-		t.Fatal("expected udp listener to exist")
-	}
-
 	// Open 3 clients (up to cap)
 	clients := make([]net.Conn, 3)
 	for i := 0; i < 3; i++ {
-		// Wait for any prior async session setup to finish clearing pending state
-		// so that this client does not race against pending session counts.
-		pollUntil(t, 5*time.Second, func() bool {
-			pl.mu.Lock()
-			defer pl.mu.Unlock()
-			return len(pl.pending) == 0
-		})
-
 		c, err := net.Dial("udp", proxyAddr)
 		if err != nil {
 			t.Fatalf("client %d dial failed: %v", i, err)
@@ -477,24 +462,10 @@ func TestProxy_UDPCapEnforced(t *testing.T) {
 		defer c.Close()
 		clients[i] = c
 
-		clientKey := c.LocalAddr().String()
-
-		// Wait for session to be established in proxy.
-		// Since session setup is async (goroutine per new client), retry sending
-		// if needed until the session is registered in pl.sessions.
-		pollUntil(t, 5*time.Second, func() bool {
-			pl.mu.Lock()
-			_, exists := pl.sessions[clientKey]
-			pl.mu.Unlock()
-			if exists {
-				return true
-			}
-			_ = c.SetDeadline(time.Now().Add(100 * time.Millisecond))
-			_, _ = c.Write([]byte(fmt.Sprintf("client-%d", i)))
-			return false
-		})
-
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := c.Write([]byte(fmt.Sprintf("client-%d", i))); err != nil {
+			t.Fatalf("client %d write failed: %v", i, err)
+		}
 		buf := make([]byte, 256)
 		n, err := c.Read(buf)
 		if err != nil {
@@ -504,13 +475,6 @@ func TestProxy_UDPCapEnforced(t *testing.T) {
 			t.Fatalf("client %d reply mismatch: got %q, want %q", i, string(buf[:n]), fmt.Sprintf("client-%d", i))
 		}
 	}
-
-	// Wait for all 3 sessions to be active and pending setups cleared
-	pollUntil(t, 5*time.Second, func() bool {
-		pl.mu.Lock()
-		defer pl.mu.Unlock()
-		return len(pl.sessions) == 3 && len(pl.pending) == 0
-	})
 
 	// 4th client exceeds cap: should be dropped (no reply)
 	client4, err := net.Dial("udp", proxyAddr)
@@ -544,6 +508,136 @@ func TestProxy_UDPCapEnforced(t *testing.T) {
 		if err != nil || string(buf[:n]) != fmt.Sprintf("client-%d-again", i) {
 			t.Fatalf("client %d failed after cap attempt: %q, err %v", i, string(buf[:n]), err)
 		}
+	}
+}
+
+// TestProxy_UDPCapBackToBack verifies that driving clients up to the cap
+// back-to-back (without waiting for backend replies between them) does not drop
+// any clients within the cap. This specifically guards against regressions where
+// clients are double-counted in both pending and active session sets.
+func TestProxy_UDPCapBackToBack(t *testing.T) {
+	// A backend that queues datagrams and only replies after releaseCh is closed.
+	type packet struct {
+		data []byte
+		addr net.Addr
+	}
+	packetCh := make(chan packet, 10)
+	releaseCh := make(chan struct{})
+
+	backendConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on backend: %v", err)
+	}
+	defer backendConn.Close()
+	backendPort := backendConn.LocalAddr().(*net.UDPAddr).Port
+
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, addr, err := backendConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			dataCopy := make([]byte, n)
+			copy(dataCopy, buf[:n])
+			packetCh <- packet{data: dataCopy, addr: addr}
+		}
+	}()
+
+	go func() {
+		<-releaseCh
+		for {
+			p, ok := <-packetCh
+			if !ok {
+				return
+			}
+			_, _ = backendConn.WriteTo(p.data, p.addr)
+		}
+	}()
+
+	proxyPort := getFreeUDPPort(t)
+
+	p := NewProxy()
+	p.SetUDPBindHost("127.0.0.1")
+	p.SetUDPMaxSessions(3)
+	defer p.Close()
+
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "udp-capped-backtoback",
+			Protocol: gatewayv1.UDPProtocolType,
+			Port:     gatewayv1.PortNumber(proxyPort),
+			UDPBackends: []state.InternalUDPBackend{
+				{Target: fmt.Sprintf("127.0.0.1:%d", backendPort), Weight: 1},
+			},
+		},
+	}, nil)
+
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+
+	p.mu.RLock()
+	pl := p.udpListeners[gatewayv1.PortNumber(proxyPort)]
+	p.mu.RUnlock()
+	if pl == nil {
+		t.Fatal("expected udp listener to exist")
+	}
+
+	// Send datagrams from 3 clients back-to-back without waiting for replies.
+	clients := make([]net.Conn, 3)
+	for i := 0; i < 3; i++ {
+		c, err := net.Dial("udp", proxyAddr)
+		if err != nil {
+			t.Fatalf("client %d dial failed: %v", i, err)
+		}
+		defer c.Close()
+		clients[i] = c
+
+		if _, err := c.Write([]byte(fmt.Sprintf("client-%d", i))); err != nil {
+			t.Fatalf("client %d write failed: %v", i, err)
+		}
+	}
+
+	// Wait for all 3 sessions to be registered in the proxy before letting backend reply.
+	pollUntil(t, 5*time.Second, func() bool {
+		pl.mu.Lock()
+		defer pl.mu.Unlock()
+		return len(pl.sessions) == 3 && len(pl.pending) == 0
+	})
+
+	// Release backend echoes now that sessions are registered.
+	close(releaseCh)
+
+	// All 3 clients must receive their echoes (none dropped).
+	buf := make([]byte, 256)
+	for i := 0; i < 3; i++ {
+		_ = clients[i].SetDeadline(time.Now().Add(5 * time.Second))
+		n, err := clients[i].Read(buf)
+		if err != nil {
+			t.Fatalf("client %d read failed: %v", i, err)
+		}
+		if string(buf[:n]) != fmt.Sprintf("client-%d", i) {
+			t.Fatalf("client %d reply mismatch: got %q, want %q", i, string(buf[:n]), fmt.Sprintf("client-%d", i))
+		}
+	}
+
+	// 4th client exceeds cap: should be dropped.
+	client4, err := net.Dial("udp", proxyAddr)
+	if err != nil {
+		t.Fatalf("client 4 dial failed: %v", err)
+	}
+	defer client4.Close()
+
+	_ = client4.SetDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err := client4.Write([]byte("client-4")); err != nil {
+		t.Fatalf("client 4 write failed: %v", err)
+	}
+	_, err = client4.Read(buf)
+	if err == nil {
+		t.Fatalf("expected client 4 to be dropped due to cap, but received reply %q", string(buf))
+	}
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error for dropped client 4, got: %v", err)
 	}
 }
 

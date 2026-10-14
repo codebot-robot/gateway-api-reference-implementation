@@ -315,22 +315,25 @@ func (p *Proxy) handleUDPDatagram(pl *udpPortListener, clientAddr net.Addr, data
 }
 
 func (p *Proxy) setupUDPSession(pl *udpPortListener, clientAddr net.Addr, clientKey string, data []byte) {
-	defer func() {
+	deletePending := func() {
 		pl.mu.Lock()
 		delete(pl.pending, clientKey)
 		pl.mu.Unlock()
-	}()
+	}
 
 	if pl.closed.Load() {
+		deletePending()
 		return
 	}
 
 	bp := pl.backends.Load()
 	if bp == nil || len(*bp) == 0 {
+		deletePending()
 		return
 	}
 	target, ok := state.PickTCPBackend(*bp)
 	if !ok || target == "" {
+		deletePending()
 		return
 	}
 
@@ -338,16 +341,19 @@ func (p *Proxy) setupUDPSession(pl *udpPortListener, clientAddr net.Addr, client
 	backendConn, err := dialFn("udp", target)
 	if err != nil {
 		klog.V(2).Infof("UDP backend dial failed for %s to %s: %v", clientKey, target, err)
+		deletePending()
 		return
 	}
 
 	pl.mu.Lock()
 	if pl.closed.Load() {
+		delete(pl.pending, clientKey)
 		pl.mu.Unlock()
 		closeConn(backendConn)
 		return
 	}
 	if existing, exists := pl.sessions[clientKey]; exists {
+		delete(pl.pending, clientKey)
 		pl.mu.Unlock()
 		closeConn(backendConn)
 		existing.lastActive.Store(time.Now().UnixNano())
@@ -358,6 +364,7 @@ func (p *Proxy) setupUDPSession(pl *udpPortListener, clientAddr net.Addr, client
 	}
 	maxSess := int(pl.maxSessions.Load())
 	if len(pl.sessions) >= maxSess {
+		delete(pl.pending, clientKey)
 		pl.mu.Unlock()
 		closeConn(backendConn)
 		klog.V(2).Infof("UDP session cap reached (%d), dropping new session for %s", maxSess, clientKey)
@@ -370,6 +377,7 @@ func (p *Proxy) setupUDPSession(pl *udpPortListener, clientAddr net.Addr, client
 	}
 	sess.lastActive.Store(time.Now().UnixNano())
 	pl.sessions[clientKey] = sess
+	delete(pl.pending, clientKey)
 	if !pl.cleanerRunning {
 		pl.cleanerRunning = true
 		go pl.cleanerLoop()
