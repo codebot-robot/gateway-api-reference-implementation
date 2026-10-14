@@ -314,7 +314,9 @@ func (p *Proxy) handleUDPDatagram(pl *udpPortListener, clientAddr net.Addr, data
 		pl.mu.Unlock()
 		closeConn(backendConn)
 		existing.lastActive.Store(time.Now().UnixNano())
-		_, _ = existing.backendConn.Write(data)
+		if _, err := existing.backendConn.Write(data); err != nil {
+			klog.V(2).Infof("UDP backend write error for %s: %v", clientKey, err)
+		}
 		return
 	}
 	if len(pl.sessions) >= pl.maxSessions {
