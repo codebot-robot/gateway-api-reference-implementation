@@ -157,6 +157,16 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 				{Target: "backend2.default.svc.cluster.local:9000", Weight: 0},
 			},
 		},
+		{
+			Name:        "udp",
+			Protocol:    gatewayv1.UDPProtocolType,
+			Port:        5301,
+			GatewayName: gwKey,
+			UDPBackends: []InternalUDPBackend{
+				{Target: "dns1.default.svc.cluster.local:53", Weight: 10},
+				{Target: "dns2.default.svc.cluster.local:53", Weight: 0},
+			},
+		},
 	}
 
 	routes := []InternalRoute{
@@ -265,6 +275,27 @@ func TestDataplaneConfig_Roundtrip(t *testing.T) {
 	}
 	if tcpListener.TCPBackends[1].Target != "backend2.default.svc.cluster.local:9000" || tcpListener.TCPBackends[1].Weight != 0 {
 		t.Errorf("unexpected TCPBackend[1]: %+v", tcpListener.TCPBackends[1])
+	}
+
+	// Verify UDP listener with weighted backends
+	var udpListener *InternalListener
+	for i := range restored.Listeners {
+		if restored.Listeners[i].Protocol == gatewayv1.UDPProtocolType {
+			udpListener = &restored.Listeners[i]
+			break
+		}
+	}
+	if udpListener == nil {
+		t.Fatal("expected UDP listener in restored listeners")
+	}
+	if len(udpListener.UDPBackends) != 2 {
+		t.Fatalf("expected 2 UDPBackends, got %d", len(udpListener.UDPBackends))
+	}
+	if udpListener.UDPBackends[0].Target != "dns1.default.svc.cluster.local:53" || udpListener.UDPBackends[0].Weight != 10 {
+		t.Errorf("unexpected UDPBackend[0]: %+v", udpListener.UDPBackends[0])
+	}
+	if udpListener.UDPBackends[1].Target != "dns2.default.svc.cluster.local:53" || udpListener.UDPBackends[1].Weight != 0 {
+		t.Errorf("unexpected UDPBackend[1]: %+v", udpListener.UDPBackends[1])
 	}
 
 	// Extract certificates

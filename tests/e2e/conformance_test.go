@@ -96,6 +96,7 @@ func TestConformance(t *testing.T) {
 				features.SupportGatewayBackendClientCertificate,
 				features.SupportGatewayFrontendClientCertificateValidation,
 				features.SupportTCPRoute,
+				features.SupportUDPRoute,
 			},
 			UsableNetworkAddresses: []gatewayv1.GatewaySpecAddress{
 				{
@@ -234,6 +235,12 @@ func TestConformance(t *testing.T) {
 		tests.TCPRouteMultipleRoutesAttachment,
 		tests.TCPRouteReferenceGrant,
 		tests.TCPRouteWeightedRouting,
+		tests.UDPRouteInvalidBackendRefNonexistent,
+		tests.UDPRouteInvalidCrossNamespaceBackendRef,
+		tests.UDPRouteNotAllowedByListeners,
+		// UDPRouteMultipleRoutesAttachment includes a data-plane traffic verification step
+		// ("Only the oldest UDPRoute should receive traffic") and is deferred to Part 2 along
+		// with UDP socket listening and provisioning changes, matching TCPRouteMultipleRoutesAttachment.
 	}
 
 	cSuite.Setup(t, selectedTests)

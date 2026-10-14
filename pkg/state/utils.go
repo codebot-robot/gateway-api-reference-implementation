@@ -47,6 +47,12 @@ func IsTCPRoute(group *gatewayv1.Group, kind gatewayv1.Kind) bool {
 	return (g == "" || g == gatewayv1.GroupName) && kind == "TCPRoute"
 }
 
+// IsUDPRoute returns true if the group and kind represent a UDPRoute in Gateway API.
+func IsUDPRoute(group *gatewayv1.Group, kind gatewayv1.Kind) bool {
+	g := ValueOf(group)
+	return (g == "" || g == gatewayv1.GroupName) && kind == "UDPRoute"
+}
+
 // IntersectHostnames calculates the intersection of route hostnames and a listener hostname.
 func IntersectHostnames(routeHostnames []string, listenerHostname string) []string {
 	if listenerHostname == "" || listenerHostname == "*" {

@@ -265,6 +265,10 @@ func TestReconcilerSetupWithManager_RequiresControllerName(t *testing.T) {
 			setupErr: (&TCPRouteReconciler{}).SetupWithManager(nil),
 		},
 		{
+			name:     "UDPRouteReconciler",
+			setupErr: (&UDPRouteReconciler{}).SetupWithManager(nil),
+		},
+		{
 			name:     "BackendTLSPolicyReconciler",
 			setupErr: (&BackendTLSPolicyReconciler{}).SetupWithManager(nil),
 		},

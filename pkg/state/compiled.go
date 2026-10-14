@@ -91,6 +91,8 @@ type EffectiveListener struct {
 	TLSBackends      map[string][]InternalTLSBackend
 	BoundTCPRoute    *types.NamespacedName
 	TCPBackends      []InternalTCPBackend
+	BoundUDPRoute    *types.NamespacedName
+	UDPBackends      []InternalUDPBackend
 	ClientValidation *InternalClientValidation
 	Generation       int64
 }
@@ -160,6 +162,11 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		tcpBackends = make([]InternalTCPBackend, len(el.TCPBackends))
 		copy(tcpBackends, el.TCPBackends)
 	}
+	var udpBackends []InternalUDPBackend
+	if len(el.UDPBackends) > 0 {
+		udpBackends = make([]InternalUDPBackend, len(el.UDPBackends))
+		copy(udpBackends, el.UDPBackends)
+	}
 	var clientValidation *InternalClientValidation
 	if el.ClientValidation != nil {
 		clientValidation = el.ClientValidation.DeepCopy()
@@ -174,6 +181,7 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 		TLSMode:          tlsMode,
 		TLSBackends:      tlsBackends,
 		TCPBackends:      tcpBackends,
+		UDPBackends:      udpBackends,
 		ClientValidation: clientValidation,
 	}
 }
@@ -216,13 +224,21 @@ type CompiledTCPRoute struct {
 	ParentConditions []metav1.Condition
 }
 
-// CompiledModel is the complete compiled model of Gateways, ListenerSets, HTTPRoutes, TLSRoutes, GRPCRoutes, and TCPRoutes.
+// CompiledUDPRoute contains the compiled state for a UDPRoute.
+type CompiledUDPRoute struct {
+	UDPRoute         *gatewayv1.UDPRoute
+	RouteState       *UDPRouteState
+	ParentConditions []metav1.Condition
+}
+
+// CompiledModel is the complete compiled model of Gateways, ListenerSets, HTTPRoutes, TLSRoutes, GRPCRoutes, TCPRoutes, and UDPRoutes.
 type CompiledModel struct {
 	Gateways     map[types.NamespacedName]*CompiledGateway
 	HTTPRoutes   map[types.NamespacedName]*CompiledRoute
 	TLSRoutes    map[types.NamespacedName]*CompiledTLSRoute
 	GRPCRoutes   map[types.NamespacedName]*CompiledGRPCRoute
 	TCPRoutes    map[types.NamespacedName]*CompiledTCPRoute
+	UDPRoutes    map[types.NamespacedName]*CompiledUDPRoute
 	ListenerSets map[types.NamespacedName]*gatewayv1.ListenerSet
 }
 
@@ -279,6 +295,7 @@ type ModelInputs struct {
 	TLSRoutes             []*gatewayv1.TLSRoute
 	GRPCRoutes            []*gatewayv1.GRPCRoute
 	TCPRoutes             []*gatewayv1.TCPRoute
+	UDPRoutes             []*gatewayv1.UDPRoute
 	Services              map[types.NamespacedName]*corev1.Service
 	BackendTLSPolicies    []*gatewayv1.BackendTLSPolicy
 	ConfigMaps            map[types.NamespacedName]*corev1.ConfigMap
@@ -298,6 +315,7 @@ type Outputs struct {
 	TLSRouteStatuses         map[types.NamespacedName]gatewayv1.TLSRouteStatus
 	GRPCRouteStatuses        map[types.NamespacedName]gatewayv1.GRPCRouteStatus
 	TCPRouteStatuses         map[types.NamespacedName]gatewayv1.TCPRouteStatus
+	UDPRouteStatuses         map[types.NamespacedName]gatewayv1.UDPRouteStatus
 	ListenerSetStatuses      map[types.NamespacedName]gatewayv1.ListenerSetStatus
 	BackendTLSPolicyStatuses map[types.NamespacedName]gatewayv1.PolicyStatus
 	GatewayClassStatuses     map[types.NamespacedName]gatewayv1.GatewayClassStatus
@@ -1092,6 +1110,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		TLSRoutes:    make(map[types.NamespacedName]*CompiledTLSRoute),
 		GRPCRoutes:   make(map[types.NamespacedName]*CompiledGRPCRoute),
 		TCPRoutes:    make(map[types.NamespacedName]*CompiledTCPRoute),
+		UDPRoutes:    make(map[types.NamespacedName]*CompiledUDPRoute),
 		ListenerSets: make(map[types.NamespacedName]*gatewayv1.ListenerSet),
 	}
 
@@ -1405,6 +1424,36 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 
 		cm.TCPRoutes[routeKey] = &CompiledTCPRoute{
 			TCPRoute:         route,
+			RouteState:       rs,
+			ParentConditions: parentConditions,
+		}
+	}
+
+	// 6. Compile UDPRoutes and perform route binding
+	for _, route := range inputs.UDPRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		rs := &UDPRouteState{UDPRoute: route}
+		rs.Compile(inputs.Services, refValidator)
+
+		parentConditions := make([]metav1.Condition, len(route.Spec.ParentRefs))
+		boundListenersForRoute := make(map[*EffectiveListener]bool)
+
+		for pIdx, parentRef := range route.Spec.ParentRefs {
+			parentConditions[pIdx] = bindUDPRouteParentRef(
+				route,
+				rs,
+				parentRef,
+				cm,
+				inputs.Namespaces,
+				boundListenersForRoute,
+			)
+		}
+
+		cm.UDPRoutes[routeKey] = &CompiledUDPRoute{
+			UDPRoute:         route,
 			RouteState:       rs,
 			ParentConditions: parentConditions,
 		}
@@ -1803,6 +1852,49 @@ func bindTCPRouteParentRef(
 	)
 }
 
+func bindUDPRouteParentRef(
+	route *gatewayv1.UDPRoute,
+	rs *UDPRouteState,
+	parentRef gatewayv1.ParentReference,
+	cm *CompiledModel,
+	namespaces map[string]*corev1.Namespace,
+	boundListenersForRoute map[*EffectiveListener]bool,
+) metav1.Condition {
+	var valCond *metav1.Condition
+	if rs.Internal != nil {
+		valCond = &rs.Internal.ValidationCondition
+	}
+	return bindParentRef(
+		routeBindingConfig{
+			namespace:      route.Namespace,
+			generation:     route.Generation,
+			hostnames:      nil,
+			validationCond: valCond,
+			isProtocolCompatible: func(el *EffectiveListener) bool {
+				return el.Protocol == gatewayv1.UDPProtocolType
+			},
+			isKindAllowed: IsUDPRoute,
+			onBind: func(el *EffectiveListener, effectiveHostnames []string) {
+				if rs.Internal != nil {
+					routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+					if el.BoundUDPRoute == nil || *el.BoundUDPRoute == routeKey {
+						el.BoundUDPRoute = &routeKey
+						for _, rule := range rs.Internal.Rules {
+							if len(rule.Backends) > 0 {
+								el.UDPBackends = append(el.UDPBackends, rule.Backends...)
+							}
+						}
+					}
+				}
+			},
+		},
+		parentRef,
+		cm,
+		namespaces,
+		boundListenersForRoute,
+	)
+}
+
 // ExtractCertificates extracts TLS certificates once per effective listener across all compiled gateways.
 func ExtractCertificates(
 	gateways []*CompiledGateway,
@@ -1927,6 +2019,9 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 			if el.Protocol == gatewayv1.TCPProtocolType && !el.IsProgrammed() {
 				continue
 			}
+			if el.Protocol == gatewayv1.UDPProtocolType && !el.IsProgrammed() {
+				continue
+			}
 			iListener := el.ToInternalListener()
 			proxyListeners = append(proxyListeners, iListener)
 			proxyRoutes = append(proxyRoutes, el.Routes...)
@@ -1951,6 +2046,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		TLSRouteStatuses:         make(map[types.NamespacedName]gatewayv1.TLSRouteStatus),
 		GRPCRouteStatuses:        make(map[types.NamespacedName]gatewayv1.GRPCRouteStatus),
 		TCPRouteStatuses:         make(map[types.NamespacedName]gatewayv1.TCPRouteStatus),
+		UDPRouteStatuses:         make(map[types.NamespacedName]gatewayv1.UDPRouteStatus),
 		ListenerSetStatuses:      make(map[types.NamespacedName]gatewayv1.ListenerSetStatus),
 		BackendTLSPolicyStatuses: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
 		GatewayClassStatuses:     make(map[types.NamespacedName]gatewayv1.GatewayClassStatus),
@@ -2045,7 +2141,17 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		outputs.TCPRouteStatuses[routeKey] = ComputeDesiredTCPRouteStatus(route, compiledRoute, inputs.ControllerName)
 	}
 
-	// 7. BackendTLSPolicy Statuses
+	// 7. UDPRoute Statuses
+	for _, route := range inputs.UDPRoutes {
+		if route == nil {
+			continue
+		}
+		routeKey := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+		compiledRoute := compiled.UDPRoutes[routeKey]
+		outputs.UDPRouteStatuses[routeKey] = ComputeDesiredUDPRouteStatus(route, compiledRoute, inputs.ControllerName)
+	}
+
+	// 8. BackendTLSPolicy Statuses
 	for _, policy := range inputs.BackendTLSPolicies {
 		if policy == nil {
 			continue
@@ -2331,6 +2437,37 @@ func ComputeDesiredTCPRouteStatus(
 	}
 
 	return gatewayv1.TCPRouteStatus{
+		RouteStatus: gatewayv1.RouteStatus{
+			Parents: desiredParents,
+		},
+	}
+}
+
+// ComputeDesiredUDPRouteStatus computes the desired UDPRouteStatus from the compiled model.
+func ComputeDesiredUDPRouteStatus(
+	route *gatewayv1.UDPRoute,
+	compiledRoute *CompiledUDPRoute,
+	controllerName string,
+) gatewayv1.UDPRouteStatus {
+	var desiredParents []gatewayv1.RouteParentStatus
+	if compiledRoute != nil {
+		for i, parentRef := range route.Spec.ParentRefs {
+			cond := NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", route.Generation)
+			if i < len(compiledRoute.ParentConditions) {
+				cond = compiledRoute.ParentConditions[i]
+			}
+			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
+				ParentRef:      parentRef,
+				ControllerName: gatewayv1.GatewayController(controllerName),
+				Conditions: []metav1.Condition{
+					cond,
+					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+				},
+			})
+		}
+	}
+
+	return gatewayv1.UDPRouteStatus{
 		RouteStatus: gatewayv1.RouteStatus{
 			Parents: desiredParents,
 		},
@@ -2709,6 +2846,14 @@ func MergeTCPRouteStatus(current *gatewayv1.TCPRouteStatus, desired gatewayv1.TC
 	return updated
 }
 
+// MergeUDPRouteStatus merges desired UDPRouteStatus into current, preserving LastTransitionTime and other controllers' parents.
+// It returns true if semantic changes occurred that require updating status in the API server.
+func MergeUDPRouteStatus(current *gatewayv1.UDPRouteStatus, desired gatewayv1.UDPRouteStatus, routeNamespace string, controllerName gatewayv1.GatewayController) bool {
+	newParents, updated := UpdateRouteParentStatuses(current.Parents, desired.Parents, routeNamespace, controllerName)
+	current.Parents = newParents
+	return updated
+}
+
 // MergeBackendTLSPolicyStatus merges desired PolicyStatus into current, preserving LastTransitionTime and other controllers' ancestors.
 func MergeBackendTLSPolicyStatus(current *gatewayv1.PolicyStatus, desired gatewayv1.PolicyStatus, controllerName gatewayv1.GatewayController) bool {
 	newAncestors, updated := UpdatePolicyAncestors(current.Ancestors, desired.Ancestors, controllerName)
@@ -2787,6 +2932,21 @@ func GRPCRouteStatusesEqual(a, b gatewayv1.GRPCRouteStatus) bool {
 
 // TCPRouteStatusesEqual compares two TCPRouteStatus objects (ignoring LastTransitionTime).
 func TCPRouteStatusesEqual(a, b gatewayv1.TCPRouteStatus) bool {
+	if len(a.Parents) != len(b.Parents) {
+		return false
+	}
+	for i := range a.Parents {
+		if !reflectParentReferenceEqual(a.Parents[i].ParentRef, b.Parents[i].ParentRef) ||
+			a.Parents[i].ControllerName != b.Parents[i].ControllerName ||
+			!ConditionsEqual(a.Parents[i].Conditions, b.Parents[i].Conditions) {
+			return false
+		}
+	}
+	return true
+}
+
+// UDPRouteStatusesEqual compares two UDPRouteStatus objects (ignoring LastTransitionTime).
+func UDPRouteStatusesEqual(a, b gatewayv1.UDPRouteStatus) bool {
 	if len(a.Parents) != len(b.Parents) {
 		return false
 	}
