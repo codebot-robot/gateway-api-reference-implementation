@@ -100,6 +100,7 @@ type InternalListener struct {
 	TLSMode          *gatewayv1.TLSModeType
 	TLSBackends      map[string][]InternalTLSBackend
 	TCPBackends      []InternalTCPBackend
+	UDPBackends      []InternalUDPBackend
 	ClientValidation *InternalClientValidation `json:"clientValidation,omitempty"`
 }
 
@@ -229,6 +230,20 @@ func (l *InternalListener) SelectTCPBackendWithRand(r *rand.Rand) (string, bool)
 		return "", false
 	}
 	return PickTCPBackendWithRand(l.TCPBackends, r)
+}
+
+// SelectUDPBackend returns a backend target selected by weight for a UDP listener.
+func (l *InternalListener) SelectUDPBackend() (string, bool) {
+	return l.SelectUDPBackendWithRand(nil)
+}
+
+// SelectUDPBackendWithRand returns a backend target using the provided RNG for selection.
+// If r is nil, global rand.Int64N is used.
+func (l *InternalListener) SelectUDPBackendWithRand(r *rand.Rand) (string, bool) {
+	if l == nil || len(l.UDPBackends) == 0 {
+		return "", false
+	}
+	return PickTCPBackendWithRand(l.UDPBackends, r)
 }
 
 // PickTCPBackend selects a backend target from a slice of InternalTCPBackend based on weight.

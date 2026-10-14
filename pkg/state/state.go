@@ -112,6 +112,7 @@ type State struct {
 	tlsRoutes             map[types.NamespacedName]*TLSRouteState
 	grpcRoutes            map[types.NamespacedName]*GRPCRouteState
 	tcpRoutes             map[types.NamespacedName]*TCPRouteState
+	udpRoutes             map[types.NamespacedName]*UDPRouteState
 	backendTLSPolicies    map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
 	services              map[types.NamespacedName]*corev1.Service
 	configMaps            map[types.NamespacedName]*corev1.ConfigMap
@@ -133,6 +134,7 @@ type State struct {
 	tlsRouteSource         *EventSource
 	grpcRouteSource        *EventSource
 	tcpRouteSource         *EventSource
+	udpRouteSource         *EventSource
 	listenerSetSource      *EventSource
 	backendTLSPolicySource *EventSource
 	gatewayClassSource     *EventSource
@@ -156,6 +158,7 @@ func NewState() *State {
 		tlsRoutes:              make(map[types.NamespacedName]*TLSRouteState),
 		grpcRoutes:             make(map[types.NamespacedName]*GRPCRouteState),
 		tcpRoutes:              make(map[types.NamespacedName]*TCPRouteState),
+		udpRoutes:              make(map[types.NamespacedName]*UDPRouteState),
 		backendTLSPolicies:     make(map[types.NamespacedName]*gatewayv1.BackendTLSPolicy),
 		services:               make(map[types.NamespacedName]*corev1.Service),
 		configMaps:             make(map[types.NamespacedName]*corev1.ConfigMap),
@@ -167,6 +170,7 @@ func NewState() *State {
 		tlsRouteSource:         NewEventSource(),
 		grpcRouteSource:        NewEventSource(),
 		tcpRouteSource:         NewEventSource(),
+		udpRouteSource:         NewEventSource(),
 		listenerSetSource:      NewEventSource(),
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
@@ -260,6 +264,10 @@ func (s *State) GRPCRouteSource() *EventSource {
 
 func (s *State) TCPRouteSource() *EventSource {
 	return s.tcpRouteSource
+}
+
+func (s *State) UDPRouteSource() *EventSource {
+	return s.udpRouteSource
 }
 
 func (s *State) ListenerSetSource() *EventSource {
@@ -598,6 +606,25 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		return tcpRoutes[i].Name < tcpRoutes[j].Name
 	})
 
+	var udpRoutes []*gatewayv1.UDPRoute
+	for _, rState := range s.udpRoutes {
+		if rState != nil && rState.UDPRoute != nil {
+			udpRoutes = append(udpRoutes, rState.UDPRoute)
+		}
+	}
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(udpRoutes, func(i, j int) bool {
+		if !udpRoutes[i].CreationTimestamp.Equal(&udpRoutes[j].CreationTimestamp) {
+			return udpRoutes[i].CreationTimestamp.Before(&udpRoutes[j].CreationTimestamp)
+		}
+		if udpRoutes[i].Namespace != udpRoutes[j].Namespace {
+			return udpRoutes[i].Namespace < udpRoutes[j].Namespace
+		}
+		return udpRoutes[i].Name < udpRoutes[j].Name
+	})
+
 	var backendTLSPolicies []*gatewayv1.BackendTLSPolicy
 	for _, b := range s.backendTLSPolicies {
 		if b != nil {
@@ -665,6 +692,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		TLSRoutes:             tlsRoutes,
 		GRPCRoutes:            grpcRoutes,
 		TCPRoutes:             tcpRoutes,
+		UDPRoutes:             udpRoutes,
 		Services:              services,
 		BackendTLSPolicies:    backendTLSPolicies,
 		ConfigMaps:            configMaps,
@@ -787,6 +815,28 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		old, oldOk := prevTCPRouteStatuses[k]
 		if curOk != oldOk || (curOk && !TCPRouteStatusesEqual(cur, old)) {
 			s.tcpRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
+		}
+	}
+
+	// 2e. UDPRoute diff
+	var prevUDPRouteStatuses map[types.NamespacedName]gatewayv1.UDPRouteStatus
+	if prev != nil {
+		prevUDPRouteStatuses = prev.UDPRouteStatuses
+	}
+	allUDPRouteKeys := make(map[types.NamespacedName]bool)
+	for k := range outputs.UDPRouteStatuses {
+		allUDPRouteKeys[k] = true
+	}
+	if prevUDPRouteStatuses != nil {
+		for k := range prevUDPRouteStatuses {
+			allUDPRouteKeys[k] = true
+		}
+	}
+	for k := range allUDPRouteKeys {
+		cur, curOk := outputs.UDPRouteStatuses[k]
+		old, oldOk := prevUDPRouteStatuses[k]
+		if curOk != oldOk || (curOk && !UDPRouteStatusesEqual(cur, old)) {
+			s.udpRouteSource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
 
@@ -916,6 +966,16 @@ func (s *State) GetDesiredTCPRouteStatus(key types.NamespacedName) (gatewayv1.TC
 		return gatewayv1.TCPRouteStatus{}, false
 	}
 	st, ok := s.previousOutputs.TCPRouteStatuses[key]
+	return st, ok
+}
+
+func (s *State) GetDesiredUDPRouteStatus(key types.NamespacedName) (gatewayv1.UDPRouteStatus, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.previousOutputs == nil {
+		return gatewayv1.UDPRouteStatus{}, false
+	}
+	st, ok := s.previousOutputs.UDPRouteStatuses[key]
 	return st, ok
 }
 
@@ -1491,6 +1551,44 @@ func (s *State) DeleteTCPRoute(name types.NamespacedName) {
 	}
 }
 
+func (s *State) UpsertUDPRoute(route *gatewayv1.UDPRoute) {
+	if route == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := types.NamespacedName{Namespace: route.Namespace, Name: route.Name}
+	old := s.udpRoutes[key]
+	if old != nil && old.UDPRoute != nil && reflect.DeepEqual(old.Spec, route.Spec) && reflect.DeepEqual(old.Labels, route.Labels) && old.Generation == route.Generation {
+		return
+	}
+
+	s.udpRoutes[key] = &UDPRouteState{
+		UDPRoute: route.DeepCopy(),
+	}
+	s.revision++
+	s.markDirtyLocked()
+}
+
+func (s *State) GetUDPRoute(name types.NamespacedName) *UDPRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.udpRoutes[name]
+}
+
+func (s *State) DeleteUDPRoute(name types.NamespacedName) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.udpRoutes[name]; ok {
+		delete(s.udpRoutes, name)
+		s.revision++
+		s.markDirtyLocked()
+	}
+}
+
 func (s *State) UpsertBackendTLSPolicy(policy *gatewayv1.BackendTLSPolicy) {
 	if policy == nil {
 		return
@@ -1612,6 +1710,31 @@ func (s *State) GetTCPRoutes() []*TCPRouteState {
 
 	var routes []*TCPRouteState
 	for _, route := range s.tcpRoutes {
+		routes = append(routes, route)
+	}
+
+	// Precedence order:
+	// 1. Creation time (oldest first)
+	// 2. Alphabetically by "{namespace}/{name}"
+	sort.Slice(routes, func(i, j int) bool {
+		if !routes[i].CreationTimestamp.Equal(&routes[j].CreationTimestamp) {
+			return routes[i].CreationTimestamp.Before(&routes[j].CreationTimestamp)
+		}
+		if routes[i].Namespace != routes[j].Namespace {
+			return routes[i].Namespace < routes[j].Namespace
+		}
+		return routes[i].Name < routes[j].Name
+	})
+
+	return routes
+}
+
+func (s *State) GetUDPRoutes() []*UDPRouteState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var routes []*UDPRouteState
+	for _, route := range s.udpRoutes {
 		routes = append(routes, route)
 	}
 
