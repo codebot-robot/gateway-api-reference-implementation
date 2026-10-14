@@ -229,6 +229,11 @@ func TestConformance(t *testing.T) {
 		tests.TCPRouteInvalidBackendRefNonexistent,
 		tests.TCPRouteInvalidCrossNamespaceBackendRef,
 		tests.TCPRouteInvalidNonTCPListener,
+		tests.TCPRouteParentRefAttachAll,
+		tests.TCPRouteParentRefPortAndSectionName,
+		tests.TCPRouteMultipleRoutesAttachment,
+		tests.TCPRouteReferenceGrant,
+		tests.TCPRouteWeightedRouting,
 	}
 
 	cSuite.Setup(t, selectedTests)

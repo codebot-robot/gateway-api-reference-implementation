@@ -255,29 +255,7 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 		return
 	}
 
-	go func() {
-		defer closeConn(tlsConn)
-		defer closeConn(backendConn)
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		go func() {
-			defer wg.Done()
-			if err := copyAndCloseWrite(backendConn, tlsConn); err != nil {
-				klog.V(2).Infof("splice copy error: %v", err)
-			}
-		}()
-
-		go func() {
-			defer wg.Done()
-			if err := copyAndCloseWrite(tlsConn, backendConn); err != nil {
-				klog.V(2).Infof("splice copy error: %v", err)
-			}
-		}()
-
-		wg.Wait()
-	}()
+	go spliceConns(tlsConn, backendConn)
 }
 
 func spliceToBackend(clientConn net.Conn, backend string) {
@@ -288,29 +266,31 @@ func spliceToBackend(clientConn net.Conn, backend string) {
 		return
 	}
 
+	go spliceConns(clientConn, backendConn)
+}
+
+func spliceConns(c1, c2 net.Conn) {
+	defer closeConn(c1)
+	defer closeConn(c2)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
-		defer closeConn(clientConn)
-		defer closeConn(backendConn)
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		go func() {
-			defer wg.Done()
-			if err := copyAndCloseWrite(backendConn, clientConn); err != nil {
-				klog.V(2).Infof("splice copy error: %v", err)
-			}
-		}()
-
-		go func() {
-			defer wg.Done()
-			if err := copyAndCloseWrite(clientConn, backendConn); err != nil {
-				klog.V(2).Infof("splice copy error: %v", err)
-			}
-		}()
-
-		wg.Wait()
+		defer wg.Done()
+		if err := copyAndCloseWrite(c2, c1); err != nil {
+			klog.V(2).Infof("splice copy error: %v", err)
+		}
 	}()
+
+	go func() {
+		defer wg.Done()
+		if err := copyAndCloseWrite(c1, c2); err != nil {
+			klog.V(2).Infof("splice copy error: %v", err)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func closeWrite(conn net.Conn) error {

@@ -442,6 +442,13 @@ func parsePort(addr string) (int, error) {
 func (s *Server) StartProxyServers(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
+	go func() {
+		<-ctx.Done()
+		if err := s.proxy.Close(); err != nil {
+			klog.Warningf("failed to close proxy: %v", err)
+		}
+	}()
+
 	hasHTTPS := s.opts.HTTPSListener != nil || s.opts.ProxyHTTPSAddr != ""
 	hasHTTP3 := s.opts.HTTP3PacketConn != nil || s.opts.ProxyHTTP3Addr != ""
 	if hasHTTPS || hasHTTP3 {
