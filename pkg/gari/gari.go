@@ -180,6 +180,14 @@ type Options struct {
 
 	// DataplaneGatewayName is the name of the Gateway in DataplaneMode.
 	DataplaneGatewayName string
+
+	// UDPIdleTimeout is the idle timeout for UDP sessions.
+	// Defaults to 60s.
+	UDPIdleTimeout time.Duration
+
+	// UDPMaxSessions is the maximum number of concurrent UDP sessions per listener.
+	// Defaults to 10000.
+	UDPMaxSessions int
 }
 
 // DefaultOptions returns standard default options for GARI.
@@ -191,6 +199,8 @@ func DefaultOptions() Options {
 		ProxyAddr:              ":8000",
 		ProxyHTTPSAddr:         ":8443",
 		LeaderElectionID:       "gateway-api-reference-implementation",
+		UDPIdleTimeout:         proxy.DefaultUDPIdleTimeout,
+		UDPMaxSessions:         proxy.DefaultUDPMaxSessions,
 	}
 }
 
@@ -250,6 +260,12 @@ func New(opts Options) (*Server, error) {
 
 	st := state.NewState()
 	p := proxy.NewProxy()
+	if opts.UDPIdleTimeout > 0 {
+		p.SetUDPIdleTimeout(opts.UDPIdleTimeout)
+	}
+	if opts.UDPMaxSessions > 0 {
+		p.SetUDPMaxSessions(opts.UDPMaxSessions)
+	}
 
 	mgr := opts.Manager
 	if mgr == nil {

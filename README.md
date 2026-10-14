@@ -43,6 +43,17 @@ GARI supports `TCPRoute` routing raw TCP traffic on dedicated listener ports.
 - **Multiple Attached TCPRoutes**: Because raw TCP has no hostnames or paths to demultiplex on, when multiple TCPRoutes attach to the same TCP listener, only the oldest route's backends receive traffic. Subsequent routes targeting the same listener report `Accepted=True` and contribute to the listener's `attachedRoutes` count, but carry no traffic.
 - **All-in-One Mode Limitation**: In all-in-one mode where multiple Gateways share a single controller and proxy process, two Gateways cannot both bind the same TCP port. The first Gateway (by creation timestamp precedence) wins, and any subsequent Gateway listener requesting the same port reports `Programmed=False` with reason `PortUnavailable`. Per-Gateway data plane mode (`singlepod`) is the recommended and conformance path.
 
+### UDP Support (UDPRoute)
+
+GARI supports `UDPRoute` routing UDP datagram traffic on dedicated listener ports.
+
+- **Per-Port Listeners & Client-Address Sessions**: UDP listeners open a `net.PacketConn` per distinct listener port. Sessions are keyed by client address (`IP:port`); the first datagram from a client selects a backend according to configured weights, establishes a connected UDP socket, and forwards subsequent datagrams from that client to the same backend.
+- **Weighted Routing**: Traffic is distributed across configured backendRefs according to weight; backends with weight `0` receive no traffic.
+- **Session Lifecycle & Limits**: Sessions expire after an idle timeout (default 60s, configurable via `--udp-idle-timeout`) and are capped per listener (default 10000, configurable via `--udp-max-sessions`). New clients exceeding the cap are dropped without evicting active sessions.
+- **Per-Gateway Data Plane (Default / Conformance)**: In standard deployment (`singlepod`), each Gateway runs its own data plane Deployment and LoadBalancer Service mapping UDP listener ports directly to matching container ports.
+- **Reserved Port**: UDP port 8443 is reserved for HTTP/3; listeners specifying UDP 8443 report `Conflicted=True` with `ProtocolConflict`.
+- **All-in-One Mode Limitation**: In all-in-one mode, the first Gateway wins a UDP port; subsequent Gateways requesting the same port report `Programmed=False` with reason `PortUnavailable`.
+
 ## Contributing
 
 This project is licensed under the [Apache 2.0 License](LICENSE).

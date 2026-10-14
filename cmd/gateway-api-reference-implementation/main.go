@@ -53,6 +53,8 @@ func main() {
 	flag.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (disabled by default).")
 	flag.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address).")
 	flag.BoolVar(&opts.EnableH2C, "enable-h2c", opts.EnableH2C, "Enable H2C support on the proxy server.")
+	flag.DurationVar(&opts.UDPIdleTimeout, "udp-idle-timeout", opts.UDPIdleTimeout, "The idle timeout for UDP sessions.")
+	flag.IntVar(&opts.UDPMaxSessions, "udp-max-sessions", opts.UDPMaxSessions, "The maximum number of concurrent UDP sessions per listener.")
 	flag.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
