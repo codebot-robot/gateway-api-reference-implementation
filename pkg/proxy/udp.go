@@ -45,10 +45,12 @@ type udpPortListener struct {
 	closed   atomic.Bool
 	done     chan struct{}
 
+	idleTimeout atomic.Int64 // nanoseconds
+	maxSessions atomic.Int64
+
 	mu             sync.Mutex
 	sessions       map[string]*udpSession
-	idleTimeout    time.Duration
-	maxSessions    int
+	pending        map[string]bool
 	cleanerRunning bool
 }
 
@@ -80,6 +82,7 @@ func (pl *udpPortListener) close() error {
 		sessions = append(sessions, sess)
 	}
 	clear(pl.sessions)
+	clear(pl.pending)
 	pl.mu.Unlock()
 
 	for _, sess := range sessions {
@@ -99,7 +102,8 @@ func (pl *udpPortListener) removeSession(sess *udpSession) {
 }
 
 func (pl *udpPortListener) cleanupInterval() time.Duration {
-	interval := pl.idleTimeout / 2
+	idleTimeout := time.Duration(pl.idleTimeout.Load())
+	interval := idleTimeout / 2
 	if interval > 1*time.Second {
 		interval = 1 * time.Second
 	}
@@ -118,11 +122,13 @@ func (pl *udpPortListener) cleanerLoop() {
 		case <-pl.done:
 			return
 		case <-ticker.C:
+			ticker.Reset(pl.cleanupInterval())
 			now := time.Now().UnixNano()
+			timeout := pl.idleTimeout.Load()
 			var expired []*udpSession
 			pl.mu.Lock()
 			for key, sess := range pl.sessions {
-				if now-sess.lastActive.Load() > pl.idleTimeout.Nanoseconds() {
+				if now-sess.lastActive.Load() > timeout {
 					delete(pl.sessions, key)
 					expired = append(expired, sess)
 				}
@@ -208,8 +214,8 @@ func (p *Proxy) updateUDPListenersLocked(listeners []state.InternalListener) {
 
 		if pl, exists := p.udpListeners[port]; exists {
 			pl.backends.Store(&backendsCopy)
-			pl.idleTimeout = idleTimeout
-			pl.maxSessions = maxSessions
+			pl.idleTimeout.Store(int64(idleTimeout))
+			pl.maxSessions.Store(int64(maxSessions))
 		} else {
 			listenPacketFn := p.listenPacketFunc
 			if listenPacketFn == nil {
@@ -222,13 +228,14 @@ func (p *Proxy) updateUDPListenersLocked(listeners []state.InternalListener) {
 				continue
 			}
 			pl := &udpPortListener{
-				port:        port,
-				conn:        conn,
-				sessions:    make(map[string]*udpSession),
-				idleTimeout: idleTimeout,
-				maxSessions: maxSessions,
-				done:        make(chan struct{}),
+				port:     port,
+				conn:     conn,
+				sessions: make(map[string]*udpSession),
+				pending:  make(map[string]bool),
+				done:     make(chan struct{}),
 			}
+			pl.idleTimeout.Store(int64(idleTimeout))
+			pl.maxSessions.Store(int64(maxSessions))
 			pl.backends.Store(&backendsCopy)
 			p.udpListeners[port] = pl
 			go p.udpReadLoop(pl)
@@ -276,27 +283,57 @@ func (p *Proxy) handleUDPDatagram(pl *udpPortListener, clientAddr net.Addr, data
 		return
 	}
 
-	// Check cap
-	if len(pl.sessions) >= pl.maxSessions {
+	// If a session setup is already in flight for this client, drop duplicate
+	if pl.pending[clientKey] {
 		pl.mu.Unlock()
-		klog.V(2).Infof("UDP session cap reached (%d), dropping datagram from %s", pl.maxSessions, clientKey)
 		return
 	}
 
-	// Pick backend by weight
+	// Check cap (active + pending)
+	maxSess := int(pl.maxSessions.Load())
+	if len(pl.sessions)+len(pl.pending) >= maxSess {
+		pl.mu.Unlock()
+		klog.V(2).Infof("UDP session cap reached (%d), dropping datagram from %s", maxSess, clientKey)
+		return
+	}
+
+	// Check if backends are configured before launching goroutine
 	bp := pl.backends.Load()
 	if bp == nil || len(*bp) == 0 {
 		pl.mu.Unlock()
 		return
 	}
-	target, ok := state.PickTCPBackend(*bp)
-	if !ok || target == "" {
-		pl.mu.Unlock()
-		return
-	}
+
+	pl.pending[clientKey] = true
 	pl.mu.Unlock()
 
-	// Dial outside lock
+	// Copy first datagram since buf in udpReadLoop is reused across reads
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+
+	go p.setupUDPSession(pl, clientAddr, clientKey, dataCopy)
+}
+
+func (p *Proxy) setupUDPSession(pl *udpPortListener, clientAddr net.Addr, clientKey string, data []byte) {
+	defer func() {
+		pl.mu.Lock()
+		delete(pl.pending, clientKey)
+		pl.mu.Unlock()
+	}()
+
+	if pl.closed.Load() {
+		return
+	}
+
+	bp := pl.backends.Load()
+	if bp == nil || len(*bp) == 0 {
+		return
+	}
+	target, ok := state.PickTCPBackend(*bp)
+	if !ok || target == "" {
+		return
+	}
+
 	dialFn := p.getDialFunc()
 	backendConn, err := dialFn("udp", target)
 	if err != nil {
@@ -319,14 +356,15 @@ func (p *Proxy) handleUDPDatagram(pl *udpPortListener, clientAddr net.Addr, data
 		}
 		return
 	}
-	if len(pl.sessions) >= pl.maxSessions {
+	maxSess := int(pl.maxSessions.Load())
+	if len(pl.sessions) >= maxSess {
 		pl.mu.Unlock()
 		closeConn(backendConn)
-		klog.V(2).Infof("UDP session cap reached (%d), dropping new session for %s", pl.maxSessions, clientKey)
+		klog.V(2).Infof("UDP session cap reached (%d), dropping new session for %s", maxSess, clientKey)
 		return
 	}
 
-	sess = &udpSession{
+	sess := &udpSession{
 		clientAddr:  clientAddr,
 		backendConn: backendConn,
 	}
