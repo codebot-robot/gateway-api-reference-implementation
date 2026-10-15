@@ -425,7 +425,7 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{
 		"empty-cas.example.com",
 		"unparseable-pem.example.com",
-		"fallback.example.com",
+		"unsupported-mode.example.com",
 		"sibling.example.com",
 	}, nil)
 
@@ -434,10 +434,10 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 
 	p := NewProxy()
 	p.UpdateCertificates(map[string]*tls.Certificate{
-		"empty-cas.example.com":       &serverCert,
-		"unparseable-pem.example.com": &serverCert,
-		"fallback.example.com":        &serverCert,
-		"sibling.example.com":         &serverCert,
+		"empty-cas.example.com":        &serverCert,
+		"unparseable-pem.example.com":  &serverCert,
+		"unsupported-mode.example.com": &serverCert,
+		"sibling.example.com":          &serverCert,
 	}, &serverCert)
 
 	routeFor := func(host string) state.InternalRoute {
@@ -455,7 +455,7 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 	// 4 listeners on the SAME port (8443):
 	// 1. empty CACertPEMs
 	// 2. unparseable PEM
-	// 3. mode AllowInsecureFallback
+	// 3. unsupported mode
 	// 4. sibling listener without validation
 	listeners := []state.InternalListener{
 		{
@@ -481,14 +481,14 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 			},
 		},
 		{
-			Name:     "https-insecure-fallback",
+			Name:     "https-unsupported-mode",
 			Protocol: gatewayv1.HTTPSProtocolType,
 			Port:     8443,
-			Hostname: "fallback.example.com",
-			Routes:   []state.InternalRoute{routeFor("fallback.example.com")},
+			Hostname: "unsupported-mode.example.com",
+			Routes:   []state.InternalRoute{routeFor("unsupported-mode.example.com")},
 			ClientValidation: &state.InternalClientValidation{
 				CACertPEMs: [][]byte{validCAPEM},
-				Mode:       gatewayv1.AllowInsecureFallback,
+				Mode:       gatewayv1.FrontendValidationModeType("UnsupportedMode"),
 			},
 		},
 		{
@@ -503,7 +503,7 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 	routes := []state.InternalRoute{
 		routeFor("empty-cas.example.com"),
 		routeFor("unparseable-pem.example.com"),
-		routeFor("fallback.example.com"),
+		routeFor("unsupported-mode.example.com"),
 		routeFor("sibling.example.com"),
 	}
 
@@ -576,10 +576,10 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 		}
 	})
 
-	t.Run("mode AllowInsecureFallback refuses handshake", func(t *testing.T) {
-		_, err := dialTLS("fallback.example.com", &validClientCert)
+	t.Run("unsupported mode refuses handshake", func(t *testing.T) {
+		_, err := dialTLS("unsupported-mode.example.com", &validClientCert)
 		if err == nil {
-			t.Fatalf("expected handshake refusal for listener with mode AllowInsecureFallback, but request succeeded")
+			t.Fatalf("expected handshake refusal for listener with unsupported mode, but request succeeded")
 		}
 	})
 
@@ -595,6 +595,205 @@ func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T
 		body, _ := io.ReadAll(resp.Body)
 		if string(body) != "backend-ok" {
 			t.Errorf("sibling listener expected body 'backend-ok', got %q", string(body))
+		}
+	})
+}
+
+func TestClientCertificateValidation_AllowInsecureFallback(t *testing.T) {
+	// Backend server
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-response-ok"))
+	}))
+	defer backendServer.Close()
+
+	backendURL, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendURL.Host)
+	backendPort, _ := strconv.Atoi(backendPortStr)
+
+	// Generate trusted CA1 and client cert
+	ca1PEM, client1Cert := generateTestCAAndClientCert(t, "CA-1")
+	// Generate untrusted CA and client cert
+	_, clientOtherCert := generateTestCAAndClientCert(t, "CA-Other")
+
+	// Server cert covering fallback.example.com and valid.example.com
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{
+		"fallback.example.com",
+		"valid.example.com",
+	}, nil)
+
+	serverCAPool := x509.NewCertPool()
+	serverCAPool.AppendCertsFromPEM(serverCAPEM)
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"fallback.example.com": &serverCert,
+		"valid.example.com":    &serverCert,
+	}, &serverCert)
+
+	routeFallback := state.InternalRoute{
+		Hostnames: []string{"fallback.example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: []state.InternalBackend{{Host: backendHost, Port: int32(backendPort), Weight: 1}},
+			},
+		},
+	}
+	routeValid := state.InternalRoute{
+		Hostnames: []string{"valid.example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+				Backends: []state.InternalBackend{{Host: backendHost, Port: int32(backendPort), Weight: 1}},
+			},
+		},
+	}
+
+	// Two listeners on the SAME port (8443):
+	// 1. fallback.example.com with AllowInsecureFallback
+	// 2. valid.example.com with AllowValidOnly
+	listeners := []state.InternalListener{
+		{
+			Name:     "https-fallback",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "fallback.example.com",
+			Routes:   []state.InternalRoute{routeFallback},
+			ClientValidation: &state.InternalClientValidation{
+				CACertPEMs: [][]byte{ca1PEM},
+				Mode:       gatewayv1.AllowInsecureFallback,
+			},
+		},
+		{
+			Name:     "https-valid",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "valid.example.com",
+			Routes:   []state.InternalRoute{routeValid},
+			ClientValidation: &state.InternalClientValidation{
+				CACertPEMs: [][]byte{ca1PEM},
+				Mode:       gatewayv1.AllowValidOnly,
+			},
+		},
+	}
+
+	routes := []state.InternalRoute{routeFallback, routeValid}
+	p.UpdateConfig(listeners, routes)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	tlsConfig := p.TLSConfig()
+	httpsSrv := &http.Server{
+		Handler:   p,
+		TLSConfig: tlsConfig,
+	}
+	tlsLis := tls.NewListener(sniLis, tlsConfig)
+	go func() {
+		_ = httpsSrv.Serve(tlsLis)
+	}()
+	defer httpsSrv.Close()
+
+	httpsAddr := rawLis.Addr().String()
+
+	makeRequest := func(serverName string, clientCert *tls.Certificate) (*http.Response, error) {
+		var certs []tls.Certificate
+		if clientCert != nil {
+			certs = []tls.Certificate{*clientCert}
+		}
+
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:   serverName,
+				RootCAs:      serverCAPool,
+				Certificates: certs,
+			},
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, httpsAddr)
+			},
+		}
+		defer tr.CloseIdleConnections()
+
+		client := &http.Client{
+			Transport: tr,
+			Timeout:   3 * time.Second,
+		}
+
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s:8443/", serverName), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = fmt.Sprintf("%s:8443", serverName)
+		return client.Do(req)
+	}
+
+	t.Run("Fallback listener accepts valid cert", func(t *testing.T) {
+		resp, err := makeRequest("fallback.example.com", &client1Cert)
+		if err != nil {
+			t.Fatalf("expected request to succeed, got: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK, got: %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "backend-response-ok" {
+			t.Errorf("expected body 'backend-response-ok', got %q", string(body))
+		}
+	})
+
+	t.Run("Fallback listener accepts cert from another CA", func(t *testing.T) {
+		resp, err := makeRequest("fallback.example.com", &clientOtherCert)
+		if err != nil {
+			t.Fatalf("expected fallback listener to accept cert from another CA, got: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK, got: %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("Fallback listener accepts request without client cert", func(t *testing.T) {
+		resp, err := makeRequest("fallback.example.com", nil)
+		if err != nil {
+			t.Fatalf("expected fallback listener to accept request with no cert, got: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK, got: %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("AllowValidOnly listener on same port accepts valid cert", func(t *testing.T) {
+		resp, err := makeRequest("valid.example.com", &client1Cert)
+		if err != nil {
+			t.Fatalf("expected valid.example.com with CA1 cert to succeed, got: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK, got: %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("AllowValidOnly listener on same port rejects cert from another CA at handshake", func(t *testing.T) {
+		if _, err := makeRequest("valid.example.com", &clientOtherCert); err == nil {
+			t.Fatalf("expected valid.example.com to reject cert from another CA at handshake")
+		}
+	})
+
+	t.Run("AllowValidOnly listener on same port rejects request without cert at handshake", func(t *testing.T) {
+		if _, err := makeRequest("valid.example.com", nil); err == nil {
+			t.Fatalf("expected valid.example.com to reject request without cert at handshake")
 		}
 	})
 }
