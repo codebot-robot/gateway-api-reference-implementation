@@ -664,11 +664,13 @@ func ValidateListener(
 			Mode:       mode,
 		}
 
-		// Fail closed in part 1: data plane does not enforce client certificates yet.
-		// Report Programmed=False, reason Pending.
-		listenerProgrammedStatus = metav1.ConditionFalse
-		listenerProgrammedReason = gatewayv1.ListenerReasonPending
-		listenerProgrammedMessage = "Frontend validation is not yet enforced"
+		if mode == gatewayv1.AllowInsecureFallback {
+			// Fail closed for AllowInsecureFallback until part 3.
+			// Report Programmed=False, reason Pending.
+			listenerProgrammedStatus = metav1.ConditionFalse
+			listenerProgrammedReason = gatewayv1.ListenerReasonPending
+			listenerProgrammedMessage = "Frontend validation is not yet enforced"
+		}
 	}
 
 	conditions = []metav1.Condition{
@@ -1931,9 +1933,6 @@ func ExtractCertificates(
 			if !el.IsAccepted() || !el.IsProgrammed() {
 				continue
 			}
-			if el.ClientValidation != nil {
-				continue
-			}
 			if (el.Protocol != gatewayv1.HTTPSProtocolType && el.Protocol != gatewayv1.TLSProtocolType) || el.TLS == nil {
 				continue
 			}
@@ -2030,9 +2029,6 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 		}
 		for _, el := range cg.EffectiveListeners {
 			if !el.IsAccepted() || !el.IsProgrammed() {
-				continue
-			}
-			if el.ClientValidation != nil {
 				continue
 			}
 			if el.Protocol == gatewayv1.TCPProtocolType && !el.IsProgrammed() {

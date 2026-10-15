@@ -202,6 +202,9 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 		}
 
 		if selected.Protocol == gatewayv1.HTTPSProtocolType {
+			// All HTTPS ports collapse onto 8443 behind the Service, so per-port CA pools
+			// are distinguished by hostname; two validated listeners on different ports with
+			// the same hostname cannot be told apart.
 			handOffToHTTPS()
 			return
 		}

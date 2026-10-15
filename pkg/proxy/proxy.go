@@ -49,7 +49,8 @@ type Proxy struct {
 	certificates map[string]*tls.Certificate
 	defaultCert  *tls.Certificate
 
-	sniConfig atomic.Pointer[sniConfig]
+	sniConfig              atomic.Pointer[sniConfig]
+	clientValidationConfig atomic.Pointer[clientValidationConfig]
 
 	tcpListeners map[gatewayv1.PortNumber]*tcpPortListener
 	tcpBindHost  string
@@ -78,6 +79,11 @@ type sniConfig struct {
 	candidates     []state.InternalListener
 }
 
+type clientValidationConfig struct {
+	listeners  []state.InternalListener
+	tlsConfigs map[string]*tls.Config
+}
+
 func NewProxy() *Proxy {
 	p := &Proxy{
 		routes:         []state.InternalRoute{},
@@ -89,6 +95,7 @@ func NewProxy() *Proxy {
 		udpMaxSessions: DefaultUDPMaxSessions,
 	}
 	p.sniConfig.Store(&sniConfig{})
+	p.clientValidationConfig.Store(&clientValidationConfig{})
 	return p
 }
 
@@ -191,6 +198,7 @@ func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
 	defer p.mu.Unlock()
 	p.listeners = listeners
 	p.updateSNIConfigLocked(listeners)
+	p.updateClientValidationLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
 	p.updateUDPListenersLocked(listeners)
 }
@@ -201,6 +209,7 @@ func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.
 	p.listeners = listeners
 	p.routes = routes
 	p.updateSNIConfigLocked(listeners)
+	p.updateClientValidationLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
 	p.updateUDPListenersLocked(listeners)
 }
@@ -339,6 +348,78 @@ func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {
 	})
 }
 
+func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener) {
+	var httpsListeners []state.InternalListener
+	tlsConfigs := make(map[string]*tls.Config)
+
+	for _, lis := range listeners {
+		if lis.Protocol != gatewayv1.HTTPSProtocolType {
+			continue
+		}
+		httpsListeners = append(httpsListeners, lis)
+
+		if lis.ClientValidation != nil && len(lis.ClientValidation.CACertPEMs) > 0 &&
+			(lis.ClientValidation.Mode == "" || lis.ClientValidation.Mode == gatewayv1.AllowValidOnly) {
+			caPool := x509.NewCertPool()
+			for _, pem := range lis.ClientValidation.CACertPEMs {
+				caPool.AppendCertsFromPEM(pem)
+			}
+			tlsConfigs[lis.Name] = &tls.Config{
+				ClientAuth:             tls.RequireAndVerifyClientCert,
+				ClientCAs:              caPool,
+				GetCertificate:         p.GetCertificate,
+				NextProtos:             []string{"h2", "http/1.1"},
+				SessionTicketsDisabled: true,
+			}
+		}
+	}
+
+	sort.Slice(httpsListeners, func(i, j int) bool {
+		if httpsListeners[i].Port != httpsListeners[j].Port {
+			return httpsListeners[i].Port < httpsListeners[j].Port
+		}
+		return httpsListeners[i].Name < httpsListeners[j].Name
+	})
+
+	p.clientValidationConfig.Store(&clientValidationConfig{
+		listeners:  httpsListeners,
+		tlsConfigs: tlsConfigs,
+	})
+}
+
+// GetConfigForClient selects the per-listener *tls.Config by SNI using the MatchListeners
+// precedence the HTTPS path already uses.
+// All HTTPS ports collapse onto 8443 behind the Service, so per-port CA pools are distinguished
+// by hostname; two validated listeners on different ports with the same hostname cannot be told apart.
+func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	snap := p.clientValidationConfig.Load()
+	if snap == nil || len(snap.listeners) == 0 {
+		return nil, nil
+	}
+
+	sniHostname := ""
+	if hello != nil {
+		sniHostname = hello.ServerName
+	}
+
+	matched, matchType := state.MatchListeners(snap.listeners, sniHostname)
+	if matchType == state.NoMatch || len(matched) == 0 {
+		return nil, nil
+	}
+
+	selected := matched[0]
+	return snap.tlsConfigs[selected.Name], nil
+}
+
+// TLSConfig returns a base *tls.Config for HTTPS servers, configured with
+// GetCertificate and GetConfigForClient callbacks wired to this Proxy.
+func (p *Proxy) TLSConfig() *tls.Config {
+	return &tls.Config{
+		GetCertificate:     p.GetCertificate,
+		GetConfigForClient: p.GetConfigForClient,
+	}
+}
+
 func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -398,16 +479,16 @@ func (p *Proxy) HasCertificate(sni string) bool {
 	return false
 }
 
-func splitHostPort(hostPort string, defaultPort int32) (string, int32) {
+func splitHostPort(hostPort string, defaultPort int32) (string, int32, bool) {
 	h, pStr, err := net.SplitHostPort(hostPort)
 	if err != nil {
-		return hostPort, defaultPort
+		return hostPort, defaultPort, false
 	}
 	p, err := strconv.Atoi(pStr)
 	if err != nil {
-		return h, defaultPort
+		return h, defaultPort, false
 	}
-	return h, int32(p)
+	return h, int32(p), true
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -418,14 +499,50 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if len(listeners) > 0 {
 		if r.TLS != nil {
-			reqHost, reqPort := splitHostPort(r.Host, 443)
+			reqHost, reqPort, hasPort := splitHostPort(r.Host, 443)
 			reqHost = strings.ToLower(reqHost)
 
 			var httpsListeners []state.InternalListener
 			for _, l := range listeners {
 				if l.Protocol == gatewayv1.HTTPSProtocolType {
+					httpsListeners = append(httpsListeners, l)
+				}
+			}
+
+			if hasPort {
+				var filtered []state.InternalListener
+				for _, l := range httpsListeners {
 					if l.Port == 0 || int32(l.Port) == reqPort {
-						httpsListeners = append(httpsListeners, l)
+						filtered = append(filtered, l)
+					}
+				}
+				httpsListeners = filtered
+			} else {
+				// If no explicit port was in the Host header, prefer port 443 listeners unless
+				// a non-443 listener has a more specific match (e.g. Exact vs Catch-all).
+				exactNon443 := false
+				for _, l := range httpsListeners {
+					if l.Port != 443 && strings.EqualFold(l.Hostname, reqHost) {
+						exactNon443 = true
+						break
+					}
+				}
+				if !exactNon443 {
+					hasPort443Match := false
+					for _, l := range httpsListeners {
+						if (l.Port == 0 || l.Port == 443) && (l.Hostname == "" || strings.EqualFold(l.Hostname, reqHost) || state.MatchesWildcard(l.Hostname, reqHost)) {
+							hasPort443Match = true
+							break
+						}
+					}
+					if hasPort443Match {
+						var filtered []state.InternalListener
+						for _, l := range httpsListeners {
+							if l.Port == 0 || l.Port == 443 {
+								filtered = append(filtered, l)
+							}
+						}
+						httpsListeners = filtered
 					}
 				}
 			}
@@ -490,7 +607,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				routes = connRoutes
 			}
 		} else {
-			reqHost, reqPort := splitHostPort(r.Host, 80)
+			reqHost, reqPort, _ := splitHostPort(r.Host, 80)
 			reqHost = strings.ToLower(reqHost)
 
 			var httpListeners []state.InternalListener

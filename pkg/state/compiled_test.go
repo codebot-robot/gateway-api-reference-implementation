@@ -4240,7 +4240,7 @@ func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
 		t.Errorf("elPort did not resolve port-ca PEM (perPort override)")
 	}
 
-	// 3. Both are fail closed in part 1: Programmed=False, reason Pending
+	// 3. Both are Programmed=True in part 2 (AllowValidOnly)
 	for _, el := range []*EffectiveListener{elDefault, elPort} {
 		var progCond, accCond, refCond *metav1.Condition
 		for i := range el.Conditions {
@@ -4253,8 +4253,8 @@ func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
 				refCond = &el.Conditions[i]
 			}
 		}
-		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
-			t.Errorf("listener %s: expected Programmed=False/Pending, got %v", el.Name, progCond)
+		if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+			t.Errorf("listener %s: expected Programmed=True/Programmed, got %v", el.Name, progCond)
 		}
 		if accCond == nil || accCond.Status != metav1.ConditionTrue {
 			t.Errorf("listener %s: expected Accepted=True, got %v", el.Name, accCond)
@@ -4270,10 +4270,14 @@ func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
 		}
 	}
 
-	// 4. Absent from proxy listeners in part 1
+	// 4. Present in proxy listeners in part 2
 	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
-	if len(proxyListeners) != 0 {
-		t.Errorf("expected 0 proxy listeners (fail closed), got %d", len(proxyListeners))
+	if len(proxyListeners) != 2 {
+		t.Errorf("expected 2 proxy listeners, got %d", len(proxyListeners))
+	}
+	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
+	if defaultCert == nil && len(certsMap) == 0 {
+		t.Errorf("expected certificates extracted, got certsMap=%v defaultCert=%v", certsMap, defaultCert)
 	}
 }
 
@@ -4464,10 +4468,10 @@ func TestFrontendClientCertValidation_InvalidReasons(t *testing.T) {
 			useGrant:           true,
 			expectedRefReason:  gatewayv1.ListenerReasonResolvedRefs,
 			expectedAccReason:  gatewayv1.ListenerReasonAccepted,
-			expectedProgReason: gatewayv1.ListenerReasonPending,
+			expectedProgReason: gatewayv1.ListenerReasonProgrammed,
 			expectedRefStatus:  metav1.ConditionTrue,
 			expectedAccStatus:  metav1.ConditionTrue,
-			expectedProgStatus: metav1.ConditionFalse,
+			expectedProgStatus: metav1.ConditionTrue,
 		},
 	}
 
@@ -4668,5 +4672,106 @@ func TestFrontendClientCertValidation_ValidFailClosedAndInternalListener(t *test
 	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
 	if len(proxyListeners) != 0 {
 		t.Errorf("expected listener absent from proxy listeners, got %d", len(proxyListeners))
+	}
+}
+
+func TestFrontendClientCertValidation_AllowValidOnly_ProgrammedAndServed(t *testing.T) {
+	caCertPEM, _ := generateTestCertPEM(t, "ca.example.com")
+	serverCertPEM, serverKeyPEM := generateTestCertPEM(t, "server.example.com")
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "server-cert"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "server-cert"},
+			Data: map[string][]byte{
+				corev1.TLSCertKey:       serverCertPEM,
+				corev1.TLSPrivateKeyKey: serverKeyPEM,
+			},
+		},
+	}
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "valid-ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
+			Data:       map[string]string{"ca.crt": string(caCertPEM)},
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-valid-only"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "ref-class",
+			TLS: &gatewayv1.GatewayTLSConfig{
+				Frontend: &gatewayv1.FrontendTLSConfig{
+					Default: gatewayv1.TLSConfig{
+						Validation: &gatewayv1.FrontendTLSValidation{
+							CACertificateRefs: []gatewayv1.ObjectReference{
+								{Kind: "ConfigMap", Group: "", Name: "valid-ca"},
+							},
+							Mode: gatewayv1.AllowValidOnly,
+						},
+					},
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Kind: Ptr(gatewayv1.Kind("Secret")), Name: "server-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	compiled := CompileModel(ModelInputs{
+		Gateways:   []*gatewayv1.Gateway{gw},
+		Secrets:    secrets,
+		ConfigMaps: configMaps,
+	})
+
+	cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-valid-only"}]
+	if cg == nil || len(cg.EffectiveListeners) != 1 {
+		t.Fatalf("expected 1 effective listener")
+	}
+
+	el := cg.EffectiveListeners[0]
+	if el.ClientValidation == nil {
+		t.Fatalf("expected ClientValidation != nil")
+	}
+	if el.ClientValidation.Mode != gatewayv1.AllowValidOnly {
+		t.Errorf("expected Mode %v, got %v", gatewayv1.AllowValidOnly, el.ClientValidation.Mode)
+	}
+
+	// Verify Programmed=True
+	var progCond *metav1.Condition
+	for i := range el.Conditions {
+		if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
+			progCond = &el.Conditions[i]
+		}
+	}
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+		t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	// Verify compiled InternalListener
+	il := el.ToInternalListener()
+	if il.ClientValidation == nil {
+		t.Fatalf("expected InternalListener.ClientValidation != nil")
+	}
+	if il.ClientValidation.Mode != gatewayv1.AllowValidOnly {
+		t.Errorf("expected InternalListener mode %v, got %v", gatewayv1.AllowValidOnly, il.ClientValidation.Mode)
+	}
+
+	// Present in proxy listeners
+	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
+	if len(proxyListeners) != 1 {
+		t.Errorf("expected 1 proxy listener, got %d", len(proxyListeners))
+	}
+	certsMap, _ := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
+	if len(certsMap) != 1 {
+		t.Errorf("expected 1 certificate extracted, got %d", len(certsMap))
 	}
 }
