@@ -2671,3 +2671,189 @@ func TestBackendTLSPolicy_ClientCertificateAuth(t *testing.T) {
 		}
 	})
 }
+
+func TestServeHTTP_PortlessHostMatching(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendURL.Host)
+	backendPort, _ := strconv.Atoi(backendPortStr)
+	backendRef := []state.InternalBackend{{Host: backendHost, Port: int32(backendPort), Weight: 1}}
+
+	// Setup listeners representing:
+	// - 443 catch-all (Hostname: "")
+	// - 8443 exact listener (Hostname: "exact.example.com")
+	// - 8443 wildcard listener (Hostname: "*.wildcard.example.com")
+	// - 443 shared exact listener (Hostname: "shared.example.com")
+	// - 8443 shared exact listener (Hostname: "shared.example.com")
+	listeners := []state.InternalListener{
+		{
+			Name:     "catchall-443",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     443,
+			Hostname: "",
+			Routes: []state.InternalRoute{
+				{
+					Rules: []state.InternalRule{
+						{
+							Backends: backendRef,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{{Name: "X-Matched", Value: "443-catchall"}},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "exact-8443",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "exact.example.com",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"exact.example.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: backendRef,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{{Name: "X-Matched", Value: "8443-exact"}},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "wildcard-8443",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "*.wildcard.example.com",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"*.wildcard.example.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: backendRef,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{{Name: "X-Matched", Value: "8443-wildcard"}},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "shared-443",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     443,
+			Hostname: "shared.example.com",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"shared.example.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: backendRef,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{{Name: "X-Matched", Value: "443-shared"}},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:     "shared-8443",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "shared.example.com",
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"shared.example.com"},
+					Rules: []state.InternalRule{
+						{
+							Backends: backendRef,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{{Name: "X-Matched", Value: "8443-shared"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	p := NewProxy()
+	p.UpdateListeners(listeners)
+
+	tests := []struct {
+		name       string
+		serverName string
+		host       string
+		wantStatus int
+		wantMatch  string
+	}{
+		{
+			name:       "port-less Host matching a non-443 exact listener",
+			serverName: "exact.example.com",
+			host:       "exact.example.com",
+			wantStatus: http.StatusOK,
+			wantMatch:  "8443-exact",
+		},
+		{
+			name:       "port-less Host matching only a 443 catch-all",
+			serverName: "other.example.com",
+			host:       "other.example.com",
+			wantStatus: http.StatusOK,
+			wantMatch:  "443-catchall",
+		},
+		{
+			name:       "port-less Host matching a non-443 wildcard",
+			serverName: "foo.wildcard.example.com",
+			host:       "foo.wildcard.example.com",
+			wantStatus: http.StatusOK,
+			wantMatch:  "8443-wildcard",
+		},
+		{
+			name:       "explicit Host: h:8443",
+			serverName: "shared.example.com",
+			host:       "shared.example.com:8443",
+			wantStatus: http.StatusOK,
+			wantMatch:  "8443-shared",
+		},
+		{
+			name:       "port-less Host tie breaks to 443",
+			serverName: "shared.example.com",
+			host:       "shared.example.com",
+			wantStatus: http.StatusOK,
+			wantMatch:  "443-shared",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "https://"+tc.host+"/", nil)
+			req.Host = tc.host
+			req.TLS = &tls.ConnectionState{
+				ServerName: tc.serverName,
+			}
+			w := httptest.NewRecorder()
+			p.ServeHTTP(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d", tc.wantStatus, resp.StatusCode)
+			}
+			if got := resp.Header.Get("X-Matched"); got != tc.wantMatch {
+				t.Errorf("expected X-Matched %q, got %q", tc.wantMatch, got)
+			}
+		})
+	}
+}

@@ -365,10 +365,12 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 				caPool.AppendCertsFromPEM(pem)
 			}
 			tlsConfigs[lis.Name] = &tls.Config{
-				ClientAuth:             tls.RequireAndVerifyClientCert,
-				ClientCAs:              caPool,
-				GetCertificate:         p.GetCertificate,
-				NextProtos:             []string{"h2", "http/1.1"},
+				ClientAuth:     tls.RequireAndVerifyClientCert,
+				ClientCAs:      caPool,
+				GetCertificate: p.GetCertificate,
+				NextProtos:     []string{"h2", "http/1.1"},
+				// Disabling session tickets ensures client certificates are re-verified on every
+				// new TLS connection rather than skipped via session resumption.
 				SessionTicketsDisabled: true,
 			}
 		}
@@ -518,33 +520,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				httpsListeners = filtered
 			} else {
-				// If no explicit port was in the Host header, prefer port 443 listeners unless
-				// a non-443 listener has a more specific match (e.g. Exact vs Catch-all).
-				exactNon443 := false
-				for _, l := range httpsListeners {
-					if l.Port != 443 && strings.EqualFold(l.Hostname, reqHost) {
-						exactNon443 = true
-						break
+				// With no port in Host, do not filter by port; let hostname precedence decide
+				// (exact > wildcard > catch-all) with ties broken in favor of port 443.
+				sort.SliceStable(httpsListeners, func(i, j int) bool {
+					is443I := httpsListeners[i].Port == 443 || httpsListeners[i].Port == 0
+					is443J := httpsListeners[j].Port == 443 || httpsListeners[j].Port == 0
+					if is443I != is443J {
+						return is443I
 					}
-				}
-				if !exactNon443 {
-					hasPort443Match := false
-					for _, l := range httpsListeners {
-						if (l.Port == 0 || l.Port == 443) && (l.Hostname == "" || strings.EqualFold(l.Hostname, reqHost) || state.MatchesWildcard(l.Hostname, reqHost)) {
-							hasPort443Match = true
-							break
-						}
-					}
-					if hasPort443Match {
-						var filtered []state.InternalListener
-						for _, l := range httpsListeners {
-							if l.Port == 0 || l.Port == 443 {
-								filtered = append(filtered, l)
-							}
-						}
-						httpsListeners = filtered
-					}
-				}
+					return false
+				})
 			}
 
 			if len(httpsListeners) > 0 {
