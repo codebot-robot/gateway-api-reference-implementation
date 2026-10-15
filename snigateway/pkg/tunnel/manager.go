@@ -952,19 +952,14 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 }
 
 func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Duration) {
+	// The session context outlives ctx so that when ctx is cancelled (e.g. on
+	// manager shutdown), the frontend session control stream stays alive while
+	// runH2Pool drains in-flight streams with GOAWAY. sessCancel is called when
+	// runH2Pool returns.
 	sessCtx, sessCancel := context.WithCancel(context.Background())
 	defer sessCancel()
 
-	stopWait := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			sessCancel()
-		case <-stopWait:
-		}
-	}()
 	sessID, sessErrCh, err := m.client.StartSession(sessCtx)
-	close(stopWait)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
@@ -1149,7 +1144,9 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 		drainCtx, drainCancel := context.WithTimeout(context.Background(), m.h2DrainTimeout)
 		defer drainCancel()
 
-		_ = hs.Shutdown(drainCtx)
+		if err := hs.Shutdown(drainCtx); err != nil {
+			klog.V(2).Infof("H2 server shutdown error: %v", err)
+		}
 
 		drainDone := make(chan struct{})
 		go func() {

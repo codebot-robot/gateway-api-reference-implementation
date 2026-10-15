@@ -696,3 +696,69 @@ func TestH2Transport_ReadsNeverWaitOnWrites(t *testing.T) {
 		t.Fatalf("timed out waiting for backend to read upload while write is stalled")
 	}
 }
+
+func TestH2Transport_PrunesClosedConnections(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		io.Copy(io.Discard, r.Body)
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-prune-test"
+	h2Tr.RegisterSession(sessID)
+
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	conns := h2Tr.SessionConns(sessID)
+	if len(conns) != 2 {
+		t.Fatalf("expected 2 active conns, got %d", len(conns))
+	}
+
+	// Close c1's socket directly
+	_ = c1.Close()
+
+	// Wait for c1's State().Closed to become true
+	deadline := time.Now().Add(2 * time.Second)
+	var closed bool
+	for time.Now().Before(deadline) {
+		if conns[0].ClientConn().State().Closed {
+			closed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !closed {
+		t.Fatalf("expected c1 to be recognized as Closed")
+	}
+
+	// Trigger selection / pruning
+	remaining := h2Tr.SessionConns(sessID)
+	if len(remaining) != 1 {
+		t.Fatalf("expected 1 connection remaining after prune, got %d", len(remaining))
+	}
+	if remaining[0].ClientConn() == conns[0].ClientConn() {
+		t.Fatalf("expected c1 to be pruned, but c1 was still present")
+	}
+}

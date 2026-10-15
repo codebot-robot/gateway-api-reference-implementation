@@ -127,6 +127,9 @@ func NewH2Transport(opts ...H2TransportOption) *H2Transport {
 }
 
 func (h *H2Transport) broadcastLocked() {
+	for sid := range h.sessions {
+		h.pruneClosedLocked(sid)
+	}
 	close(h.notifyCh)
 	h.notifyCh = make(chan struct{})
 }
@@ -135,6 +138,24 @@ func (h *H2Transport) broadcast() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.broadcastLocked()
+}
+
+// pruneClosedLocked removes closed connections from h.sessions[sessionID] and returns the remaining active connections.
+func (h *H2Transport) pruneClosedLocked(sessionID string) []*h2Conn {
+	conns, ok := h.sessions[sessionID]
+	if !ok || len(conns) == 0 {
+		return nil
+	}
+	var active []*h2Conn
+	for _, c := range conns {
+		if !c.cc.State().Closed && !c.closed.Load() {
+			active = append(active, c)
+		}
+	}
+	if len(active) != len(conns) {
+		h.sessions[sessionID] = active
+	}
+	return active
 }
 
 // RegisterSession registers a backend session with the H2 transport.
@@ -172,7 +193,7 @@ func (h *H2Transport) HasSession(sessionID string) bool {
 func (h *H2Transport) SessionConns(sessionID string) []*H2Conn {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	conns := h.sessions[sessionID]
+	conns := h.pruneClosedLocked(sessionID)
 	res := make([]*H2Conn, len(conns))
 	copy(res, conns)
 	return res
@@ -265,8 +286,9 @@ func (h *H2Transport) TryGetConn(ctx context.Context, sessionID string) (net.Con
 		return nil, net.ErrClosed
 	}
 
+	conns := h.pruneClosedLocked(sessionID)
 	var candidates []*h2Conn
-	for _, c := range h.sessions[sessionID] {
+	for _, c := range conns {
 		if c.CanTakeNewRequest() {
 			candidates = append(candidates, c)
 		}
@@ -318,8 +340,9 @@ func (h *H2Transport) GetConnForSessions(ctx context.Context, sessionIDs []strin
 		var bestSID string
 
 		for _, sid := range sessionIDs {
+			conns := h.pruneClosedLocked(sid)
 			var candidates []*h2Conn
-			for _, c := range h.sessions[sid] {
+			for _, c := range conns {
 				if c.CanTakeNewRequest() {
 					candidates = append(candidates, c)
 				}
