@@ -15,6 +15,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -1476,5 +1477,368 @@ func TestServerStreamConn_BackpressureAndClose(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("timeout waiting for Close to unblock writer")
+	}
+}
+
+func TestManager_H2BackendShutdownGOAWAY(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "snigateway-mgr-h2-goaway-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := certs.GenerateAndWriteCertificates(tempDir, "snigateway.internal", "mgr-client"); err != nil {
+		t.Fatalf("GenerateAndWriteCertificates failed: %v", err)
+	}
+
+	caCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	serverCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	serverKeyPEM, _ := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	clientCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	clientKeyPEM, _ := os.ReadFile(filepath.Join(tempDir, "client.key"))
+
+	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	serverAddr := ln.Addr().String()
+
+	pc, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("net.ListenPacket failed: %v", err)
+	}
+
+	srv, err := frontend.NewServer(frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	mgr := NewManager(c,
+		WithTransport(TransportModeH2),
+		WithPoolSize(2),
+		WithH2DrainTimeout(5*time.Second),
+		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
+	)
+
+	mgrCtx, mgrCancel := context.WithCancel(t.Context())
+	defer mgrCancel()
+
+	mgrDone := make(chan error, 1)
+	go func() {
+		mgrDone <- mgr.Run(mgrCtx)
+	}()
+
+	hostname := "h2-goaway.example.com"
+	mgr.UpdateHostnames([]string{hostname})
+
+	// Wait for manager to establish H2 session and dial connections
+	deadline := time.Now().Add(5 * time.Second)
+	var sessID string
+	var conns []*frontend.H2Conn
+	for time.Now().Before(deadline) {
+		if mgr.IsConnected() {
+			sessID = mgr.SessionID()
+			if sessID != "" {
+				conns = srv.H2Transport().SessionConns(sessID)
+				if len(conns) >= 2 {
+					break
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if sessID == "" || len(conns) < 2 {
+		t.Fatalf("expected at least 2 active pooled H2 connections, got %d (session: %q)", len(conns), sessID)
+	}
+
+	// Verify all connections can take new requests initially
+	for i, conn := range conns {
+		if !conn.CanTakeNewRequest() {
+			t.Fatalf("conn %d: expected CanTakeNewRequest() == true before cancel", i)
+		}
+		if !conn.ClientConn().CanTakeNewRequest() {
+			t.Fatalf("conn %d: expected ClientConn.CanTakeNewRequest() == true before cancel", i)
+		}
+	}
+
+	// Open a stream on the session from frontend to backend
+	streamCtx, streamCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer streamCancel()
+
+	stream, err := srv.H2Transport().GetConn(streamCtx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Write PROXY protocol header so the backend listener accepts the connection
+	hdr := proxyproto.Header{
+		SrcAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 12345},
+		DstAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.2"), Port: 443},
+	}
+	if err := proxyproto.Encode(stream, &hdr); err != nil {
+		t.Fatalf("proxyproto.Encode failed: %v", err)
+	}
+
+	backendConn, err := mgr.Listener().Accept()
+	if err != nil {
+		t.Fatalf("mgr.Listener().Accept() failed: %v", err)
+	}
+	defer backendConn.Close()
+
+	// Find the connection carrying the open stream
+	var streamConn *frontend.H2Conn
+	for _, conn := range conns {
+		if conn.ClientConn().State().StreamsActive > 0 {
+			streamConn = conn
+			break
+		}
+	}
+	if streamConn == nil {
+		t.Fatalf("could not find connection with active stream")
+	}
+
+	// Verify that before cancellation, streamConn can take new requests
+	if !streamConn.CanTakeNewRequest() {
+		t.Fatalf("expected streamConn.CanTakeNewRequest() == true before cancellation")
+	}
+	if !streamConn.ClientConn().CanTakeNewRequest() {
+		t.Fatalf("expected streamConn.ClientConn().CanTakeNewRequest() == true before cancellation")
+	}
+
+	// Now cancel the backend manager context to trigger graceful GOAWAY drain
+	mgrCancel()
+
+	// Assert the frontend receives GOAWAY on each pooled connection before socket closes:
+	// h2Conn.CanTakeNewRequest() goes false without having to detect a dead socket.
+	goAwayDeadline := time.Now().Add(2 * time.Second)
+	var sawGoAway bool
+	for time.Now().Before(goAwayDeadline) {
+		allFalse := true
+		for _, conn := range conns {
+			if conn.CanTakeNewRequest() {
+				allFalse = false
+				break
+			}
+		}
+		if allFalse && !streamConn.ClientConn().CanTakeNewRequest() {
+			sawGoAway = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawGoAway {
+		for i, conn := range conns {
+			t.Logf("conn %d: CanTakeNewRequest=%v, cc.CanTakeNewRequest=%v, cc.State=%+v",
+				i, conn.CanTakeNewRequest(), conn.ClientConn().CanTakeNewRequest(), conn.ClientConn().State())
+		}
+		t.Fatalf("frontend ClientConns did not receive GOAWAY after manager context cancelled")
+	}
+
+	// Verify that the connection with the active stream is NOT yet Closed
+	if streamConn.ClientConn().State().Closed {
+		t.Errorf("ClientConn socket was prematurely Closed while stream still in-flight")
+	}
+
+	// Assert the open stream still finishes successfully
+	testData := []byte("payload after backend cancellation")
+	if _, err := stream.Write(testData); err != nil {
+		t.Fatalf("stream.Write failed after cancellation: %v", err)
+	}
+
+	readBuf := make([]byte, len(testData))
+	if _, err := io.ReadFull(backendConn, readBuf); err != nil {
+		t.Fatalf("backendConn.ReadFull failed: %v", err)
+	}
+	if !bytes.Equal(readBuf, testData) {
+		t.Fatalf("received %q, want %q", readBuf, testData)
+	}
+
+	echoData := []byte("echo back after goaway")
+	if _, err := backendConn.Write(echoData); err != nil {
+		t.Fatalf("backendConn.Write failed: %v", err)
+	}
+
+	echoBuf := make([]byte, len(echoData))
+	if _, err := io.ReadFull(stream, echoBuf); err != nil {
+		t.Fatalf("stream.ReadFull failed: %v", err)
+	}
+	if !bytes.Equal(echoBuf, echoData) {
+		t.Fatalf("received %q, want %q", echoBuf, echoData)
+	}
+
+	// Close the stream and backend connection now that work is complete
+	_ = backendConn.Close()
+	_ = stream.Close()
+
+	// Verify manager shutdown completes cleanly within drain timeout
+	select {
+	case err := <-mgrDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("mgr.Run returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for manager to exit after stream closed")
+	}
+}
+
+func TestManager_H2BackendDrainTimeoutForceCloses(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "snigateway-mgr-h2-drain-timeout-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := certs.GenerateAndWriteCertificates(tempDir, "snigateway.internal", "mgr-client"); err != nil {
+		t.Fatalf("GenerateAndWriteCertificates failed: %v", err)
+	}
+
+	caCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	serverCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	serverKeyPEM, _ := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	clientCertPEM, _ := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	clientKeyPEM, _ := os.ReadFile(filepath.Join(tempDir, "client.key"))
+
+	serverTLS, err := certs.NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	serverAddr := ln.Addr().String()
+
+	pc, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("net.ListenPacket failed: %v", err)
+	}
+
+	srv, err := frontend.NewServer(frontend.ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   5 * time.Second,
+		ReadSNITimeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+	}()
+
+	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	// Set a very short drain timeout (150ms)
+	drainTimeout := 150 * time.Millisecond
+	mgr := NewManager(c,
+		WithTransport(TransportModeH2),
+		WithPoolSize(1),
+		WithH2DrainTimeout(drainTimeout),
+		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
+	)
+
+	mgrCtx, mgrCancel := context.WithCancel(t.Context())
+	defer mgrCancel()
+
+	mgrDone := make(chan error, 1)
+	go func() {
+		mgrDone <- mgr.Run(mgrCtx)
+	}()
+
+	mgr.UpdateHostnames([]string{"h2-timeout.example.com"})
+
+	// Wait for manager to connect
+	deadline := time.Now().Add(5 * time.Second)
+	var sessID string
+	for time.Now().Before(deadline) {
+		if mgr.IsConnected() {
+			sessID = mgr.SessionID()
+			if sessID != "" && len(srv.H2Transport().SessionConns(sessID)) >= 1 {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sessID == "" {
+		t.Fatalf("manager failed to connect")
+	}
+
+	streamCtx, streamCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer streamCancel()
+
+	stream, err := srv.H2Transport().GetConn(streamCtx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	hdr := proxyproto.Header{
+		SrcAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 12345},
+		DstAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.2"), Port: 443},
+	}
+	if err := proxyproto.Encode(stream, &hdr); err != nil {
+		t.Fatalf("proxyproto.Encode failed: %v", err)
+	}
+
+	backendConn, err := mgr.Listener().Accept()
+	if err != nil {
+		t.Fatalf("mgr.Listener().Accept() failed: %v", err)
+	}
+	defer backendConn.Close()
+
+	start := time.Now()
+	// Cancel manager without closing stream or backendConn
+	mgrCancel()
+
+	// Manager should exit within ~drainTimeout + small margin, force closing connections
+	select {
+	case err := <-mgrDone:
+		elapsed := time.Since(start)
+		if elapsed < drainTimeout {
+			t.Fatalf("manager exited prematurely before drain timeout: elapsed %v, drain timeout %v", elapsed, drainTimeout)
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("mgr.Run returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for manager to force close and exit after drain timeout")
+	}
+
+	// Sockets should now be closed; read should return error
+	buf := make([]byte, 16)
+	_ = stream.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err = stream.Read(buf)
+	if err == nil {
+		t.Errorf("expected stream.Read to fail on force closed connection, but succeeded")
 	}
 }

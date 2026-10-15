@@ -65,6 +65,9 @@ func WithH2TargetHost(host string) H2TransportOption {
 	}
 }
 
+// H2Conn wraps an established HTTP/2 client connection pooled for a backend session.
+type H2Conn = h2Conn
+
 // h2Conn wraps an established HTTP/2 client connection pooled for a backend session.
 type h2Conn struct {
 	cc        *http2.ClientConn
@@ -78,7 +81,15 @@ func (c *h2Conn) CanTakeNewRequest() bool {
 	if c.closed.Load() || c.draining.Load() {
 		return false
 	}
+	st := c.cc.State()
+	if st.Closed || st.Closing {
+		return false
+	}
 	return c.cc.CanTakeNewRequest()
+}
+
+func (c *h2Conn) ClientConn() *http2.ClientConn {
+	return c.cc
 }
 
 func (c *h2Conn) Load() int {
@@ -155,6 +166,16 @@ func (h *H2Transport) HasSession(sessionID string) bool {
 	defer h.mu.Unlock()
 	_, exists := h.sessions[sessionID]
 	return exists
+}
+
+// SessionConns returns a snapshot of pooled H2 connections for the given session.
+func (h *H2Transport) SessionConns(sessionID string) []*H2Conn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	conns := h.sessions[sessionID]
+	res := make([]*H2Conn, len(conns))
+	copy(res, conns)
+	return res
 }
 
 // AddConn adds a newly hijacked and upgraded mTLS TCP connection to the H2 pool for sessionID.

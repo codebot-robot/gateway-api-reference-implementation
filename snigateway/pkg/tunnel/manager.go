@@ -28,7 +28,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
@@ -953,10 +952,20 @@ func (m *Manager) runPool(ctx context.Context, sessionID string, sessErrCh <-cha
 }
 
 func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Duration) {
-	sessCtx, sessCancel := context.WithCancel(ctx)
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	defer sessCancel()
+
+	stopWait := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			sessCancel()
+		case <-stopWait:
+		}
+	}()
 	sessID, sessErrCh, err := m.client.StartSession(sessCtx)
+	close(stopWait)
 	if err != nil {
-		sessCancel()
 		if ctx.Err() != nil {
 			return
 		}
@@ -983,7 +992,7 @@ func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Dur
 	klog.Infof("Established H2 session %s with frontend", sessID)
 	m.triggerRegistration()
 
-	m.runH2Pool(sessCtx, sessID, sessErrCh)
+	m.runH2Pool(ctx, sessID, sessErrCh)
 	sessCancel()
 
 	m.mu.Lock()
@@ -1005,13 +1014,25 @@ func (m *Manager) runH2SessionWithBackoff(ctx context.Context, backoff *time.Dur
 }
 
 func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-chan error) {
+	poolCtx, poolCancel := context.WithCancel(ctx)
+	defer poolCancel()
+
 	refillCh := make(chan struct{}, m.poolSize*2)
 	activeConnsMu := sync.Mutex{}
 	activeConns := 0
 
-	var activeStreams atomic.Int32
+	var connsWg sync.WaitGroup
 	var pooledConnsMu sync.Mutex
 	pooledConns := make(map[net.Conn]struct{})
+
+	h2Server := api.DefaultH2Server()
+	if m.h2PingInterval > 0 {
+		h2Server.ReadIdleTimeout = m.h2PingInterval
+	}
+	hs := &http.Server{}
+	if err := http2.ConfigureServer(hs, h2Server); err != nil {
+		klog.Errorf("Failed to configure HTTP/2 server: %v", err)
+	}
 
 	triggerRefill := func() {
 		select {
@@ -1022,7 +1043,7 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 
 	dialOne := func() {
 		activeConnsMu.Lock()
-		if activeConns >= m.poolSize {
+		if poolCtx.Err() != nil || activeConns >= m.poolSize {
 			activeConnsMu.Unlock()
 			return
 		}
@@ -1030,7 +1051,7 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 		activeConnsMu.Unlock()
 
 		go func() {
-			dialCtx, cancel := context.WithTimeout(ctx, m.dialTimeout)
+			dialCtx, cancel := context.WithTimeout(poolCtx, m.dialTimeout)
 			conn, err := m.client.DialH2Tunnel(dialCtx, sessionID)
 			cancel()
 
@@ -1039,7 +1060,7 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 				activeConns--
 				activeConnsMu.Unlock()
 
-				if ctx.Err() == nil {
+				if poolCtx.Err() == nil {
 					klog.Errorf("Failed to dial H2 tunnel connection for session %s: %v", sessionID, err)
 					time.Sleep(200 * time.Millisecond)
 					triggerRefill()
@@ -1047,14 +1068,20 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 				return
 			}
 
+			if poolCtx.Err() != nil {
+				closeConn(conn)
+				activeConnsMu.Lock()
+				activeConns--
+				activeConnsMu.Unlock()
+				return
+			}
+
+			connsWg.Add(1)
+			defer connsWg.Done()
+
 			pooledConnsMu.Lock()
 			pooledConns[conn] = struct{}{}
 			pooledConnsMu.Unlock()
-
-			h2Server := api.DefaultH2Server()
-			if m.h2PingInterval > 0 {
-				h2Server.ReadIdleTimeout = m.h2PingInterval
-			}
 
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != http.MethodConnect {
@@ -1069,9 +1096,7 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 
 				reqCtx, cancelReq := context.WithCancel(r.Context())
 				streamConn := newServerStreamConn(w, r.Body, cancelReq, conn)
-				activeStreams.Add(1)
 				defer func() {
-					activeStreams.Add(-1)
 					closeConn(streamConn)
 					// Ensure all in-flight Writes have finished before handler returns!
 					streamConn.inFlight.Wait()
@@ -1096,7 +1121,6 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 
 			h2Server.ServeConn(conn, &http2.ServeConnOpts{
 				Handler: handler,
-				Context: ctx,
 			})
 			closeConn(conn)
 
@@ -1108,7 +1132,7 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 			activeConns--
 			activeConnsMu.Unlock()
 
-			if ctx.Err() == nil {
+			if poolCtx.Err() == nil {
 				triggerRefill()
 			}
 		}()
@@ -1119,35 +1143,42 @@ func (m *Manager) runH2Pool(ctx context.Context, sessionID string, sessErrCh <-c
 		dialOne()
 	}
 
-	for {
+	drain := func() {
+		poolCancel()
+
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), m.h2DrainTimeout)
+		defer drainCancel()
+
+		_ = hs.Shutdown(drainCtx)
+
+		drainDone := make(chan struct{})
+		go func() {
+			connsWg.Wait()
+			close(drainDone)
+		}()
+
 		select {
-		case <-ctx.Done():
-			// Gracefully drain in-flight streams up to h2DrainTimeout
-			drainTimer := time.NewTimer(m.h2DrainTimeout)
-			for activeStreams.Load() > 0 {
-				select {
-				case <-drainTimer.C:
-					goto forceClose
-				case <-time.After(10 * time.Millisecond):
-				}
-			}
-			drainTimer.Stop()
-		forceClose:
+		case <-drainDone:
+		case <-drainCtx.Done():
 			pooledConnsMu.Lock()
 			for c := range pooledConns {
 				closeConn(c)
 			}
 			pooledConnsMu.Unlock()
+			<-drainDone
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			drain()
 			return
 		case err := <-sessErrCh:
 			if err != nil && !errors.Is(err, context.Canceled) {
 				klog.Warningf("Session error from frontend: %v", err)
 			}
-			pooledConnsMu.Lock()
-			for c := range pooledConns {
-				closeConn(c)
-			}
-			pooledConnsMu.Unlock()
+			drain()
 			return
 		case <-refillCh:
 			dialOne()
