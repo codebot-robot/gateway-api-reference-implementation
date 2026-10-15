@@ -4569,7 +4569,7 @@ func TestFrontendClientCertValidation_InvalidReasons(t *testing.T) {
 	}
 }
 
-func TestFrontendClientCertValidation_ValidFailClosedAndInternalListener(t *testing.T) {
+func TestFrontendClientCertValidation_AllowInsecureFallback_ProgrammedAndServed(t *testing.T) {
 	caCertPEM, _ := generateTestCertPEM(t, "ca.example.com")
 	serverCertPEM, serverKeyPEM := generateTestCertPEM(t, "server.example.com")
 
@@ -4642,18 +4642,15 @@ func TestFrontendClientCertValidation_ValidFailClosedAndInternalListener(t *test
 		t.Errorf("CACertPEMs mismatch")
 	}
 
-	// Verify fail closed status
+	// Verify Programmed=True status
 	var progCond *metav1.Condition
 	for i := range el.Conditions {
 		if el.Conditions[i].Type == string(gatewayv1.ListenerConditionProgrammed) {
 			progCond = &el.Conditions[i]
 		}
 	}
-	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
-		t.Errorf("expected Programmed=False/Pending, got %+v", progCond)
-	}
-	if progCond.Message != "Frontend validation is not yet enforced" {
-		t.Errorf("expected message 'Frontend validation is not yet enforced', got %q", progCond.Message)
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+		t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
 	}
 
 	// Verify compiled InternalListener
@@ -4668,11 +4665,317 @@ func TestFrontendClientCertValidation_ValidFailClosedAndInternalListener(t *test
 		t.Errorf("InternalListener CACertPEMs mismatch")
 	}
 
-	// Absent from proxy listeners
+	// Present in proxy listeners
 	proxyListeners, _ := BuildProxyConfig(compiled.GatewaysList())
-	if len(proxyListeners) != 0 {
-		t.Errorf("expected listener absent from proxy listeners, got %d", len(proxyListeners))
+	if len(proxyListeners) != 1 {
+		t.Errorf("expected 1 proxy listener, got %d", len(proxyListeners))
 	}
+	certsMap, _ := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
+	if len(certsMap) != 1 {
+		t.Errorf("expected 1 certificate extracted, got %d", len(certsMap))
+	}
+
+	// Verify Gateway condition InsecureFrontendValidationMode=True Reason=ConfigurationChanged
+	gwCond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+	if gwCond == nil || gwCond.Status != metav1.ConditionTrue || gwCond.Reason != string(gatewayv1.GatewayReasonConfigurationChanged) {
+		t.Errorf("expected Gateway InsecureFrontendValidationMode=True/ConfigurationChanged, got %+v", gwCond)
+	}
+}
+
+func TestGatewayCondition_InsecureFrontendValidationMode(t *testing.T) {
+	caCertPEM, _ := generateTestCertPEM(t, "ca.example.com")
+	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
+		{Namespace: "default", Name: "ca"}: {
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca"},
+			Data:       map[string]string{"ca.crt": string(caCertPEM)},
+		},
+	}
+
+	t.Run("Gateway default mode AllowInsecureFallback sets condition", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-fallback"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				TLS: &gatewayv1.GatewayTLSConfig{
+					Frontend: &gatewayv1.FrontendTLSConfig{
+						Default: gatewayv1.TLSConfig{
+							Validation: &gatewayv1.FrontendTLSValidation{
+								CACertificateRefs: []gatewayv1.ObjectReference{
+									{Kind: "ConfigMap", Group: "", Name: "ca"},
+								},
+								Mode: gatewayv1.AllowInsecureFallback,
+							},
+						},
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways:   []*gatewayv1.Gateway{gw},
+			ConfigMaps: configMaps,
+		})
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-fallback"}]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		cond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayReasonConfigurationChanged) {
+			t.Errorf("expected InsecureFrontendValidationMode=True/ConfigurationChanged, got %+v", cond)
+		}
+	})
+
+	t.Run("Gateway per-port mode AllowInsecureFallback sets condition", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-perport-fallback"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				TLS: &gatewayv1.GatewayTLSConfig{
+					Frontend: &gatewayv1.FrontendTLSConfig{
+						Default: gatewayv1.TLSConfig{
+							Validation: &gatewayv1.FrontendTLSValidation{
+								CACertificateRefs: []gatewayv1.ObjectReference{
+									{Kind: "ConfigMap", Group: "", Name: "ca"},
+								},
+								Mode: gatewayv1.AllowValidOnly,
+							},
+						},
+						PerPort: []gatewayv1.TLSPortConfig{
+							{
+								Port: 8443,
+								TLS: gatewayv1.TLSConfig{
+									Validation: &gatewayv1.FrontendTLSValidation{
+										CACertificateRefs: []gatewayv1.ObjectReference{
+											{Kind: "ConfigMap", Group: "", Name: "ca"},
+										},
+										Mode: gatewayv1.AllowInsecureFallback,
+									},
+								},
+							},
+						},
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "https-443", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+					{Name: "https-8443", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways:   []*gatewayv1.Gateway{gw},
+			ConfigMaps: configMaps,
+		})
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-perport-fallback"}]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		cond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayReasonConfigurationChanged) {
+			t.Errorf("expected InsecureFrontendValidationMode=True/ConfigurationChanged, got %+v", cond)
+		}
+	})
+
+	t.Run("Gateway AllowValidOnly condition is absent", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-valid-only"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				TLS: &gatewayv1.GatewayTLSConfig{
+					Frontend: &gatewayv1.FrontendTLSConfig{
+						Default: gatewayv1.TLSConfig{
+							Validation: &gatewayv1.FrontendTLSValidation{
+								CACertificateRefs: []gatewayv1.ObjectReference{
+									{Kind: "ConfigMap", Group: "", Name: "ca"},
+								},
+								Mode: gatewayv1.AllowValidOnly,
+							},
+						},
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways:   []*gatewayv1.Gateway{gw},
+			ConfigMaps: configMaps,
+		})
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-valid-only"}]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		cond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond != nil {
+			t.Errorf("expected InsecureFrontendValidationMode to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("Gateway unspecified mode defaults to AllowValidOnly and condition is absent", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-default-mode"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				TLS: &gatewayv1.GatewayTLSConfig{
+					Frontend: &gatewayv1.FrontendTLSConfig{
+						Default: gatewayv1.TLSConfig{
+							Validation: &gatewayv1.FrontendTLSValidation{
+								CACertificateRefs: []gatewayv1.ObjectReference{
+									{Kind: "ConfigMap", Group: "", Name: "ca"},
+								},
+							},
+						},
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways:   []*gatewayv1.Gateway{gw},
+			ConfigMaps: configMaps,
+		})
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-default-mode"}]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		cond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond != nil {
+			t.Errorf("expected InsecureFrontendValidationMode to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("Gateway without frontend validation condition is absent", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-no-validation"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways: []*gatewayv1.Gateway{gw},
+		})
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-no-validation"}]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		cond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond != nil {
+			t.Errorf("expected InsecureFrontendValidationMode to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("Gateway with HTTP listeners only condition is absent", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-http-only"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				TLS: &gatewayv1.GatewayTLSConfig{
+					Frontend: &gatewayv1.FrontendTLSConfig{
+						Default: gatewayv1.TLSConfig{
+							Validation: &gatewayv1.FrontendTLSValidation{
+								CACertificateRefs: []gatewayv1.ObjectReference{
+									{Kind: "ConfigMap", Group: "", Name: "ca"},
+								},
+								Mode: gatewayv1.AllowInsecureFallback,
+							},
+						},
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+			},
+		}
+
+		compiled := CompileModel(ModelInputs{
+			Gateways:   []*gatewayv1.Gateway{gw},
+			ConfigMaps: configMaps,
+		})
+		cg := compiled.Gateways[types.NamespacedName{Namespace: "default", Name: "gw-http-only"}]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		cond := findCondition(cg.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond != nil {
+			t.Errorf("expected InsecureFrontendValidationMode to be absent for HTTP-only listeners, got %+v", cond)
+		}
+	})
+
+	t.Run("Transition: condition present on AllowInsecureFallback and removed when changed to AllowValidOnly", func(t *testing.T) {
+		st := NewState()
+		st.SetControllerName("example.net/gateway-controller")
+
+		gc := &gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "ref-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+		}
+		st.UpsertGatewayClass(gc)
+
+		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-transition"}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-transition"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "ref-class",
+				TLS: &gatewayv1.GatewayTLSConfig{
+					Frontend: &gatewayv1.FrontendTLSConfig{
+						Default: gatewayv1.TLSConfig{
+							Validation: &gatewayv1.FrontendTLSValidation{
+								CACertificateRefs: []gatewayv1.ObjectReference{
+									{Kind: "ConfigMap", Group: "", Name: "ca"},
+								},
+								Mode: gatewayv1.AllowInsecureFallback,
+							},
+						},
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType},
+				},
+			},
+		}
+
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(configMaps[types.NamespacedName{Namespace: "default", Name: "ca"}])
+		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "10.0.0.1"}})
+		st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+		st.Recompute()
+
+		status, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			t.Fatalf("expected desired status for gateway")
+		}
+		cond := findCondition(status.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayReasonConfigurationChanged) {
+			t.Fatalf("expected InsecureFrontendValidationMode=True/ConfigurationChanged initially, got %+v", cond)
+		}
+
+		// Update Gateway spec to AllowValidOnly
+		gwUpdated := gw.DeepCopy()
+		gwUpdated.Spec.TLS.Frontend.Default.Validation.Mode = gatewayv1.AllowValidOnly
+		st.UpsertGateway(gwUpdated)
+		st.Recompute()
+
+		statusUpdated, ok := st.GetDesiredGatewayStatus(gwKey)
+		if !ok {
+			t.Fatalf("expected desired status for gateway after update")
+		}
+		condUpdated := findCondition(statusUpdated.Conditions, string(gatewayv1.GatewayConditionInsecureFrontendValidationMode))
+		if condUpdated != nil {
+			t.Errorf("expected InsecureFrontendValidationMode to be removed after change to AllowValidOnly, got %+v", condUpdated)
+		}
+	})
 }
 
 func TestFrontendClientCertValidation_AllowValidOnly_ProgrammedAndServed(t *testing.T) {

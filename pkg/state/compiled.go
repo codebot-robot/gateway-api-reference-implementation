@@ -663,14 +663,6 @@ func ValidateListener(
 			CACertPEMs: caPEMs,
 			Mode:       mode,
 		}
-
-		if mode == gatewayv1.AllowInsecureFallback {
-			// Fail closed for AllowInsecureFallback until part 3.
-			// Report Programmed=False, reason Pending.
-			listenerProgrammedStatus = metav1.ConditionFalse
-			listenerProgrammedReason = gatewayv1.ListenerReasonPending
-			listenerProgrammedMessage = "Frontend validation is not yet enforced"
-		}
 	}
 
 	conditions = []metav1.Condition{
@@ -1038,7 +1030,7 @@ func ComputeGatewayConditions(
 		)
 	}
 
-	return []metav1.Condition{
+	conds := []metav1.Condition{
 		NewCondition(
 			string(gatewayv1.GatewayConditionProgrammed),
 			gwProgrammedStatus,
@@ -1055,6 +1047,32 @@ func ComputeGatewayConditions(
 		),
 		resolvedRefsCond,
 	}
+
+	if hasInsecureFallbackListener(gw, effectiveListeners) {
+		conds = append(conds, NewCondition(
+			string(gatewayv1.GatewayConditionInsecureFrontendValidationMode),
+			metav1.ConditionTrue,
+			string(gatewayv1.GatewayReasonConfigurationChanged),
+			"Frontend validation mode is set to AllowInsecureFallback",
+			gw.Generation,
+		))
+	}
+
+	return conds
+}
+
+func hasInsecureFallbackListener(gw *gatewayv1.Gateway, effectiveListeners []*EffectiveListener) bool {
+	for _, el := range effectiveListeners {
+		if el.ClientValidation != nil && el.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
+			return true
+		}
+		if gw != nil && el.Protocol == gatewayv1.HTTPSProtocolType {
+			if effVal := EffectiveFrontendValidation(gw.Spec.TLS, el.Port, el.Protocol); effVal != nil && effVal.Mode == gatewayv1.AllowInsecureFallback {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // areProtocolsCompatible returns true if two listeners on the same port can co-exist.

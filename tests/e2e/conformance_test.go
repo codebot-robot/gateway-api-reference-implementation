@@ -95,6 +95,7 @@ func TestConformance(t *testing.T) {
 			SupportedFeatures: []features.FeatureName{
 				features.SupportGatewayBackendClientCertificate,
 				features.SupportGatewayFrontendClientCertificateValidation,
+				features.SupportGatewayFrontendClientCertificateValidationInsecureFallback,
 				features.SupportTCPRoute,
 				features.SupportUDPRoute,
 			},
@@ -126,6 +127,7 @@ func TestConformance(t *testing.T) {
 		tests.BackendTLSPolicySANValidation,
 		tests.GatewayClassObservedGenerationBump,
 		tests.GatewayFrontendClientCertificateValidation,
+		tests.GatewayFrontendClientCertificateValidationInsecureFallback,
 		tests.GatewayFrontendInvalidDefaultClientCertificateValidation,
 		tests.GatewayHTTPListenerIsolation,
 		tests.GatewayInfrastructureMetadata,

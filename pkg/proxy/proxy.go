@@ -353,8 +353,8 @@ func isClientValidationServable(cv *state.InternalClientValidation) (bool, strin
 	if cv == nil {
 		return true, ""
 	}
-	if cv.Mode != "" && cv.Mode != gatewayv1.AllowValidOnly {
-		return false, fmt.Sprintf("unsupported validation mode %q (only AllowValidOnly is supported)", cv.Mode)
+	if cv.Mode != "" && cv.Mode != gatewayv1.AllowValidOnly && cv.Mode != gatewayv1.AllowInsecureFallback {
+		return false, fmt.Sprintf("unsupported validation mode %q (only AllowValidOnly and AllowInsecureFallback are supported)", cv.Mode)
 	}
 	if len(cv.CACertPEMs) == 0 {
 		return false, "no CA certificates provided"
@@ -395,8 +395,13 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 			for _, pem := range lis.ClientValidation.CACertPEMs {
 				caPool.AppendCertsFromPEM(pem)
 			}
+			clientAuth := tls.RequireAndVerifyClientCert
+			if lis.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
+				clientAuth = tls.RequestClientCert
+			}
+
 			tlsConfigs[lis.Name] = &tls.Config{
-				ClientAuth:     tls.RequireAndVerifyClientCert,
+				ClientAuth:     clientAuth,
 				ClientCAs:      caPool,
 				GetCertificate: p.GetCertificate,
 				NextProtos:     []string{"h2", "http/1.1"},
