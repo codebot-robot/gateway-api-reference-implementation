@@ -3096,3 +3096,348 @@ func TestProxy_GRPCRoute_HeaderModifiers(t *testing.T) {
 		t.Errorf("expected X-Resp-Original 'orig', got %q", got)
 	}
 }
+
+func TestProxy_BackendConnectionReuse(t *testing.T) {
+	_, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	var handshakes atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-response"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			handshakes.Add(1)
+			return nil
+		},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("failed to parse server URL: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	httpsProto := "https"
+
+	p := NewProxy()
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+				},
+				Backends: []state.InternalBackend{
+					{
+						Host:        host,
+						Port:        int32(port),
+						AppProtocol: &httpsProto,
+						Weight:      1,
+					},
+				},
+			},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{route})
+
+	// Request 1
+	req1 := httptest.NewRequest("GET", "http://example.com/test", nil)
+	w1 := httptest.NewRecorder()
+	p.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("request 1 failed: status %d", w1.Code)
+	}
+
+	// Request 2 to the same TLS backend
+	req2 := httptest.NewRequest("GET", "http://example.com/test", nil)
+	w2 := httptest.NewRecorder()
+	p.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("request 2 failed: status %d", w2.Code)
+	}
+
+	if hs := handshakes.Load(); hs != 1 {
+		t.Errorf("expected 1 TLS handshake for 2 requests to same backend (connection reuse), got %d", hs)
+	}
+}
+
+func TestProxy_BackendTransportCachingAndEviction(t *testing.T) {
+	httpsProto := "https"
+	b1 := state.InternalBackend{
+		Host:        "backend1.local",
+		Port:        8443,
+		AppProtocol: &httpsProto,
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname: "backend1.local",
+		},
+	}
+	b2 := state.InternalBackend{
+		Host:        "backend2.local",
+		Port:        8443,
+		AppProtocol: &httpsProto,
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname: "backend2.local",
+		},
+	}
+
+	p := NewProxy()
+	tr1 := p.buildTransport(b1)
+	tr2 := p.buildTransport(b1)
+	if tr1 != tr2 {
+		t.Fatalf("expected buildTransport to return cached transport for same backend")
+	}
+
+	trB2 := p.buildTransport(b2)
+	if tr1 == trB2 {
+		t.Fatalf("expected different transports for different backends")
+	}
+
+	// Configure routes with only b1
+	route1 := state.InternalRoute{
+		Rules: []state.InternalRule{
+			{Backends: []state.InternalBackend{b1}},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{route1})
+
+	// b2 should have been evicted
+	p.transportsMu.Lock()
+	_, b1Cached := p.transports[backendTransportKey(b1)]
+	_, b2Cached := p.transports[backendTransportKey(b2)]
+	p.transportsMu.Unlock()
+
+	if !b1Cached {
+		t.Errorf("expected b1 to remain cached")
+	}
+	if b2Cached {
+		t.Errorf("expected b2 to be evicted")
+	}
+}
+
+func TestTLSSessionResumption_HTTPToTLSBackend(t *testing.T) {
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	var mu sync.Mutex
+	var resumeStates []bool
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			mu.Lock()
+			resumeStates = append(resumeStates, cs.DidResume)
+			mu.Unlock()
+			return nil
+		},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("failed to parse server URL: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	httpsProto := "https"
+
+	p := NewProxy()
+	b := state.InternalBackend{
+		Host:        host,
+		Port:        int32(port),
+		AppProtocol: &httpsProto,
+		Weight:      1,
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname: "backend.local",
+			CACerts:  [][]byte{serverCAPEM},
+		},
+	}
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+				},
+				Backends: []state.InternalBackend{b},
+			},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{route})
+
+	// Request 1: triggers first dial
+	req1 := httptest.NewRequest("GET", "http://example.com/", nil)
+	w1 := httptest.NewRecorder()
+	p.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("request 1 failed: status %d, body: %q", w1.Code, w1.Body.String())
+	}
+
+	// Close idle connections to force transport to dial a new connection on next request
+	p.transportsMu.Lock()
+	tr := p.transports[backendTransportKey(b)]
+	tr.(*http.Transport).CloseIdleConnections()
+	p.transportsMu.Unlock()
+
+	// Request 2: dials new connection, which should resume via ClientSessionCache
+	req2 := httptest.NewRequest("GET", "http://example.com/", nil)
+	w2 := httptest.NewRecorder()
+	p.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("request 2 failed: status %d, body: %q", w2.Code, w2.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(resumeStates) != 2 {
+		t.Fatalf("expected 2 TLS handshakes, got %d", len(resumeStates))
+	}
+	if resumeStates[0] {
+		t.Errorf("connection 1 expected DidResume=false, got true")
+	}
+	if !resumeStates[1] {
+		t.Errorf("connection 2 expected DidResume=true, got false")
+	}
+}
+
+func TestTLSSessionResumption_TLSRouteReencryptBackend(t *testing.T) {
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"reencrypt.backend.local"}, nil)
+
+	var mu sync.Mutex
+	var resumeStates []bool
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			mu.Lock()
+			resumeStates = append(resumeStates, cs.DidResume)
+			mu.Unlock()
+			return nil
+		},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	targetAddr := fmt.Sprintf("%s:%d", host, port)
+
+	p := NewProxy()
+	b := state.InternalBackend{
+		Host: host,
+		Port: int32(port),
+		TLSConfig: &state.InternalTLSConfig{
+			Hostname: "reencrypt.backend.local",
+			CACerts:  [][]byte{serverCAPEM},
+		},
+	}
+
+	// Dial 1 via buildBackendTLSConfig
+	tlsCfg1 := p.buildBackendTLSConfig(b)
+	var d1 net.Dialer
+	conn1, err := tls.DialWithDialer(&d1, "tcp", targetAddr, tlsCfg1)
+	if err != nil {
+		t.Fatalf("dial 1 failed: %v", err)
+	}
+	req := "GET / HTTP/1.1\r\nHost: reencrypt.backend.local\r\nConnection: close\r\n\r\n"
+	if _, err := conn1.Write([]byte(req)); err != nil {
+		t.Fatalf("write 1 failed: %v", err)
+	}
+	_, _ = io.ReadAll(conn1)
+	if conn1.ConnectionState().DidResume {
+		t.Errorf("dial 1 expected DidResume=false, got true")
+	}
+	conn1.Close()
+
+	// Dial 2 via buildBackendTLSConfig
+	tlsCfg2 := p.buildBackendTLSConfig(b)
+	var d2 net.Dialer
+	conn2, err := tls.DialWithDialer(&d2, "tcp", targetAddr, tlsCfg2)
+	if err != nil {
+		t.Fatalf("dial 2 failed: %v", err)
+	}
+	if _, err := conn2.Write([]byte(req)); err != nil {
+		t.Fatalf("write 2 failed: %v", err)
+	}
+	_, _ = io.ReadAll(conn2)
+	if !conn2.ConnectionState().DidResume {
+		t.Errorf("dial 2 expected DidResume=true, got false")
+	}
+	conn2.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(resumeStates) != 2 {
+		t.Fatalf("expected 2 server-side handshake events, got %d", len(resumeStates))
+	}
+	if resumeStates[0] {
+		t.Errorf("server handshake 1 expected DidResume=false, got true")
+	}
+	if !resumeStates[1] {
+		t.Errorf("server handshake 2 expected DidResume=true, got false")
+	}
+}
+
+func BenchmarkProxy_TLSBackend_Handshakes(b *testing.B) {
+	_, serverCert := generateTestCAAndCert(b, []string{"bench.backend.local"}, nil)
+	var handshakes atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			handshakes.Add(1)
+			return nil
+		},
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	httpsProto := "https"
+
+	p := NewProxy()
+	route := state.InternalRoute{
+		Hostnames: []string{"bench.example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+				},
+				Backends: []state.InternalBackend{
+					{
+						Host:        host,
+						Port:        int32(port),
+						AppProtocol: &httpsProto,
+						Weight:      1,
+					},
+				},
+			},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{route})
+
+	req := httptest.NewRequest("GET", "http://bench.example.com/", nil)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(handshakes.Load()), "handshakes")
+}

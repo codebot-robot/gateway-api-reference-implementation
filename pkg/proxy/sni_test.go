@@ -1207,3 +1207,213 @@ func TestSNIListener_ConsistentConfigSnapshotDuringSwap(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+func TestTLSSessionResumption_HTTPSListener(t *testing.T) {
+	caPEM, cert := generateTestCAAndCert(t, []string{"https.example.com"}, nil)
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"https.example.com": &cert,
+	}, &cert)
+
+	routes := []state.InternalRoute{
+		{
+			Hostnames: []string{"https.example.com"},
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+					},
+				},
+			},
+		},
+	}
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "https-listener",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "https.example.com",
+			Routes:   routes,
+		},
+	}, routes)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	tlsLis := tls.NewListener(sniLis, p.TLSConfig())
+	defer tlsLis.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+	go func() {
+		_ = srv.Serve(tlsLis)
+	}()
+	defer srv.Close()
+
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caPEM)
+
+	clientTLS := &tls.Config{
+		ServerName:         "https.example.com",
+		RootCAs:            caPool,
+		ClientSessionCache: tls.NewLRUClientSessionCache(10),
+	}
+
+	addr := rawLis.Addr().String()
+
+	// Connection 1: full TLS handshake, receives session ticket
+	conn1, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial 1 failed: %v", err)
+	}
+	req := "GET / HTTP/1.1\r\nHost: https.example.com\r\nConnection: close\r\n\r\n"
+	if _, err := conn1.Write([]byte(req)); err != nil {
+		t.Fatalf("write 1 failed: %v", err)
+	}
+	_, _ = io.ReadAll(conn1)
+	if conn1.ConnectionState().DidResume {
+		t.Errorf("connection 1 expected DidResume=false, got true")
+	}
+	conn1.Close()
+
+	// Connection 2: resumed TLS handshake
+	conn2, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial 2 failed: %v", err)
+	}
+	if _, err := conn2.Write([]byte(req)); err != nil {
+		t.Fatalf("write 2 failed: %v", err)
+	}
+	_, _ = io.ReadAll(conn2)
+	if !conn2.ConnectionState().DidResume {
+		t.Errorf("connection 2 expected DidResume=true, got false")
+	}
+	conn2.Close()
+}
+
+func TestTLSSessionResumption_TLSRouteTerminate(t *testing.T) {
+	caPEM, cert := generateTestCAAndCert(t, []string{"tls.example.com"}, nil)
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"tls.example.com": &cert,
+	}, &cert)
+
+	// Plain TCP backend that echoes back
+	backendLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on backend: %v", err)
+	}
+	defer backendLis.Close()
+
+	go func() {
+		for {
+			c, err := backendLis.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 1024)
+				n, _ := conn.Read(buf)
+				if n > 0 {
+					_, _ = conn.Write([]byte("backend-echo: " + string(buf[:n])))
+				}
+			}(c)
+		}
+	}()
+
+	terminateMode := gatewayv1.TLSModeTerminate
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "tls-terminate-listener",
+			Protocol: gatewayv1.TLSProtocolType,
+			Port:     8443,
+			Hostname: "tls.example.com",
+			TLSMode:  &terminateMode,
+			TLSBackends: map[string][]state.InternalTLSBackend{
+				"tls.example.com": {
+					{
+						Target: backendLis.Addr().String(),
+						Weight: 1,
+					},
+				},
+			},
+		},
+	}, nil)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	go func() {
+		for {
+			c, err := sniLis.Accept()
+			if err != nil {
+				return
+			}
+			// sniLis internally handles terminateTLSToBackend
+			_ = c
+		}
+	}()
+
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caPEM)
+
+	clientTLS := &tls.Config{
+		ServerName:         "tls.example.com",
+		RootCAs:            caPool,
+		ClientSessionCache: tls.NewLRUClientSessionCache(10),
+	}
+
+	addr := rawLis.Addr().String()
+
+	// Connection 1: full TLS handshake
+	conn1, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial 1 failed: %v", err)
+	}
+	if _, err := conn1.Write([]byte("ping1\n")); err != nil {
+		t.Fatalf("write 1 failed: %v", err)
+	}
+	buf := make([]byte, 1024)
+	n, err := conn1.Read(buf)
+	if err != nil || !strings.Contains(string(buf[:n]), "backend-echo: ping1") {
+		t.Fatalf("read 1 failed: %v, resp: %s", err, string(buf[:n]))
+	}
+	if conn1.ConnectionState().DidResume {
+		t.Errorf("connection 1 expected DidResume=false, got true")
+	}
+	conn1.Close()
+
+	// Connection 2: resumed TLS handshake
+	conn2, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial 2 failed: %v", err)
+	}
+	if _, err := conn2.Write([]byte("ping2\n")); err != nil {
+		t.Fatalf("write 2 failed: %v", err)
+	}
+	n, err = conn2.Read(buf)
+	if err != nil || !strings.Contains(string(buf[:n]), "backend-echo: ping2") {
+		t.Fatalf("read 2 failed: %v, resp: %s", err, string(buf[:n]))
+	}
+	if !conn2.ConnectionState().DidResume {
+		t.Errorf("connection 2 expected DidResume=true, got false")
+	}
+	conn2.Close()
+}

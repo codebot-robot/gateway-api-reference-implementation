@@ -18,8 +18,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	crypto_rand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -73,6 +76,15 @@ type Proxy struct {
 	udpMaxSessions   int
 	listenPacketFunc func(network, addr string) (net.PacketConn, error)
 
+	baseTLSConfig      *tls.Config
+	clientSessionCache tls.ClientSessionCache
+
+	transportsMu sync.Mutex
+	transports   map[string]http.RoundTripper
+
+	clientValidationTicketKeys map[string][][32]byte
+	clientValidationCAHashes   map[string]string
+
 	closed bool
 }
 
@@ -99,16 +111,27 @@ type clientValidationConfig struct {
 
 func NewProxy() *Proxy {
 	p := &Proxy{
-		routes:            []state.InternalRoute{},
-		listeners:         []state.InternalListener{},
-		certificates:      make(map[string]*tls.Certificate),
-		tcpListeners:      make(map[gatewayv1.PortNumber]*tcpPortListener),
-		tcpIdleTimeout:    DefaultTCPIdleTimeout,
-		tcpMaxConnections: DefaultTCPMaxConnections,
-		udpListeners:      make(map[gatewayv1.PortNumber]*udpPortListener),
-		udpIdleTimeout:    DefaultUDPIdleTimeout,
-		udpMaxSessions:    DefaultUDPMaxSessions,
+		routes:                     []state.InternalRoute{},
+		listeners:                  []state.InternalListener{},
+		certificates:               make(map[string]*tls.Certificate),
+		tcpListeners:               make(map[gatewayv1.PortNumber]*tcpPortListener),
+		tcpIdleTimeout:             DefaultTCPIdleTimeout,
+		tcpMaxConnections:         DefaultTCPMaxConnections,
+		udpListeners:               make(map[gatewayv1.PortNumber]*udpPortListener),
+		udpIdleTimeout:             DefaultUDPIdleTimeout,
+		udpMaxSessions:             DefaultUDPMaxSessions,
+		clientSessionCache:         tls.NewLRUClientSessionCache(128),
+		transports:                 make(map[string]http.RoundTripper),
+		clientValidationTicketKeys: make(map[string][][32]byte),
+		clientValidationCAHashes:   make(map[string]string),
 	}
+	p.baseTLSConfig = &tls.Config{
+		GetCertificate:     p.GetCertificate,
+		GetConfigForClient: p.GetConfigForClient,
+	}
+	// Pre-initialize session ticket keys on the base config so cloned or inheriting configs share them.
+	_, _ = p.baseTLSConfig.DecryptTicket(nil, tls.ConnectionState{})
+
 	p.sniConfig.Store(&sniConfig{})
 	p.clientValidationConfig.Store(&clientValidationConfig{})
 	return p
@@ -228,13 +251,22 @@ func (p *Proxy) Close() error {
 		}
 		delete(p.udpListeners, port)
 	}
+	p.transportsMu.Lock()
+	for k, tr := range p.transports {
+		if ic, ok := tr.(idleConnCloser); ok {
+			ic.CloseIdleConnections()
+		}
+		delete(p.transports, k)
+	}
+	p.transportsMu.Unlock()
 	return errors.Join(errs...)
 }
 
 func (p *Proxy) UpdateRoutes(routes []state.InternalRoute) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.routes = routes
+	p.mu.Unlock()
+	p.evictUnusedTransports(routes)
 }
 
 func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
@@ -249,13 +281,14 @@ func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
 
 func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.InternalRoute) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.listeners = listeners
 	p.routes = routes
 	p.updateSNIConfigLocked(listeners)
 	p.updateClientValidationLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
 	p.updateUDPListenersLocked(listeners)
+	p.mu.Unlock()
+	p.evictUnusedTransports(routes)
 }
 
 func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
@@ -429,10 +462,28 @@ func isClientValidationServable(cv *state.InternalClientValidation) (bool, strin
 	return true, ""
 }
 
+func hashCAPEMs(pems [][]byte) string {
+	h := sha256.New()
+	for _, pem := range pems {
+		h.Write(pem)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener) {
+	if p.clientValidationTicketKeys == nil {
+		p.clientValidationTicketKeys = make(map[string][][32]byte)
+	}
+	if p.clientValidationCAHashes == nil {
+		p.clientValidationCAHashes = make(map[string]string)
+	}
+
 	var httpsListeners []state.InternalListener
 	tlsConfigs := make(map[string]*tls.Config)
 	tlsErrors := make(map[string]error)
+
+	currentListenerNames := make(map[string]bool)
 
 	for _, lis := range listeners {
 		if lis.Protocol != gatewayv1.HTTPSProtocolType {
@@ -441,6 +492,7 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 		httpsListeners = append(httpsListeners, lis)
 
 		if lis.ClientValidation != nil {
+			currentListenerNames[lis.Name] = true
 			servable, reason := isClientValidationServable(lis.ClientValidation)
 			if !servable {
 				klog.Warningf("Listener %q with ClientValidation cannot be served: %s", lis.Name, reason)
@@ -457,15 +509,52 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 				clientAuth = tls.RequestClientCert
 			}
 
-			tlsConfigs[lis.Name] = &tls.Config{
+			cfg := &tls.Config{
 				ClientAuth:     clientAuth,
 				ClientCAs:      caPool,
 				GetCertificate: p.GetCertificate,
 				NextProtos:     []string{"h2", "http/1.1"},
-				// Disabling session tickets ensures client certificates are re-verified on every
-				// new TLS connection rather than skipped via session resumption.
-				SessionTicketsDisabled: true,
 			}
+
+			if lis.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
+				// For AllowInsecureFallback, session tickets remain disabled to ensure
+				// fallback validation semantics are evaluated on each connection.
+				cfg.SessionTicketsDisabled = true
+			} else {
+				// AllowValidOnly (default): Re-enable session tickets for TLS session resumption.
+				//
+				// Trade-off: When session resumption is enabled on a mutual TLS listener, a resumed TLS
+				// handshake (via session ticket) reuses the client certificate verified during the initial
+				// full handshake without re-verifying the client certificate against the CA pool on every
+				// resumed connection. If a client certificate is revoked or the CA trust pool changes, an
+				// existing session ticket could allow resumption until expired or rotated.
+				// To mitigate this when the CA set changes, the listener's session ticket keys are rotated
+				// (SetSessionTicketKeys) whenever its CA pool changes, invalidating all outstanding session
+				// tickets and forcing full handshakes with re-verification against the new CA set.
+				caHash := hashCAPEMs(lis.ClientValidation.CACertPEMs)
+				oldHash, hasOld := p.clientValidationCAHashes[lis.Name]
+				keys, hasKeys := p.clientValidationTicketKeys[lis.Name]
+
+				if !hasOld || !hasKeys || oldHash != caHash {
+					var newKey [32]byte
+					if _, err := io.ReadFull(crypto_rand.Reader, newKey[:]); err != nil {
+						klog.Errorf("failed to generate session ticket key for listener %s: %v", lis.Name, err)
+					}
+					keys = [][32]byte{newKey}
+					p.clientValidationTicketKeys[lis.Name] = keys
+					p.clientValidationCAHashes[lis.Name] = caHash
+				}
+				cfg.SetSessionTicketKeys(keys)
+			}
+
+			tlsConfigs[lis.Name] = cfg
+		}
+	}
+
+	for name := range p.clientValidationCAHashes {
+		if !currentListenerNames[name] {
+			delete(p.clientValidationCAHashes, name)
+			delete(p.clientValidationTicketKeys, name)
 		}
 	}
 
@@ -515,10 +604,16 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 // TLSConfig returns a base *tls.Config for HTTPS servers, configured with
 // GetCertificate and GetConfigForClient callbacks wired to this Proxy.
 func (p *Proxy) TLSConfig() *tls.Config {
-	return &tls.Config{
-		GetCertificate:     p.GetCertificate,
-		GetConfigForClient: p.GetConfigForClient,
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.baseTLSConfig == nil {
+		p.baseTLSConfig = &tls.Config{
+			GetCertificate:     p.GetCertificate,
+			GetConfigForClient: p.GetConfigForClient,
+		}
+		_, _ = p.baseTLSConfig.DecryptTicket(nil, tls.ConnectionState{})
 	}
+	return p.baseTLSConfig
 }
 
 func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
@@ -1131,9 +1226,48 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 	return req, targetURL, nil
 }
 
+type prefixedClientSessionCache struct {
+	prefix string
+	cache  tls.ClientSessionCache
+}
+
+func (p *prefixedClientSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
+	return p.cache.Get(p.prefix + sessionKey)
+}
+
+func (p *prefixedClientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
+	p.cache.Put(p.prefix+sessionKey, cs)
+}
+
+func (p *Proxy) getClientSessionCache() tls.ClientSessionCache {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.clientSessionCache == nil {
+		p.clientSessionCache = tls.NewLRUClientSessionCache(128)
+	}
+	return p.clientSessionCache
+}
+
 func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config {
+	var clientCertKey string
+	if backend.TLSConfig != nil {
+		if backend.TLSConfig.ClientCertID != "" {
+			clientCertKey = backend.TLSConfig.ClientCertID
+		} else if backend.TLSConfig.ClientCert != nil && len(backend.TLSConfig.ClientCert.Certificate) > 0 {
+			h := sha256.Sum256(backend.TLSConfig.ClientCert.Certificate[0])
+			clientCertKey = hex.EncodeToString(h[:])
+		}
+	}
+	sessionCache := &prefixedClientSessionCache{
+		prefix: "client-cert:" + clientCertKey + ":",
+		cache:  p.getClientSessionCache(),
+	}
+
 	if backend.TLSConfig == nil {
-		return &tls.Config{InsecureSkipVerify: true}
+		return &tls.Config{
+			InsecureSkipVerify: true,
+			ClientSessionCache: sessionCache,
+		}
 	}
 
 	var rootCAs *x509.CertPool
@@ -1162,6 +1296,7 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 			ServerName:         serverName,
 			InsecureSkipVerify: true,
 			Certificates:       clientCerts,
+			ClientSessionCache: sessionCache,
 			VerifyConnection: func(cs tls.ConnectionState) error {
 				if len(cs.PeerCertificates) == 0 {
 					return fmt.Errorf("no peer certificates presented")
@@ -1192,6 +1327,7 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 		InsecureSkipVerify: false,
 		RootCAs:            rootCAs,
 		Certificates:       clientCerts,
+		ClientSessionCache: sessionCache,
 	}
 }
 
@@ -1244,21 +1380,125 @@ func verifySubjectAltNames(cert *x509.Certificate, sans []gatewayv1.SubjectAltNa
 	return fmt.Errorf("certificate does not match configured SubjectAltNames")
 }
 
+func backendTransportKey(backend state.InternalBackend) string {
+	appProto := strings.ToLower(state.ValueOf(backend.AppProtocol))
+	if !strings.EqualFold(appProto, "https") && appProto != "kubernetes.io/h2c" {
+		return "default"
+	}
+	target := fmt.Sprintf("%s:%d", backend.Host, backend.Port)
+	if appProto == "kubernetes.io/h2c" {
+		return fmt.Sprintf("h2c|%s", target)
+	}
+
+	var b strings.Builder
+	b.WriteString("https|")
+	b.WriteString(target)
+	b.WriteString("|")
+	if backend.TLSConfig != nil {
+		b.WriteString("host:")
+		b.WriteString(backend.TLSConfig.Hostname)
+		b.WriteString("|wk:")
+		if backend.TLSConfig.WellKnownCACertificates != nil {
+			b.WriteString(string(*backend.TLSConfig.WellKnownCACertificates))
+		}
+		b.WriteString("|cas:")
+		if len(backend.TLSConfig.CACerts) > 0 {
+			h := sha256.New()
+			for _, ca := range backend.TLSConfig.CACerts {
+				h.Write(ca)
+				h.Write([]byte{0})
+			}
+			b.WriteString(hex.EncodeToString(h.Sum(nil)))
+		}
+		b.WriteString("|sans:")
+		for i, san := range backend.TLSConfig.SubjectAltNames {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(string(san.Type))
+			b.WriteString(":")
+			if san.Type == gatewayv1.HostnameSubjectAltNameType {
+				b.WriteString(string(san.Hostname))
+			} else if san.Type == gatewayv1.URISubjectAltNameType {
+				b.WriteString(string(san.URI))
+			}
+		}
+		b.WriteString("|clientCert:")
+		if backend.TLSConfig.ClientCertID != "" {
+			b.WriteString(backend.TLSConfig.ClientCertID)
+		} else if backend.TLSConfig.ClientCert != nil && len(backend.TLSConfig.ClientCert.Certificate) > 0 {
+			h := sha256.Sum256(backend.TLSConfig.ClientCert.Certificate[0])
+			b.WriteString(hex.EncodeToString(h[:]))
+		}
+	} else {
+		b.WriteString("insecure")
+	}
+	return b.String()
+}
+
+type idleConnCloser interface {
+	CloseIdleConnections()
+}
+
+func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
+	activeKeys := make(map[string]bool)
+	for _, route := range activeRoutes {
+		for _, rule := range route.Rules {
+			for _, b := range rule.Backends {
+				activeKeys[backendTransportKey(b)] = true
+			}
+			for _, m := range rule.Mirrors {
+				activeKeys[backendTransportKey(m.Backend)] = true
+			}
+		}
+	}
+
+	p.transportsMu.Lock()
+	defer p.transportsMu.Unlock()
+	for k, tr := range p.transports {
+		if !activeKeys[k] {
+			if ic, ok := tr.(idleConnCloser); ok {
+				ic.CloseIdleConnections()
+			}
+			delete(p.transports, k)
+		}
+	}
+}
+
 func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper {
+	key := backendTransportKey(backend)
+	if key == "default" {
+		return http.DefaultTransport
+	}
+
+	p.transportsMu.Lock()
+	defer p.transportsMu.Unlock()
+	if p.transports == nil {
+		p.transports = make(map[string]http.RoundTripper)
+	}
+	if tr, ok := p.transports[key]; ok {
+		return tr
+	}
+
+	var tr http.RoundTripper
 	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
-		return &http.Transport{
+		tr = &http.Transport{
 			TLSClientConfig: p.buildBackendTLSConfig(backend),
 		}
 	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
-		return &http2.Transport{
+		tr = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 				var d net.Dialer
 				return d.DialContext(ctx, network, addr)
 			},
 		}
+	} else {
+		return http.DefaultTransport
 	}
-	return http.DefaultTransport
+
+	p.transports[key] = tr
+	return tr
 }
 
 func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, timeouts *state.InternalTimeouts) {
