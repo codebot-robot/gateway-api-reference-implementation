@@ -402,3 +402,199 @@ func TestClientCertificateValidation_RealSockets(t *testing.T) {
 		}
 	})
 }
+
+func TestClientCertificateValidation_FailClosedInvalidConfiguration(t *testing.T) {
+	// Backend server
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-ok"))
+	}))
+	defer backendServer.Close()
+
+	backendURL, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendURL.Host)
+	backendPort, _ := strconv.Atoi(backendPortStr)
+
+	// Valid CA and client cert
+	validCAPEM, validClientCert := generateTestCAAndClientCert(t, "Valid-CA")
+
+	// Server cert covering all test hostnames
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{
+		"empty-cas.example.com",
+		"unparseable-pem.example.com",
+		"fallback.example.com",
+		"sibling.example.com",
+	}, nil)
+
+	serverCAPool := x509.NewCertPool()
+	serverCAPool.AppendCertsFromPEM(serverCAPEM)
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"empty-cas.example.com":       &serverCert,
+		"unparseable-pem.example.com": &serverCert,
+		"fallback.example.com":        &serverCert,
+		"sibling.example.com":         &serverCert,
+	}, &serverCert)
+
+	routeFor := func(host string) state.InternalRoute {
+		return state.InternalRoute{
+			Hostnames: []string{host},
+			Rules: []state.InternalRule{
+				{
+					Matches:  []state.InternalMatch{{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}}},
+					Backends: []state.InternalBackend{{Host: backendHost, Port: int32(backendPort), Weight: 1}},
+				},
+			},
+		}
+	}
+
+	// 4 listeners on the SAME port (8443):
+	// 1. empty CACertPEMs
+	// 2. unparseable PEM
+	// 3. mode AllowInsecureFallback
+	// 4. sibling listener without validation
+	listeners := []state.InternalListener{
+		{
+			Name:     "https-empty-cas",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "empty-cas.example.com",
+			Routes:   []state.InternalRoute{routeFor("empty-cas.example.com")},
+			ClientValidation: &state.InternalClientValidation{
+				CACertPEMs: [][]byte{},
+				Mode:       gatewayv1.AllowValidOnly,
+			},
+		},
+		{
+			Name:     "https-unparseable-pem",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "unparseable-pem.example.com",
+			Routes:   []state.InternalRoute{routeFor("unparseable-pem.example.com")},
+			ClientValidation: &state.InternalClientValidation{
+				CACertPEMs: [][]byte{[]byte("not a valid pem block")},
+				Mode:       gatewayv1.AllowValidOnly,
+			},
+		},
+		{
+			Name:     "https-insecure-fallback",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "fallback.example.com",
+			Routes:   []state.InternalRoute{routeFor("fallback.example.com")},
+			ClientValidation: &state.InternalClientValidation{
+				CACertPEMs: [][]byte{validCAPEM},
+				Mode:       gatewayv1.AllowInsecureFallback,
+			},
+		},
+		{
+			Name:     "https-sibling",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "sibling.example.com",
+			Routes:   []state.InternalRoute{routeFor("sibling.example.com")},
+		},
+	}
+
+	routes := []state.InternalRoute{
+		routeFor("empty-cas.example.com"),
+		routeFor("unparseable-pem.example.com"),
+		routeFor("fallback.example.com"),
+		routeFor("sibling.example.com"),
+	}
+
+	p.UpdateConfig(listeners, routes)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	tlsConfig := p.TLSConfig()
+	httpsSrv := &http.Server{
+		Handler:   p,
+		TLSConfig: tlsConfig,
+	}
+	tlsLis := tls.NewListener(sniLis, tlsConfig)
+	go func() {
+		_ = httpsSrv.Serve(tlsLis)
+	}()
+	defer httpsSrv.Close()
+
+	httpsAddr := rawLis.Addr().String()
+
+	dialTLS := func(serverName string, clientCert *tls.Certificate) (*http.Response, error) {
+		var certs []tls.Certificate
+		if clientCert != nil {
+			certs = []tls.Certificate{*clientCert}
+		}
+
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:   serverName,
+				RootCAs:      serverCAPool,
+				Certificates: certs,
+			},
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, network, httpsAddr)
+			},
+		}
+		defer tr.CloseIdleConnections()
+
+		client := &http.Client{
+			Transport: tr,
+			Timeout:   3 * time.Second,
+		}
+
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s:8443/", serverName), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = fmt.Sprintf("%s:8443", serverName)
+		return client.Do(req)
+	}
+
+	t.Run("empty CACertPEMs refuses handshake", func(t *testing.T) {
+		_, err := dialTLS("empty-cas.example.com", &validClientCert)
+		if err == nil {
+			t.Fatalf("expected handshake refusal for listener with empty CACertPEMs, but request succeeded")
+		}
+	})
+
+	t.Run("unparseable PEM refuses handshake", func(t *testing.T) {
+		_, err := dialTLS("unparseable-pem.example.com", &validClientCert)
+		if err == nil {
+			t.Fatalf("expected handshake refusal for listener with unparseable PEM, but request succeeded")
+		}
+	})
+
+	t.Run("mode AllowInsecureFallback refuses handshake", func(t *testing.T) {
+		_, err := dialTLS("fallback.example.com", &validClientCert)
+		if err == nil {
+			t.Fatalf("expected handshake refusal for listener with mode AllowInsecureFallback, but request succeeded")
+		}
+	})
+
+	t.Run("sibling listener without validation on same port still serves", func(t *testing.T) {
+		resp, err := dialTLS("sibling.example.com", nil)
+		if err != nil {
+			t.Fatalf("sibling listener should succeed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("sibling listener expected status 200, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "backend-ok" {
+			t.Errorf("sibling listener expected body 'backend-ok', got %q", string(body))
+		}
+	})
+}

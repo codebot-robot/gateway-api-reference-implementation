@@ -82,6 +82,7 @@ type sniConfig struct {
 type clientValidationConfig struct {
 	listeners  []state.InternalListener
 	tlsConfigs map[string]*tls.Config
+	tlsErrors  map[string]error
 }
 
 func NewProxy() *Proxy {
@@ -348,9 +349,33 @@ func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {
 	})
 }
 
+func isClientValidationServable(cv *state.InternalClientValidation) (bool, string) {
+	if cv == nil {
+		return true, ""
+	}
+	if cv.Mode != "" && cv.Mode != gatewayv1.AllowValidOnly {
+		return false, fmt.Sprintf("unsupported validation mode %q (only AllowValidOnly is supported)", cv.Mode)
+	}
+	if len(cv.CACertPEMs) == 0 {
+		return false, "no CA certificates provided"
+	}
+	hasValidCA := false
+	pool := x509.NewCertPool()
+	for _, pem := range cv.CACertPEMs {
+		if pool.AppendCertsFromPEM(pem) {
+			hasValidCA = true
+		}
+	}
+	if !hasValidCA {
+		return false, "no valid CA certificates could be parsed from PEM"
+	}
+	return true, ""
+}
+
 func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener) {
 	var httpsListeners []state.InternalListener
 	tlsConfigs := make(map[string]*tls.Config)
+	tlsErrors := make(map[string]error)
 
 	for _, lis := range listeners {
 		if lis.Protocol != gatewayv1.HTTPSProtocolType {
@@ -358,8 +383,14 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 		}
 		httpsListeners = append(httpsListeners, lis)
 
-		if lis.ClientValidation != nil && len(lis.ClientValidation.CACertPEMs) > 0 &&
-			(lis.ClientValidation.Mode == "" || lis.ClientValidation.Mode == gatewayv1.AllowValidOnly) {
+		if lis.ClientValidation != nil {
+			servable, reason := isClientValidationServable(lis.ClientValidation)
+			if !servable {
+				klog.Warningf("Listener %q with ClientValidation cannot be served: %s", lis.Name, reason)
+				tlsErrors[lis.Name] = fmt.Errorf("listener %q cannot be served: %s", lis.Name, reason)
+				continue
+			}
+
 			caPool := x509.NewCertPool()
 			for _, pem := range lis.ClientValidation.CACertPEMs {
 				caPool.AppendCertsFromPEM(pem)
@@ -386,6 +417,7 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 	p.clientValidationConfig.Store(&clientValidationConfig{
 		listeners:  httpsListeners,
 		tlsConfigs: tlsConfigs,
+		tlsErrors:  tlsErrors,
 	})
 }
 
@@ -410,6 +442,11 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 	}
 
 	selected := matched[0]
+	if snap.tlsErrors != nil {
+		if err, ok := snap.tlsErrors[selected.Name]; ok {
+			return nil, err
+		}
+	}
 	return snap.tlsConfigs[selected.Name], nil
 }
 
@@ -507,7 +544,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var httpsListeners []state.InternalListener
 			for _, l := range listeners {
 				if l.Protocol == gatewayv1.HTTPSProtocolType {
-					httpsListeners = append(httpsListeners, l)
+					if servable, _ := isClientValidationServable(l.ClientValidation); servable {
+						httpsListeners = append(httpsListeners, l)
+					}
 				}
 			}
 
