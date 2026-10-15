@@ -49,7 +49,8 @@ type Proxy struct {
 	certificates map[string]*tls.Certificate
 	defaultCert  *tls.Certificate
 
-	sniConfig atomic.Pointer[sniConfig]
+	sniConfig              atomic.Pointer[sniConfig]
+	clientValidationConfig atomic.Pointer[clientValidationConfig]
 
 	tcpListeners map[gatewayv1.PortNumber]*tcpPortListener
 	tcpBindHost  string
@@ -78,6 +79,12 @@ type sniConfig struct {
 	candidates     []state.InternalListener
 }
 
+type clientValidationConfig struct {
+	listeners  []state.InternalListener
+	tlsConfigs map[string]*tls.Config
+	tlsErrors  map[string]error
+}
+
 func NewProxy() *Proxy {
 	p := &Proxy{
 		routes:         []state.InternalRoute{},
@@ -89,6 +96,7 @@ func NewProxy() *Proxy {
 		udpMaxSessions: DefaultUDPMaxSessions,
 	}
 	p.sniConfig.Store(&sniConfig{})
+	p.clientValidationConfig.Store(&clientValidationConfig{})
 	return p
 }
 
@@ -191,6 +199,7 @@ func (p *Proxy) UpdateListeners(listeners []state.InternalListener) {
 	defer p.mu.Unlock()
 	p.listeners = listeners
 	p.updateSNIConfigLocked(listeners)
+	p.updateClientValidationLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
 	p.updateUDPListenersLocked(listeners)
 }
@@ -201,6 +210,7 @@ func (p *Proxy) UpdateConfig(listeners []state.InternalListener, routes []state.
 	p.listeners = listeners
 	p.routes = routes
 	p.updateSNIConfigLocked(listeners)
+	p.updateClientValidationLocked(listeners)
 	p.updateTCPListenersLocked(listeners)
 	p.updateUDPListenersLocked(listeners)
 }
@@ -339,6 +349,116 @@ func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {
 	})
 }
 
+func isClientValidationServable(cv *state.InternalClientValidation) (bool, string) {
+	if cv == nil {
+		return true, ""
+	}
+	if cv.Mode != "" && cv.Mode != gatewayv1.AllowValidOnly {
+		return false, fmt.Sprintf("unsupported validation mode %q (only AllowValidOnly is supported)", cv.Mode)
+	}
+	if len(cv.CACertPEMs) == 0 {
+		return false, "no CA certificates provided"
+	}
+	hasValidCA := false
+	pool := x509.NewCertPool()
+	for _, pem := range cv.CACertPEMs {
+		if pool.AppendCertsFromPEM(pem) {
+			hasValidCA = true
+		}
+	}
+	if !hasValidCA {
+		return false, "no valid CA certificates could be parsed from PEM"
+	}
+	return true, ""
+}
+
+func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener) {
+	var httpsListeners []state.InternalListener
+	tlsConfigs := make(map[string]*tls.Config)
+	tlsErrors := make(map[string]error)
+
+	for _, lis := range listeners {
+		if lis.Protocol != gatewayv1.HTTPSProtocolType {
+			continue
+		}
+		httpsListeners = append(httpsListeners, lis)
+
+		if lis.ClientValidation != nil {
+			servable, reason := isClientValidationServable(lis.ClientValidation)
+			if !servable {
+				klog.Warningf("Listener %q with ClientValidation cannot be served: %s", lis.Name, reason)
+				tlsErrors[lis.Name] = fmt.Errorf("listener %q cannot be served: %s", lis.Name, reason)
+				continue
+			}
+
+			caPool := x509.NewCertPool()
+			for _, pem := range lis.ClientValidation.CACertPEMs {
+				caPool.AppendCertsFromPEM(pem)
+			}
+			tlsConfigs[lis.Name] = &tls.Config{
+				ClientAuth:     tls.RequireAndVerifyClientCert,
+				ClientCAs:      caPool,
+				GetCertificate: p.GetCertificate,
+				NextProtos:     []string{"h2", "http/1.1"},
+				// Disabling session tickets ensures client certificates are re-verified on every
+				// new TLS connection rather than skipped via session resumption.
+				SessionTicketsDisabled: true,
+			}
+		}
+	}
+
+	sort.Slice(httpsListeners, func(i, j int) bool {
+		if httpsListeners[i].Port != httpsListeners[j].Port {
+			return httpsListeners[i].Port < httpsListeners[j].Port
+		}
+		return httpsListeners[i].Name < httpsListeners[j].Name
+	})
+
+	p.clientValidationConfig.Store(&clientValidationConfig{
+		listeners:  httpsListeners,
+		tlsConfigs: tlsConfigs,
+		tlsErrors:  tlsErrors,
+	})
+}
+
+// GetConfigForClient selects the per-listener *tls.Config by SNI using the MatchListeners
+// precedence the HTTPS path already uses.
+// All HTTPS ports collapse onto 8443 behind the Service, so per-port CA pools are distinguished
+// by hostname; two validated listeners on different ports with the same hostname cannot be told apart.
+func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	snap := p.clientValidationConfig.Load()
+	if snap == nil || len(snap.listeners) == 0 {
+		return nil, nil
+	}
+
+	sniHostname := ""
+	if hello != nil {
+		sniHostname = hello.ServerName
+	}
+
+	matched, matchType := state.MatchListeners(snap.listeners, sniHostname)
+	if matchType == state.NoMatch || len(matched) == 0 {
+		return nil, nil
+	}
+
+	selected := matched[0]
+	if snap.tlsErrors != nil {
+		if err, ok := snap.tlsErrors[selected.Name]; ok {
+			return nil, err
+		}
+	}
+	return snap.tlsConfigs[selected.Name], nil
+}
+
+// TLSConfig returns a base *tls.Config for HTTPS servers, configured with
+// GetCertificate and GetConfigForClient callbacks wired to this Proxy.
+func (p *Proxy) TLSConfig() *tls.Config {
+	return &tls.Config{
+		GetCertificate:     p.GetCertificate,
+		GetConfigForClient: p.GetConfigForClient,
+	}
+}
+
 func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -398,16 +518,16 @@ func (p *Proxy) HasCertificate(sni string) bool {
 	return false
 }
 
-func splitHostPort(hostPort string, defaultPort int32) (string, int32) {
+func splitHostPort(hostPort string, defaultPort int32) (string, int32, bool) {
 	h, pStr, err := net.SplitHostPort(hostPort)
 	if err != nil {
-		return hostPort, defaultPort
+		return hostPort, defaultPort, false
 	}
 	p, err := strconv.Atoi(pStr)
 	if err != nil {
-		return h, defaultPort
+		return h, defaultPort, false
 	}
-	return h, int32(p)
+	return h, int32(p), true
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -418,16 +538,37 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if len(listeners) > 0 {
 		if r.TLS != nil {
-			reqHost, reqPort := splitHostPort(r.Host, 443)
+			reqHost, reqPort, hasPort := splitHostPort(r.Host, 443)
 			reqHost = strings.ToLower(reqHost)
 
 			var httpsListeners []state.InternalListener
 			for _, l := range listeners {
 				if l.Protocol == gatewayv1.HTTPSProtocolType {
-					if l.Port == 0 || int32(l.Port) == reqPort {
+					if servable, _ := isClientValidationServable(l.ClientValidation); servable {
 						httpsListeners = append(httpsListeners, l)
 					}
 				}
+			}
+
+			if hasPort {
+				var filtered []state.InternalListener
+				for _, l := range httpsListeners {
+					if l.Port == 0 || int32(l.Port) == reqPort {
+						filtered = append(filtered, l)
+					}
+				}
+				httpsListeners = filtered
+			} else {
+				// With no port in Host, do not filter by port; let hostname precedence decide
+				// (exact > wildcard > catch-all) with ties broken in favor of port 443.
+				sort.SliceStable(httpsListeners, func(i, j int) bool {
+					is443I := httpsListeners[i].Port == 443 || httpsListeners[i].Port == 0
+					is443J := httpsListeners[j].Port == 443 || httpsListeners[j].Port == 0
+					if is443I != is443J {
+						return is443I
+					}
+					return false
+				})
 			}
 
 			if len(httpsListeners) > 0 {
@@ -490,7 +631,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				routes = connRoutes
 			}
 		} else {
-			reqHost, reqPort := splitHostPort(r.Host, 80)
+			reqHost, reqPort, _ := splitHostPort(r.Host, 80)
 			reqHost = strings.ToLower(reqHost)
 
 			var httpListeners []state.InternalListener

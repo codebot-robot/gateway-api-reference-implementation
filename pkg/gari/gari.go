@@ -441,9 +441,7 @@ func (s *Server) initDefaultCertificate() error {
 }
 
 func (s *Server) newTLSConfig() *tls.Config {
-	return &tls.Config{
-		GetCertificate: s.proxy.GetCertificate,
-	}
+	return s.proxy.TLSConfig()
 }
 
 func parsePort(addr string) (int, error) {
