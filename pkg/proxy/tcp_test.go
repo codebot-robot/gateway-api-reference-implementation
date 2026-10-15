@@ -407,3 +407,238 @@ func TestProxy_TCPRefuseNoBackends(t *testing.T) {
 		t.Fatalf("expected EOF for zero-weight backend, got %v", readErr2)
 	}
 }
+
+// TestProxy_TCPListenerMaxConnections tests that the TCP listener cap refuses the N+1th connection
+// and admits a new one after one closes.
+func TestProxy_TCPListenerMaxConnections(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on backend: %v", err)
+	}
+	defer backendLn.Close()
+
+	// Simple echo backend
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+	proxyPort := getFreePort(t)
+
+	p := NewProxy()
+	p.SetTCPBindHost("127.0.0.1")
+	p.SetTCPMaxConnections(2)
+	defer p.Close()
+
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "tcp-cap-test",
+			Protocol: gatewayv1.TCPProtocolType,
+			Port:     gatewayv1.PortNumber(proxyPort),
+			TCPBackends: []state.InternalTCPBackend{
+				{Target: fmt.Sprintf("127.0.0.1:%d", backendPort), Weight: 1},
+			},
+		},
+	}, nil)
+
+	// Conn 1 (admitted)
+	conn1, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn1: %v", err)
+	}
+	defer conn1.Close()
+	if _, err := conn1.Write([]byte("ping1\n")); err != nil {
+		t.Fatalf("conn1 write failed: %v", err)
+	}
+	buf := make([]byte, 64)
+	if _, err := conn1.Read(buf); err != nil {
+		t.Fatalf("conn1 read failed: %v", err)
+	}
+
+	// Conn 2 (admitted)
+	conn2, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn2: %v", err)
+	}
+	defer conn2.Close()
+	if _, err := conn2.Write([]byte("ping2\n")); err != nil {
+		t.Fatalf("conn2 write failed: %v", err)
+	}
+	if _, err := conn2.Read(buf); err != nil {
+		t.Fatalf("conn2 read failed: %v", err)
+	}
+
+	// Conn 3 (N+1 = 3 > 2: refused by server and immediately closed)
+	conn3, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn3: %v", err)
+	}
+	defer conn3.Close()
+	_ = conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_, readErr := conn3.Read(buf)
+	if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, net.ErrClosed) {
+		t.Fatalf("expected conn3 to be refused and closed (EOF), got %v", readErr)
+	}
+
+	// Close Conn 1 to free up a slot
+	conn1.Close()
+	// Allow server goroutine to finish decrementing activeConns
+	time.Sleep(30 * time.Millisecond)
+
+	// Conn 4 (now admitted because active conns is 1 <= 2)
+	conn4, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn4: %v", err)
+	}
+	defer conn4.Close()
+	if _, err := conn4.Write([]byte("ping4\n")); err != nil {
+		t.Fatalf("conn4 write failed: %v", err)
+	}
+	if _, err := conn4.Read(buf); err != nil {
+		t.Fatalf("conn4 read failed: %v", err)
+	}
+}
+
+// TestProxy_TCPIdleTimeout tests that idle TCP splice is closed after the idle timeout when enabled,
+// and untouched when disabled.
+func TestProxy_TCPIdleTimeout(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on backend: %v", err)
+	}
+	defer backendLn.Close()
+
+	// Simple echo backend
+	go func() {
+		for {
+			conn, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	t.Run("idle timeout enabled closes idle connection", func(t *testing.T) {
+		proxyPort := getFreePort(t)
+		p := NewProxy()
+		p.SetTCPBindHost("127.0.0.1")
+		p.SetTCPIdleTimeout(100 * time.Millisecond)
+		defer p.Close()
+
+		p.UpdateConfig([]state.InternalListener{
+			{
+				Name:     "tcp-idle-enabled",
+				Protocol: gatewayv1.TCPProtocolType,
+				Port:     gatewayv1.PortNumber(proxyPort),
+				TCPBackends: []state.InternalTCPBackend{
+					{Target: fmt.Sprintf("127.0.0.1:%d", backendPort), Weight: 1},
+				},
+			},
+		}, nil)
+
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to dial: %v", err)
+		}
+		defer conn.Close()
+
+		// Write initial message and verify connection is healthy
+		if _, err := conn.Write([]byte("hello\n")); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		buf := make([]byte, 64)
+		if _, err := conn.Read(buf); err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+
+		// Now stay idle for idle timeout (100ms)
+		start := time.Now()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			_, rerr := conn.Read(buf)
+			if rerr != nil {
+				break
+			}
+		}
+		elapsed := time.Since(start)
+
+		if elapsed < 50*time.Millisecond || elapsed > 1500*time.Millisecond {
+			t.Errorf("expected idle connection to be closed around 100ms, elapsed %v", elapsed)
+		}
+	})
+
+	t.Run("idle timeout disabled keeps connection untouched", func(t *testing.T) {
+		proxyPort := getFreePort(t)
+		p := NewProxy()
+		p.SetTCPBindHost("127.0.0.1")
+		p.SetTCPIdleTimeout(0) // disabled
+		defer p.Close()
+
+		p.UpdateConfig([]state.InternalListener{
+			{
+				Name:     "tcp-idle-disabled",
+				Protocol: gatewayv1.TCPProtocolType,
+				Port:     gatewayv1.PortNumber(proxyPort),
+				TCPBackends: []state.InternalTCPBackend{
+					{Target: fmt.Sprintf("127.0.0.1:%d", backendPort), Weight: 1},
+				},
+			},
+		}, nil)
+
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort), 2*time.Second)
+		if err != nil {
+			t.Fatalf("failed to dial: %v", err)
+		}
+		defer conn.Close()
+
+		// Wait 150ms while idle
+		time.Sleep(150 * time.Millisecond)
+
+		// Connection should remain untouched; write and read echo
+		if _, err := conn.Write([]byte("still alive\n")); err != nil {
+			t.Fatalf("expected connection to remain open, but write failed: %v", err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		buf := make([]byte, 64)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("expected connection to remain open, but read failed: %v", err)
+		}
+		if string(buf[:n]) != "still alive\n" {
+			t.Errorf("expected %q, got %q", "still alive\n", string(buf[:n]))
+		}
+	})
+}

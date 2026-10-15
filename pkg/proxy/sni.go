@@ -37,6 +37,39 @@ type sniListener struct {
 	closed      atomic.Bool
 	closeOnce   sync.Once
 	done        chan struct{}
+	activeConns atomic.Int64
+}
+
+type countedConn struct {
+	net.Conn
+	onClose func()
+	closed  atomic.Bool
+}
+
+func wrapCountedConn(c net.Conn, onClose func()) net.Conn {
+	return &countedConn{
+		Conn:    c,
+		onClose: onClose,
+	}
+}
+
+func (c *countedConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	}
+	return c.Conn.Close()
+}
+
+func (c *countedConn) CloseWrite() error {
+	type closeWriter interface {
+		CloseWrite() error
+	}
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // NewSNIListener creates a net.Listener that wraps rawLis, inspects TLS SNI on incoming connections,
@@ -69,15 +102,42 @@ func isNormalClose(err error) bool {
 	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
-func copyAndCloseWrite(dst, src net.Conn) error {
+func copyAndCloseWrite(dst, src net.Conn, idleTimeout time.Duration) error {
 	var errs []error
-	if _, err := io.Copy(dst, src); err != nil && !isNormalClose(err) {
+	if err := copyWithIdleTimeout(dst, src, idleTimeout); err != nil && !isNormalClose(err) {
 		errs = append(errs, err)
 	}
 	if err := closeWrite(dst); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+func copyWithIdleTimeout(dst, src net.Conn, idleTimeout time.Duration) error {
+	if idleTimeout <= 0 {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+			_ = dst.SetReadDeadline(time.Now().Add(idleTimeout))
+			_, werr := dst.Write(buf[:nr])
+			if werr != nil {
+				return werr
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return nil
+			}
+			return rerr
+		}
+	}
 }
 
 func (l *sniListener) Accept() (net.Conn, error) {
@@ -134,17 +194,28 @@ func (l *sniListener) acceptLoop() {
 			continue
 		}
 
+		maxConns := int64(l.p.getTCPMaxConnections())
+		if maxConns > 0 && l.activeConns.Add(1) > maxConns {
+			l.activeConns.Add(-1)
+			closeConn(conn)
+			continue
+		}
+
+		wrapped := wrapCountedConn(conn, func() {
+			l.activeConns.Add(-1)
+		})
+
 		cfg := l.p.sniConfig.Load()
 		if cfg == nil || !cfg.hasPassthrough {
 			select {
 			case <-l.done:
-				closeConn(conn)
-			case l.httpsConnCh <- conn:
+				closeConn(wrapped)
+			case l.httpsConnCh <- wrapped:
 			}
 			continue
 		}
 
-		go l.handleConn(conn, cfg)
+		go l.handleConn(wrapped, cfg)
 	}
 }
 
@@ -187,7 +258,7 @@ func (l *sniListener) handleConn(conn net.Conn, cfg *sniConfig) {
 				return
 			}
 			handedOff = true
-			spliceToBackend(peekedConn, backend)
+			l.spliceToBackend(peekedConn, backend)
 			return
 		}
 
@@ -258,10 +329,11 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 		return
 	}
 
-	go spliceConns(tlsConn, backendConn)
+	idleTimeout := l.p.getTCPIdleTimeout()
+	go spliceConns(tlsConn, backendConn, idleTimeout)
 }
 
-func spliceToBackend(clientConn net.Conn, backend string) {
+func (l *sniListener) spliceToBackend(clientConn net.Conn, backend string) {
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	backendConn, err := dialer.Dial("tcp", backend)
 	if err != nil {
@@ -269,10 +341,11 @@ func spliceToBackend(clientConn net.Conn, backend string) {
 		return
 	}
 
-	go spliceConns(clientConn, backendConn)
+	idleTimeout := l.p.getTCPIdleTimeout()
+	go spliceConns(clientConn, backendConn, idleTimeout)
 }
 
-func spliceConns(c1, c2 net.Conn) {
+func spliceConns(c1, c2 net.Conn, idleTimeout time.Duration) {
 	defer closeConn(c1)
 	defer closeConn(c2)
 
@@ -281,15 +354,25 @@ func spliceConns(c1, c2 net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		if err := copyAndCloseWrite(c2, c1); err != nil {
-			klog.V(2).Infof("splice copy error: %v", err)
+		err := copyAndCloseWrite(c2, c1, idleTimeout)
+		if err != nil {
+			if !isNormalClose(err) {
+				klog.V(2).Infof("splice copy error: %v", err)
+			}
+			closeConn(c1)
+			closeConn(c2)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		if err := copyAndCloseWrite(c1, c2); err != nil {
-			klog.V(2).Infof("splice copy error: %v", err)
+		err := copyAndCloseWrite(c1, c2, idleTimeout)
+		if err != nil {
+			if !isNormalClose(err) {
+				klog.V(2).Infof("splice copy error: %v", err)
+			}
+			closeConn(c1)
+			closeConn(c2)
 		}
 	}()
 
