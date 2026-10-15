@@ -176,6 +176,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteMatching,
 		tests.HTTPRouteMatchingAcrossRoutes,
 		tests.HTTPRouteMethodMatching,
+		tests.HTTPRouteMultipleGateways,
 		tests.HTTPRouteNamedRule,
 		tests.HTTPRouteNoBackendRefs,
 		tests.HTTPRouteObservedGenerationBump,
