@@ -339,6 +339,13 @@ func (c *bufferedClientConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+func (c *bufferedClientConn) ConnectionState() tls.ConnectionState {
+	if tc, ok := c.Conn.(*tls.Conn); ok {
+		return tc.ConnectionState()
+	}
+	return tls.ConnectionState{}
+}
+
 // DialQUIC dials an mTLS QUIC connection to the frontend server.
 func (c *Client) DialQUIC(ctx context.Context) (*quic.Conn, error) {
 	quicTLS := c.tlsConfig.Clone()

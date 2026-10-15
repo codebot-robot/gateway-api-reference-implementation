@@ -18,9 +18,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -272,6 +274,23 @@ func NewServerTLSConfigWithCertPool(clientCAPool *x509.CertPool, serverCertPEM, 
 	}, nil
 }
 
+// DefaultClientSessionCache is the shared LRU cache used by client TLS configurations
+// for TLS session resumption across connections.
+var DefaultClientSessionCache = tls.NewLRUClientSessionCache(128)
+
+type prefixedClientSessionCache struct {
+	prefix string
+	cache  tls.ClientSessionCache
+}
+
+func (p *prefixedClientSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
+	return p.cache.Get(p.prefix + sessionKey)
+}
+
+func (p *prefixedClientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
+	p.cache.Put(p.prefix+sessionKey, cs)
+}
+
 // NewClientTLSConfig creates a *tls.Config for mTLS clients connecting to the frontend.
 func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverName string) (*tls.Config, error) {
 	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
@@ -288,10 +307,21 @@ func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverNam
 		serverName = "snigateway.internal"
 	}
 
+	var clientCertKey string
+	if len(clientCert.Certificate) > 0 {
+		h := sha256.Sum256(clientCert.Certificate[0])
+		clientCertKey = hex.EncodeToString(h[:])
+	}
+	sessionCache := &prefixedClientSessionCache{
+		prefix: "client-cert:" + clientCertKey + ":",
+		cache:  DefaultClientSessionCache,
+	}
+
 	return &tls.Config{
-		Certificates: []tls.Certificate{clientCert},
-		RootCAs:      caPool,
-		ServerName:   serverName,
-		MinVersion:   tls.VersionTLS12,
+		Certificates:       []tls.Certificate{clientCert},
+		RootCAs:            caPool,
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: sessionCache,
 	}, nil
 }
