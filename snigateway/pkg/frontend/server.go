@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
@@ -50,6 +51,8 @@ type ServerConfig struct {
 	ReadSNITimeout     time.Duration
 	Authorizer         Authorizer
 	CompositeTransport *CompositeTransport
+	MaxConnections     int
+	IdleTimeout        time.Duration
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -71,6 +74,7 @@ type Server struct {
 	quicListeners []*quic.Listener
 	closed        bool
 	shutdownCh    chan struct{}
+	activeConns   atomic.Int64
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -89,6 +93,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	if cfg.ReadSNITimeout <= 0 {
 		cfg.ReadSNITimeout = 5 * time.Second
+	}
+	if cfg.MaxConnections == 0 {
+		cfg.MaxConnections = 10000
+	} else if cfg.MaxConnections < 0 {
+		cfg.MaxConnections = 0
 	}
 	if cfg.ServerTLSConfig == nil {
 		return nil, errors.New("ServerTLSConfig is required")
@@ -230,6 +239,13 @@ func (s *Server) ServeAll(listeners []net.Listener, udpConns []net.PacketConn) e
 						return
 					}
 				}
+				if maxConns := s.config.MaxConnections; maxConns > 0 {
+					if s.activeConns.Add(1) > int64(maxConns) {
+						s.activeConns.Add(-1)
+						closeCloser(conn)
+						continue
+					}
+				}
 				go s.handleConnection(conn)
 			}
 		}(ln)
@@ -314,6 +330,7 @@ func setTCPKeepAlive(conn net.Conn) {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
+	defer s.activeConns.Add(-1)
 	setTCPKeepAlive(conn)
 
 	sniHostname, peekedConn, err := sni.SniffSNI(conn, s.config.ReadSNITimeout)
@@ -435,7 +452,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	spliceConnections(rawClientConn, committedTunnel)
+	spliceConnections(rawClientConn, committedTunnel, s.config.IdleTimeout)
 }
 
 func isNormalClose(err error) bool {
@@ -452,7 +469,7 @@ var spliceBufPool = sync.Pool{
 	},
 }
 
-func spliceConnections(c1, c2 net.Conn) {
+func spliceConnections(c1, c2 net.Conn, idleTimeout time.Duration) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -460,25 +477,62 @@ func spliceConnections(c1, c2 net.Conn) {
 		defer wg.Done()
 		bufPtr := spliceBufPool.Get().(*[]byte)
 		defer spliceBufPool.Put(bufPtr)
-		if _, err := io.CopyBuffer(c2, c1, *bufPtr); err != nil && !isNormalClose(err) {
-			klog.V(2).Infof("Frontend: splice error copying c1 to c2: %v", err)
+		err := copyWithIdleTimeout(c2, c1, *bufPtr, idleTimeout)
+		if err != nil {
+			if !isNormalClose(err) {
+				klog.V(2).Infof("Frontend: splice error copying c1 to c2: %v", err)
+			}
+			closeCloser(c1)
+			closeCloser(c2)
+		} else {
+			closeCloser(c2)
+			closeCloser(c1)
 		}
-		closeCloser(c2)
-		closeCloser(c1)
 	}()
 
 	go func() {
 		defer wg.Done()
 		bufPtr := spliceBufPool.Get().(*[]byte)
 		defer spliceBufPool.Put(bufPtr)
-		if _, err := io.CopyBuffer(c1, c2, *bufPtr); err != nil && !isNormalClose(err) {
-			klog.V(2).Infof("Frontend: splice error copying c2 to c1: %v", err)
+		err := copyWithIdleTimeout(c1, c2, *bufPtr, idleTimeout)
+		if err != nil {
+			if !isNormalClose(err) {
+				klog.V(2).Infof("Frontend: splice error copying c2 to c1: %v", err)
+			}
+			closeCloser(c1)
+			closeCloser(c2)
+		} else {
+			closeCloser(c1)
+			closeCloser(c2)
 		}
-		closeCloser(c1)
-		closeCloser(c2)
 	}()
 
 	wg.Wait()
+}
+
+func copyWithIdleTimeout(dst, src net.Conn, buf []byte, idleTimeout time.Duration) error {
+	if idleTimeout <= 0 {
+		_, err := io.CopyBuffer(dst, src, buf)
+		return err
+	}
+	for {
+		_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+			_ = dst.SetReadDeadline(time.Now().Add(idleTimeout))
+			_, werr := dst.Write(buf[:nr])
+			if werr != nil {
+				return werr
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return nil
+			}
+			return rerr
+		}
+	}
 }
 
 func extractIdentityFromTLSState(tlsState tls.ConnectionState) (ClientIdentity, error) {

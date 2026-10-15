@@ -1341,3 +1341,205 @@ func TestChanListener_ConcurrentSendAndClose(t *testing.T) {
 		t.Fatalf("expected net.ErrClosed from Accept after Close, got: %v", err)
 	}
 }
+
+func TestFrontendServer_MaxConnections(t *testing.T) {
+	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	srv, err := NewServer(ServerConfig{
+		ServerTLSConfig:  serverTLS,
+		InternalHostname: "snigateway.internal",
+		ConnectTimeout:   2 * time.Second,
+		ReadSNITimeout:   1 * time.Second,
+		MaxConnections:   2,
+	})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	serverAddr := ln.Addr().String()
+
+	// Conn 1 (admitted)
+	conn1, err := net.DialTimeout("tcp", serverAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn1: %v", err)
+	}
+	defer conn1.Close()
+
+	// Conn 2 (admitted)
+	conn2, err := net.DialTimeout("tcp", serverAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn2: %v", err)
+	}
+	defer conn2.Close()
+
+	// Conn 3 (N+1 = 3 > 2: refused by server and immediately closed)
+	conn3, err := net.DialTimeout("tcp", serverAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn3: %v", err)
+	}
+	defer conn3.Close()
+
+	_ = conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
+	buf := make([]byte, 64)
+	_, readErr := conn3.Read(buf)
+	if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, net.ErrClosed) {
+		t.Fatalf("expected conn3 to be refused and closed (EOF), got %v", readErr)
+	}
+
+	// Close Conn 1 to free up a slot
+	conn1.Close()
+	time.Sleep(30 * time.Millisecond)
+
+	// Conn 4 (now admitted because active conns is 1 <= 2)
+	conn4, err := net.DialTimeout("tcp", serverAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial conn4: %v", err)
+	}
+	defer conn4.Close()
+
+	// Send invalid SNI to verify connection was accepted and handled by server
+	_ = conn4.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	_, _ = conn4.Write([]byte("not-tls\n"))
+}
+
+func TestFrontendServer_IdleTimeout(t *testing.T) {
+	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen ln1: %v", err)
+	}
+	defer ln1.Close()
+
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen ln2: %v", err)
+	}
+	defer ln2.Close()
+
+	t.Run("splice idle timeout enabled closes connections", func(t *testing.T) {
+		errCh := make(chan error, 2)
+		var c1, c2 net.Conn
+		go func() {
+			var err error
+			c1, err = ln1.Accept()
+			errCh <- err
+		}()
+		go func() {
+			var err error
+			c2, err = ln2.Accept()
+			errCh <- err
+		}()
+
+		dial1, err := net.Dial("tcp", ln1.Addr().String())
+		if err != nil {
+			t.Fatalf("dial1 failed: %v", err)
+		}
+		defer dial1.Close()
+
+		dial2, err := net.Dial("tcp", ln2.Addr().String())
+		if err != nil {
+			t.Fatalf("dial2 failed: %v", err)
+		}
+		defer dial2.Close()
+
+		for i := 0; i < 2; i++ {
+			if err := <-errCh; err != nil {
+				t.Fatalf("accept failed: %v", err)
+			}
+		}
+
+		go spliceConnections(c1, c2, 100*time.Millisecond)
+
+		// Test initial communication
+		if _, err := dial1.Write([]byte("ping\n")); err != nil {
+			t.Fatalf("dial1 write failed: %v", err)
+		}
+		buf := make([]byte, 64)
+		if _, err := dial2.Read(buf); err != nil {
+			t.Fatalf("dial2 read failed: %v", err)
+		}
+
+		// Now stay idle for 100ms
+		start := time.Now()
+		_ = dial1.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			_, rerr := dial1.Read(buf)
+			if rerr != nil {
+				break
+			}
+		}
+		elapsed := time.Since(start)
+
+		if elapsed < 50*time.Millisecond || elapsed > 1500*time.Millisecond {
+			t.Errorf("expected idle connection to be closed around 100ms, elapsed %v", elapsed)
+		}
+	})
+
+	t.Run("splice idle timeout disabled keeps connections untouched", func(t *testing.T) {
+		errCh := make(chan error, 2)
+		var c1, c2 net.Conn
+		go func() {
+			var err error
+			c1, err = ln1.Accept()
+			errCh <- err
+		}()
+		go func() {
+			var err error
+			c2, err = ln2.Accept()
+			errCh <- err
+		}()
+
+		dial1, err := net.Dial("tcp", ln1.Addr().String())
+		if err != nil {
+			t.Fatalf("dial1 failed: %v", err)
+		}
+		defer dial1.Close()
+
+		dial2, err := net.Dial("tcp", ln2.Addr().String())
+		if err != nil {
+			t.Fatalf("dial2 failed: %v", err)
+		}
+		defer dial2.Close()
+
+		for i := 0; i < 2; i++ {
+			if err := <-errCh; err != nil {
+				t.Fatalf("accept failed: %v", err)
+			}
+		}
+
+		go spliceConnections(c1, c2, 0) // disabled
+
+		time.Sleep(150 * time.Millisecond)
+
+		if _, err := dial1.Write([]byte("hello still here\n")); err != nil {
+			t.Fatalf("dial1 write failed: %v", err)
+		}
+		buf := make([]byte, 64)
+		_ = dial2.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, err := dial2.Read(buf)
+		if err != nil {
+			t.Fatalf("dial2 read failed: %v", err)
+		}
+		if string(buf[:n]) != "hello still here\n" {
+			t.Errorf("expected %q, got %q", "hello still here\n", string(buf[:n]))
+		}
+	})
+}
