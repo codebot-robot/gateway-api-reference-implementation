@@ -3515,3 +3515,37 @@ func TestProxy_ClientSessionCacheDynamicSizing_GrowAndShrink(t *testing.T) {
 		t.Fatalf("expected cache len 256 (oldest 44 of the 300 evicted), got %d", cache.Len())
 	}
 }
+
+func TestProxy_WrapUnwrapSession_NoWriteLock(t *testing.T) {
+	p := NewProxy()
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// Calling wrapSession and unwrapSession while holding RLock must not deadlock or block
+	// since ticketConfig is initialized in NewProxy and accessed concurrently without write locks.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cs := tls.ConnectionState{ServerName: "example.com"}
+		ss := &tls.SessionState{}
+		ticket, err := p.wrapSession(cs, ss)
+		if err != nil {
+			t.Errorf("wrapSession failed: %v", err)
+			return
+		}
+		if len(ticket) == 0 {
+			t.Errorf("expected non-empty ticket")
+			return
+		}
+		// unwrapSession must not attempt to acquire p.mu.Lock() either.
+		_, _ = p.unwrapSession(ticket, cs)
+	}()
+
+	select {
+	case <-done:
+		// Success: neither wrapSession nor unwrapSession contended on p.mu.Lock()
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("deadlock: wrapSession or unwrapSession attempted to acquire write lock while read lock was held")
+	}
+}
