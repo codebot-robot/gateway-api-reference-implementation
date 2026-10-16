@@ -76,6 +76,8 @@ type Proxy struct {
 	udpMaxSessions   int
 	listenPacketFunc func(network, addr string) (net.PacketConn, error)
 
+	// baseTLSConfig and ticketConfig are initialized once in NewProxy and read concurrently
+	// without holding p.mu during TLS handshakes.
 	baseTLSConfig      *tls.Config
 	ticketConfig       *tls.Config
 	clientSessionCache *sni.LRUClientSessionCache
@@ -484,24 +486,11 @@ func (p *Proxy) wrapSession(cs tls.ConnectionState, ss *tls.SessionState) ([]byt
 			}
 		}
 	}
-	p.mu.Lock()
-	if p.ticketConfig == nil {
-		p.ticketConfig = &tls.Config{}
-	}
-	tc := p.ticketConfig
-	p.mu.Unlock()
-	return tc.EncryptTicket(cs, ss)
+	return p.ticketConfig.EncryptTicket(cs, ss)
 }
 
 func (p *Proxy) unwrapSession(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
-	p.mu.Lock()
-	if p.ticketConfig == nil {
-		p.ticketConfig = &tls.Config{}
-	}
-	tc := p.ticketConfig
-	p.mu.Unlock()
-
-	ss, err := tc.DecryptTicket(identity, cs)
+	ss, err := p.ticketConfig.DecryptTicket(identity, cs)
 	if err != nil || ss == nil {
 		return nil, nil
 	}
@@ -645,19 +634,6 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 // mutate shared TLS configuration fields (such as NextProtos), while still sharing ticket encryption
 // and decryption through Proxy-managed WrapSession and UnwrapSession callbacks.
 func (p *Proxy) TLSConfig() *tls.Config {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.baseTLSConfig == nil {
-		if p.ticketConfig == nil {
-			p.ticketConfig = &tls.Config{}
-		}
-		p.baseTLSConfig = &tls.Config{
-			GetCertificate:     p.GetCertificate,
-			GetConfigForClient: p.GetConfigForClient,
-			WrapSession:        p.wrapSession,
-			UnwrapSession:      p.unwrapSession,
-		}
-	}
 	return p.baseTLSConfig.Clone()
 }
 

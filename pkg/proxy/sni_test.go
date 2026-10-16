@@ -1301,6 +1301,104 @@ func TestTLSSessionResumption_HTTPSListener(t *testing.T) {
 	conn2.Close()
 }
 
+func TestTLSSessionResumption_HTTPSListener_ConcurrentWithReadLock(t *testing.T) {
+	caPEM, cert := generateTestCAAndCert(t, []string{"https.example.com"}, nil)
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"https.example.com": &cert,
+	}, &cert)
+
+	routes := []state.InternalRoute{
+		{
+			Hostnames: []string{"https.example.com"},
+			Rules: []state.InternalRule{
+				{
+					Matches: []state.InternalMatch{
+						{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+					},
+				},
+			},
+		},
+	}
+	p.UpdateConfig([]state.InternalListener{
+		{
+			Name:     "https-listener",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     8443,
+			Hostname: "https.example.com",
+			Routes:   routes,
+		},
+	}, routes)
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	tlsLis := tls.NewListener(sniLis, p.TLSConfig())
+	defer tlsLis.Close()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+	go func() {
+		_ = srv.Serve(tlsLis)
+	}()
+	defer srv.Close()
+
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caPEM)
+
+	clientTLS := &tls.Config{
+		ServerName:         "https.example.com",
+		RootCAs:            caPool,
+		ClientSessionCache: tls.NewLRUClientSessionCache(10),
+	}
+
+	addr := rawLis.Addr().String()
+
+	// Acquire proxy read lock. Both full handshake (wrapSession) and resumed handshake
+	// (unwrapSession) must succeed concurrently without deadlocking on write locks.
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// Connection 1: full TLS handshake, receives session ticket
+	conn1, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial 1 failed: %v", err)
+	}
+	req := "GET / HTTP/1.1\r\nHost: https.example.com\r\nConnection: close\r\n\r\n"
+	if _, err := conn1.Write([]byte(req)); err != nil {
+		t.Fatalf("write 1 failed: %v", err)
+	}
+	_, _ = io.ReadAll(conn1)
+	if conn1.ConnectionState().DidResume {
+		t.Errorf("connection 1 expected DidResume=false, got true")
+	}
+	conn1.Close()
+
+	// Connection 2: resumed TLS handshake
+	conn2, err := tls.Dial("tcp", addr, clientTLS)
+	if err != nil {
+		t.Fatalf("dial 2 failed: %v", err)
+	}
+	if _, err := conn2.Write([]byte(req)); err != nil {
+		t.Fatalf("write 2 failed: %v", err)
+	}
+	_, _ = io.ReadAll(conn2)
+	if !conn2.ConnectionState().DidResume {
+		t.Errorf("connection 2 expected DidResume=true, got false")
+	}
+	conn2.Close()
+}
+
 func TestTLSSessionResumption_TLSRouteTerminate(t *testing.T) {
 	caPEM, cert := generateTestCAAndCert(t, []string{"tls.example.com"}, nil)
 	p := NewProxy()
