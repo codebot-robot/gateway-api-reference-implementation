@@ -716,6 +716,19 @@ func (p *AddressProvider) PublishDataplaneConfig(ctx context.Context, gw *gatewa
 	}
 
 	name := ResourceNameForGateway(gw.Name)
+
+	var existingSecret corev1.Secret
+	err := p.client.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: name}, &existingSecret)
+	if err == nil {
+		if !isOwnedByGateway(&existingSecret, gw) {
+			return &controller.OwnershipConflictError{
+				Message: fmt.Sprintf("conflict: existing Secret %s/%s is not owned by Gateway %s", gw.Namespace, name, gw.Name),
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to get config Secret for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
+	}
+
 	labels, annotations := buildLabelsAndAnnotations(gw)
 	ownerRef := metav1ac.OwnerReference().
 		WithAPIVersion(gatewayv1.GroupVersion.String()).

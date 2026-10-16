@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -390,6 +392,15 @@ func (s *State) Recompute() *Outputs {
 	return outputs
 }
 
+// OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
+type OwnershipConflictError struct {
+	Message string
+}
+
+func (e *OwnershipConflictError) Error() string {
+	return e.Message
+}
+
 // publishDataplaneConfigs iterates through compiled data-plane configs and pushes updates to the publisher.
 // TODO(#637): Publishing is currently synchronous inside Recompute; consider making it asynchronous
 // or streaming (e.g. xDS-like) if cluster size or write latency becomes an issue.
@@ -432,12 +443,47 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 
 		if err := publisher.PublishDataplaneConfig(ctx, cg.Gateway, dpConfig); err != nil {
 			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
+			var conflictErr *OwnershipConflictError
+			if errors.As(err, &conflictErr) {
+				s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
+				s.mu.Lock()
+				readiness := GatewayReadiness{Ready: true}
+				if r, ok := s.gatewayReadiness[gwKey]; ok {
+					readiness = r
+				}
+				addrs := s.gatewayAddresses[gwKey]
+				supportedTypes := s.supportedAddressTypes
+				s.mu.Unlock()
+
+				desiredStatus := ComputeDesiredGatewayStatus(cg.Gateway, cg, addrs, readiness, conflictErr.Error(), supportedTypes)
+				outputs.GatewayStatuses[gwKey] = desiredStatus
+				cg.Conditions = desiredStatus.Conditions
+				s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: gwKey})
+			}
 			continue
 		}
 
 		s.mu.Lock()
 		s.lastWrittenConfigs[gwKey] = data
+		curErr := s.provisioningErrors[gwKey]
 		s.mu.Unlock()
+
+		if strings.Contains(curErr, "conflict: existing Secret") {
+			s.SetGatewayProvisioningError(gwKey, "")
+			s.mu.Lock()
+			readiness := GatewayReadiness{Ready: true}
+			if r, ok := s.gatewayReadiness[gwKey]; ok {
+				readiness = r
+			}
+			addrs := s.gatewayAddresses[gwKey]
+			supportedTypes := s.supportedAddressTypes
+			s.mu.Unlock()
+
+			desiredStatus := ComputeDesiredGatewayStatus(cg.Gateway, cg, addrs, readiness, "", supportedTypes)
+			outputs.GatewayStatuses[gwKey] = desiredStatus
+			cg.Conditions = desiredStatus.Conditions
+			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: gwKey})
+		}
 	}
 
 	var removedKeys []types.NamespacedName
