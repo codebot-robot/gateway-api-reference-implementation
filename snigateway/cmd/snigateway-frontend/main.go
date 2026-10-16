@@ -71,10 +71,8 @@ func run(ctx context.Context, args []string) error {
 	serverKeyPath := fs.String("server-key", "server.key", "Path to server private key PEM file")
 	internalHostname := fs.String("internal-hostname", api.DefaultInternalHostname, "Internal SNI hostname for mTLS management API")
 	connectTimeout := fs.Duration("connect-timeout", 10*time.Second, "Timeout for client to dial back and claim pending connection")
-	maxConnections := fs.Int("max-connections", 10000, "Maximum number of concurrent client connections per listener")
-	fs.IntVar(maxConnections, "tcp-max-connections", 10000, "Maximum number of concurrent client connections per listener (alias for --max-connections)")
-	idleTimeout := fs.Duration("idle-timeout", 0, "Idle timeout for spliced client connections (disabled by default)")
-	fs.DurationVar(idleTimeout, "tcp-idle-timeout", 0, "Idle timeout for spliced client connections (alias for --idle-timeout)")
+	maxConnections := fs.Int("tcp-max-connections", 10000, "Maximum number of concurrent client connections per listener")
+	idleTimeout := fs.Duration("tcp-idle-timeout", 0, "Idle timeout for spliced client connections (disabled by default)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
