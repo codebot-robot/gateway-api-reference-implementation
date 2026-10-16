@@ -113,6 +113,8 @@ func copyAndCloseWrite(dst, src net.Conn, idleTimeout time.Duration) error {
 	return errors.Join(errs...)
 }
 
+// copyWithIdleTimeout copies data from src to dst while refreshing read deadlines on each copy.
+// Note: enabling idle timeout gives up io.Copy's ReaderFrom fast path (kernel splice on Linux for TCP<->TCP).
 func copyWithIdleTimeout(dst, src net.Conn, idleTimeout time.Duration) error {
 	if idleTimeout <= 0 {
 		_, err := io.Copy(dst, src)
@@ -121,11 +123,20 @@ func copyWithIdleTimeout(dst, src net.Conn, idleTimeout time.Duration) error {
 
 	buf := make([]byte, 32*1024)
 	for {
-		_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
+		if err := src.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+			klog.V(2).Infof("failed to set read deadline on source connection: %v", err)
+			return err
+		}
 		nr, rerr := src.Read(buf)
 		if nr > 0 {
-			_ = src.SetReadDeadline(time.Now().Add(idleTimeout))
-			_ = dst.SetReadDeadline(time.Now().Add(idleTimeout))
+			if err := src.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+				klog.V(2).Infof("failed to refresh read deadline on source connection: %v", err)
+				return err
+			}
+			if err := dst.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+				klog.V(2).Infof("failed to refresh read deadline on destination connection: %v", err)
+				return err
+			}
 			_, werr := dst.Write(buf[:nr])
 			if werr != nil {
 				return werr
