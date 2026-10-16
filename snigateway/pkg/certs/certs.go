@@ -18,9 +18,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -28,6 +30,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 )
 
 // CertificatePair holds PEM-encoded certificate and private key.
@@ -272,6 +276,10 @@ func NewServerTLSConfigWithCertPool(clientCAPool *x509.CertPool, serverCertPEM, 
 	}, nil
 }
 
+// DefaultClientSessionCache is the shared LRU cache used by client TLS configurations
+// for TLS session resumption across connections.
+var DefaultClientSessionCache = tls.NewLRUClientSessionCache(128)
+
 // NewClientTLSConfig creates a *tls.Config for mTLS clients connecting to the frontend.
 func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverName string) (*tls.Config, error) {
 	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
@@ -288,10 +296,18 @@ func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverNam
 		serverName = "snigateway.internal"
 	}
 
+	var clientCertKey string
+	if len(clientCert.Certificate) > 0 {
+		h := sha256.Sum256(clientCert.Certificate[0])
+		clientCertKey = hex.EncodeToString(h[:])
+	}
+	sessionCache := sni.NewPrefixedClientSessionCache("client-cert:"+clientCertKey+":", DefaultClientSessionCache)
+
 	return &tls.Config{
-		Certificates: []tls.Certificate{clientCert},
-		RootCAs:      caPool,
-		ServerName:   serverName,
-		MinVersion:   tls.VersionTLS12,
+		Certificates:       []tls.Certificate{clientCert},
+		RootCAs:            caPool,
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: sessionCache,
 	}, nil
 }

@@ -685,6 +685,228 @@ func TestHTTP3_Enabled_AltSvcAndQUICRouting(t *testing.T) {
 	}
 }
 
+func TestHTTP3_TCPCrossProtocolResumption(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend:" + r.URL.Path))
+	}))
+	defer backend.Close()
+
+	host, portStr, _ := net.SplitHostPort(backend.Listener.Addr().String())
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create HTTPS listener: %v", err)
+	}
+	defer httpsLis.Close()
+
+	h3Conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create UDP packet conn: %v", err)
+	}
+	defer h3Conn.Close()
+
+	h3Addr := h3Conn.LocalAddr().String()
+
+	opts := Options{
+		HTTPSListener:            httpsLis,
+		HTTP3PacketConn:          h3Conn,
+		ProxyHTTP3AdvertisedPort: 443,
+		ProxyAddr:                "",
+		Scheme:                   DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+
+	p.UpdateListeners([]state.InternalListener{
+		{
+			Name:     "https-resumption",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Hostname: "example.com",
+			Port:     443,
+			Routes: []state.InternalRoute{
+				{
+					Hostnames: []string{"example.com"},
+					Rules: []state.InternalRule{
+						{
+							Matches: []state.InternalMatch{
+								{
+									Path: &state.InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/foo",
+									},
+								},
+							},
+							Backends: []state.InternalBackend{
+								{
+									Host:   host,
+									Port:   int32(port),
+									Weight: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	httpsAddr := httpsLis.Addr().String()
+
+	// Wait for server to start
+	for i := 0; i < 20; i++ {
+		c, err := net.DialTimeout("tcp", httpsAddr, 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 1. TCP (HTTPS) -> HTTP/3 cross-protocol resumption
+	t.Run("TCP ticket resumes over HTTP/3", func(t *testing.T) {
+		sessionCache := tls.NewLRUClientSessionCache(10)
+
+		tcpTr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "example.com",
+				InsecureSkipVerify: true,
+				ClientSessionCache: sessionCache,
+			},
+		}
+		tcpClient := &http.Client{Transport: tcpTr, Timeout: 3 * time.Second}
+
+		req, _ := http.NewRequest("GET", "https://"+httpsAddr+"/foo", nil)
+		req.Host = "example.com"
+		respTCP, err := tcpClient.Do(req)
+		if err != nil {
+			t.Fatalf("TCP request failed: %v", err)
+		}
+		_, _ = io.ReadAll(respTCP.Body)
+		respTCP.Body.Close()
+		tcpTr.CloseIdleConnections()
+
+		if respTCP.TLS == nil {
+			t.Fatalf("expected non-nil respTCP.TLS")
+		}
+		if respTCP.TLS.DidResume {
+			t.Errorf("expected initial TCP connection DidResume=false, got true")
+		}
+
+		h3Transport := &http3.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "example.com",
+				InsecureSkipVerify: true,
+				ClientSessionCache: sessionCache,
+			},
+			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				return quic.DialAddrEarly(ctx, h3Addr, tlsCfg, cfg)
+			},
+		}
+		defer h3Transport.Close()
+
+		h3Client := &http.Client{Transport: h3Transport, Timeout: 3 * time.Second}
+		respH3, err := h3Client.Get("https://example.com/foo")
+		if err != nil {
+			t.Fatalf("HTTP/3 request failed: %v", err)
+		}
+		_, _ = io.ReadAll(respH3.Body)
+		respH3.Body.Close()
+
+		if respH3.TLS == nil {
+			t.Fatalf("expected non-nil respH3.TLS")
+		}
+		if !respH3.TLS.DidResume {
+			t.Errorf("expected HTTP/3 request to resume from TCP ticket, got DidResume=false")
+		}
+	})
+
+	// 2. HTTP/3 -> TCP cross-protocol resumption
+	t.Run("HTTP/3 ticket resumes over TCP", func(t *testing.T) {
+		sessionCache := tls.NewLRUClientSessionCache(10)
+
+		h3Transport := &http3.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "example.com",
+				InsecureSkipVerify: true,
+				ClientSessionCache: sessionCache,
+			},
+			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				return quic.DialAddrEarly(ctx, h3Addr, tlsCfg, cfg)
+			},
+		}
+		defer h3Transport.Close()
+
+		h3Client := &http.Client{Transport: h3Transport, Timeout: 3 * time.Second}
+		respH3, err := h3Client.Get("https://example.com/foo")
+		if err != nil {
+			t.Fatalf("HTTP/3 request failed: %v", err)
+		}
+		_, _ = io.ReadAll(respH3.Body)
+		respH3.Body.Close()
+
+		if respH3.TLS == nil {
+			t.Fatalf("expected non-nil respH3.TLS")
+		}
+		if respH3.TLS.DidResume {
+			t.Errorf("expected initial HTTP/3 connection DidResume=false, got true")
+		}
+
+		tcpTr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "example.com",
+				InsecureSkipVerify: true,
+				ClientSessionCache: sessionCache,
+			},
+		}
+		tcpClient := &http.Client{Transport: tcpTr, Timeout: 3 * time.Second}
+
+		req, _ := http.NewRequest("GET", "https://"+httpsAddr+"/foo", nil)
+		req.Host = "example.com"
+		respTCP, err := tcpClient.Do(req)
+		if err != nil {
+			t.Fatalf("TCP request failed: %v", err)
+		}
+		_, _ = io.ReadAll(respTCP.Body)
+		respTCP.Body.Close()
+		tcpTr.CloseIdleConnections()
+
+		if respTCP.TLS == nil {
+			t.Fatalf("expected non-nil respTCP.TLS")
+		}
+		if !respTCP.TLS.DidResume {
+			t.Errorf("expected TCP request to resume from HTTP/3 ticket, got DidResume=false")
+		}
+	})
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for proxy shutdown")
+	}
+}
+
 func TestHTTP3_AutomaticAdvertisedPort(t *testing.T) {
 	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

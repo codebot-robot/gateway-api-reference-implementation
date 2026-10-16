@@ -314,10 +314,7 @@ func (l *sniListener) terminateTLSToBackend(clientConn net.Conn, sniHostname, ba
 		return
 	}
 
-	tlsConfig := &tls.Config{
-		GetCertificate: l.p.GetCertificate,
-	}
-	tlsConn := tls.Server(clientConn, tlsConfig)
+	tlsConn := tls.Server(clientConn, l.p.TLSConfig())
 	if err := clientConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		klog.V(2).Infof("failed to set deadline for TLS handshake: %v", err)
 		closeConn(clientConn)

@@ -797,3 +797,177 @@ func TestClientCertificateValidation_AllowInsecureFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestTLSSessionResumption_ValidatedListener(t *testing.T) {
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"validated.example.com"}, nil)
+	clientCA1PEM, client1Cert := generateTestCAAndClientCert(t, "client1")
+	clientCA2PEM, client2Cert := generateTestCAAndClientCert(t, "client2")
+
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend-ok"))
+	}))
+	defer backendServer.Close()
+
+	backendURL, err := url.Parse(backendServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse backend URL: %v", err)
+	}
+	backendHost, backendPortStr, err := net.SplitHostPort(backendURL.Host)
+	if err != nil {
+		t.Fatalf("failed to split backend host port: %v", err)
+	}
+	backendPort, err := strconv.Atoi(backendPortStr)
+	if err != nil {
+		t.Fatalf("failed to parse backend port: %v", err)
+	}
+
+	p := NewProxy()
+	p.UpdateCertificates(map[string]*tls.Certificate{
+		"validated.example.com": &serverCert,
+	}, &serverCert)
+
+	route := state.InternalRoute{
+		Hostnames: []string{"validated.example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+				},
+				Backends: []state.InternalBackend{
+					{
+						Host:   backendHost,
+						Port:   int32(backendPort),
+						Weight: 1,
+					},
+				},
+			},
+		},
+	}
+
+	listenerCA1 := state.InternalListener{
+		Name:     "validated-listener",
+		Protocol: gatewayv1.HTTPSProtocolType,
+		Port:     8443,
+		Hostname: "validated.example.com",
+		ClientValidation: &state.InternalClientValidation{
+			CACertPEMs: [][]byte{clientCA1PEM},
+			Mode:       gatewayv1.AllowValidOnly,
+		},
+		Routes: []state.InternalRoute{route},
+	}
+	p.UpdateConfig([]state.InternalListener{listenerCA1}, []state.InternalRoute{route})
+
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on TCP: %v", err)
+	}
+	defer rawLis.Close()
+
+	sniLis := p.NewSNIListener(rawLis)
+	defer sniLis.Close()
+
+	tlsConfig := p.TLSConfig()
+	httpsSrv := &http.Server{
+		Handler:   p,
+		TLSConfig: tlsConfig,
+	}
+	tlsLis := tls.NewListener(sniLis, tlsConfig)
+	go func() {
+		_ = httpsSrv.Serve(tlsLis)
+	}()
+	defer httpsSrv.Close()
+
+	addr := rawLis.Addr().String()
+	serverCertPool := x509.NewCertPool()
+	serverCertPool.AppendCertsFromPEM(serverCAPEM)
+
+	sessionCache := tls.NewLRUClientSessionCache(10)
+
+	dialWithCert := func(clientCert *tls.Certificate) (*tls.Conn, error) {
+		var certs []tls.Certificate
+		if clientCert != nil {
+			certs = []tls.Certificate{*clientCert}
+		}
+		cCfg := &tls.Config{
+			ServerName:         "validated.example.com",
+			RootCAs:            serverCertPool,
+			Certificates:       certs,
+			ClientSessionCache: sessionCache,
+		}
+		conn, err := tls.Dial("tcp", addr, cCfg)
+		if err != nil {
+			return nil, err
+		}
+		req := "GET / HTTP/1.1\r\nHost: validated.example.com\r\nConnection: close\r\n\r\n"
+		if _, err := conn.Write([]byte(req)); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		resp, rErr := io.ReadAll(conn)
+		if rErr != nil || len(resp) == 0 {
+			conn.Close()
+			return nil, fmt.Errorf("handshake failed or connection closed without response: %w", rErr)
+		}
+		return conn, nil
+	}
+
+	// Step 1: Connect with client cert 1 -> Full handshake, DidResume == false
+	conn1, err := dialWithCert(&client1Cert)
+	if err != nil {
+		t.Fatalf("conn 1 failed: %v", err)
+	}
+	if conn1.ConnectionState().DidResume {
+		t.Errorf("conn 1 expected DidResume=false, got true")
+	}
+	conn1.Close()
+
+	// Step 2: Connect with client cert 1 again -> Resumed handshake, DidResume == true
+	conn2, err := dialWithCert(&client1Cert)
+	if err != nil {
+		t.Fatalf("conn 2 failed: %v", err)
+	}
+	if !conn2.ConnectionState().DidResume {
+		t.Errorf("conn 2 expected DidResume=true, got false")
+	}
+	conn2.Close()
+
+	// Step 3: Update config: Swap CA to CA2
+	listenerCA2 := state.InternalListener{
+		Name:     "validated-listener",
+		Protocol: gatewayv1.HTTPSProtocolType,
+		Port:     8443,
+		Hostname: "validated.example.com",
+		ClientValidation: &state.InternalClientValidation{
+			CACertPEMs: [][]byte{clientCA2PEM},
+			Mode:       gatewayv1.AllowValidOnly,
+		},
+		Routes: []state.InternalRoute{route},
+	}
+	p.UpdateConfig([]state.InternalListener{listenerCA2}, []state.InternalRoute{route})
+
+	// Step 4: Old client cert 1 should now be rejected at handshake (even if presenting old session ticket)
+	if _, err := dialWithCert(&client1Cert); err == nil {
+		t.Errorf("expected client cert 1 to fail handshake after CA update to CA2")
+	}
+
+	// Step 5: Connect with valid client cert 2 (using same session cache) -> Ticket key was rotated, so DidResume == false
+	conn3, err := dialWithCert(&client2Cert)
+	if err != nil {
+		t.Fatalf("conn 3 with client cert 2 failed: %v", err)
+	}
+	if conn3.ConnectionState().DidResume {
+		t.Errorf("conn 3 expected DidResume=false after CA change, got true")
+	}
+	conn3.Close()
+
+	// Step 6: Connect with valid client cert 2 again -> Resumed handshake, DidResume == true
+	conn4, err := dialWithCert(&client2Cert)
+	if err != nil {
+		t.Fatalf("conn 4 with client cert 2 failed: %v", err)
+	}
+	if !conn4.ConnectionState().DidResume {
+		t.Errorf("conn 4 expected DidResume=true on second connection with CA2, got false")
+	}
+	conn4.Close()
+}

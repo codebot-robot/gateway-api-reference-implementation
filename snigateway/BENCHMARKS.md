@@ -215,6 +215,18 @@ sudo sysctl -w net.core.wmem_max=7500000
   - **Total Process CPU**: **8.59 CPU-s/GB** (within 5.6% of TCP pool's 8.13 CPU-s/GB).
   - **Burst Latency (20ms RTT)**: **42.5 ms p50** (down from 62.0 ms, ~3.7x faster than TCP pool 157.0 ms).
 
+### 6.7 TLS Session Resumption & Backend Transport Caching (#724)
+- **Problem**: Previously, `buildTransport` was invoked on every request inside `forward` and `mirror`, constructing a new `http.Transport` per request. Every proxied request to a TLS backend suffered a new TCP connection and full TLS handshake (1,000 handshakes per 1,000 requests). In addition, client TLS configs lacked a `ClientSessionCache`, preventing TLS session resumption when new connections were dialed.
+- **Optimization**:
+  - **Backend Transport Caching**: Cached `http.RoundTripper` per backend (keyed by target address, application protocol, CA cert hash, SANs, and client cert ID), with idle connection closure and cache eviction on route/config changes.
+  - **Shared Client Session Cache**: Provided a shared LRU `tls.ClientSessionCache` across all backend TLS configs in `pkg/proxy` and `snigateway/pkg/certs` (with client credential isolation to prevent cross-identity resumption).
+  - **Shared Server Session Callbacks**: Shared `WrapSession`/`UnwrapSession` callbacks across HTTPS servers, HTTP/3 servers, and TLSRoute terminate paths backed by a dedicated proxy ticket configuration, enabling cross-protocol resumption (TCP ↔ HTTP/3) without sharing mutable config state.
+  - **Validated Listener Resumption**: Enabled session tickets on `AllowValidOnly` listeners by binding the listener's CA set hash into the ticket payload via `WrapSession` and refusing to resume in `UnwrapSession` when the CA set changes.
+- **Numbers (AMD EPYC 9B14, `BenchmarkProxy_TLSBackend_Handshakes`)**:
+  - **Handshakes per 1,000 requests to a TLS backend**:
+    - **Before**: 1,000 handshakes (1 handshake / request due to per-request `http.Transport` rebuild)
+    - **After**: 1 handshake (connection reuse via keep-alive; subsequent dials resume via `ClientSessionCache`, a 1,000x reduction in handshakes)
+
 ---
 
 ## 7. Open Architectural Discussion: TLS Redundancy vs Metadata Security
