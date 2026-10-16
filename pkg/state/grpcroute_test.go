@@ -16,12 +16,14 @@ package state
 
 import (
 	"math/rand/v2"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 func TestGRPCRoute_MethodCompilation(t *testing.T) {
@@ -760,4 +762,453 @@ func TestGRPCRoute_WeightedBackends(t *testing.T) {
 	if ratio2 < 0.25 || ratio2 > 0.35 {
 		t.Errorf("expected host2 proportion ~0.30, got %f (%d/%d)", ratio2, counts[host2], totalDraws)
 	}
+}
+
+func TestGRPCRoute_HeaderModifiers(t *testing.T) {
+	ruleReqMod := &gatewayv1.HTTPHeaderFilter{
+		Set:    []gatewayv1.HTTPHeader{{Name: "X-Rule-Req-Set", Value: "rule-set"}},
+		Add:    []gatewayv1.HTTPHeader{{Name: "X-Rule-Req-Add", Value: "rule-add"}},
+		Remove: []string{"X-Rule-Req-Remove"},
+	}
+	ruleRespMod := &gatewayv1.HTTPHeaderFilter{
+		Set:    []gatewayv1.HTTPHeader{{Name: "X-Rule-Resp-Set", Value: "rule-resp-set"}},
+		Add:    []gatewayv1.HTTPHeader{{Name: "X-Rule-Resp-Add", Value: "rule-resp-add"}},
+		Remove: []string{"X-Rule-Resp-Remove"},
+	}
+	backendReqMod := &gatewayv1.HTTPHeaderFilter{
+		Set:    []gatewayv1.HTTPHeader{{Name: "X-Backend-Req-Set", Value: "backend-set"}},
+		Add:    []gatewayv1.HTTPHeader{{Name: "X-Backend-Req-Add", Value: "backend-add"}},
+		Remove: []string{"X-Backend-Req-Remove"},
+	}
+	backendRespMod := &gatewayv1.HTTPHeaderFilter{
+		Set:    []gatewayv1.HTTPHeader{{Name: "X-Backend-Resp-Set", Value: "backend-resp-set"}},
+		Add:    []gatewayv1.HTTPHeader{{Name: "X-Backend-Resp-Add", Value: "backend-resp-add"}},
+		Remove: []string{"X-Backend-Resp-Remove"},
+	}
+	port := gatewayv1.PortNumber(8080)
+	route := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "header-modifiers-grpcroute", Namespace: "default"},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					Filters: []gatewayv1.GRPCRouteFilter{
+						{
+							Type:                  gatewayv1.GRPCRouteFilterRequestHeaderModifier,
+							RequestHeaderModifier: ruleReqMod,
+						},
+						{
+							Type:                   gatewayv1.GRPCRouteFilterResponseHeaderModifier,
+							ResponseHeaderModifier: ruleRespMod,
+						},
+					},
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend-svc",
+									Port: &port,
+								},
+							},
+							Filters: []gatewayv1.GRPCRouteFilter{
+								{
+									Type:                  gatewayv1.GRPCRouteFilterRequestHeaderModifier,
+									RequestHeaderModifier: backendReqMod,
+								},
+								{
+									Type:                   gatewayv1.GRPCRouteFilterResponseHeaderModifier,
+									ResponseHeaderModifier: backendRespMod,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			ObjectMeta: metav1.ObjectMeta{Name: "backend-svc", Namespace: "default"},
+			Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+	}
+
+	compiled := CompileGRPCRoute(route, services, nil, nil, nil)
+	if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+		t.Fatalf("ValidationCondition.Status = %v, want True", compiled.ValidationCondition.Status)
+	}
+	if compiled.ResolvedRefsCondition.Status != metav1.ConditionTrue {
+		t.Fatalf("ResolvedRefsCondition.Status = %v, want True", compiled.ResolvedRefsCondition.Status)
+	}
+	if len(compiled.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(compiled.Rules))
+	}
+
+	rule := compiled.Rules[0]
+	if !reflect.DeepEqual(rule.RequestHeaderModifier, ruleReqMod) {
+		t.Errorf("rule RequestHeaderModifier = %+v, want %+v", rule.RequestHeaderModifier, ruleReqMod)
+	}
+	if !reflect.DeepEqual(rule.ResponseHeaderModifier, ruleRespMod) {
+		t.Errorf("rule ResponseHeaderModifier = %+v, want %+v", rule.ResponseHeaderModifier, ruleRespMod)
+	}
+
+	if len(rule.Backends) != 1 {
+		t.Fatalf("expected 1 backend, got %d", len(rule.Backends))
+	}
+	backend := rule.Backends[0]
+	if !reflect.DeepEqual(backend.RequestHeaderModifier, backendReqMod) {
+		t.Errorf("backend RequestHeaderModifier = %+v, want %+v", backend.RequestHeaderModifier, backendReqMod)
+	}
+	if !reflect.DeepEqual(backend.ResponseHeaderModifier, backendRespMod) {
+		t.Errorf("backend ResponseHeaderModifier = %+v, want %+v", backend.ResponseHeaderModifier, backendRespMod)
+	}
+}
+
+func TestGRPCRoute_RequestMirror(t *testing.T) {
+	port8080 := gatewayv1.PortNumber(8080)
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+		{Namespace: "other-ns", Name: "mirror-svc"}: {
+			Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+	}
+
+	crossGrantForGRPCRoute := &gatewayv1beta1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "grant-grpc"},
+		Spec: gatewayv1beta1.ReferenceGrantSpec{
+			From: []gatewayv1beta1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      "GRPCRoute",
+					Namespace: "default",
+				},
+			},
+			To: []gatewayv1beta1.ReferenceGrantTo{
+				{
+					Group: "",
+					Kind:  "Service",
+				},
+			},
+		},
+	}
+
+	crossGrantForHTTPRouteOnly := &gatewayv1beta1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "grant-http"},
+		Spec: gatewayv1beta1.ReferenceGrantSpec{
+			From: []gatewayv1beta1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      "HTTPRoute",
+					Namespace: "default",
+				},
+			},
+			To: []gatewayv1beta1.ReferenceGrantTo{
+				{
+					Group: "",
+					Kind:  "Service",
+				},
+			},
+		},
+	}
+
+	routeWithCrossNsMirror := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-route"},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					Filters: []gatewayv1.GRPCRouteFilter{
+						{
+							Type: gatewayv1.GRPCRouteFilterRequestMirror,
+							RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Namespace: Ptr(gatewayv1.Namespace("other-ns")),
+									Name:      "mirror-svc",
+									Port:      &port8080,
+								},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend-svc",
+									Port: &port8080,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	t.Run("cross-namespace mirror without ReferenceGrant is rejected", func(t *testing.T) {
+		compiled := CompileGRPCRoute(routeWithCrossNsMirror, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ValidationCondition True, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ResolvedRefsCondition False, got %v", compiled.ResolvedRefsCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Reason != string(gatewayv1.RouteReasonRefNotPermitted) {
+			t.Errorf("expected Reason RefNotPermitted, got %v", compiled.ResolvedRefsCondition.Reason)
+		}
+		if len(compiled.Rules) > 0 && len(compiled.Rules[0].Mirrors) != 0 {
+			t.Errorf("expected 0 mirrors, got %d", len(compiled.Rules[0].Mirrors))
+		}
+	})
+
+	t.Run("cross-namespace mirror with ReferenceGrant for HTTPRoute only is rejected", func(t *testing.T) {
+		refValidator := mapReferenceValidator{
+			referenceGrants: map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant{
+				{Namespace: "other-ns", Name: "grant-http"}: crossGrantForHTTPRouteOnly,
+			},
+		}
+		compiled := CompileGRPCRoute(routeWithCrossNsMirror, services, nil, nil, refValidator)
+		if compiled.ResolvedRefsCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ResolvedRefsCondition False, got %v", compiled.ResolvedRefsCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Reason != string(gatewayv1.RouteReasonRefNotPermitted) {
+			t.Errorf("expected Reason RefNotPermitted, got %v", compiled.ResolvedRefsCondition.Reason)
+		}
+	})
+
+	t.Run("cross-namespace mirror with ReferenceGrant for GRPCRoute succeeds", func(t *testing.T) {
+		refValidator := mapReferenceValidator{
+			referenceGrants: map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant{
+				{Namespace: "other-ns", Name: "grant-grpc"}: crossGrantForGRPCRoute,
+			},
+		}
+		compiled := CompileGRPCRoute(routeWithCrossNsMirror, services, nil, nil, refValidator)
+		if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ValidationCondition True, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ResolvedRefsCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ResolvedRefsCondition True, got %v (%s)", compiled.ResolvedRefsCondition.Status, compiled.ResolvedRefsCondition.Message)
+		}
+		if compiled.ResolvedRefsCondition.Reason != string(gatewayv1.RouteReasonResolvedRefs) {
+			t.Errorf("expected Reason ResolvedRefs, got %v", compiled.ResolvedRefsCondition.Reason)
+		}
+		if len(compiled.Rules) != 1 || len(compiled.Rules[0].Mirrors) != 1 {
+			t.Fatalf("expected 1 mirror, got %d", len(compiled.Rules[0].Mirrors))
+		}
+		mirror := compiled.Rules[0].Mirrors[0]
+		if mirror.Backend.Host != "mirror-svc.other-ns.svc.cluster.local" {
+			t.Errorf("expected mirror host mirror-svc.other-ns.svc.cluster.local, got %s", mirror.Backend.Host)
+		}
+		if mirror.Numerator != 100 || mirror.Denominator != 100 {
+			t.Errorf("expected fraction 100/100, got %d/%d", mirror.Numerator, mirror.Denominator)
+		}
+	})
+
+	t.Run("mirror percent and fraction options", func(t *testing.T) {
+		routePercent := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "mirror-percent"},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						Filters: []gatewayv1.GRPCRouteFilter{
+							{
+								Type: gatewayv1.GRPCRouteFilterRequestMirror,
+								RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+									BackendRef: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: &port8080,
+									},
+									Percent: Ptr(int32(40)),
+								},
+							},
+						},
+						BackendRefs: []gatewayv1.GRPCBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: &port8080,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		compiled := CompileGRPCRoute(routePercent, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionTrue {
+			t.Errorf("expected ValidationCondition True, got %v", compiled.ValidationCondition.Status)
+		}
+		if len(compiled.Rules[0].Mirrors) != 1 || compiled.Rules[0].Mirrors[0].Numerator != 40 || compiled.Rules[0].Mirrors[0].Denominator != 100 {
+			t.Errorf("expected 40/100 mirror, got %+v", compiled.Rules[0].Mirrors)
+		}
+	})
+}
+
+func TestGRPCRoute_ExtensionRef_And_UnsupportedFilters(t *testing.T) {
+	port8080 := gatewayv1.PortNumber(8080)
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+		},
+	}
+
+	t.Run("rule-level ExtensionRef rejected with UnsupportedValue", func(t *testing.T) {
+		route := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "extref-rule", Namespace: "default"},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						Filters: []gatewayv1.GRPCRouteFilter{
+							{
+								Type: gatewayv1.GRPCRouteFilterExtensionRef,
+								ExtensionRef: &gatewayv1.LocalObjectReference{
+									Group: "custom.example.com",
+									Kind:  "CustomFilter",
+									Name:  "my-filter",
+								},
+							},
+						},
+						BackendRefs: []gatewayv1.GRPCBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: &port8080,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileGRPCRoute(route, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %v", compiled.ValidationCondition.Reason)
+		}
+		if len(compiled.Rules[0].Backends) != 0 {
+			t.Errorf("expected 0 backends on invalid rule, got %d", len(compiled.Rules[0].Backends))
+		}
+
+		routeState := &GRPCRouteState{GRPCRoute: route, Internal: compiled}
+		if err := routeState.Validate(); err == nil {
+			t.Errorf("expected Validate() error, got nil")
+		}
+	})
+
+	t.Run("backend-level ExtensionRef rejected with UnsupportedValue", func(t *testing.T) {
+		route := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "extref-backend", Namespace: "default"},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						BackendRefs: []gatewayv1.GRPCBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: &port8080,
+									},
+								},
+								Filters: []gatewayv1.GRPCRouteFilter{
+									{
+										Type: gatewayv1.GRPCRouteFilterExtensionRef,
+										ExtensionRef: &gatewayv1.LocalObjectReference{
+											Group: "custom.example.com",
+											Kind:  "CustomFilter",
+											Name:  "my-filter",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileGRPCRoute(route, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %v", compiled.ValidationCondition.Reason)
+		}
+
+		routeState := &GRPCRouteState{GRPCRoute: route, Internal: compiled}
+		if err := routeState.Validate(); err == nil {
+			t.Errorf("expected Validate() error, got nil")
+		}
+	})
+
+	t.Run("backend-level RequestMirror rejected with UnsupportedValue", func(t *testing.T) {
+		route := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "mirror-backend", Namespace: "default"},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						BackendRefs: []gatewayv1.GRPCBackendRef{
+							{
+								BackendRef: gatewayv1.BackendRef{
+									BackendObjectReference: gatewayv1.BackendObjectReference{
+										Name: "backend-svc",
+										Port: &port8080,
+									},
+								},
+								Filters: []gatewayv1.GRPCRouteFilter{
+									{
+										Type: gatewayv1.GRPCRouteFilterRequestMirror,
+										RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+											BackendRef: gatewayv1.BackendObjectReference{
+												Name: "backend-svc",
+												Port: &port8080,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileGRPCRoute(route, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %v", compiled.ValidationCondition.Reason)
+		}
+	})
+
+	t.Run("rule-level unknown filter rejected with UnsupportedValue", func(t *testing.T) {
+		route := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "unknown-filter", Namespace: "default"},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						Filters: []gatewayv1.GRPCRouteFilter{
+							{
+								Type: gatewayv1.GRPCRouteFilterType("CompletelyUnknown"),
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileGRPCRoute(route, services, nil, nil, nil)
+		if compiled.ValidationCondition.Status != metav1.ConditionFalse {
+			t.Errorf("expected ValidationCondition False, got %v", compiled.ValidationCondition.Status)
+		}
+		if compiled.ValidationCondition.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason UnsupportedValue, got %v", compiled.ValidationCondition.Reason)
+		}
+	})
 }

@@ -160,7 +160,68 @@ func CompileGRPCRoute(
 			seenRuleNames[*rule.Name] = true
 		}
 
-		// 1. Process matches
+		// 1. Process rule filters
+		for _, filter := range rule.Filters {
+			switch filter.Type {
+			case gatewayv1.GRPCRouteFilterRequestHeaderModifier:
+				iRule.RequestHeaderModifier = filter.RequestHeaderModifier
+
+			case gatewayv1.GRPCRouteFilterResponseHeaderModifier:
+				iRule.ResponseHeaderModifier = filter.ResponseHeaderModifier
+
+			case gatewayv1.GRPCRouteFilterRequestMirror:
+				if filter.RequestMirror != nil {
+					mirror, validationErr, refErr := compileRequestMirrorFilter(
+						filter.RequestMirror,
+						"GRPCRoute",
+						route.Namespace,
+						route.Generation,
+						services,
+						sortedTLSPolicies,
+						configMaps,
+						refValidator,
+					)
+					if validationErr != nil {
+						if validationCondition.Status == metav1.ConditionTrue {
+							validationCondition = validationErr.Condition
+						}
+						if iRule.Error == nil {
+							iRule.Error = validationErr
+						}
+					}
+					if refErr != nil {
+						if resolvedRefsCondition.Status == metav1.ConditionTrue {
+							resolvedRefsCondition = refErr.Condition
+						}
+					}
+					if mirror != nil {
+						iRule.Mirrors = append(iRule.Mirrors, *mirror)
+					}
+				}
+
+			default:
+				msg := fmt.Sprintf("unsupported filter type: %s", filter.Type)
+				errCond := NewCondition(
+					string(gatewayv1.RouteConditionAccepted),
+					metav1.ConditionFalse,
+					string(gatewayv1.RouteReasonUnsupportedValue),
+					msg,
+					route.Generation,
+				)
+				if validationCondition.Status == metav1.ConditionTrue {
+					validationCondition = errCond
+				}
+				if iRule.Error == nil {
+					iRule.Error = &ErrorState{
+						Condition:      errCond,
+						HTTPStatusCode: http.StatusInternalServerError,
+						HTTPMessage:    msg,
+					}
+				}
+			}
+		}
+
+		// 2. Process matches
 		for _, match := range rule.Matches {
 			iMatch := InternalMatch{}
 			if match.Method != nil {
@@ -249,6 +310,42 @@ func CompileGRPCRoute(
 					break
 				}
 
+				// Backend filters
+				var backendReqHeaderModifier *gatewayv1.HTTPHeaderFilter
+				var backendRespHeaderModifier *gatewayv1.HTTPHeaderFilter
+				var backendFilterErr error
+				for _, filter := range backendRef.Filters {
+					switch filter.Type {
+					case gatewayv1.GRPCRouteFilterRequestHeaderModifier:
+						backendReqHeaderModifier = filter.RequestHeaderModifier
+					case gatewayv1.GRPCRouteFilterResponseHeaderModifier:
+						backendRespHeaderModifier = filter.ResponseHeaderModifier
+					default:
+						backendFilterErr = fmt.Errorf("Unsupported backend filter type: %s", filter.Type)
+					}
+				}
+
+				if backendFilterErr != nil {
+					errCond := NewCondition(
+						string(gatewayv1.RouteConditionAccepted),
+						metav1.ConditionFalse,
+						string(gatewayv1.RouteReasonUnsupportedValue),
+						backendFilterErr.Error(),
+						route.Generation,
+					)
+					if validationCondition.Status == metav1.ConditionTrue {
+						validationCondition = errCond
+					}
+					if iRule.Error == nil {
+						iRule.Error = &ErrorState{
+							Condition:      errCond,
+							HTTPStatusCode: http.StatusInternalServerError,
+							HTTPMessage:    backendFilterErr.Error(),
+						}
+					}
+					break
+				}
+
 				weight := int32(1)
 				if backendRef.Weight != nil {
 					weight = *backendRef.Weight
@@ -258,12 +355,15 @@ func CompileGRPCRoute(
 				}
 
 				backend.Weight = weight
+				backend.RequestHeaderModifier = backendReqHeaderModifier
+				backend.ResponseHeaderModifier = backendRespHeaderModifier
 				iRule.Backends = append(iRule.Backends, *backend)
 			}
 		}
 
 		if iRule.Error != nil {
 			iRule.Backends = nil
+			iRule.Mirrors = nil
 		}
 
 		compiledRules = append(compiledRules, iRule)

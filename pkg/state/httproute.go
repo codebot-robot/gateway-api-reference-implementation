@@ -285,7 +285,9 @@ func CompileHTTPRoute(
 				if filter.RequestMirror != nil {
 					mirror, validationErr, refErr := compileRequestMirrorFilter(
 						filter.RequestMirror,
-						route,
+						"HTTPRoute",
+						route.Namespace,
+						route.Generation,
 						services,
 						sortedTLSPolicies,
 						configMaps,
@@ -950,7 +952,9 @@ func validateBackendTLSPolicy(
 // compileRequestMirrorFilter validates the filter settings and resolves the mirror backend target.
 func compileRequestMirrorFilter(
 	m *gatewayv1.HTTPRequestMirrorFilter,
-	route *gatewayv1.HTTPRoute,
+	routeKind string,
+	routeNamespace string,
+	routeGeneration int64,
 	services map[types.NamespacedName]*corev1.Service,
 	sortedTLSPolicies []*gatewayv1.BackendTLSPolicy,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
@@ -966,7 +970,7 @@ func compileRequestMirrorFilter(
 			metav1.ConditionFalse,
 			string(gatewayv1.RouteReasonUnsupportedValue),
 			msg,
-			route.Generation,
+			routeGeneration,
 		)
 		return nil, &ErrorState{
 			Condition:      errCond,
@@ -981,7 +985,7 @@ func compileRequestMirrorFilter(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonUnsupportedValue),
 				msg,
-				route.Generation,
+				routeGeneration,
 			)
 			return nil, &ErrorState{
 				Condition:      errCond,
@@ -1003,7 +1007,7 @@ func compileRequestMirrorFilter(
 				metav1.ConditionFalse,
 				string(gatewayv1.RouteReasonUnsupportedValue),
 				msg,
-				route.Generation,
+				routeGeneration,
 			)
 			return nil, &ErrorState{
 				Condition:      errCond,
@@ -1017,9 +1021,9 @@ func compileRequestMirrorFilter(
 
 	backend, refErr := resolveBackendTarget(
 		m.BackendRef,
-		"HTTPRoute",
-		route.Namespace,
-		route.Generation,
+		routeKind,
+		routeNamespace,
+		routeGeneration,
 		services,
 		sortedTLSPolicies,
 		configMaps,
