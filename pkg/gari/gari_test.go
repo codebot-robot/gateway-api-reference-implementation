@@ -15,6 +15,7 @@
 package gari
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -65,6 +66,18 @@ func TestDefaultOptions(t *testing.T) {
 	}
 	if opts.HealthProbeBindAddress != ":8081" {
 		t.Errorf("expected probe addr :8081, got %q", opts.HealthProbeBindAddress)
+	}
+	if opts.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("expected read header timeout 10s, got %v", opts.ReadHeaderTimeout)
+	}
+	if opts.IdleTimeout != 60*time.Second {
+		t.Errorf("expected idle timeout 60s, got %v", opts.IdleTimeout)
+	}
+	if opts.TCPIdleTimeout != 0 {
+		t.Errorf("expected tcp idle timeout 0, got %v", opts.TCPIdleTimeout)
+	}
+	if opts.TCPMaxConnections != 10000 {
+		t.Errorf("expected tcp max connections 10000, got %d", opts.TCPMaxConnections)
 	}
 }
 
@@ -1435,5 +1448,299 @@ func TestInProcessDataplanePublisher_MultipleGatewaysDistinctCertificates(t *tes
 
 	if bytes.Equal(gotA.Certificate[0], gotB.Certificate[0]) {
 		t.Errorf("expected distinct certificates for a.example.com and b.example.com, but got identical certificates")
+	}
+}
+
+func TestHTTP_ReadHeaderTimeout_SlowlorisClosed(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer httpLis.Close()
+
+	opts := Options{
+		HTTPListener:      httpLis,
+		ProxyHTTPSAddr:    "",
+		ReadHeaderTimeout: 100 * time.Millisecond,
+		Scheme:            DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = server.StartProxyServers(ctx)
+	}()
+
+	conn, err := net.DialTimeout("tcp", httpLis.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial server: %v", err)
+	}
+	defer conn.Close()
+
+	// Send partial headers without closing CRLF CRLF (slowloris)
+	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: example.com\r\n")); err != nil {
+		t.Fatalf("failed to write partial headers: %v", err)
+	}
+
+	// Read until connection is closed by server
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	start := time.Now()
+	buf := make([]byte, 1024)
+	for {
+		_, rerr := conn.Read(buf)
+		if rerr != nil {
+			break
+		}
+	}
+	elapsed := time.Since(start)
+
+	if elapsed < 50*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("expected connection to be closed around 100ms, elapsed %v", elapsed)
+	}
+}
+
+type stallClientConn struct {
+	net.Conn
+	firstWriteDone bool
+	serverClosed   chan struct{}
+}
+
+func (c *stallClientConn) Write(b []byte) (int, error) {
+	if !c.firstWriteDone {
+		c.firstWriteDone = true
+		return c.Conn.Write(b)
+	}
+	<-c.serverClosed
+	return 0, net.ErrClosed
+}
+
+func TestHTTPS_TLSStallAfterClientHello_ClosedOnReadHeaderTimeout(t *testing.T) {
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer httpsLis.Close()
+
+	opts := Options{
+		HTTPSListener:     httpsLis,
+		ProxyAddr:         "",
+		ReadHeaderTimeout: 150 * time.Millisecond,
+		Scheme:            DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = server.StartProxyServers(ctx)
+	}()
+
+	rawConn, err := net.DialTimeout("tcp", httpsLis.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial https listener: %v", err)
+	}
+	defer rawConn.Close()
+
+	stall := &stallClientConn{
+		Conn:         rawConn,
+		serverClosed: make(chan struct{}),
+	}
+
+	tlsClient := tls.Client(stall, &tls.Config{
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+	})
+
+	errCh := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		errCh <- tlsClient.Handshake()
+	}()
+
+	// Detect when server closes connection
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			_, err := rawConn.Read(buf)
+			if err != nil {
+				select {
+				case <-stall.serverClosed:
+				default:
+					close(stall.serverClosed)
+				}
+				return
+			}
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatalf("expected stalled TLS handshake to fail, but succeeded")
+		}
+		if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
+			t.Errorf("expected TLS handshake stall to be closed around 150ms, elapsed %v", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for stalled TLS connection to be closed")
+	}
+}
+
+func TestHTTP_IdleTimeout_KeepAliveClosed(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer httpLis.Close()
+
+	opts := Options{
+		HTTPListener:   httpLis,
+		ProxyHTTPSAddr: "",
+		IdleTimeout:    150 * time.Millisecond,
+		Scheme:         DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = server.StartProxyServers(ctx)
+	}()
+
+	conn, err := net.DialTimeout("tcp", httpLis.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	req := "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("failed to write request: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Connection is now idle on keep-alive. Server should close it after IdleTimeout (150ms).
+	start := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	for {
+		_, rerr := reader.Read(buf)
+		if rerr != nil {
+			break
+		}
+	}
+	elapsed := time.Since(start)
+
+	if elapsed < 80*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Errorf("expected keep-alive connection to close around 150ms, elapsed %v", elapsed)
+	}
+}
+
+func TestHTTP_SlowProgressingResponseBody_NotCutOff(t *testing.T) {
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer httpLis.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		flusher, ok := w.(http.Flusher)
+		for i := 0; i < 5; i++ {
+			_, _ = fmt.Fprintf(w, "chunk-%d\n", i)
+			if ok {
+				flusher.Flush()
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+	}))
+	defer backend.Close()
+
+	host, portStr, _ := net.SplitHostPort(backend.Listener.Addr().String())
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	opts := Options{
+		HTTPListener:      httpLis,
+		ProxyHTTPSAddr:    "",
+		ReadHeaderTimeout: 100 * time.Millisecond, // shorter than total response time (200ms)
+		Scheme:            DefaultScheme(),
+	}
+
+	st := state.NewState()
+	p := proxy.NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Rules: []state.InternalRule{
+				{
+					Backends: []state.InternalBackend{
+						{Host: host, Port: int32(port), Weight: 1},
+					},
+				},
+			},
+		},
+	})
+
+	server := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = server.StartProxyServers(ctx)
+	}()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://" + httpLis.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("client.Get failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %v", err)
+	}
+
+	expected := "chunk-0\nchunk-1\nchunk-2\nchunk-3\nchunk-4\n"
+	if string(bodyBytes) != expected {
+		t.Errorf("expected body %q, got %q", expected, string(bodyBytes))
 	}
 }

@@ -42,6 +42,14 @@ import (
 )
 
 // Proxy is a minimal implementation of a Gateway API proxy.
+const (
+	// DefaultTCPIdleTimeout is the default duration after which an idle spliced TCP connection expires (0 = disabled).
+	DefaultTCPIdleTimeout = 0
+
+	// DefaultTCPMaxConnections is the default maximum number of concurrent TCP connections per listener.
+	DefaultTCPMaxConnections = 10000
+)
+
 type Proxy struct {
 	mu           sync.RWMutex
 	routes       []state.InternalRoute
@@ -52,10 +60,12 @@ type Proxy struct {
 	sniConfig              atomic.Pointer[sniConfig]
 	clientValidationConfig atomic.Pointer[clientValidationConfig]
 
-	tcpListeners map[gatewayv1.PortNumber]*tcpPortListener
-	tcpBindHost  string
-	listenFunc   func(network, addr string) (net.Listener, error)
-	dialFunc     func(network, addr string) (net.Conn, error)
+	tcpListeners      map[gatewayv1.PortNumber]*tcpPortListener
+	tcpBindHost       string
+	tcpIdleTimeout    time.Duration
+	tcpMaxConnections int
+	listenFunc        func(network, addr string) (net.Listener, error)
+	dialFunc          func(network, addr string) (net.Conn, error)
 
 	udpListeners     map[gatewayv1.PortNumber]*udpPortListener
 	udpBindHost      string
@@ -67,11 +77,13 @@ type Proxy struct {
 }
 
 type tcpPortListener struct {
-	port     gatewayv1.PortNumber
-	ln       net.Listener
-	backends atomic.Pointer[[]state.InternalTCPBackend]
-	closed   atomic.Bool
-	done     chan struct{}
+	port        gatewayv1.PortNumber
+	ln          net.Listener
+	backends    atomic.Pointer[[]state.InternalTCPBackend]
+	closed      atomic.Bool
+	done        chan struct{}
+	activeConns atomic.Int64
+	maxConns    atomic.Int64
 }
 
 type sniConfig struct {
@@ -87,13 +99,15 @@ type clientValidationConfig struct {
 
 func NewProxy() *Proxy {
 	p := &Proxy{
-		routes:         []state.InternalRoute{},
-		listeners:      []state.InternalListener{},
-		certificates:   make(map[string]*tls.Certificate),
-		tcpListeners:   make(map[gatewayv1.PortNumber]*tcpPortListener),
-		udpListeners:   make(map[gatewayv1.PortNumber]*udpPortListener),
-		udpIdleTimeout: DefaultUDPIdleTimeout,
-		udpMaxSessions: DefaultUDPMaxSessions,
+		routes:            []state.InternalRoute{},
+		listeners:         []state.InternalListener{},
+		certificates:      make(map[string]*tls.Certificate),
+		tcpListeners:      make(map[gatewayv1.PortNumber]*tcpPortListener),
+		tcpIdleTimeout:    DefaultTCPIdleTimeout,
+		tcpMaxConnections: DefaultTCPMaxConnections,
+		udpListeners:      make(map[gatewayv1.PortNumber]*udpPortListener),
+		udpIdleTimeout:    DefaultUDPIdleTimeout,
+		udpMaxSessions:    DefaultUDPMaxSessions,
 	}
 	p.sniConfig.Store(&sniConfig{})
 	p.clientValidationConfig.Store(&clientValidationConfig{})
@@ -110,6 +124,35 @@ func (p *Proxy) SetTCPBindHost(host string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.tcpBindHost = host
+}
+
+// SetTCPIdleTimeout sets the idle timeout for spliced TCP connections.
+func (p *Proxy) SetTCPIdleTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tcpIdleTimeout = d
+}
+
+// SetTCPMaxConnections sets the maximum number of concurrent TCP connections per listener.
+func (p *Proxy) SetTCPMaxConnections(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tcpMaxConnections = n
+}
+
+func (p *Proxy) getTCPIdleTimeout() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.tcpIdleTimeout
+}
+
+func (p *Proxy) getTCPMaxConnections() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.tcpMaxConnections <= 0 {
+		return DefaultTCPMaxConnections
+	}
+	return p.tcpMaxConnections
 }
 
 func (p *Proxy) SetUDPBindHost(host string) {
@@ -250,8 +293,14 @@ func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
 		backendsCopy := make([]state.InternalTCPBackend, len(backends))
 		copy(backendsCopy, backends)
 
+		maxConns := p.tcpMaxConnections
+		if maxConns <= 0 {
+			maxConns = DefaultTCPMaxConnections
+		}
+
 		if pl, exists := p.tcpListeners[port]; exists {
 			pl.backends.Store(&backendsCopy)
+			pl.maxConns.Store(int64(maxConns))
 		} else {
 			listenFn := p.listenFunc
 			if listenFn == nil {
@@ -269,6 +318,7 @@ func (p *Proxy) updateTCPListenersLocked(listeners []state.InternalListener) {
 				done: make(chan struct{}),
 			}
 			pl.backends.Store(&backendsCopy)
+			pl.maxConns.Store(int64(maxConns))
 			p.tcpListeners[port] = pl
 			go p.tcpAcceptLoop(pl)
 		}
@@ -289,6 +339,12 @@ func (p *Proxy) tcpAcceptLoop(pl *tcpPortListener) {
 			}
 			continue
 		}
+		maxConns := pl.maxConns.Load()
+		if maxConns > 0 && pl.activeConns.Add(1) > maxConns {
+			pl.activeConns.Add(-1)
+			closeConn(conn)
+			continue
+		}
 		go p.handleTCPConn(conn, pl)
 	}
 }
@@ -303,25 +359,26 @@ func (p *Proxy) getDialFunc() func(network, addr string) (net.Conn, error) {
 }
 
 func (p *Proxy) handleTCPConn(conn net.Conn, pl *tcpPortListener) {
+	defer pl.activeConns.Add(-1)
+	defer closeConn(conn)
+
 	bp := pl.backends.Load()
 	if bp == nil || len(*bp) == 0 {
-		closeConn(conn)
 		return
 	}
 	target, ok := state.PickTCPBackend(*bp)
 	if !ok || target == "" {
-		closeConn(conn)
 		return
 	}
 
 	dialFn := p.getDialFunc()
 	backendConn, err := dialFn("tcp", target)
 	if err != nil {
-		closeConn(conn)
 		return
 	}
 
-	go spliceConns(conn, backendConn)
+	idleTimeout := p.getTCPIdleTimeout()
+	spliceConns(conn, backendConn, idleTimeout)
 }
 
 func (p *Proxy) updateSNIConfigLocked(listeners []state.InternalListener) {

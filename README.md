@@ -33,11 +33,19 @@ HTTP/3 is opt-in and disabled by default.
 
 When HTTP/3 is enabled, HTTPS (TCP) responses automatically include an `Alt-Svc: h3=":<advertised-port>"; ma=86400` header so compatible clients can discover and upgrade to HTTP/3.
 
+### HTTP and HTTPS Support
+
+- **Slow and Idle Client Bounds**:
+  - `ReadHeaderTimeout` (default: 10s, configurable via `--read-header-timeout`): Bounds the time allowed to read HTTP request headers and bounds TLS handshakes. Protects against slowloris attacks and stalled TLS handshakes.
+  - `IdleTimeout` (default: 60s, configurable via `--idle-timeout`): Maximum amount of time to wait for the next request when keep-alives are enabled. Also sets QUIC `MaxIdleTimeout` for HTTP/3 when not explicitly specified in `HTTP3QUICConfig`.
+  - `ReadTimeout` / `WriteTimeout` (default: 0 / disabled, configurable via `--read-timeout` / `--write-timeout`): Unset by default to preserve long-lived streams and slow-progressing response bodies.
+
 ### TCP Support (TCPRoute)
 
 GARI supports `TCPRoute` routing raw TCP traffic on dedicated listener ports.
 
 - **Per-Port Listeners & Splicing**: TCP listeners open individual accept sockets per distinct listener port and splice bidirectional TCP traffic to resolved backends immediately upon connection establishment without waiting for client data (safe for backends that speak first).
+- **Connection Lifecycle & Limits**: Connections can optionally expire after an idle timeout on the splice (default off / 0s, configurable via `--tcp-idle-timeout`) and are capped per listener (default 10000, configurable via `--tcp-max-connections`). New connections exceeding the cap are refused and closed immediately without evicting active connections.
 - **Weighted Routing**: Traffic is distributed across configured backendRefs according to weight; backends with weight `0` receive no traffic.
 - **Per-Gateway Data Plane (Default / Conformance)**: In standard deployment (`singlepod`), each Gateway runs its own data plane Deployment and LoadBalancer Service mapping TCP listener ports directly to matching container ports without collapsing onto shared proxy ports.
 - **Multiple Attached TCPRoutes**: Because raw TCP has no hostnames or paths to demultiplex on, when multiple TCPRoutes attach to the same TCP listener, only the oldest route's backends receive traffic. Subsequent routes targeting the same listener report `Accepted=True` and contribute to the listener's `attachedRoutes` count, but carry no traffic.
@@ -53,6 +61,23 @@ GARI supports `UDPRoute` routing UDP datagram traffic on dedicated listener port
 - **Per-Gateway Data Plane (Default / Conformance)**: In standard deployment (`singlepod`), each Gateway runs its own data plane Deployment and LoadBalancer Service mapping UDP listener ports directly to matching container ports.
 - **Reserved Port**: UDP port 8443 is reserved for HTTP/3; listeners specifying UDP 8443 report `Conflicted=True` with `ProtocolConflict`.
 - **All-in-One Mode Limitation**: In all-in-one mode, the first Gateway wins a UDP port; subsequent Gateways requesting the same port report `Programmed=False` with reason `PortUnavailable`.
+
+### Configuration Flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--read-header-timeout` | `10s` | Maximum duration allowed to read request headers and complete TLS handshakes on HTTP and HTTPS servers. |
+| `--idle-timeout` | `60s` | Maximum duration to wait for the next request on keep-alive connections (and QUIC `MaxIdleTimeout` for HTTP/3). |
+| `--read-timeout` | `0s` (disabled) | Maximum duration for reading the entire request, including body. |
+| `--write-timeout` | `0s` (disabled) | Maximum duration before timing out response writes. |
+| `--tcp-max-connections` | `10000` | Maximum number of concurrent TCP connections per listener. |
+| `--tcp-idle-timeout` | `0s` (disabled) | Idle timeout for spliced TCP connections. |
+| `--udp-max-sessions` | `10000` | Maximum number of concurrent UDP sessions per listener. |
+| `--udp-idle-timeout` | `60s` | Idle timeout for UDP sessions. |
+| `--proxy-bind-address` | `:8000` | Address the proxy binds to for HTTP. |
+| `--proxy-https-bind-address` | `:8443` | Address the proxy binds to for HTTPS. |
+| `--proxy-http3-bind-address` | `""` (disabled) | UDP address the proxy binds to for HTTP/3. |
+| `--proxy-http3-advertised-port` | `0` (inferred) | Port advertised in the `Alt-Svc` header for HTTP/3. |
 
 ## Contributing
 

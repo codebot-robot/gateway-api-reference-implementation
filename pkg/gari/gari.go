@@ -188,6 +188,30 @@ type Options struct {
 	// UDPMaxSessions is the maximum number of concurrent UDP sessions per listener.
 	// Defaults to 10000.
 	UDPMaxSessions int
+
+	// ReadHeaderTimeout is the amount of time allowed to read request headers on HTTP and HTTPS servers.
+	// Defaults to 10s.
+	ReadHeaderTimeout time.Duration
+
+	// ReadTimeout is the maximum duration for reading the entire request, including the body.
+	// Defaults to 0 (disabled).
+	ReadTimeout time.Duration
+
+	// WriteTimeout is the maximum duration before timing out writes of the response.
+	// Defaults to 0 (disabled).
+	WriteTimeout time.Duration
+
+	// IdleTimeout is the maximum amount of time to wait for the next request when keep-alives are enabled.
+	// Defaults to 60s.
+	IdleTimeout time.Duration
+
+	// TCPIdleTimeout is the idle timeout for spliced TCP and TLS passthrough connections.
+	// Defaults to 0 (disabled).
+	TCPIdleTimeout time.Duration
+
+	// TCPMaxConnections is the maximum number of concurrent TCP connections per listener.
+	// Defaults to 10000.
+	TCPMaxConnections int
 }
 
 // DefaultOptions returns standard default options for GARI.
@@ -201,6 +225,10 @@ func DefaultOptions() Options {
 		LeaderElectionID:       "gateway-api-reference-implementation",
 		UDPIdleTimeout:         proxy.DefaultUDPIdleTimeout,
 		UDPMaxSessions:         proxy.DefaultUDPMaxSessions,
+		ReadHeaderTimeout:      10 * time.Second,
+		IdleTimeout:            60 * time.Second,
+		TCPIdleTimeout:         proxy.DefaultTCPIdleTimeout,
+		TCPMaxConnections:      proxy.DefaultTCPMaxConnections,
 	}
 }
 
@@ -213,6 +241,21 @@ func (o *Options) complete() error {
 	}
 	if o.LeaderElectionID == "" {
 		o.LeaderElectionID = "gateway-api-reference-implementation"
+	}
+	if o.UDPIdleTimeout <= 0 {
+		o.UDPIdleTimeout = proxy.DefaultUDPIdleTimeout
+	}
+	if o.UDPMaxSessions <= 0 {
+		o.UDPMaxSessions = proxy.DefaultUDPMaxSessions
+	}
+	if o.ReadHeaderTimeout == 0 {
+		o.ReadHeaderTimeout = 10 * time.Second
+	}
+	if o.IdleTimeout == 0 {
+		o.IdleTimeout = 60 * time.Second
+	}
+	if o.TCPMaxConnections == 0 {
+		o.TCPMaxConnections = proxy.DefaultTCPMaxConnections
 	}
 	if o.DataplaneMode {
 		o.LeaderElection = false
@@ -265,6 +308,12 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.UDPMaxSessions > 0 {
 		p.SetUDPMaxSessions(opts.UDPMaxSessions)
+	}
+	if opts.TCPIdleTimeout > 0 {
+		p.SetTCPIdleTimeout(opts.TCPIdleTimeout)
+	}
+	if opts.TCPMaxConnections > 0 {
+		p.SetTCPMaxConnections(opts.TCPMaxConnections)
 	}
 
 	mgr := opts.Manager
@@ -453,6 +502,41 @@ func parsePort(addr string) (int, error) {
 }
 
 // StartProxyServers starts the HTTP and HTTPS proxy servers and blocks until ctx is canceled.
+func (s *Server) newHTTPServer(handler http.Handler, tlsConfig *tls.Config) *http.Server {
+	readHeaderTimeout := s.opts.ReadHeaderTimeout
+	if readHeaderTimeout <= 0 {
+		if readHeaderTimeout < 0 {
+			readHeaderTimeout = 0
+		} else {
+			readHeaderTimeout = 10 * time.Second
+		}
+	}
+	idleTimeout := s.opts.IdleTimeout
+	if idleTimeout <= 0 {
+		if idleTimeout < 0 {
+			idleTimeout = 0
+		} else {
+			idleTimeout = 60 * time.Second
+		}
+	}
+	readTimeout := s.opts.ReadTimeout
+	if readTimeout < 0 {
+		readTimeout = 0
+	}
+	writeTimeout := s.opts.WriteTimeout
+	if writeTimeout < 0 {
+		writeTimeout = 0
+	}
+	return &http.Server{
+		Handler:           handler,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+	}
+}
+
 func (s *Server) StartProxyServers(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -491,9 +575,7 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				h2s := &http2.Server{}
 				handler = h2c.NewHandler(s.proxy, h2s)
 			}
-			srv := &http.Server{
-				Handler: handler,
-			}
+			srv := s.newHTTPServer(handler, nil)
 			go func() {
 				<-ctx.Done()
 				setupLog.Info("shutting down proxy server")
@@ -566,10 +648,7 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			}
 
 			tlsConfig := s.newTLSConfig()
-			srv := &http.Server{
-				Handler:   handler,
-				TLSConfig: tlsConfig,
-			}
+			srv := s.newHTTPServer(handler, tlsConfig)
 			if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
 				return fmt.Errorf("failed to configure HTTP/2 on HTTPS proxy: %w", err)
 			}
@@ -600,11 +679,29 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			setupLog.Info("starting proxy HTTP/3 server", "addr", h3Conn.LocalAddr().String())
 
 			tlsConfig := s.newTLSConfig()
+			quicConfig := s.opts.HTTP3QUICConfig
+			if quicConfig == nil {
+				quicConfig = &quic.Config{}
+			} else {
+				quicConfig = quicConfig.Clone()
+			}
+			if quicConfig.MaxIdleTimeout == 0 {
+				idleTimeout := s.opts.IdleTimeout
+				if idleTimeout <= 0 {
+					if idleTimeout < 0 {
+						idleTimeout = 0
+					} else {
+						idleTimeout = 60 * time.Second
+					}
+				}
+				quicConfig.MaxIdleTimeout = idleTimeout
+			}
+
 			h3Server := &http3.Server{
 				Handler:    s.proxy,
 				TLSConfig:  tlsConfig,
 				Port:       advertisedH3Port,
-				QUICConfig: s.opts.HTTP3QUICConfig,
+				QUICConfig: quicConfig,
 			}
 
 			go func() {
