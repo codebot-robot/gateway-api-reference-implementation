@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -5076,5 +5077,482 @@ func TestFrontendClientCertValidation_AllowValidOnly_ProgrammedAndServed(t *test
 	certsMap, _ := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
 	if len(certsMap) != 1 {
 		t.Errorf("expected 1 certificate extracted, got %d", len(certsMap))
+	}
+}
+
+func TestHTTPListener_AllInOneModeConflict(t *testing.T) {
+	now := metav1.Now()
+	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw1-older",
+			Namespace:         "default",
+			CreationTimestamp: olderTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-shared",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("example.com")),
+				},
+			},
+		},
+	}
+
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw2-newer",
+			Namespace:         "default",
+			CreationTimestamp: newerTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-shared",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("example.com")),
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	// 1. With AllInOneMode: true
+	inputsAllInOne := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw2, gw1}, // pass in reverse order to ensure sorting works
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputsAllInOne := ComputeOutputs(inputsAllInOne)
+
+	// First gateway (older) wins: Programmed=True
+	gw1Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw1.Name}]
+	var gw1ProgCond *metav1.Condition
+	for _, c := range gw1Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw1ProgCond = &c
+			break
+		}
+	}
+	if gw1ProgCond == nil || gw1ProgCond.Status != metav1.ConditionTrue {
+		t.Errorf("gw1 (older) expected Programmed=True, got %+v", gw1ProgCond)
+	}
+
+	// Second gateway (newer) loses: Programmed=False, reason HostnameConflict
+	gw2Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2ProgCond *metav1.Condition
+	for _, c := range gw2Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2ProgCond = &c
+			break
+		}
+	}
+	if gw2ProgCond == nil || gw2ProgCond.Status != metav1.ConditionFalse || gw2ProgCond.Reason != string(gatewayv1.ListenerReasonHostnameConflict) {
+		t.Errorf("gw2 (newer) expected Programmed=False HostnameConflict, got %+v", gw2ProgCond)
+	}
+	if gw2ProgCond != nil && (!strings.Contains(gw2ProgCond.Message, "default/gw1-older") || !strings.Contains(gw2ProgCond.Message, "example.com")) {
+		t.Errorf("gw2 expected message naming winning Gateway gw1-older and hostname, got %q", gw2ProgCond.Message)
+	}
+
+	// Proxy listeners in all-in-one should only include the first (gw1) listener
+	if len(outputsAllInOne.ProxyListeners) != 1 || outputsAllInOne.ProxyListeners[0].GatewayName.String() != "default/gw1-older" {
+		t.Errorf("expected only gw1 proxy listener, got %+v", outputsAllInOne.ProxyListeners)
+	}
+
+	// 2. With AllInOneMode: false (singlepod mode)
+	inputsSinglePod := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw1, gw2},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   false,
+	}
+
+	outputsSinglePod := ComputeOutputs(inputsSinglePod)
+	gw2SinglePodStatus := outputsSinglePod.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2SinglePodProg *metav1.Condition
+	for _, c := range gw2SinglePodStatus.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2SinglePodProg = &c
+			break
+		}
+	}
+	if gw2SinglePodProg == nil || gw2SinglePodProg.Status != metav1.ConditionTrue {
+		t.Errorf("in singlepod mode, gw2 expected Programmed=True, got %+v", gw2SinglePodProg)
+	}
+	if len(outputsSinglePod.ProxyListeners) != 2 {
+		t.Errorf("in singlepod mode, expected 2 proxy listeners, got %d", len(outputsSinglePod.ProxyListeners))
+	}
+}
+
+func TestHTTPListener_AllInOneModeConflict_Hostnameless(t *testing.T) {
+	now := metav1.Now()
+	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw1-older",
+			Namespace:         "default",
+			CreationTimestamp: olderTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-catchall",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw2-newer",
+			Namespace:         "default",
+			CreationTimestamp: newerTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-catchall",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	inputsAllInOne := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputsAllInOne := ComputeOutputs(inputsAllInOne)
+
+	// Older wins: Programmed=True
+	gw1Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw1.Name}]
+	var gw1ProgCond *metav1.Condition
+	for _, c := range gw1Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw1ProgCond = &c
+			break
+		}
+	}
+	if gw1ProgCond == nil || gw1ProgCond.Status != metav1.ConditionTrue {
+		t.Errorf("gw1 expected Programmed=True, got %+v", gw1ProgCond)
+	}
+
+	// Newer loses: Programmed=False, reason PortUnavailable
+	gw2Status := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2ProgCond *metav1.Condition
+	for _, c := range gw2Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2ProgCond = &c
+			break
+		}
+	}
+	if gw2ProgCond == nil || gw2ProgCond.Status != metav1.ConditionFalse || gw2ProgCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+		t.Errorf("gw2 expected Programmed=False PortUnavailable, got %+v", gw2ProgCond)
+	}
+	if gw2ProgCond != nil && !strings.Contains(gw2ProgCond.Message, "default/gw1-older") {
+		t.Errorf("gw2 expected message naming winning Gateway gw1-older, got %q", gw2ProgCond.Message)
+	}
+
+	if len(outputsAllInOne.ProxyListeners) != 1 || outputsAllInOne.ProxyListeners[0].GatewayName.String() != "default/gw1-older" {
+		t.Errorf("expected only gw1 proxy listener, got %+v", outputsAllInOne.ProxyListeners)
+	}
+}
+
+func TestHTTPListener_AllInOneModeConflict_WildcardVsExact(t *testing.T) {
+	now := metav1.Now()
+	t1 := metav1.NewTime(now.Add(-20 * time.Minute))
+	t2 := metav1.NewTime(now.Add(-15 * time.Minute))
+	t3 := metav1.NewTime(now.Add(-10 * time.Minute))
+	t4 := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw1-wildcard",
+			Namespace:         "default",
+			CreationTimestamp: t1,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-wildcard",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+				},
+			},
+		},
+	}
+
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw2-exact",
+			Namespace:         "default",
+			CreationTimestamp: t2,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-exact",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+				},
+			},
+		},
+	}
+
+	gw3 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw3-wildcard-dup",
+			Namespace:         "default",
+			CreationTimestamp: t3,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-wildcard-dup",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+				},
+			},
+		},
+	}
+
+	gw4 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw4-exact-dup",
+			Namespace:         "default",
+			CreationTimestamp: t4,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http-exact-dup",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw4, gw3, gw2, gw1},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputs := ComputeOutputs(inputs)
+
+	getProgCond := func(gwName string) *metav1.Condition {
+		status := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gwName}]
+		for _, c := range status.Listeners[0].Conditions {
+			if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+				return &c
+			}
+		}
+		return nil
+	}
+
+	// gw1 (*.example.com) and gw2 (foo.example.com) do NOT conflict with each other
+	gw1Prog := getProgCond("gw1-wildcard")
+	if gw1Prog == nil || gw1Prog.Status != metav1.ConditionTrue {
+		t.Errorf("gw1 expected Programmed=True, got %+v", gw1Prog)
+	}
+
+	gw2Prog := getProgCond("gw2-exact")
+	if gw2Prog == nil || gw2Prog.Status != metav1.ConditionTrue {
+		t.Errorf("gw2 expected Programmed=True (wildcard vs exact overlap allowed), got %+v", gw2Prog)
+	}
+
+	// gw3 conflicts with gw1 (*.example.com)
+	gw3Prog := getProgCond("gw3-wildcard-dup")
+	if gw3Prog == nil || gw3Prog.Status != metav1.ConditionFalse || gw3Prog.Reason != string(gatewayv1.ListenerReasonHostnameConflict) {
+		t.Errorf("gw3 expected Programmed=False HostnameConflict, got %+v", gw3Prog)
+	}
+	if gw3Prog != nil && !strings.Contains(gw3Prog.Message, "default/gw1-wildcard") {
+		t.Errorf("gw3 expected message naming gw1-wildcard, got %q", gw3Prog.Message)
+	}
+
+	// gw4 conflicts with gw2 (foo.example.com)
+	gw4Prog := getProgCond("gw4-exact-dup")
+	if gw4Prog == nil || gw4Prog.Status != metav1.ConditionFalse || gw4Prog.Reason != string(gatewayv1.ListenerReasonHostnameConflict) {
+		t.Errorf("gw4 expected Programmed=False HostnameConflict, got %+v", gw4Prog)
+	}
+	if gw4Prog != nil && !strings.Contains(gw4Prog.Message, "default/gw2-exact") {
+		t.Errorf("gw4 expected message naming gw2-exact, got %q", gw4Prog.Message)
+	}
+
+	// Proxy listeners should contain only gw1 and gw2
+	if len(outputs.ProxyListeners) != 2 {
+		t.Fatalf("expected 2 proxy listeners (gw1 and gw2), got %d", len(outputs.ProxyListeners))
+	}
+	proxyGWs := map[string]bool{
+		outputs.ProxyListeners[0].GatewayName.String(): true,
+		outputs.ProxyListeners[1].GatewayName.String(): true,
+	}
+	if !proxyGWs["default/gw1-wildcard"] || !proxyGWs["default/gw2-exact"] {
+		t.Errorf("expected proxy listeners from gw1 and gw2, got %+v", outputs.ProxyListeners)
+	}
+}
+
+func TestHTTPSAndTLSListener_AllInOneModeConflict(t *testing.T) {
+	now := metav1.Now()
+	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	certPEM, keyPEM := generateTestCertPEM(t, "secure.example.com")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: "default"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw1-https",
+			Namespace:         "default",
+			CreationTimestamp: olderTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("secure.example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "tls-secret"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw2-tls",
+			Namespace:         "default",
+			CreationTimestamp: newerTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "tls",
+					Port:     443,
+					Protocol: gatewayv1.TLSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("secure.example.com")),
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw2, gw1},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		Secrets:        map[types.NamespacedName]*corev1.Secret{types.NamespacedName{Namespace: "default", Name: "tls-secret"}: secret},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputs := ComputeOutputs(inputs)
+
+	gw1Status := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw1.Name}]
+	var gw1ProgCond *metav1.Condition
+	for _, c := range gw1Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw1ProgCond = &c
+			break
+		}
+	}
+	if gw1ProgCond == nil || gw1ProgCond.Status != metav1.ConditionTrue {
+		t.Errorf("gw1 expected Programmed=True, got %+v", gw1ProgCond)
+	}
+
+	gw2Status := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw2.Name}]
+	var gw2ProgCond *metav1.Condition
+	for _, c := range gw2Status.Listeners[0].Conditions {
+		if c.Type == string(gatewayv1.ListenerConditionProgrammed) {
+			gw2ProgCond = &c
+			break
+		}
+	}
+	if gw2ProgCond == nil || gw2ProgCond.Status != metav1.ConditionFalse || gw2ProgCond.Reason != string(gatewayv1.ListenerReasonHostnameConflict) {
+		t.Errorf("gw2 expected Programmed=False HostnameConflict, got %+v", gw2ProgCond)
+	}
+	if gw2ProgCond != nil && !strings.Contains(gw2ProgCond.Message, "default/gw1-https") {
+		t.Errorf("gw2 expected message naming winning Gateway gw1-https, got %q", gw2ProgCond.Message)
+	}
+
+	if len(outputs.ProxyListeners) != 1 || outputs.ProxyListeners[0].GatewayName.String() != "default/gw1-https" {
+		t.Errorf("expected only gw1 proxy listener, got %+v", outputs.ProxyListeners)
 	}
 }
