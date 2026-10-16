@@ -39,6 +39,13 @@ When HTTP/3 is enabled, HTTPS (TCP) responses automatically include an `Alt-Svc:
   - `ReadHeaderTimeout` (default: 10s, configurable via `--read-header-timeout`): Bounds the time allowed to read HTTP request headers and bounds TLS handshakes. Protects against slowloris attacks and stalled TLS handshakes.
   - `IdleTimeout` (default: 60s, configurable via `--idle-timeout`): Maximum amount of time to wait for the next request when keep-alives are enabled. Also sets QUIC `MaxIdleTimeout` for HTTP/3 when not explicitly specified in `HTTP3QUICConfig`.
   - `ReadTimeout` / `WriteTimeout` (default: 0 / disabled, configurable via `--read-timeout` / `--write-timeout`): Unset by default to preserve long-lived streams and slow-progressing response bodies.
+- **Forwarded Headers and Trust Policy**:
+  Outbound requests across all HTTP forwarding paths (standard forwarding, WebSocket upgrades, and request mirrors) are stamped with consistent forwarded headers:
+  - `X-Forwarded-Proto`: Set to `https` when the client connection used TLS or HTTP/3, and `http` for plaintext requests. Any client-supplied value is untrusted and replaced.
+  - `X-Forwarded-Host`: When a route applies a `URLRewrite` that modifies the hostname, `X-Forwarded-Host` carries the original pre-rewrite `Host` requested by the client, while the outbound `Host` header carries the rewritten hostname. When no hostname rewrite occurs, `X-Forwarded-Host` is omitted (and any client-supplied `X-Forwarded-Host` is stripped) because the outbound `Host` header already carries the authoritative client `Host`.
+  - `X-Forwarded-For`:
+    - `append` mode (default): Appends the immediate client IP to any existing `X-Forwarded-For` header. In edge deployments facing untrusted clients, only the rightmost entry added by GARI is trustworthy; earlier entries may have been forged unless GARI is behind an upstream trusted proxy.
+    - `replace` mode (`--forwarded-for-mode=replace`): Drops any client-supplied `X-Forwarded-For` header and sets `X-Forwarded-For` solely to the immediate client IP. This ensures backends only receive verified client IPs when GARI is the edge proxy (first hop).
 
 ### TCP Support (TCPRoute)
 
@@ -74,6 +81,7 @@ GARI supports `UDPRoute` routing UDP datagram traffic on dedicated listener port
 | `--tcp-idle-timeout` | `0s` (disabled) | Idle timeout for spliced TCP connections. |
 | `--udp-max-sessions` | `10000` | Maximum number of concurrent UDP sessions per listener. |
 | `--udp-idle-timeout` | `60s` | Idle timeout for UDP sessions. |
+| `--forwarded-for-mode` | `append` | How to handle `X-Forwarded-For`: `append` (default) or `replace`. |
 | `--proxy-bind-address` | `:8000` | Address the proxy binds to for HTTP. |
 | `--proxy-https-bind-address` | `:8443` | Address the proxy binds to for HTTPS. |
 | `--proxy-http3-bind-address` | `""` (disabled) | UDP address the proxy binds to for HTTP/3. |

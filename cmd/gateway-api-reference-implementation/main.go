@@ -61,6 +61,7 @@ func main() {
 	flag.DurationVar(&opts.WriteTimeout, "write-timeout", opts.WriteTimeout, "The maximum duration before timing out writes of the response (disabled by default).")
 	flag.DurationVar(&opts.TCPIdleTimeout, "tcp-idle-timeout", opts.TCPIdleTimeout, "The idle timeout for TCP connections on spliced listeners (disabled by default).")
 	flag.IntVar(&opts.TCPMaxConnections, "tcp-max-connections", opts.TCPMaxConnections, "The maximum number of concurrent TCP connections per listener.")
+	flag.StringVar((*string)(&opts.ForwardedForMode), "forwarded-for-mode", string(opts.ForwardedForMode), "How to handle X-Forwarded-For: append (default) or replace.")
 	flag.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -92,6 +93,7 @@ func main() {
 			nil,
 			singlepod.WithDataplaneImage(dataplaneImage),
 			singlepod.WithEnableH2C(opts.EnableH2C),
+			singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
 		)
 	}
 

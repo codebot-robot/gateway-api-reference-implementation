@@ -1941,3 +1941,45 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 		t.Errorf("conflicted port 8443 should NOT be declared on Deployment container ports as udp-8443")
 	}
 }
+
+func TestSinglePodAddressProvider_ForwardedForModeArg(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c, WithForwardedForMode("replace"))
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("test-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	_, _, err := p.GatewayAddresses(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	name := ResourceNameForGateway("test-gw")
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: name}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+	hasArg := false
+	for _, arg := range args {
+		if arg == "--forwarded-for-mode=replace" {
+			hasArg = true
+			break
+		}
+	}
+	if !hasArg {
+		t.Errorf("expected container args to include '--forwarded-for-mode=replace', got %v", args)
+	}
+}

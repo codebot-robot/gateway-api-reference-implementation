@@ -206,7 +206,7 @@ func TestProxyRewrite(t *testing.T) {
 				req.URL.RawPath = tt.initialRawPath
 			}
 
-			p.rewrite(req, tt.rewrite, tt.match)
+			req = p.rewrite(req, tt.rewrite, tt.match)
 
 			if req.Host != tt.expectedHost {
 				t.Errorf("expected host %s, got %s", tt.expectedHost, req.Host)
