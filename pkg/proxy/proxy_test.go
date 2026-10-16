@@ -42,6 +42,9 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -2855,5 +2858,241 @@ func TestServeHTTP_PortlessHostMatching(t *testing.T) {
 				t.Errorf("expected X-Matched %q, got %q", tc.wantMatch, got)
 			}
 		})
+	}
+}
+
+func TestProxy_GRPCRoute_HeaderModifiers(t *testing.T) {
+	var receivedMu sync.Mutex
+	var receivedHeaders http.Header
+
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMu.Lock()
+		receivedHeaders = r.Header.Clone()
+		receivedMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("X-Resp-Original", "orig")
+		w.Header().Set("X-Resp-Remove", "to-be-removed")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("grpc-reply"))
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+		w.Header().Set(http.TrailerPrefix+"Grpc-Message", "ok")
+	})
+	backendH2cHandler := h2c.NewHandler(backendHandler, &http2.Server{})
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for backend: %v", err)
+	}
+	defer backendLn.Close()
+	backendSrv := &http.Server{Handler: backendH2cHandler}
+	go backendSrv.Serve(backendLn)
+	defer backendSrv.Close()
+
+	backendHost, backendPortStr, _ := net.SplitHostPort(backendLn.Addr().String())
+	backendPort, _ := strconv.Atoi(backendPortStr)
+
+	h2cProto := "kubernetes.io/h2c"
+	port := gatewayv1.PortNumber(backendPort)
+	serviceName := "my.service"
+	methodName := "Echo"
+
+	grpcRoute := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-grpcroute-modifiers",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Hostnames: []gatewayv1.Hostname{"example.com"},
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Service: &serviceName,
+								Method:  &methodName,
+							},
+						},
+					},
+					Filters: []gatewayv1.GRPCRouteFilter{
+						{
+							Type: gatewayv1.GRPCRouteFilterRequestHeaderModifier,
+							RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "X-Rule-Req-Set", Value: "rule-set-val"},
+								},
+								Add: []gatewayv1.HTTPHeader{
+									{Name: "X-Rule-Req-Add", Value: "rule-add-val"},
+								},
+								Remove: []string{"X-Rule-Req-Remove"},
+							},
+						},
+						{
+							Type: gatewayv1.GRPCRouteFilterResponseHeaderModifier,
+							ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+								Set: []gatewayv1.HTTPHeader{
+									{Name: "X-Rule-Resp-Set", Value: "rule-resp-set-val"},
+								},
+								Add: []gatewayv1.HTTPHeader{
+									{Name: "X-Rule-Resp-Add", Value: "rule-resp-add-val"},
+								},
+								Remove: []string{"X-Resp-Remove"},
+							},
+						},
+					},
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "backend-svc",
+									Port: &port,
+								},
+							},
+							Filters: []gatewayv1.GRPCRouteFilter{
+								{
+									Type: gatewayv1.GRPCRouteFilterRequestHeaderModifier,
+									RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+										Set: []gatewayv1.HTTPHeader{
+											{Name: "X-Backend-Req-Set", Value: "backend-set-val"},
+										},
+									},
+								},
+								{
+									Type: gatewayv1.GRPCRouteFilterResponseHeaderModifier,
+									ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+										Set: []gatewayv1.HTTPHeader{
+											{Name: "X-Backend-Resp-Set", Value: "backend-resp-set-val"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	services := map[types.NamespacedName]*corev1.Service{
+		{Namespace: "default", Name: "backend-svc"}: {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "backend-svc",
+				Namespace: "default",
+			},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{
+						Port:        int32(backendPort),
+						AppProtocol: &h2cProto,
+					},
+				},
+			},
+		},
+	}
+
+	compiled := state.CompileGRPCRoute(grpcRoute, services, nil, nil, nil)
+	if compiled == nil || len(compiled.Rules) != 1 || len(compiled.Rules[0].Backends) != 1 {
+		t.Fatalf("expected compiled GRPCRoute with 1 rule and 1 backend, got %+v", compiled)
+	}
+
+	// Direct compiled backend to the live local test server listener
+	compiled.Rules[0].Backends[0].Host = backendHost
+	compiled.Rules[0].Backends[0].Port = int32(backendPort)
+
+	p := NewProxy()
+	p.UpdateRoutes([]state.InternalRoute{
+		{
+			Hostnames: compiled.Hostnames,
+			Rules:     compiled.Rules,
+		},
+	})
+
+	proxyH2cHandler := h2c.NewHandler(p, &http2.Server{})
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for proxy: %v", err)
+	}
+	defer proxyLn.Close()
+	proxySrv := &http.Server{Handler: proxyH2cHandler}
+	go proxySrv.Serve(proxyLn)
+	defer proxySrv.Close()
+
+	proxyAddr := proxyLn.Addr().String()
+
+	client := &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+	}
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/my.service/Echo", proxyAddr), nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Host = "example.com"
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Add("X-Rule-Req-Add", "orig-req-val")
+	req.Header.Set("X-Rule-Req-Remove", "should-be-deleted")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read body: %v", err)
+	}
+	if string(body) != "grpc-reply" {
+		t.Errorf("expected body 'grpc-reply', got %q", string(body))
+	}
+
+	if gs := resp.Trailer.Get("Grpc-Status"); gs != "0" {
+		t.Errorf("expected Grpc-Status trailer 0, got %q", gs)
+	}
+
+	receivedMu.Lock()
+	defer receivedMu.Unlock()
+
+	// Verify request headers modified before reaching backend
+	if ct := receivedHeaders.Get("Content-Type"); ct != "application/grpc" {
+		t.Errorf("expected Content-Type application/grpc, got %q", ct)
+	}
+	if got := receivedHeaders.Get("X-Rule-Req-Set"); got != "rule-set-val" {
+		t.Errorf("expected X-Rule-Req-Set 'rule-set-val', got %q", got)
+	}
+	reqAddValues := receivedHeaders.Values("X-Rule-Req-Add")
+	if len(reqAddValues) != 2 || reqAddValues[0] != "orig-req-val" || reqAddValues[1] != "rule-add-val" {
+		t.Errorf("expected X-Rule-Req-Add ['orig-req-val', 'rule-add-val'], got %v", reqAddValues)
+	}
+	if got := receivedHeaders.Get("X-Rule-Req-Remove"); got != "" {
+		t.Errorf("expected X-Rule-Req-Remove to be removed, got %q", got)
+	}
+	if got := receivedHeaders.Get("X-Backend-Req-Set"); got != "backend-set-val" {
+		t.Errorf("expected X-Backend-Req-Set 'backend-set-val', got %q", got)
+	}
+
+	// Verify response headers modified before reaching client
+	if got := resp.Header.Get("X-Rule-Resp-Set"); got != "rule-resp-set-val" {
+		t.Errorf("expected X-Rule-Resp-Set 'rule-resp-set-val', got %q", got)
+	}
+	if got := resp.Header.Get("X-Rule-Resp-Add"); got != "rule-resp-add-val" {
+		t.Errorf("expected X-Rule-Resp-Add 'rule-resp-add-val', got %q", got)
+	}
+	if got := resp.Header.Get("X-Resp-Remove"); got != "" {
+		t.Errorf("expected X-Resp-Remove to be removed, got %q", got)
+	}
+	if got := resp.Header.Get("X-Backend-Resp-Set"); got != "backend-resp-set-val" {
+		t.Errorf("expected X-Backend-Resp-Set 'backend-resp-set-val', got %q", got)
+	}
+	if got := resp.Header.Get("X-Resp-Original"); got != "orig" {
+		t.Errorf("expected X-Resp-Original 'orig', got %q", got)
 	}
 }
