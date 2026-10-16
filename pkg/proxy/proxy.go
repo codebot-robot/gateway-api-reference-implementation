@@ -54,6 +54,11 @@ const (
 	ForwardedForModeReplace ForwardedForMode = "replace"
 )
 
+var (
+	defaultForwardedForModeAppend  = ForwardedForModeAppend
+	defaultForwardedForModeReplace = ForwardedForModeReplace
+)
+
 type contextKey string
 
 const (
@@ -80,7 +85,7 @@ type Proxy struct {
 	sniConfig              atomic.Pointer[sniConfig]
 	clientValidationConfig atomic.Pointer[clientValidationConfig]
 
-	forwardedForMode ForwardedForMode
+	forwardedForMode atomic.Pointer[ForwardedForMode]
 
 	tcpListeners      map[gatewayv1.PortNumber]*tcpPortListener
 	tcpBindHost       string
@@ -142,8 +147,8 @@ func NewProxy() *Proxy {
 		clientSessionCache: sni.NewLRUClientSessionCache(256),
 		transports:         make(map[string]http.RoundTripper),
 		ticketConfig:       &tls.Config{},
-		forwardedForMode:   ForwardedForModeAppend,
 	}
+	p.forwardedForMode.Store(&defaultForwardedForModeAppend)
 	p.baseTLSConfig = &tls.Config{
 		GetCertificate:     p.GetCertificate,
 		GetConfigForClient: p.GetConfigForClient,
@@ -235,23 +240,19 @@ func (p *Proxy) SetUDPMaxSessions(n int) {
 
 // SetForwardedForMode sets the forwarding mode for X-Forwarded-For headers (append or replace).
 func (p *Proxy) SetForwardedForMode(mode ForwardedForMode) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	switch strings.ToLower(string(mode)) {
 	case string(ForwardedForModeReplace):
-		p.forwardedForMode = ForwardedForModeReplace
+		p.forwardedForMode.Store(&defaultForwardedForModeReplace)
 	default:
-		p.forwardedForMode = ForwardedForModeAppend
+		p.forwardedForMode.Store(&defaultForwardedForModeAppend)
 	}
 }
 
 func (p *Proxy) getForwardedForMode() ForwardedForMode {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.forwardedForMode == "" {
-		return ForwardedForModeAppend
+	if m := p.forwardedForMode.Load(); m != nil && *m != "" {
+		return *m
 	}
-	return p.forwardedForMode
+	return ForwardedForModeAppend
 }
 
 func getOriginalHost(r *http.Request) string {
@@ -929,10 +930,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Rewrite != nil {
-			if hostname := state.ValueOf(bestRule.Rewrite.Hostname); hostname != "" {
-				r = r.WithContext(context.WithValue(r.Context(), hostRewrittenContextKey, true))
-			}
-			p.rewrite(r, *bestRule.Rewrite, bestMatch)
+			r = p.rewrite(r, *bestRule.Rewrite, bestMatch)
 		}
 		if bestRule.RequestHeaderModifier != nil {
 			p.modifyHeaders(r, *bestRule.RequestHeaderModifier)
@@ -1094,13 +1092,20 @@ func modifyHeaders(header http.Header, modifier gatewayv1.HTTPHeaderFilter) {
 	}
 }
 
-// rewrite modifies the incoming *http.Request in place before it is forwarded to the backend.
-func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *state.InternalMatch) {
+// rewrite returns an updated *http.Request with path and host rewritten before forwarding to the backend.
+func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *state.InternalMatch) *http.Request {
+	if state.ValueOf(rewrite.Hostname) == "" && rewrite.Path == nil {
+		return r
+	}
+	ctx := r.Context()
 	if hostname := state.ValueOf(rewrite.Hostname); hostname != "" {
-		if r.Context().Value(originalHostContextKey) == nil {
-			*r = *r.WithContext(context.WithValue(r.Context(), originalHostContextKey, r.Host))
+		if ctx.Value(originalHostContextKey) == nil {
+			ctx = context.WithValue(ctx, originalHostContextKey, r.Host)
 		}
-		*r = *r.WithContext(context.WithValue(r.Context(), hostRewrittenContextKey, true))
+		ctx = context.WithValue(ctx, hostRewrittenContextKey, true)
+	}
+	r = r.Clone(ctx)
+	if hostname := state.ValueOf(rewrite.Hostname); hostname != "" {
 		r.Host = string(hostname)
 	}
 
@@ -1133,6 +1138,7 @@ func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *s
 			}
 		}
 	}
+	return r
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {

@@ -15,7 +15,6 @@
 package proxy
 
 import (
-	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -97,7 +96,7 @@ func TestForwardedProto(t *testing.T) {
 				inReq.Header.Set("X-Forwarded-Proto", tt.incomingXFP)
 			}
 
-			outReq, _, err := p.buildBackendRequest(context.Background(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
+			outReq, _, err := p.buildBackendRequest(t.Context(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
 			if err != nil {
 				t.Fatalf("buildBackendRequest failed: %v", err)
 			}
@@ -117,11 +116,11 @@ func TestForwardedHost(t *testing.T) {
 		inReq.Header.Set("X-Forwarded-Host", "spoofed.example.com")
 
 		// Rewrite hostname
-		p.rewrite(inReq, state.InternalRewrite{
+		inReq = p.rewrite(inReq, state.InternalRewrite{
 			Hostname: state.Ptr(gatewayv1.PreciseHostname("rewritten.example.com")),
 		}, nil)
 
-		outReq, _, err := p.buildBackendRequest(context.Background(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
+		outReq, _, err := p.buildBackendRequest(t.Context(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
 		if err != nil {
 			t.Fatalf("buildBackendRequest failed: %v", err)
 		}
@@ -140,7 +139,7 @@ func TestForwardedHost(t *testing.T) {
 		inReq.Host = "example.com"
 		inReq.Header.Set("X-Forwarded-Host", "spoofed.example.com")
 
-		outReq, _, err := p.buildBackendRequest(context.Background(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
+		outReq, _, err := p.buildBackendRequest(t.Context(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
 		if err != nil {
 			t.Fatalf("buildBackendRequest failed: %v", err)
 		}
@@ -223,7 +222,7 @@ func TestForwardedFor(t *testing.T) {
 				inReq.Header.Add("X-Forwarded-For", xff)
 			}
 
-			outReq, _, err := p.buildBackendRequest(context.Background(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
+			outReq, _, err := p.buildBackendRequest(t.Context(), inReq, state.InternalBackend{Host: "backend.local", Port: 8080}, nil)
 			if err != nil {
 				t.Fatalf("buildBackendRequest failed: %v", err)
 			}
