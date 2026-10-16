@@ -3441,3 +3441,77 @@ func BenchmarkProxy_TLSBackend_Handshakes(b *testing.B) {
 	b.StopTimer()
 	b.ReportMetric(float64(handshakes.Load()), "handshakes")
 }
+
+func TestProxy_ClientSessionCacheDynamicSizing_GrowAndShrink(t *testing.T) {
+	p := NewProxy()
+
+	// Initial default capacity should be 256
+	if cap := p.getClientSessionCache().Capacity(); cap != 256 {
+		t.Fatalf("expected initial capacity 256, got %d", cap)
+	}
+
+	httpsProto := "https"
+	const numBackends = 300
+	backends := make([]state.InternalBackend, numBackends)
+	for i := 0; i < numBackends; i++ {
+		backends[i] = state.InternalBackend{
+			Host:        fmt.Sprintf("backend-%d.local", i),
+			Port:        8443,
+			AppProtocol: &httpsProto,
+			TLSConfig: &state.InternalTLSConfig{
+				Hostname: fmt.Sprintf("backend-%d.local", i),
+			},
+		}
+	}
+
+	// 1. Grow: Configure routes with 300 distinct TLS backends (exceeding old static bound of 128 and default 256)
+	// Capacity should be clamp(2 * 300, 256, 65536) = 600
+	route := state.InternalRoute{
+		Rules: []state.InternalRule{
+			{Backends: backends},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{route})
+
+	cache := p.getClientSessionCache()
+	if cap := cache.Capacity(); cap != 600 {
+		t.Fatalf("expected grown capacity 600, got %d", cap)
+	}
+
+	// Populate sessions for all 300 backends via buildBackendTLSConfig
+	for i := 0; i < numBackends; i++ {
+		cfg := p.buildBackendTLSConfig(backends[i])
+		cfg.ClientSessionCache.Put(fmt.Sprintf("backend-%d.local", i), &tls.ClientSessionState{})
+	}
+
+	if cache.Len() != numBackends {
+		t.Fatalf("expected cache len %d, got %d", numBackends, cache.Len())
+	}
+
+	// Verify resumption cache lookup succeeds for every backend
+	for i := 0; i < numBackends; i++ {
+		cfg := p.buildBackendTLSConfig(backends[i])
+		if _, ok := cfg.ClientSessionCache.Get(fmt.Sprintf("backend-%d.local", i)); !ok {
+			t.Fatalf("expected session state present for backend %d", i)
+		}
+	}
+
+	// 2. Shrink: Update routes with only 50 distinct backends
+	// Capacity should shrink to clamp(2 * 50, 256, 65536) = 256
+	shrunkRoute := state.InternalRoute{
+		Rules: []state.InternalRule{
+			{Backends: backends[:50]},
+		},
+	}
+	p.UpdateRoutes([]state.InternalRoute{shrunkRoute})
+
+	if cap := cache.Capacity(); cap != 256 {
+		t.Fatalf("expected shrunk capacity 256, got %d", cap)
+	}
+	if cache.Len() > 256 {
+		t.Fatalf("expected cache len <= 256 after shrink, got %d", cache.Len())
+	}
+	if cache.Len() != 256 {
+		t.Fatalf("expected cache len 256 (oldest 44 of the 300 evicted), got %d", cache.Len())
+	}
+}

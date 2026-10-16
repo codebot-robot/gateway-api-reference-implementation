@@ -78,7 +78,7 @@ type Proxy struct {
 
 	baseTLSConfig      *tls.Config
 	ticketConfig       *tls.Config
-	clientSessionCache tls.ClientSessionCache
+	clientSessionCache *sni.LRUClientSessionCache
 
 	transportsMu sync.Mutex
 	transports   map[string]http.RoundTripper
@@ -114,11 +114,11 @@ func NewProxy() *Proxy {
 		certificates:       make(map[string]*tls.Certificate),
 		tcpListeners:       make(map[gatewayv1.PortNumber]*tcpPortListener),
 		tcpIdleTimeout:     DefaultTCPIdleTimeout,
-		tcpMaxConnections: DefaultTCPMaxConnections,
+		tcpMaxConnections:  DefaultTCPMaxConnections,
 		udpListeners:       make(map[gatewayv1.PortNumber]*udpPortListener),
 		udpIdleTimeout:     DefaultUDPIdleTimeout,
 		udpMaxSessions:     DefaultUDPMaxSessions,
-		clientSessionCache: tls.NewLRUClientSessionCache(128),
+		clientSessionCache: sni.NewLRUClientSessionCache(256),
 		transports:         make(map[string]http.RoundTripper),
 		ticketConfig:       &tls.Config{},
 	}
@@ -580,12 +580,8 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 				UnwrapSession:  p.unwrapSession,
 			}
 
-			if lis.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
-				// For AllowInsecureFallback, session tickets remain disabled to ensure
-				// fallback validation semantics are evaluated on each connection.
-				cfg.SessionTicketsDisabled = true
-			}
-			// For AllowValidOnly (default): Re-enable session tickets for TLS session resumption.
+			// Validated listeners (both AllowValidOnly and AllowInsecureFallback) have session tickets
+			// enabled for TLS session resumption.
 			//
 			// Trade-off: When session resumption is enabled on a mutual TLS listener, a resumed TLS
 			// handshake (via session ticket) reuses the client certificate verified during the initial
@@ -1275,11 +1271,11 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 	return req, targetURL, nil
 }
 
-func (p *Proxy) getClientSessionCache() tls.ClientSessionCache {
+func (p *Proxy) getClientSessionCache() *sni.LRUClientSessionCache {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.clientSessionCache == nil {
-		p.clientSessionCache = tls.NewLRUClientSessionCache(128)
+		p.clientSessionCache = sni.NewLRUClientSessionCache(256)
 	}
 	return p.clientSessionCache
 }
@@ -1475,16 +1471,37 @@ type idleConnCloser interface {
 
 func (p *Proxy) evictUnusedTransports(activeRoutes []state.InternalRoute) {
 	activeKeys := make(map[string]bool)
+	distinctTLSCount := 0
 	for _, route := range activeRoutes {
 		for _, rule := range route.Rules {
 			for _, b := range rule.Backends {
-				activeKeys[backendTransportKey(b)] = true
+				key := backendTransportKey(b)
+				if !activeKeys[key] {
+					activeKeys[key] = true
+					if strings.HasPrefix(key, "https|") {
+						distinctTLSCount++
+					}
+				}
 			}
 			for _, m := range rule.Mirrors {
-				activeKeys[backendTransportKey(m.Backend)] = true
+				key := backendTransportKey(m.Backend)
+				if !activeKeys[key] {
+					activeKeys[key] = true
+					if strings.HasPrefix(key, "https|") {
+						distinctTLSCount++
+					}
+				}
 			}
 		}
 	}
+
+	desiredCap := 2 * distinctTLSCount
+	if desiredCap < 256 {
+		desiredCap = 256
+	} else if desiredCap > 65536 {
+		desiredCap = 65536
+	}
+	p.getClientSessionCache().SetCapacity(desiredCap)
 
 	p.transportsMu.Lock()
 	defer p.transportsMu.Unlock()
