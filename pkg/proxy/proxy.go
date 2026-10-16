@@ -18,7 +18,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	crypto_rand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -37,6 +36,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"golang.org/x/net/http2"
 	"k8s.io/klog/v2"
@@ -77,13 +77,11 @@ type Proxy struct {
 	listenPacketFunc func(network, addr string) (net.PacketConn, error)
 
 	baseTLSConfig      *tls.Config
+	ticketConfig       *tls.Config
 	clientSessionCache tls.ClientSessionCache
 
 	transportsMu sync.Mutex
 	transports   map[string]http.RoundTripper
-
-	clientValidationTicketKeys map[string][][32]byte
-	clientValidationCAHashes   map[string]string
 
 	closed bool
 }
@@ -111,26 +109,25 @@ type clientValidationConfig struct {
 
 func NewProxy() *Proxy {
 	p := &Proxy{
-		routes:                     []state.InternalRoute{},
-		listeners:                  []state.InternalListener{},
-		certificates:               make(map[string]*tls.Certificate),
-		tcpListeners:               make(map[gatewayv1.PortNumber]*tcpPortListener),
-		tcpIdleTimeout:             DefaultTCPIdleTimeout,
-		tcpMaxConnections:         DefaultTCPMaxConnections,
-		udpListeners:               make(map[gatewayv1.PortNumber]*udpPortListener),
-		udpIdleTimeout:             DefaultUDPIdleTimeout,
-		udpMaxSessions:             DefaultUDPMaxSessions,
-		clientSessionCache:         tls.NewLRUClientSessionCache(128),
-		transports:                 make(map[string]http.RoundTripper),
-		clientValidationTicketKeys: make(map[string][][32]byte),
-		clientValidationCAHashes:   make(map[string]string),
+		routes:             []state.InternalRoute{},
+		listeners:          []state.InternalListener{},
+		certificates:       make(map[string]*tls.Certificate),
+		tcpListeners:       make(map[gatewayv1.PortNumber]*tcpPortListener),
+		tcpIdleTimeout:     DefaultTCPIdleTimeout,
+		tcpMaxConnections: DefaultTCPMaxConnections,
+		udpListeners:       make(map[gatewayv1.PortNumber]*udpPortListener),
+		udpIdleTimeout:     DefaultUDPIdleTimeout,
+		udpMaxSessions:     DefaultUDPMaxSessions,
+		clientSessionCache: tls.NewLRUClientSessionCache(128),
+		transports:         make(map[string]http.RoundTripper),
+		ticketConfig:       &tls.Config{},
 	}
 	p.baseTLSConfig = &tls.Config{
 		GetCertificate:     p.GetCertificate,
 		GetConfigForClient: p.GetConfigForClient,
+		WrapSession:        p.wrapSession,
+		UnwrapSession:      p.unwrapSession,
 	}
-	// Pre-initialize session ticket keys on the base config so cloned or inheriting configs share them.
-	_, _ = p.baseTLSConfig.DecryptTicket(nil, tls.ConnectionState{})
 
 	p.sniConfig.Store(&sniConfig{})
 	p.clientValidationConfig.Store(&clientValidationConfig{})
@@ -471,19 +468,85 @@ func hashCAPEMs(pems [][]byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener) {
-	if p.clientValidationTicketKeys == nil {
-		p.clientValidationTicketKeys = make(map[string][][32]byte)
+const caHashSessionExtraPrefix = "gari-ca-hash:"
+
+func (p *Proxy) wrapSession(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
+	if cs.ServerName != "" {
+		snap := p.clientValidationConfig.Load()
+		if snap != nil && len(snap.listeners) > 0 {
+			matched, matchType := state.MatchListeners(snap.listeners, cs.ServerName)
+			if matchType != state.NoMatch && len(matched) > 0 {
+				selected := matched[0]
+				if selected.ClientValidation != nil {
+					caHash := hashCAPEMs(selected.ClientValidation.CACertPEMs)
+					ss.Extra = append(ss.Extra, []byte(caHashSessionExtraPrefix+caHash))
+				}
+			}
+		}
 	}
-	if p.clientValidationCAHashes == nil {
-		p.clientValidationCAHashes = make(map[string]string)
+	p.mu.Lock()
+	if p.ticketConfig == nil {
+		p.ticketConfig = &tls.Config{}
+	}
+	tc := p.ticketConfig
+	p.mu.Unlock()
+	return tc.EncryptTicket(cs, ss)
+}
+
+func (p *Proxy) unwrapSession(identity []byte, cs tls.ConnectionState) (*tls.SessionState, error) {
+	p.mu.Lock()
+	if p.ticketConfig == nil {
+		p.ticketConfig = &tls.Config{}
+	}
+	tc := p.ticketConfig
+	p.mu.Unlock()
+
+	ss, err := tc.DecryptTicket(identity, cs)
+	if err != nil || ss == nil {
+		return nil, nil
 	}
 
+	var ticketCAHash string
+	for _, extra := range ss.Extra {
+		if bytes.HasPrefix(extra, []byte(caHashSessionExtraPrefix)) {
+			ticketCAHash = string(bytes.TrimPrefix(extra, []byte(caHashSessionExtraPrefix)))
+			break
+		}
+	}
+
+	snap := p.clientValidationConfig.Load()
+	var currentCAHash string
+	hasClientValidation := false
+	if snap != nil && len(snap.listeners) > 0 && cs.ServerName != "" {
+		matched, matchType := state.MatchListeners(snap.listeners, cs.ServerName)
+		if matchType != state.NoMatch && len(matched) > 0 {
+			selected := matched[0]
+			if selected.ClientValidation != nil {
+				hasClientValidation = true
+				currentCAHash = hashCAPEMs(selected.ClientValidation.CACertPEMs)
+			}
+		}
+	}
+
+	if hasClientValidation {
+		// Validated listener: only resume if ticket was minted for the exact current CA set.
+		if ticketCAHash == "" || ticketCAHash != currentCAHash {
+			return nil, nil
+		}
+	} else {
+		// Unvalidated listener: do not resume tickets minted under a validated listener.
+		if ticketCAHash != "" {
+			return nil, nil
+		}
+	}
+
+	return ss, nil
+}
+
+func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener) {
 	var httpsListeners []state.InternalListener
 	tlsConfigs := make(map[string]*tls.Config)
 	tlsErrors := make(map[string]error)
-
-	currentListenerNames := make(map[string]bool)
 
 	for _, lis := range listeners {
 		if lis.Protocol != gatewayv1.HTTPSProtocolType {
@@ -492,7 +555,6 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 		httpsListeners = append(httpsListeners, lis)
 
 		if lis.ClientValidation != nil {
-			currentListenerNames[lis.Name] = true
 			servable, reason := isClientValidationServable(lis.ClientValidation)
 			if !servable {
 				klog.Warningf("Listener %q with ClientValidation cannot be served: %s", lis.Name, reason)
@@ -514,47 +576,27 @@ func (p *Proxy) updateClientValidationLocked(listeners []state.InternalListener)
 				ClientCAs:      caPool,
 				GetCertificate: p.GetCertificate,
 				NextProtos:     []string{"h2", "http/1.1"},
+				WrapSession:    p.wrapSession,
+				UnwrapSession:  p.unwrapSession,
 			}
 
 			if lis.ClientValidation.Mode == gatewayv1.AllowInsecureFallback {
 				// For AllowInsecureFallback, session tickets remain disabled to ensure
 				// fallback validation semantics are evaluated on each connection.
 				cfg.SessionTicketsDisabled = true
-			} else {
-				// AllowValidOnly (default): Re-enable session tickets for TLS session resumption.
-				//
-				// Trade-off: When session resumption is enabled on a mutual TLS listener, a resumed TLS
-				// handshake (via session ticket) reuses the client certificate verified during the initial
-				// full handshake without re-verifying the client certificate against the CA pool on every
-				// resumed connection. If a client certificate is revoked or the CA trust pool changes, an
-				// existing session ticket could allow resumption until expired or rotated.
-				// To mitigate this when the CA set changes, the listener's session ticket keys are rotated
-				// (SetSessionTicketKeys) whenever its CA pool changes, invalidating all outstanding session
-				// tickets and forcing full handshakes with re-verification against the new CA set.
-				caHash := hashCAPEMs(lis.ClientValidation.CACertPEMs)
-				oldHash, hasOld := p.clientValidationCAHashes[lis.Name]
-				keys, hasKeys := p.clientValidationTicketKeys[lis.Name]
-
-				if !hasOld || !hasKeys || oldHash != caHash {
-					var newKey [32]byte
-					if _, err := io.ReadFull(crypto_rand.Reader, newKey[:]); err != nil {
-						klog.Errorf("failed to generate session ticket key for listener %s: %v", lis.Name, err)
-					}
-					keys = [][32]byte{newKey}
-					p.clientValidationTicketKeys[lis.Name] = keys
-					p.clientValidationCAHashes[lis.Name] = caHash
-				}
-				cfg.SetSessionTicketKeys(keys)
 			}
+			// For AllowValidOnly (default): Re-enable session tickets for TLS session resumption.
+			//
+			// Trade-off: When session resumption is enabled on a mutual TLS listener, a resumed TLS
+			// handshake (via session ticket) reuses the client certificate verified during the initial
+			// full handshake without re-verifying the client certificate against the CA pool on every
+			// resumed connection. If a client certificate is revoked or the CA trust pool changes, an
+			// existing session ticket could allow resumption until expired or rotated.
+			// To ensure tickets cannot resume after a CA change, WrapSession binds the listener's CA
+			// set hash into the ticket payload (SessionState.Extra), and UnwrapSession refuses to resume
+			// if the ticket's CA hash does not match the listener's current CA set hash.
 
 			tlsConfigs[lis.Name] = cfg
-		}
-	}
-
-	for name := range p.clientValidationCAHashes {
-		if !currentListenerNames[name] {
-			delete(p.clientValidationCAHashes, name)
-			delete(p.clientValidationTicketKeys, name)
 		}
 	}
 
@@ -601,19 +643,26 @@ func (p *Proxy) GetConfigForClient(hello *tls.ClientHelloInfo) (*tls.Config, err
 	return snap.tlsConfigs[selected.Name], nil
 }
 
-// TLSConfig returns a base *tls.Config for HTTPS servers, configured with
-// GetCertificate and GetConfigForClient callbacks wired to this Proxy.
+// TLSConfig returns a cloned base *tls.Config for HTTPS servers, configured with
+// GetCertificate, GetConfigForClient, WrapSession, and UnwrapSession callbacks wired to this Proxy.
+// A clone is returned per caller to ensure servers (e.g. HTTPS http.Server and http3.Server) do not
+// mutate shared TLS configuration fields (such as NextProtos), while still sharing ticket encryption
+// and decryption through Proxy-managed WrapSession and UnwrapSession callbacks.
 func (p *Proxy) TLSConfig() *tls.Config {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.baseTLSConfig == nil {
+		if p.ticketConfig == nil {
+			p.ticketConfig = &tls.Config{}
+		}
 		p.baseTLSConfig = &tls.Config{
 			GetCertificate:     p.GetCertificate,
 			GetConfigForClient: p.GetConfigForClient,
+			WrapSession:        p.wrapSession,
+			UnwrapSession:      p.unwrapSession,
 		}
-		_, _ = p.baseTLSConfig.DecryptTicket(nil, tls.ConnectionState{})
 	}
-	return p.baseTLSConfig
+	return p.baseTLSConfig.Clone()
 }
 
 func (p *Proxy) UpdateCertificates(certs map[string]*tls.Certificate, defaultCert *tls.Certificate) {
@@ -1226,19 +1275,6 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 	return req, targetURL, nil
 }
 
-type prefixedClientSessionCache struct {
-	prefix string
-	cache  tls.ClientSessionCache
-}
-
-func (p *prefixedClientSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
-	return p.cache.Get(p.prefix + sessionKey)
-}
-
-func (p *prefixedClientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
-	p.cache.Put(p.prefix+sessionKey, cs)
-}
-
 func (p *Proxy) getClientSessionCache() tls.ClientSessionCache {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1258,10 +1294,7 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 			clientCertKey = hex.EncodeToString(h[:])
 		}
 	}
-	sessionCache := &prefixedClientSessionCache{
-		prefix: "client-cert:" + clientCertKey + ":",
-		cache:  p.getClientSessionCache(),
-	}
+	sessionCache := sni.NewPrefixedClientSessionCache("client-cert:"+clientCertKey+":", p.getClientSessionCache())
 
 	if backend.TLSConfig == nil {
 		return &tls.Config{

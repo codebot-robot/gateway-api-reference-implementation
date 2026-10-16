@@ -15,6 +15,7 @@
 package sni
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -213,4 +214,29 @@ func ParseSNI(payload []byte) (string, error) {
 	}
 
 	return "", ErrNoSNI
+}
+
+// PrefixedClientSessionCache wraps a tls.ClientSessionCache and namespaces session cache
+// keys with a prefix string (e.g. to isolate client certificates or identities).
+type PrefixedClientSessionCache struct {
+	prefix string
+	cache  tls.ClientSessionCache
+}
+
+// NewPrefixedClientSessionCache returns a tls.ClientSessionCache delegating to cache with keys prefixed by prefix.
+func NewPrefixedClientSessionCache(prefix string, cache tls.ClientSessionCache) tls.ClientSessionCache {
+	return &PrefixedClientSessionCache{
+		prefix: prefix,
+		cache:  cache,
+	}
+}
+
+// Get retrieves a session state with the prefixed session key.
+func (p *PrefixedClientSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
+	return p.cache.Get(p.prefix + sessionKey)
+}
+
+// Put stores a session state with the prefixed session key.
+func (p *PrefixedClientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
+	p.cache.Put(p.prefix+sessionKey, cs)
 }
