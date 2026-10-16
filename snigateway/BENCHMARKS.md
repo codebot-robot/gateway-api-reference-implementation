@@ -220,8 +220,8 @@ sudo sysctl -w net.core.wmem_max=7500000
 - **Optimization**:
   - **Backend Transport Caching**: Cached `http.RoundTripper` per backend (keyed by target address, application protocol, CA cert hash, SANs, and client cert ID), with idle connection closure and cache eviction on route/config changes.
   - **Shared Client Session Cache**: Provided a shared LRU `tls.ClientSessionCache` across all backend TLS configs in `pkg/proxy` and `snigateway/pkg/certs` (with client credential isolation to prevent cross-identity resumption).
-  - **Shared Base Server Config**: Reused a single base `*tls.Config` across HTTPS servers, HTTP/3 servers, and TLSRoute terminate paths, enabling auto-rotated ticket key inheritance and cross-protocol resumption (TCP ↔ HTTP/3).
-  - **Validated Listener Resumption**: Enabled session tickets on `AllowValidOnly` listeners, rotating ticket keys (`SetSessionTicketKeys`) whenever the listener's CA set changes so old tickets stop resuming.
+  - **Shared Server Session Callbacks**: Shared `WrapSession`/`UnwrapSession` callbacks across HTTPS servers, HTTP/3 servers, and TLSRoute terminate paths backed by a dedicated proxy ticket configuration, enabling cross-protocol resumption (TCP ↔ HTTP/3) without sharing mutable config state.
+  - **Validated Listener Resumption**: Enabled session tickets on `AllowValidOnly` listeners by binding the listener's CA set hash into the ticket payload via `WrapSession` and refusing to resume in `UnwrapSession` when the CA set changes.
 - **Numbers (AMD EPYC 9B14, `BenchmarkProxy_TLSBackend_Handshakes`)**:
   - **Handshakes per 1,000 requests to a TLS backend**:
     - **Before**: 1,000 handshakes (1 handshake / request due to per-request `http.Transport` rebuild)

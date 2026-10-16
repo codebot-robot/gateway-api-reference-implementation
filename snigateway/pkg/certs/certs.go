@@ -30,6 +30,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 )
 
 // CertificatePair holds PEM-encoded certificate and private key.
@@ -278,19 +280,6 @@ func NewServerTLSConfigWithCertPool(clientCAPool *x509.CertPool, serverCertPEM, 
 // for TLS session resumption across connections.
 var DefaultClientSessionCache = tls.NewLRUClientSessionCache(128)
 
-type prefixedClientSessionCache struct {
-	prefix string
-	cache  tls.ClientSessionCache
-}
-
-func (p *prefixedClientSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
-	return p.cache.Get(p.prefix + sessionKey)
-}
-
-func (p *prefixedClientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
-	p.cache.Put(p.prefix+sessionKey, cs)
-}
-
 // NewClientTLSConfig creates a *tls.Config for mTLS clients connecting to the frontend.
 func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverName string) (*tls.Config, error) {
 	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
@@ -312,10 +301,7 @@ func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverNam
 		h := sha256.Sum256(clientCert.Certificate[0])
 		clientCertKey = hex.EncodeToString(h[:])
 	}
-	sessionCache := &prefixedClientSessionCache{
-		prefix: "client-cert:" + clientCertKey + ":",
-		cache:  DefaultClientSessionCache,
-	}
+	sessionCache := sni.NewPrefixedClientSessionCache("client-cert:"+clientCertKey+":", DefaultClientSessionCache)
 
 	return &tls.Config{
 		Certificates:       []tls.Certificate{clientCert},
