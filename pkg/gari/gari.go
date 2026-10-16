@@ -131,6 +131,10 @@ type Options struct {
 	// EnableH2C enables HTTP/2 Cleartext (H2C) support on the HTTP proxy server.
 	EnableH2C bool
 
+	// ForwardedForMode specifies how the X-Forwarded-For header is handled: "append" or "replace".
+	// Defaults to "append".
+	ForwardedForMode proxy.ForwardedForMode
+
 	// LeaderElection enables leader election for the controller manager.
 	LeaderElection bool
 
@@ -229,6 +233,7 @@ func DefaultOptions() Options {
 		IdleTimeout:            60 * time.Second,
 		TCPIdleTimeout:         proxy.DefaultTCPIdleTimeout,
 		TCPMaxConnections:      proxy.DefaultTCPMaxConnections,
+		ForwardedForMode:       proxy.ForwardedForModeAppend,
 	}
 }
 
@@ -256,6 +261,11 @@ func (o *Options) complete() error {
 	}
 	if o.TCPMaxConnections == 0 {
 		o.TCPMaxConnections = proxy.DefaultTCPMaxConnections
+	}
+	if o.ForwardedForMode == "" {
+		o.ForwardedForMode = proxy.ForwardedForModeAppend
+	} else if o.ForwardedForMode != proxy.ForwardedForModeAppend && o.ForwardedForMode != proxy.ForwardedForModeReplace {
+		return fmt.Errorf("invalid forwarded-for-mode: %q (must be %q or %q)", o.ForwardedForMode, proxy.ForwardedForModeAppend, proxy.ForwardedForModeReplace)
 	}
 	if o.DataplaneMode {
 		o.LeaderElection = false
@@ -314,6 +324,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.TCPMaxConnections > 0 {
 		p.SetTCPMaxConnections(opts.TCPMaxConnections)
+	}
+	if opts.ForwardedForMode != "" {
+		p.SetForwardedForMode(opts.ForwardedForMode)
 	}
 
 	mgr := opts.Manager

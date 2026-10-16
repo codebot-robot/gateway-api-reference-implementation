@@ -44,6 +44,23 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// ForwardedForMode specifies how the X-Forwarded-For header should be handled.
+type ForwardedForMode string
+
+const (
+	// ForwardedForModeAppend appends the client IP to any existing X-Forwarded-For header.
+	ForwardedForModeAppend ForwardedForMode = "append"
+	// ForwardedForModeReplace replaces any existing X-Forwarded-For header with the client IP.
+	ForwardedForModeReplace ForwardedForMode = "replace"
+)
+
+type contextKey string
+
+const (
+	originalHostContextKey  contextKey = "original-host"
+	hostRewrittenContextKey contextKey = "host-rewritten"
+)
+
 // Proxy is a minimal implementation of a Gateway API proxy.
 const (
 	// DefaultTCPIdleTimeout is the default duration after which an idle spliced TCP connection expires (0 = disabled).
@@ -62,6 +79,8 @@ type Proxy struct {
 
 	sniConfig              atomic.Pointer[sniConfig]
 	clientValidationConfig atomic.Pointer[clientValidationConfig]
+
+	forwardedForMode ForwardedForMode
 
 	tcpListeners      map[gatewayv1.PortNumber]*tcpPortListener
 	tcpBindHost       string
@@ -123,6 +142,7 @@ func NewProxy() *Proxy {
 		clientSessionCache: sni.NewLRUClientSessionCache(256),
 		transports:         make(map[string]http.RoundTripper),
 		ticketConfig:       &tls.Config{},
+		forwardedForMode:   ForwardedForModeAppend,
 	}
 	p.baseTLSConfig = &tls.Config{
 		GetCertificate:     p.GetCertificate,
@@ -211,6 +231,34 @@ func (p *Proxy) SetUDPMaxSessions(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.udpMaxSessions = n
+}
+
+// SetForwardedForMode sets the forwarding mode for X-Forwarded-For headers (append or replace).
+func (p *Proxy) SetForwardedForMode(mode ForwardedForMode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch strings.ToLower(string(mode)) {
+	case string(ForwardedForModeReplace):
+		p.forwardedForMode = ForwardedForModeReplace
+	default:
+		p.forwardedForMode = ForwardedForModeAppend
+	}
+}
+
+func (p *Proxy) getForwardedForMode() ForwardedForMode {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.forwardedForMode == "" {
+		return ForwardedForModeAppend
+	}
+	return p.forwardedForMode
+}
+
+func getOriginalHost(r *http.Request) string {
+	if v, ok := r.Context().Value(originalHostContextKey).(string); ok && v != "" {
+		return v
+	}
+	return r.Host
 }
 
 func (p *Proxy) GetTCPListener(port gatewayv1.PortNumber) net.Listener {
@@ -709,6 +757,9 @@ func splitHostPort(hostPort string, defaultPort int32) (string, int32, bool) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Context().Value(originalHostContextKey) == nil {
+		r = r.WithContext(context.WithValue(r.Context(), originalHostContextKey, r.Host))
+	}
 	p.mu.RLock()
 	routes := p.routes
 	listeners := p.listeners
@@ -878,6 +929,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if bestRule.Rewrite != nil {
+			if hostname := state.ValueOf(bestRule.Rewrite.Hostname); hostname != "" {
+				r = r.WithContext(context.WithValue(r.Context(), hostRewrittenContextKey, true))
+			}
 			p.rewrite(r, *bestRule.Rewrite, bestMatch)
 		}
 		if bestRule.RequestHeaderModifier != nil {
@@ -1043,6 +1097,10 @@ func modifyHeaders(header http.Header, modifier gatewayv1.HTTPHeaderFilter) {
 // rewrite modifies the incoming *http.Request in place before it is forwarded to the backend.
 func (p *Proxy) rewrite(r *http.Request, rewrite state.InternalRewrite, match *state.InternalMatch) {
 	if hostname := state.ValueOf(rewrite.Hostname); hostname != "" {
+		if r.Context().Value(originalHostContextKey) == nil {
+			*r = *r.WithContext(context.WithValue(r.Context(), originalHostContextKey, r.Host))
+		}
+		*r = *r.WithContext(context.WithValue(r.Context(), hostRewrittenContextKey, true))
 		r.Host = string(hostname)
 	}
 
@@ -1209,6 +1267,78 @@ func containsToken(header, token string) bool {
 	return false
 }
 
+// setForwardedHeaders stamps X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host
+// headers on outbound requests forwarded to backends.
+//
+// Forwarded Headers Trust Policy:
+// 1. X-Forwarded-For:
+//   - append mode (default): Appends the immediate downstream client IP to any existing
+//     X-Forwarded-For header received from the client. In an edge deployment facing untrusted clients,
+//     only the rightmost IP address added by GARI is trustworthy; any preceding entries could be
+//     forged by the client unless GARI is deployed behind an upstream trusted proxy.
+//   - replace mode (--forwarded-for-mode=replace): Drops any client-supplied X-Forwarded-For header
+//     and sets X-Forwarded-For solely to the immediate downstream client IP. This is recommended
+//     when GARI is the edge proxy (first hop), ensuring backends receive only verified client IPs.
+//
+// 2. X-Forwarded-Proto:
+//   - Set to "https" when the client connection used TLS (inReq.TLS != nil) or HTTP/3, and "http"
+//     for plaintext requests.
+//   - Any client-supplied X-Forwarded-Proto header is untrusted and always replaced by GARI,
+//     as GARI is the protocol termination and transport boundary.
+//
+// 3. X-Forwarded-Host:
+//   - When URLRewrite modifies the Host header, X-Forwarded-Host is set to the client's
+//     original pre-rewrite Host while the outbound Host header carries the rewritten hostname.
+//   - When no hostname rewrite occurs, X-Forwarded-Host is omitted (and any client-supplied
+//     X-Forwarded-Host is removed) because the outbound Host header already carries the
+//     authoritative client Host.
+//   - Any client-supplied X-Forwarded-Host header is untrusted and dropped/replaced.
+func (p *Proxy) setForwardedHeaders(outReq *http.Request, inReq *http.Request) {
+	// 1. X-Forwarded-For
+	var clientIP string
+	if host, _, err := net.SplitHostPort(inReq.RemoteAddr); err == nil {
+		clientIP = host
+	} else if inReq.RemoteAddr != "" {
+		clientIP = inReq.RemoteAddr
+	}
+
+	mode := p.getForwardedForMode()
+	if mode == ForwardedForModeReplace {
+		if clientIP != "" {
+			outReq.Header.Set("X-Forwarded-For", clientIP)
+		} else {
+			outReq.Header.Del("X-Forwarded-For")
+		}
+	} else {
+		if clientIP != "" {
+			priors := outReq.Header.Values("X-Forwarded-For")
+			if len(priors) > 0 {
+				clientIP = strings.Join(priors, ", ") + ", " + clientIP
+			}
+			outReq.Header.Set("X-Forwarded-For", clientIP)
+		}
+	}
+
+	// 2. X-Forwarded-Proto
+	proto := "http"
+	if inReq.TLS != nil || inReq.ProtoMajor == 3 || strings.HasPrefix(strings.ToUpper(inReq.Proto), "HTTP/3") || strings.EqualFold(inReq.URL.Scheme, "https") {
+		proto = "https"
+	}
+	outReq.Header.Set("X-Forwarded-Proto", proto)
+
+	// 3. X-Forwarded-Host
+	origHost := getOriginalHost(inReq)
+	rewritten, _ := inReq.Context().Value(hostRewrittenContextKey).(bool)
+	if !rewritten && origHost != "" && inReq.Host != "" && origHost != inReq.Host {
+		rewritten = true
+	}
+	if rewritten && origHost != "" {
+		outReq.Header.Set("X-Forwarded-Host", origHost)
+	} else {
+		outReq.Header.Del("X-Forwarded-Host")
+	}
+}
+
 func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backend state.InternalBackend, body io.Reader) (*http.Request, *url.URL, error) {
 	scheme := "http"
 	if strings.EqualFold(state.ValueOf(backend.AppProtocol), "https") {
@@ -1230,18 +1360,7 @@ func (p *Proxy) buildBackendRequest(ctx context.Context, r *http.Request, backen
 	req.Header = r.Header.Clone()
 	removeHopByHopHeaders(req.Header)
 
-	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
-			clientIP = prior + ", " + clientIP
-		}
-		req.Header.Set("X-Forwarded-For", clientIP)
-	} else if r.RemoteAddr != "" {
-		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
-			req.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
-		} else {
-			req.Header.Set("X-Forwarded-For", r.RemoteAddr)
-		}
-	}
+	p.setForwardedHeaders(req, r)
 
 	req.Host = r.Host
 	return req, targetURL, nil
@@ -1615,18 +1734,7 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 		outReq.Header.Del(k)
 	}
 
-	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
-			clientIP = prior + ", " + clientIP
-		}
-		outReq.Header.Set("X-Forwarded-For", clientIP)
-	} else if r.RemoteAddr != "" {
-		if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
-			outReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
-		} else {
-			outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-		}
-	}
+	p.setForwardedHeaders(outReq, r)
 
 	outReq.Host = r.Host
 
@@ -1859,18 +1967,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		outReq.Header = r.Header.Clone()
 		removeHopByHopHeaders(outReq.Header)
 
-		if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
-				clientIP = prior + ", " + clientIP
-			}
-			outReq.Header.Set("X-Forwarded-For", clientIP)
-		} else if r.RemoteAddr != "" {
-			if prior := outReq.Header.Get("X-Forwarded-For"); prior != "" {
-				outReq.Header.Set("X-Forwarded-For", prior+", "+r.RemoteAddr)
-			} else {
-				outReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
-			}
-		}
+		p.setForwardedHeaders(outReq, r)
 
 		outReq.Host = r.Host
 

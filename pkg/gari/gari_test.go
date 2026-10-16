@@ -79,6 +79,38 @@ func TestDefaultOptions(t *testing.T) {
 	if opts.TCPMaxConnections != 10000 {
 		t.Errorf("expected tcp max connections 10000, got %d", opts.TCPMaxConnections)
 	}
+	if opts.ForwardedForMode != proxy.ForwardedForModeAppend {
+		t.Errorf("expected forwarded for mode %q, got %q", proxy.ForwardedForModeAppend, opts.ForwardedForMode)
+	}
+}
+
+func TestForwardedForModeOptions(t *testing.T) {
+	t.Run("default empty completes to append", func(t *testing.T) {
+		opts := Options{}
+		if err := opts.complete(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.ForwardedForMode != proxy.ForwardedForModeAppend {
+			t.Errorf("expected %q, got %q", proxy.ForwardedForModeAppend, opts.ForwardedForMode)
+		}
+	})
+
+	t.Run("valid replace mode", func(t *testing.T) {
+		opts := Options{ForwardedForMode: proxy.ForwardedForModeReplace}
+		if err := opts.complete(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.ForwardedForMode != proxy.ForwardedForModeReplace {
+			t.Errorf("expected %q, got %q", proxy.ForwardedForModeReplace, opts.ForwardedForMode)
+		}
+	})
+
+	t.Run("invalid mode returns error", func(t *testing.T) {
+		opts := Options{ForwardedForMode: "invalid-mode"}
+		if err := opts.complete(); err == nil {
+			t.Fatalf("expected error for invalid forwarded-for-mode, got nil")
+		}
+	})
 }
 
 func TestServerCustomHTTPListener(t *testing.T) {

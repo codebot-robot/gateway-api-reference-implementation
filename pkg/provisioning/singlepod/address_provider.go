@@ -100,6 +100,13 @@ func WithEnableH2C(enable bool) Option {
 	}
 }
 
+// WithForwardedForMode configures the forwarded-for-mode on data-plane instances.
+func WithForwardedForMode(mode string) Option {
+	return func(p *AddressProvider) {
+		p.forwardedForMode = mode
+	}
+}
+
 // WithAPIReader configures the direct API reader for the AddressProvider.
 func WithAPIReader(reader client.Reader) Option {
 	return func(p *AddressProvider) {
@@ -109,10 +116,11 @@ func WithAPIReader(reader client.Reader) Option {
 
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 type AddressProvider struct {
-	client         client.Client
-	apiReader      client.Reader
-	dataplaneImage string
-	enableH2C      bool
+	client           client.Client
+	apiReader        client.Reader
+	dataplaneImage   string
+	enableH2C        bool
+	forwardedForMode string
 }
 
 // NewAddressProvider creates a new singlepod AddressProvider.
@@ -331,6 +339,9 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 	if p.enableH2C {
 		args = append(args, "--enable-h2c")
+	}
+	if p.forwardedForMode != "" {
+		args = append(args, fmt.Sprintf("--forwarded-for-mode=%s", p.forwardedForMode))
 	}
 
 	image := p.dataplaneImage
