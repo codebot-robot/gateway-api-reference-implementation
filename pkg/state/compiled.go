@@ -1117,6 +1117,11 @@ func markListenerConflicted(el *EffectiveListener, reason gatewayv1.ListenerCond
 	))
 }
 
+type portHostnameKey struct {
+	port     gatewayv1.PortNumber
+	hostname string
+}
+
 // CompileModel compiles the effective listeners, route bindings, and statuses across all Gateways and ListenerSets.
 func CompileModel(inputs ModelInputs) *CompiledModel {
 	refValidator := inputs.RefValidator
@@ -1164,6 +1169,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 
 	boundTCPPorts := make(map[gatewayv1.PortNumber]string)
 	boundUDPPorts := make(map[gatewayv1.PortNumber]string)
+	boundHostnames := make(map[portHostnameKey]string)
 
 	for _, gw := range sortedGateways {
 		if gw == nil {
@@ -1285,6 +1291,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		}
 
 		// In all-in-one mode, two Gateways with the same TCP/UDP port cannot both bind; first wins and second reports Programmed=False.
+		// Similarly, HTTP/HTTPS/TLS listeners sharing the same (port, hostname) conflict across Gateways; first wins and second reports Programmed=False.
 		if inputs.AllInOneMode {
 			for _, el := range cg.EffectiveListeners {
 				if el.Protocol == gatewayv1.TCPProtocolType && el.IsAccepted() && !el.IsConflicted() {
@@ -1311,6 +1318,27 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 						))
 					} else {
 						boundUDPPorts[el.Port] = gwKey.String()
+					}
+				}
+				if (el.Protocol == gatewayv1.HTTPProtocolType || el.Protocol == gatewayv1.HTTPSProtocolType || el.Protocol == gatewayv1.TLSProtocolType) && el.IsAccepted() && !el.IsConflicted() {
+					h := strings.ToLower(string(ValueOf(el.Hostname)))
+					key := portHostnameKey{port: el.Port, hostname: h}
+					if firstGW, exists := boundHostnames[key]; exists {
+						reason := gatewayv1.ListenerReasonHostnameConflict
+						msg := fmt.Sprintf("Hostname %q is already bound by Gateway %s on port %d in all-in-one mode", h, firstGW, el.Port)
+						if h == "" {
+							reason = gatewayv1.ListenerReasonPortUnavailable
+							msg = fmt.Sprintf("Port %d is already bound by Gateway %s in all-in-one mode", el.Port, firstGW)
+						}
+						SetCondition(&el.Conditions, NewCondition(
+							string(gatewayv1.ListenerConditionProgrammed),
+							metav1.ConditionFalse,
+							string(reason),
+							msg,
+							el.Generation,
+						))
+					} else {
+						boundHostnames[key] = gwKey.String()
 					}
 				}
 			}

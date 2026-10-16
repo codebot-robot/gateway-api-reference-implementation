@@ -15,6 +15,7 @@
 package state
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -674,5 +675,155 @@ func TestDataplaneConfig_Roundtrip_ClientValidation(t *testing.T) {
 	httpLis := restored.Listeners[1]
 	if httpLis.ClientValidation != nil {
 		t.Errorf("expected http listener ClientValidation to be nil, got %v", httpLis.ClientValidation)
+	}
+}
+
+func TestInProcessDataplanePublisher_ConflictingHostnameCertificates(t *testing.T) {
+	ctx := t.Context()
+
+	now := metav1.Now()
+	olderTime := metav1.NewTime(now.Add(-10 * time.Minute))
+	newerTime := metav1.NewTime(now.Add(-5 * time.Minute))
+
+	certPEM_A, keyPEM_A := generateTestCertPEM(t, "shared.example.com")
+	certPEM_B, keyPEM_B := generateTestCertPEM(t, "shared.example.com")
+
+	secretA := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "secret-a", Namespace: "default"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM_A,
+			corev1.TLSPrivateKeyKey: keyPEM_A,
+		},
+	}
+	secretB := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "secret-b", Namespace: "default"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM_B,
+			corev1.TLSPrivateKeyKey: keyPEM_B,
+		},
+	}
+
+	gwA := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw-a-older",
+			Namespace:         "default",
+			CreationTimestamp: olderTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https-shared",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("shared.example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "secret-a"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	gwB := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw-b-newer",
+			Namespace:         "default",
+			CreationTimestamp: newerTime,
+			Generation:        1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https-shared",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("shared.example.com")),
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "secret-b"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	secrets := map[types.NamespacedName]*corev1.Secret{
+		{Namespace: "default", Name: "secret-a"}: secretA,
+		{Namespace: "default", Name: "secret-b"}: secretB,
+	}
+
+	inputs := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gwB, gwA}, // passed in arbitrary order
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		Secrets:        secrets,
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputs := ComputeOutputs(inputs)
+
+	gwAKey := types.NamespacedName{Namespace: "default", Name: "gw-a-older"}
+	gwBKey := types.NamespacedName{Namespace: "default", Name: "gw-b-newer"}
+
+	cfgA := outputs.DataplaneConfigs[gwAKey]
+	cfgB := outputs.DataplaneConfigs[gwBKey]
+
+	if cfgA == nil {
+		t.Fatalf("expected DataplaneConfig for gw-a-older")
+	}
+	if cfgB == nil {
+		t.Fatalf("expected DataplaneConfig for gw-b-newer")
+	}
+
+	// gw-a-older (winner) carries the certificate for shared.example.com
+	if _, ok := cfgA.HostCertificates["shared.example.com"]; !ok {
+		t.Errorf("gw-a-older expected HostCertificates for shared.example.com")
+	}
+
+	// gw-b-newer (loser, Programmed=False) must NOT carry certificate for shared.example.com
+	if _, ok := cfgB.HostCertificates["shared.example.com"]; ok {
+		t.Errorf("gw-b-newer should NOT carry HostCertificates for shared.example.com when excluded")
+	}
+
+	// Publish both configs to InProcessDataplanePublisher
+	updater := &mockProxyUpdater{}
+	pub := NewInProcessDataplanePublisher(updater)
+	if err := pub.Begin(ctx); err != nil {
+		t.Fatalf("Begin failed: %v", err)
+	}
+	if err := pub.PublishDataplaneConfig(ctx, gwA, cfgA); err != nil {
+		t.Fatalf("PublishDataplaneConfig gwA failed: %v", err)
+	}
+	if err := pub.PublishDataplaneConfig(ctx, gwB, cfgB); err != nil {
+		t.Fatalf("PublishDataplaneConfig gwB failed: %v", err)
+	}
+	if err := pub.Commit(ctx); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// updater must only carry the winner's cert for shared.example.com
+	appliedCert := updater.certs["shared.example.com"]
+	if appliedCert == nil {
+		t.Fatalf("expected cert for shared.example.com in updater, got nil")
+	}
+	expectedCert, err := tls.X509KeyPair(certPEM_A, keyPEM_A)
+	if err != nil {
+		t.Fatalf("failed to parse expected cert A: %v", err)
+	}
+	if !bytes.Equal(appliedCert.Certificate[0], expectedCert.Certificate[0]) {
+		t.Errorf("expected winner (gw-a) certificate to be served for shared.example.com")
 	}
 }
