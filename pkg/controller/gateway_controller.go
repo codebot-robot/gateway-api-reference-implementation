@@ -109,13 +109,7 @@ type AddressTypeProvider interface {
 }
 
 // OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
-type OwnershipConflictError struct {
-	Message string
-}
-
-func (e *OwnershipConflictError) Error() string {
-	return e.Message
-}
+type OwnershipConflictError = state.OwnershipConflictError
 
 // DefaultConflictRequeueDelay is the duration after which a Gateway with an ownership conflict is requeued.
 const DefaultConflictRequeueDelay = time.Minute

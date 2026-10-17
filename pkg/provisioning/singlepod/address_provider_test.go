@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"reflect"
 	"strings"
@@ -601,6 +602,270 @@ func TestSinglePodAddressProvider_OwnershipConflict(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-gw",
+			Namespace: "default",
+			UID:       types.UID("gw-uid-123"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	resName := ResourceNameForGateway("my-gw")
+
+	trueVal := true
+	diffOwnerRef := metav1.OwnerReference{
+		APIVersion: gatewayv1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       "my-gw",
+		UID:        types.UID("different-uid-456"),
+		Controller: &trueVal,
+	}
+
+	existingSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            resName,
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{diffOwnerRef},
+		},
+		Data: map[string][]byte{
+			"custom-key": []byte("original-payload"),
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existingSecret).
+		Build()
+
+	p := NewAddressProvider(cl)
+	ctx := t.Context()
+
+	dpCfg := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "my-gw"},
+	}
+
+	// 1. Direct call to PublishDataplaneConfig returns OwnershipConflictError
+	err := p.PublishDataplaneConfig(ctx, gw, dpCfg)
+	if err == nil {
+		t.Fatalf("expected OwnershipConflictError, got nil")
+	}
+	var conflictErr *controller.OwnershipConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected OwnershipConflictError, got: %v", err)
+	}
+	expectedMsg := fmt.Sprintf("conflict: existing Secret default/%s is not owned by Gateway my-gw", resName)
+	if conflictErr.Error() != expectedMsg {
+		t.Errorf("expected error message %q, got %q", expectedMsg, conflictErr.Error())
+	}
+
+	// 2. Secret data and ownerReferences are unchanged
+	var fetchedSec corev1.Secret
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &fetchedSec); err != nil {
+		t.Fatalf("failed to fetch secret: %v", err)
+	}
+	if string(fetchedSec.Data["custom-key"]) != "original-payload" {
+		t.Errorf("expected secret data to remain unchanged, got %+v", fetchedSec.Data)
+	}
+	if _, ok := fetchedSec.Data[DataplaneSecretDataKey]; ok {
+		t.Errorf("dataplane config key should NOT be present on conflicted secret")
+	}
+	if len(fetchedSec.OwnerReferences) != 1 || fetchedSec.OwnerReferences[0].UID != "different-uid-456" {
+		t.Errorf("expected ownerReferences to remain unchanged, got %+v", fetchedSec.OwnerReferences)
+	}
+
+	// 3. Gateway reports Programmed=False with the conflict message when state recomputes and publishes
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.SetDataplanePublisher(p)
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.Recompute()
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired gateway status")
+	}
+	var progCond *metav1.Condition
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Fatalf("expected Programmed=False/Pending on conflict, got %+v", progCond)
+	}
+	if !strings.Contains(progCond.Message, conflictErr.Error()) {
+		t.Errorf("expected conflict message in condition, got %s", progCond.Message)
+	}
+
+	// 4. Resolve conflict by deleting conflicting secret -> Recompute succeeds and restores Programmed=True
+	if err := cl.Delete(ctx, &fetchedSec); err != nil {
+		t.Fatalf("failed to delete conflicting secret: %v", err)
+	}
+	st.Recompute()
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired gateway status")
+	}
+	progCond = nil
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Fatalf("expected Programmed=True when conflict resolved, got %+v", progCond)
+	}
+}
+
+func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnedAndNew(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+			UID:       types.UID("gw-uid-current"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+	resName := ResourceNameForGateway("test-gw")
+	dpCfg := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
+	}
+
+	t.Run("no existing secret -> created with controller ownerRef", func(t *testing.T) {
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+		p := NewAddressProvider(cl)
+		ctx := t.Context()
+
+		if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
+			t.Fatalf("PublishDataplaneConfig failed: %v", err)
+		}
+
+		var sec corev1.Secret
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &sec); err != nil {
+			t.Fatalf("failed to get created Secret: %v", err)
+		}
+		if _, ok := sec.Data[DataplaneSecretDataKey]; !ok {
+			t.Fatalf("expected DataplaneSecretDataKey in secret data")
+		}
+		ref := metav1.GetControllerOf(&sec)
+		if ref == nil {
+			t.Fatalf("expected controller ownerRef on created secret")
+		}
+		if ref.Kind != "Gateway" || ref.Name != "test-gw" || ref.UID != "gw-uid-current" {
+			t.Errorf("unexpected ownerRef: %+v", ref)
+		}
+	})
+
+	t.Run("secret owned by this Gateway -> applied and updated", func(t *testing.T) {
+		trueVal := true
+		existingSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      resName,
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: gatewayv1.GroupVersion.String(),
+						Kind:       "Gateway",
+						Name:       "test-gw",
+						UID:        types.UID("gw-uid-current"),
+						Controller: &trueVal,
+					},
+				},
+			},
+			Data: map[string][]byte{
+				DataplaneSecretDataKey: []byte(`{"old":"data"}`),
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existingSecret).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+		p := NewAddressProvider(cl)
+		ctx := t.Context()
+
+		if err := p.PublishDataplaneConfig(ctx, gw, dpCfg); err != nil {
+			t.Fatalf("PublishDataplaneConfig failed: %v", err)
+		}
+
+		var sec corev1.Secret
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: "default", Name: resName}, &sec); err != nil {
+			t.Fatalf("failed to get updated Secret: %v", err)
+		}
+		if string(sec.Data[DataplaneSecretDataKey]) == `{"old":"data"}` {
+			t.Errorf("expected Secret data to be updated from old value")
+		}
+		ref := metav1.GetControllerOf(&sec)
+		if ref == nil || ref.UID != "gw-uid-current" {
+			t.Errorf("expected controller ownerRef with matching UID, got: %+v", ref)
+		}
+	})
+
+	t.Run("secret with no ownerRef -> conflict error", func(t *testing.T) {
+		unownedSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      resName,
+				Namespace: "default",
+			},
+			Data: map[string][]byte{
+				"foo": []byte("bar"),
+			},
+		}
+
+		cl := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(unownedSecret).
+			Build()
+		p := NewAddressProvider(cl)
+		ctx := t.Context()
+
+		err := p.PublishDataplaneConfig(ctx, gw, dpCfg)
+		if err == nil {
+			t.Fatalf("expected OwnershipConflictError, got nil")
+		}
+		var conflictErr *controller.OwnershipConflictError
+		if !errors.As(err, &conflictErr) {
+			t.Fatalf("expected OwnershipConflictError, got: %v", err)
+		}
+	})
 }
 
 func TestSinglePodAddressProvider_Watches(t *testing.T) {

@@ -782,6 +782,106 @@ func TestState_GatewayProvisioningErrorStatus(t *testing.T) {
 	}
 }
 
+type mockDataplanePublisher struct {
+	publishErr error
+	published  map[types.NamespacedName]*DataplaneConfig
+}
+
+func (m *mockDataplanePublisher) Begin(ctx context.Context) error  { return nil }
+func (m *mockDataplanePublisher) Commit(ctx context.Context) error { return nil }
+func (m *mockDataplanePublisher) PublishDataplaneConfig(ctx context.Context, gw *gatewayv1.Gateway, config *DataplaneConfig) error {
+	if m.publishErr != nil {
+		return m.publishErr
+	}
+	if m.published == nil {
+		m.published = make(map[types.NamespacedName]*DataplaneConfig)
+	}
+	if gw != nil {
+		m.published[types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}] = config
+	}
+	return nil
+}
+
+func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("example.net/gateway-controller")
+
+	mockPub := &mockDataplanePublisher{
+		publishErr: &OwnershipConflictError{
+			Message: "conflict: existing Secret default/my-gw-gari is not owned by Gateway my-gw",
+		},
+	}
+	st.SetDataplanePublisher(mockPub)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+
+	// 1. Initial recompute publishes config and encounters OwnershipConflictError,
+	// which records the provisioning error and marks state dirty.
+	st.Recompute()
+	// Next recompute folds the recorded conflict into Gateway status.
+	st.Recompute()
+
+	status, ok := st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	var progCond *metav1.Condition
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionFalse || progCond.Message != mockPub.publishErr.Error() {
+		t.Errorf("expected Programmed=False Message=%q, got Status=%s Message=%q", mockPub.publishErr.Error(), progCond.Status, progCond.Message)
+	}
+
+	// 2. Conflict resolved: publisher succeeds, clearing the recorded error.
+	mockPub.publishErr = nil
+	st.Recompute()
+	// Next recompute folds the cleared error into Gateway status, restoring Programmed=True.
+	st.Recompute()
+
+	status, ok = st.GetDesiredGatewayStatus(gwKey)
+	if !ok {
+		t.Fatalf("expected desired status for gateway")
+	}
+	progCond = nil
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			progCond = &status.Conditions[i]
+			break
+		}
+	}
+	if progCond == nil {
+		t.Fatalf("expected Programmed condition")
+	}
+	if progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Programmed=True when conflict resolved, got Status=%s Reason=%s", progCond.Status, progCond.Reason)
+	}
+}
+
 type countingProxyUpdater struct {
 	mu          sync.Mutex
 	updateCount int

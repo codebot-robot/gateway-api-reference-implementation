@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"sync"
@@ -126,6 +127,7 @@ type State struct {
 
 	dataplanePublisher DataplanePublisher
 	lastWrittenConfigs map[types.NamespacedName][]byte
+	publishConflicts   map[types.NamespacedName]struct{}
 
 	previousOutputs *Outputs
 
@@ -175,6 +177,7 @@ func NewState() *State {
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
 		lastWrittenConfigs:     make(map[types.NamespacedName][]byte),
+		publishConflicts:       make(map[types.NamespacedName]struct{}),
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
 		running:                false,
@@ -390,6 +393,15 @@ func (s *State) Recompute() *Outputs {
 	return outputs
 }
 
+// OwnershipConflictError indicates that an existing resource in the cluster is not owned by the Gateway being reconciled.
+type OwnershipConflictError struct {
+	Message string
+}
+
+func (e *OwnershipConflictError) Error() string {
+	return e.Message
+}
+
 // publishDataplaneConfigs iterates through compiled data-plane configs and pushes updates to the publisher.
 // TODO(#637): Publishing is currently synchronous inside Recompute; consider making it asynchronous
 // or streaming (e.g. xDS-like) if cluster size or write latency becomes an issue.
@@ -432,12 +444,27 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 
 		if err := publisher.PublishDataplaneConfig(ctx, cg.Gateway, dpConfig); err != nil {
 			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
+			var conflictErr *OwnershipConflictError
+			if errors.As(err, &conflictErr) {
+				s.mu.Lock()
+				s.publishConflicts[gwKey] = struct{}{}
+				s.mu.Unlock()
+				s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
+			}
 			continue
 		}
 
 		s.mu.Lock()
 		s.lastWrittenConfigs[gwKey] = data
+		_, hadConflict := s.publishConflicts[gwKey]
+		if hadConflict {
+			delete(s.publishConflicts, gwKey)
+		}
 		s.mu.Unlock()
+
+		if hadConflict {
+			s.SetGatewayProvisioningError(gwKey, "")
+		}
 	}
 
 	var removedKeys []types.NamespacedName
@@ -445,6 +472,7 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 	for gwKey := range s.lastWrittenConfigs {
 		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
 			delete(s.lastWrittenConfigs, gwKey)
+			delete(s.publishConflicts, gwKey)
 			removedKeys = append(removedKeys, gwKey)
 		}
 	}
@@ -1075,6 +1103,7 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 			delete(s.gatewayAddresses, key)
 			delete(s.gatewayReadiness, key)
 			delete(s.provisioningErrors, key)
+			delete(s.publishConflicts, key)
 			s.revision++
 			s.markDirtyLocked()
 		}
@@ -1102,6 +1131,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 		delete(s.gatewayAddresses, name)
 		delete(s.gatewayReadiness, name)
 		delete(s.provisioningErrors, name)
+		delete(s.publishConflicts, name)
 		s.revision++
 		s.markDirtyLocked()
 	}
