@@ -25,6 +25,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -3002,6 +3003,103 @@ func TestBackendTLSPolicy_MissingClientCertID_FailsClosed(t *testing.T) {
 		}
 		if !handshakeCompleted.Load() {
 			t.Fatalf("expected TLS handshake to complete successfully")
+		}
+	})
+
+	// 9. Verify buildBackendTLSConfig backstop fails handshake unconditionally even if backend does not request client certificates
+	t.Run("buildBackendTLSConfig backstop fails handshake unconditionally without client auth", func(t *testing.T) {
+		noAuthServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		noAuthServer.TLS = &tls.Config{
+			Certificates: []tls.Certificate{serverCert},
+		}
+		noAuthServer.StartTLS()
+		defer noAuthServer.Close()
+
+		uNoAuth, err := url.Parse(noAuthServer.URL)
+		if err != nil {
+			t.Fatalf("failed to parse test server URL: %v", err)
+		}
+		portNoAuth, _ := strconv.Atoi(uNoAuth.Port())
+
+		missingBackend := state.InternalBackend{
+			Host:        uNoAuth.Hostname(),
+			Port:        int32(portNoAuth),
+			AppProtocol: &httpsProto,
+			TLSConfig: &state.InternalTLSConfig{
+				Hostname:     "backend.local",
+				CACerts:      [][]byte{serverCAPEM},
+				ClientCertID: "missing-cert-id",
+			},
+		}
+
+		tlsCfg := p.buildBackendTLSConfig(missingBackend)
+		if tlsCfg.InsecureSkipVerify {
+			t.Errorf("expected InsecureSkipVerify to be false in backstop config, got true")
+		}
+
+		conn, dialErr := tls.Dial("tcp", noAuthServer.Listener.Addr().String(), tlsCfg)
+		if conn != nil {
+			conn.Close()
+		}
+		if dialErr == nil {
+			t.Fatalf("expected TLS handshake to fail when ClientCertID is set without ClientCert against backend without client auth")
+		}
+		if !errors.Is(dialErr, errMissingClientCert) {
+			t.Fatalf("expected error %v, got %v", errMissingClientCert, dialErr)
+		}
+	})
+
+	t.Run("buildBackendTLSConfig backstop fails handshake against backend requiring client auth", func(t *testing.T) {
+		missingBackend := state.InternalBackend{
+			Host:        host,
+			Port:        int32(port),
+			AppProtocol: &httpsProto,
+			TLSConfig: &state.InternalTLSConfig{
+				Hostname:     "backend.local",
+				CACerts:      [][]byte{serverCAPEM},
+				ClientCertID: "missing-cert-id",
+			},
+		}
+
+		tlsCfg := p.buildBackendTLSConfig(missingBackend)
+		conn, dialErr := tls.Dial("tcp", server.Listener.Addr().String(), tlsCfg)
+		if conn != nil {
+			conn.Close()
+		}
+		if dialErr == nil {
+			t.Fatalf("expected TLS handshake to fail when ClientCertID is set without ClientCert against backend requiring client auth")
+		}
+		if !errors.Is(dialErr, errMissingClientCert) {
+			t.Fatalf("expected error %v, got %v", errMissingClientCert, dialErr)
+		}
+	})
+
+	t.Run("backendMissingClientCert helper behavior", func(t *testing.T) {
+		b := state.InternalBackend{
+			TLSConfig: &state.InternalTLSConfig{
+				ClientCertID: "missing-cert",
+			},
+		}
+		if !backendMissingClientCert(b) {
+			t.Errorf("expected backendMissingClientCert to be true")
+		}
+
+		b.TLSConfig.ClientCert = &clientTLSCert
+		if backendMissingClientCert(b) {
+			t.Errorf("expected backendMissingClientCert to be false when ClientCert is non-nil")
+		}
+
+		b.TLSConfig.ClientCertID = ""
+		b.TLSConfig.ClientCert = nil
+		if backendMissingClientCert(b) {
+			t.Errorf("expected backendMissingClientCert to be false when ClientCertID is empty")
+		}
+
+		b.TLSConfig = nil
+		if backendMissingClientCert(b) {
+			t.Errorf("expected backendMissingClientCert to be false when TLSConfig is nil")
 		}
 	})
 }
