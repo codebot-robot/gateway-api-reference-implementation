@@ -27,6 +27,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -326,12 +327,30 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 		defaultCert = parsedCerts[cfg.DefaultCertID]
 	}
 
+	resolveBackendClientCert := func(backend *InternalBackend) error {
+		if backend.TLSConfig != nil && backend.TLSConfig.ClientCertID != "" {
+			cert, ok := parsedCerts[backend.TLSConfig.ClientCertID]
+			if !ok {
+				klog.Errorf("gateway %s: backend %s:%d specifies ClientCertID %q which is missing from certificates",
+					cfg.GatewayName, backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
+				return fmt.Errorf("gateway %s: backend %s:%d specifies ClientCertID %q which is missing from certificates",
+					cfg.GatewayName, backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
+			}
+			backend.TLSConfig.ClientCert = cert
+		}
+		return nil
+	}
+
 	for i := range cfg.Routes {
 		for j := range cfg.Routes[i].Rules {
 			for k := range cfg.Routes[i].Rules[j].Backends {
-				backend := &cfg.Routes[i].Rules[j].Backends[k]
-				if backend.TLSConfig != nil && backend.TLSConfig.ClientCertID != "" {
-					backend.TLSConfig.ClientCert = parsedCerts[backend.TLSConfig.ClientCertID]
+				if err := resolveBackendClientCert(&cfg.Routes[i].Rules[j].Backends[k]); err != nil {
+					return err
+				}
+			}
+			for k := range cfg.Routes[i].Rules[j].Mirrors {
+				if err := resolveBackendClientCert(&cfg.Routes[i].Rules[j].Mirrors[k].Backend); err != nil {
+					return err
 				}
 			}
 		}
@@ -341,9 +360,13 @@ func ApplyDataplaneConfig(updater ProxyConfigUpdater, data []byte) error {
 		for j := range cfg.Listeners[i].Routes {
 			for k := range cfg.Listeners[i].Routes[j].Rules {
 				for l := range cfg.Listeners[i].Routes[j].Rules[k].Backends {
-					backend := &cfg.Listeners[i].Routes[j].Rules[k].Backends[l]
-					if backend.TLSConfig != nil && backend.TLSConfig.ClientCertID != "" {
-						backend.TLSConfig.ClientCert = parsedCerts[backend.TLSConfig.ClientCertID]
+					if err := resolveBackendClientCert(&cfg.Listeners[i].Routes[j].Rules[k].Backends[l]); err != nil {
+						return err
+					}
+				}
+				for l := range cfg.Listeners[i].Routes[j].Rules[k].Mirrors {
+					if err := resolveBackendClientCert(&cfg.Listeners[i].Routes[j].Rules[k].Mirrors[l].Backend); err != nil {
+						return err
 					}
 				}
 			}
