@@ -73,6 +73,7 @@ func run(ctx context.Context, args []string) error {
 	connectTimeout := fs.Duration("connect-timeout", 10*time.Second, "Timeout for client to dial back and claim pending connection")
 	maxConnections := fs.Int("tcp-max-connections", 10000, "Maximum number of concurrent client connections per listener")
 	idleTimeout := fs.Duration("tcp-idle-timeout", 0, "Idle timeout for spliced client connections (disabled by default)")
+	maxHostnames := fs.Int("max-hostnames-per-session", frontend.DefaultMaxHostnamesPerSession, "Maximum number of hostnames a session may register")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -167,14 +168,15 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	srv, err := frontend.NewServer(frontend.ServerConfig{
-		ListenAddrs:      listenAddrs,
-		UDPListenAddrs:   tunnelListenUDP,
-		InternalHostname: *internalHostname,
-		ServerTLSConfig:  serverTLS,
-		ConnectTimeout:   *connectTimeout,
-		Authorizer:       authorizer,
-		MaxConnections:   *maxConnections,
-		IdleTimeout:      *idleTimeout,
+		ListenAddrs:            listenAddrs,
+		UDPListenAddrs:         tunnelListenUDP,
+		InternalHostname:       *internalHostname,
+		ServerTLSConfig:        serverTLS,
+		ConnectTimeout:         *connectTimeout,
+		Authorizer:             authorizer,
+		MaxConnections:         *maxConnections,
+		IdleTimeout:            *idleTimeout,
+		MaxHostnamesPerSession: *maxHostnames,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing frontend server: %w", err)

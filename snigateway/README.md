@@ -68,17 +68,19 @@ This generates:
 
 ### 2. Run `snigateway-frontend`
 
-Choose one of the following deployment methods depending on your environment. Use `--client-ca` to specify client CA certificate paths and their allowed hostname patterns (e.g. `--client-ca=/path/to/ca.crt='*.example.com,app.example.org'`). If no `--client-ca` flags are provided, `--ca-cert` is used with unrestricted registration (`*`).
+Choose one of the following deployment methods depending on your environment. Use `--client-ca` to specify client CA certificate paths and their allowed hostname patterns (e.g. `--client-ca=certs/ca.crt=*.example.com`). If no `--client-ca` flags are provided, `--ca-cert` is used with unrestricted registration (`*`).
 
 #### Option A: Local Development (`go run`)
 
 ```bash
 go run ./cmd/snigateway-frontend \
   --listen ":8443" \
-  --client-ca certs/ca.crt=* \
+  --client-ca certs/ca.crt=*.example.com \
   --server-cert certs/server.crt \
   --server-key certs/server.key
 ```
+
+> **Note (Development only)**: You may specify `--client-ca certs/ca.crt=*` as a dev-only option to accept any hostname; in a multi-tenant deployment, this allow-all setting lets any backend take over any hostname.
 
 #### Option B: Docker Container
 
@@ -93,7 +95,7 @@ docker run -d \
   snigateway-frontend:latest \
   --listen :8443 \
   --tunnel-listen-udp :8443 \
-  --client-ca /certs/ca.crt=* \
+  --client-ca /certs/ca.crt=*.example.com \
   --server-cert /certs/server.crt \
   --server-key /certs/server.key
 ```
@@ -108,7 +110,7 @@ docker run -d \
   -v $(pwd)/certs:/certs:ro \
   snigateway-frontend:latest \
   --listen :443 \
-  --client-ca /certs/ca.crt=* \
+  --client-ca /certs/ca.crt=*.example.com \
   --server-cert /certs/server.crt \
   --server-key /certs/server.key
 ```

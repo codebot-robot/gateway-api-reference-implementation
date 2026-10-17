@@ -1543,3 +1543,411 @@ func TestFrontendServer_IdleTimeout(t *testing.T) {
 		}
 	})
 }
+
+func setupTestServerWithConfig(t *testing.T, modifyCfg func(*ServerConfig)) (*Server, string, *certs.GeneratedCerts, func()) {
+	t.Helper()
+
+	generated, err := certs.GenerateAll("snigateway.internal", "test-cluster-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certs failed: %v", err)
+	}
+
+	serverTLS, err := certs.NewServerTLSConfig(generated.CA.CertPEM, generated.Server.CertPEM, generated.Server.KeyPEM)
+	if err != nil {
+		t.Fatalf("NewServerTLSConfig failed: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+
+	serverAddr := ln.Addr().String()
+
+	pc, err := net.ListenPacket("udp", serverAddr)
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+
+	cfg := ServerConfig{
+		ServerTLSConfig:   serverTLS,
+		InternalHostname:  "snigateway.internal",
+		ConnectTimeout:    5 * time.Second,
+		PerAttemptTimeout: 500 * time.Millisecond,
+		ReadSNITimeout:    2 * time.Second,
+	}
+	if modifyCfg != nil {
+		modifyCfg(&cfg)
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	go func() {
+		_ = srv.ServeAll([]net.Listener{ln}, []net.PacketConn{pc})
+	}()
+
+	cleanup := func() {
+		_ = srv.Close()
+	}
+
+	return srv, serverAddr, generated, cleanup
+}
+
+func TestRegistration_OversizedBody(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerWithConfig(t, nil)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	ctx := t.Context()
+
+	sessID, _, err := c.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	// 1. Initial valid registration
+	if _, err := c.Register(ctx, sessID, []string{"initial.example.com"}); err != nil {
+		t.Fatalf("initial Register failed: %v", err)
+	}
+	reg := srv.RegistrationTable().GetRegisteredHostnames(sessID)
+	if len(reg) != 1 || reg[0] != "initial.example.com" {
+		t.Fatalf("expected [initial.example.com], got %v", reg)
+	}
+
+	// 2. Send oversized body (> 256 KiB) directly via HTTP PUT
+	largeHostnames := make([]string, 15000)
+	for i := range largeHostnames {
+		largeHostnames[i] = fmt.Sprintf("host-%05d.example.com", i)
+	}
+	body, err := json.Marshal(api.RegistrationRequest{Hostnames: largeHostnames})
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if len(body) <= DefaultMaxRegistrationBodyBytes {
+		t.Fatalf("body length %d <= limit %d", len(body), DefaultMaxRegistrationBodyBytes)
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: clientTLS,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(network, serverAddr)
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "https://snigateway.internal/v1/registration", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequestWithContext failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(api.HeaderSessionID, sessID)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected status 413 (StatusRequestEntityTooLarge), got %d", resp.StatusCode)
+	}
+
+	// 3. Verify no table change occurred
+	regAfter := srv.RegistrationTable().GetRegisteredHostnames(sessID)
+	if len(regAfter) != 1 || regAfter[0] != "initial.example.com" {
+		t.Fatalf("registration table changed after oversized request, expected [initial.example.com], got %v", regAfter)
+	}
+}
+
+func TestRegistration_HostnameCap(t *testing.T) {
+	const cap = 5
+	srv, serverAddr, generated, cleanup := setupTestServerWithConfig(t, func(cfg *ServerConfig) {
+		cfg.MaxHostnamesPerSession = cap
+	})
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	ctx := t.Context()
+
+	t.Run("HTTP path", func(t *testing.T) {
+		c := client.NewClient(serverAddr, clientTLS)
+		sessID, _, err := c.StartSession(ctx)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+
+		// Initial registration: 2 hostnames
+		if _, err := c.Register(ctx, sessID, []string{"h1.example.com", "h2.example.com"}); err != nil {
+			t.Fatalf("initial Register failed: %v", err)
+		}
+
+		// > cap hostnames (6 > 5) -> rejected with 400 Bad Request
+		tooMany := []string{"a1.com", "a2.com", "a3.com", "a4.com", "a5.com", "a6.com"}
+		_, err = c.Register(ctx, sessID, tooMany)
+		if err == nil {
+			t.Fatal("expected registration exceeding cap to fail")
+		}
+		if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "exceeds limit") {
+			t.Fatalf("unexpected error response: %v", err)
+		}
+
+		// Table unchanged: still [h1.example.com, h2.example.com]
+		reg := srv.RegistrationTable().GetRegisteredHostnames(sessID)
+		if len(reg) != 2 {
+			t.Fatalf("table modified after rejected registration: %v", reg)
+		}
+
+		// at-cap hostnames (5 == 5) -> accepted
+		atCap := []string{"b1.com", "b2.com", "b3.com", "b4.com", "b5.com"}
+		resp, err := c.Register(ctx, sessID, atCap)
+		if err != nil {
+			t.Fatalf("at-cap registration failed: %v", err)
+		}
+		if len(resp.Hostnames) != cap {
+			t.Fatalf("expected %d hostnames, got %v", cap, resp.Hostnames)
+		}
+		regAfter := srv.RegistrationTable().GetRegisteredHostnames(sessID)
+		if len(regAfter) != cap {
+			t.Fatalf("table expected %d hostnames, got %v", cap, regAfter)
+		}
+	})
+
+	t.Run("QUIC path", func(t *testing.T) {
+		c := client.NewClient(serverAddr, clientTLS)
+		qConn, err := c.DialQUIC(ctx)
+		if err != nil {
+			t.Fatalf("DialQUIC failed: %v", err)
+		}
+		defer qConn.CloseWithError(0, "test done")
+
+		ctrlStream, err := qConn.OpenStreamSync(ctx)
+		if err != nil {
+			t.Fatalf("OpenStreamSync failed: %v", err)
+		}
+		defer ctrlStream.Close()
+
+		if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
+			t.Fatalf("writing handshake failed: %v", err)
+		}
+		reader := bufio.NewReader(ctrlStream)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("reading SessionResponse failed: %v", err)
+		}
+		var sessResp api.SessionResponse
+		if err := json.Unmarshal(bytes.TrimSpace(line), &sessResp); err != nil {
+			t.Fatalf("unmarshal SessionResponse failed: %v", err)
+		}
+
+		// Initial registration: 1 hostname
+		regReq1 := api.RegistrationRequest{Hostnames: []string{"q1.example.com"}}
+		reqBytes1, _ := json.Marshal(regReq1)
+		_, _ = ctrlStream.Write(append(reqBytes1, '\n'))
+		respLine1, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read response failed: %v", err)
+		}
+		var resp1 api.RegistrationResponse
+		_ = json.Unmarshal(bytes.TrimSpace(respLine1), &resp1)
+		if resp1.Status != "registered" {
+			t.Fatalf("initial registration failed: %s", resp1.Status)
+		}
+
+		// > cap hostnames (6 > 5) -> rejected with error status
+		tooMany := []string{"qa1.com", "qa2.com", "qa3.com", "qa4.com", "qa5.com", "qa6.com"}
+		regReq2 := api.RegistrationRequest{Hostnames: tooMany}
+		reqBytes2, _ := json.Marshal(regReq2)
+		_, _ = ctrlStream.Write(append(reqBytes2, '\n'))
+		respLine2, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read response failed: %v", err)
+		}
+		var resp2 api.RegistrationResponse
+		_ = json.Unmarshal(bytes.TrimSpace(respLine2), &resp2)
+		if !strings.HasPrefix(resp2.Status, "error:") || !strings.Contains(resp2.Status, "exceeds limit") {
+			t.Fatalf("expected error status for > cap, got %q", resp2.Status)
+		}
+
+		// Table unchanged: still [q1.example.com]
+		reg := srv.RegistrationTable().GetRegisteredHostnames(sessResp.SessionID)
+		if len(reg) != 1 || reg[0] != "q1.example.com" {
+			t.Fatalf("table modified after rejected registration: %v", reg)
+		}
+
+		// at-cap hostnames (5 == 5) -> accepted
+		atCap := []string{"qb1.com", "qb2.com", "qb3.com", "qb4.com", "qb5.com"}
+		regReq3 := api.RegistrationRequest{Hostnames: atCap}
+		reqBytes3, _ := json.Marshal(regReq3)
+		_, _ = ctrlStream.Write(append(reqBytes3, '\n'))
+		respLine3, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read response failed: %v", err)
+		}
+		var resp3 api.RegistrationResponse
+		_ = json.Unmarshal(bytes.TrimSpace(respLine3), &resp3)
+		if resp3.Status != "registered" || len(resp3.Hostnames) != cap {
+			t.Fatalf("expected registered at-cap, got %+v", resp3)
+		}
+		regAfter := srv.RegistrationTable().GetRegisteredHostnames(sessResp.SessionID)
+		if len(regAfter) != cap {
+			t.Fatalf("table expected %d hostnames, got %v", cap, regAfter)
+		}
+	})
+}
+
+func TestRegistration_DuplicateHostnames(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerWithConfig(t, nil)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	ctx := t.Context()
+
+	t.Run("HTTP path duplicate rejection", func(t *testing.T) {
+		c := client.NewClient(serverAddr, clientTLS)
+		sessID, _, err := c.StartSession(ctx)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+
+		// 1. Exact duplicate strings
+		_, err = c.Register(ctx, sessID, []string{"dup.example.com", "dup.example.com"})
+		if err == nil {
+			t.Fatal("expected duplicate hostnames to be rejected")
+		}
+		if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "duplicate hostname") {
+			t.Fatalf("unexpected error response: %v", err)
+		}
+
+		// 2. Case-insensitive duplicate
+		_, err = c.Register(ctx, sessID, []string{"case.example.com", "CASE.EXAMPLE.COM"})
+		if err == nil {
+			t.Fatal("expected case-insensitive duplicate to be rejected")
+		}
+		if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "duplicate hostname") {
+			t.Fatalf("unexpected error response: %v", err)
+		}
+
+		// 3. Port variation duplicate
+		_, err = c.Register(ctx, sessID, []string{"port.example.com:443", "port.example.com"})
+		if err == nil {
+			t.Fatal("expected duplicate with port to be rejected")
+		}
+		if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "duplicate hostname") {
+			t.Fatalf("unexpected error response: %v", err)
+		}
+
+		// Table must be empty
+		reg := srv.RegistrationTable().GetRegisteredHostnames(sessID)
+		if len(reg) != 0 {
+			t.Fatalf("table expected empty, got %v", reg)
+		}
+	})
+
+	t.Run("QUIC path duplicate rejection", func(t *testing.T) {
+		c := client.NewClient(serverAddr, clientTLS)
+		qConn, err := c.DialQUIC(ctx)
+		if err != nil {
+			t.Fatalf("DialQUIC failed: %v", err)
+		}
+		defer qConn.CloseWithError(0, "test done")
+
+		ctrlStream, err := qConn.OpenStreamSync(ctx)
+		if err != nil {
+			t.Fatalf("OpenStreamSync failed: %v", err)
+		}
+		defer ctrlStream.Close()
+
+		if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
+			t.Fatalf("writing handshake failed: %v", err)
+		}
+		reader := bufio.NewReader(ctrlStream)
+		line, _ := reader.ReadBytes('\n')
+		var sessResp api.SessionResponse
+		_ = json.Unmarshal(bytes.TrimSpace(line), &sessResp)
+
+		// Send duplicate hostnames
+		dupReq := api.RegistrationRequest{Hostnames: []string{"qdup.example.com", "qdup.example.com"}}
+		reqBytes, _ := json.Marshal(dupReq)
+		_, _ = ctrlStream.Write(append(reqBytes, '\n'))
+		respLine, err := reader.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read response failed: %v", err)
+		}
+		var resp api.RegistrationResponse
+		_ = json.Unmarshal(bytes.TrimSpace(respLine), &resp)
+		if !strings.HasPrefix(resp.Status, "error:") || !strings.Contains(resp.Status, "duplicate hostname") {
+			t.Fatalf("expected error status for duplicate hostnames, got %q", resp.Status)
+		}
+
+		// Table must be empty
+		reg := srv.RegistrationTable().GetRegisteredHostnames(sessResp.SessionID)
+		if len(reg) != 0 {
+			t.Fatalf("table expected empty, got %v", reg)
+		}
+	})
+}
+
+func TestRegistration_DefaultHostnameCap(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerWithConfig(t, nil)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+
+	c := client.NewClient(serverAddr, clientTLS)
+	ctx := t.Context()
+	sessID, _, err := c.StartSession(ctx)
+	if err != nil {
+		t.Fatalf("StartSession failed: %v", err)
+	}
+
+	// 1001 hostnames (> 1000) -> rejected
+	hosts1001 := make([]string, 1001)
+	for i := range hosts1001 {
+		hosts1001[i] = fmt.Sprintf("h%04d.default.test", i)
+	}
+	_, err = c.Register(ctx, sessID, hosts1001)
+	if err == nil {
+		t.Fatal("expected 1001 hostnames to be rejected with default cap")
+	}
+	if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "exceeds limit of 1000") {
+		t.Fatalf("unexpected error response: %v", err)
+	}
+
+	// 1000 hostnames (== 1000, at-cap) -> accepted
+	hosts1000 := make([]string, 1000)
+	for i := range hosts1000 {
+		hosts1000[i] = fmt.Sprintf("h%04d.default.test", i)
+	}
+	resp, err := c.Register(ctx, sessID, hosts1000)
+	if err != nil {
+		t.Fatalf("expected 1000 hostnames to be accepted at-cap: %v", err)
+	}
+	if len(resp.Hostnames) != 1000 {
+		t.Fatalf("expected 1000 hostnames in response, got %d", len(resp.Hostnames))
+	}
+	reg := srv.RegistrationTable().GetRegisteredHostnames(sessID)
+	if len(reg) != 1000 {
+		t.Fatalf("expected 1000 hostnames in table, got %d", len(reg))
+	}
+}
