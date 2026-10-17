@@ -121,9 +121,10 @@ type State struct {
 	referenceGrants       map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 	namespaces            map[string]*corev1.Namespace
 
-	controllerName   string
-	onGatewaysUpdate func([]*gatewayv1.Gateway)
-	gatewayFilter    func(gw *gatewayv1.Gateway) bool
+	controllerName          string
+	gatewayCRDBundleVersion *string
+	onGatewaysUpdate        func([]*gatewayv1.Gateway)
+	gatewayFilter           func(gw *gatewayv1.Gateway) bool
 
 	dataplanePublisher DataplanePublisher
 	lastWrittenConfigs map[types.NamespacedName][]byte
@@ -188,6 +189,33 @@ func (s *State) SetControllerName(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.controllerName = name
+}
+
+func (s *State) SetGatewayCRDBundleVersion(v *string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if (s.gatewayCRDBundleVersion == nil && v == nil) ||
+		(s.gatewayCRDBundleVersion != nil && v != nil && *s.gatewayCRDBundleVersion == *v) {
+		return
+	}
+	if v == nil {
+		s.gatewayCRDBundleVersion = nil
+	} else {
+		val := *v
+		s.gatewayCRDBundleVersion = &val
+	}
+	s.revision++
+	s.markDirtyLocked()
+}
+
+func (s *State) GatewayCRDBundleVersion() *string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.gatewayCRDBundleVersion == nil {
+		return nil
+	}
+	val := *s.gatewayCRDBundleVersion
+	return &val
 }
 
 func (s *State) SetProxy(p ProxyConfigUpdater) {
@@ -708,28 +736,29 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 	}
 
 	return ModelInputs{
-		Revision:              s.revision,
-		Gateways:              gws,
-		GatewayClasses:        gcs,
-		GatewayAddresses:      gwAddrs,
-		GatewayReadiness:      gwReady,
-		ProvisioningErrors:    gwProvErrs,
-		SupportedAddressTypes: suppAddrs,
-		ListenerSets:          listenerSets,
-		HTTPRoutes:            routes,
-		TLSRoutes:             tlsRoutes,
-		GRPCRoutes:            grpcRoutes,
-		TCPRoutes:             tcpRoutes,
-		UDPRoutes:             udpRoutes,
-		Services:              services,
-		BackendTLSPolicies:    backendTLSPolicies,
-		ConfigMaps:            configMaps,
-		Secrets:               secrets,
-		Namespaces:            namespaces,
-		ReferenceGrants:       referenceGrants,
-		RefValidator:          mapReferenceValidator{referenceGrants: referenceGrants},
-		ControllerName:        s.controllerName,
-		AllInOneMode:          allInOne,
+		Revision:                s.revision,
+		Gateways:                gws,
+		GatewayClasses:          gcs,
+		GatewayAddresses:        gwAddrs,
+		GatewayReadiness:        gwReady,
+		ProvisioningErrors:      gwProvErrs,
+		SupportedAddressTypes:   suppAddrs,
+		ListenerSets:            listenerSets,
+		HTTPRoutes:              routes,
+		TLSRoutes:               tlsRoutes,
+		GRPCRoutes:              grpcRoutes,
+		TCPRoutes:               tcpRoutes,
+		UDPRoutes:               udpRoutes,
+		Services:                services,
+		BackendTLSPolicies:      backendTLSPolicies,
+		ConfigMaps:              configMaps,
+		Secrets:                 secrets,
+		Namespaces:              namespaces,
+		ReferenceGrants:         referenceGrants,
+		RefValidator:            mapReferenceValidator{referenceGrants: referenceGrants},
+		ControllerName:          s.controllerName,
+		AllInOneMode:            allInOne,
+		GatewayCRDBundleVersion: s.gatewayCRDBundleVersion,
 	}
 }
 

@@ -96,6 +96,31 @@ func SetConditions(conditions *[]metav1.Condition, newConditions []metav1.Condit
 	return changed
 }
 
+// RemoveCondition removes a condition of the specified type from conditions.
+// It returns true if a condition was removed.
+func RemoveCondition(conditions *[]metav1.Condition, condType string) bool {
+	if conditions == nil {
+		return false
+	}
+	for i, c := range *conditions {
+		if c.Type == condType {
+			*conditions = append((*conditions)[:i], (*conditions)[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// FindCondition searches a slice of conditions for a condition with the specified type.
+func FindCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
 // ConditionsEqual compares two condition slices for equality (ignoring LastTransitionTime).
 func ConditionsEqual(a, b []metav1.Condition) bool {
 	if len(a) != len(b) {

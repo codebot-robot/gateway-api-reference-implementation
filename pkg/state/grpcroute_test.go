@@ -17,6 +17,7 @@ package state
 import (
 	"math/rand/v2"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -1337,6 +1338,145 @@ func TestCompileGRPCRoute_BackendTLSWithoutPolicy_ResolvedRefsMessage(t *testing
 		expectedMsg := "Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName grpc-https-svc.default.svc.cluster.local (backend Service specifies appProtocol: https without a BackendTLSPolicy)"
 		if compiled.ResolvedRefsCondition.Message != expectedMsg {
 			t.Errorf("expected message %q, got %q", expectedMsg, compiled.ResolvedRefsCondition.Message)
+		}
+	})
+}
+
+func TestGRPCRouteStatus_PartiallyInvalid(t *testing.T) {
+	route := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-grpc-route",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GRPCRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "my-gateway",
+					},
+				},
+			},
+		},
+	}
+
+	validRule := InternalRule{}
+	invalidRule := InternalRule{
+		Error: &ErrorState{
+			HTTPStatusCode: 500,
+			HTTPMessage:    "Backend Not Found",
+		},
+	}
+
+	t.Run("fully valid: PartiallyInvalid absent", func(t *testing.T) {
+		compiled := &CompiledGRPCRoute{
+			GRPCRoute: route,
+			RouteState: &GRPCRouteState{
+				GRPCRoute: route,
+				Internal: &InternalGRPCRoute{
+					Rules: []InternalRule{validRule, validRule},
+				},
+			},
+			ParentConditions: []metav1.Condition{
+				NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionTrue, string(gatewayv1.RouteReasonAccepted), "Accepted", 1),
+			},
+		}
+		status := ComputeDesiredGRPCRouteStatus(route, compiled, "test-controller")
+		if len(status.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(status.Parents))
+		}
+		cond := FindCondition(status.Parents[0].Conditions, string(gatewayv1.RouteConditionPartiallyInvalid))
+		if cond != nil {
+			t.Errorf("expected PartiallyInvalid to be absent for fully valid route, got %+v", cond)
+		}
+	})
+
+	t.Run("fully invalid: PartiallyInvalid absent", func(t *testing.T) {
+		compiled := &CompiledGRPCRoute{
+			GRPCRoute: route,
+			RouteState: &GRPCRouteState{
+				GRPCRoute: route,
+				Internal: &InternalGRPCRoute{
+					Rules: []InternalRule{invalidRule, invalidRule},
+				},
+			},
+			ParentConditions: []metav1.Condition{
+				NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionTrue, string(gatewayv1.RouteReasonAccepted), "Accepted", 1),
+			},
+		}
+		status := ComputeDesiredGRPCRouteStatus(route, compiled, "test-controller")
+		if len(status.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(status.Parents))
+		}
+		cond := FindCondition(status.Parents[0].Conditions, string(gatewayv1.RouteConditionPartiallyInvalid))
+		if cond != nil {
+			t.Errorf("expected PartiallyInvalid to be absent for fully invalid route, got %+v", cond)
+		}
+	})
+
+	t.Run("not accepted: PartiallyInvalid absent", func(t *testing.T) {
+		compiled := &CompiledGRPCRoute{
+			GRPCRoute: route,
+			RouteState: &GRPCRouteState{
+				GRPCRoute: route,
+				Internal: &InternalGRPCRoute{
+					Rules: []InternalRule{validRule, invalidRule},
+				},
+			},
+			ParentConditions: []metav1.Condition{
+				NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionFalse, string(gatewayv1.RouteReasonNoMatchingParent), "Parent not found", 1),
+			},
+		}
+		status := ComputeDesiredGRPCRouteStatus(route, compiled, "test-controller")
+		if len(status.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(status.Parents))
+		}
+		cond := FindCondition(status.Parents[0].Conditions, string(gatewayv1.RouteConditionPartiallyInvalid))
+		if cond != nil {
+			t.Errorf("expected PartiallyInvalid to be absent when route is not accepted, got %+v", cond)
+		}
+	})
+
+	t.Run("partially invalid: PartiallyInvalid=True", func(t *testing.T) {
+		ruleName := gatewayv1.SectionName("bad-rule")
+		invalidNamedRule := InternalRule{
+			Name: &ruleName,
+			Error: &ErrorState{
+				HTTPStatusCode: 500,
+				HTTPMessage:    "Backend Not Found",
+			},
+		}
+		compiled := &CompiledGRPCRoute{
+			GRPCRoute: route,
+			RouteState: &GRPCRouteState{
+				GRPCRoute: route,
+				Internal: &InternalGRPCRoute{
+					Rules: []InternalRule{validRule, invalidNamedRule},
+				},
+			},
+			ParentConditions: []metav1.Condition{
+				NewCondition(string(gatewayv1.RouteConditionAccepted), metav1.ConditionTrue, string(gatewayv1.RouteReasonAccepted), "Accepted", 1),
+			},
+		}
+		status := ComputeDesiredGRPCRouteStatus(route, compiled, "test-controller")
+		if len(status.Parents) != 1 {
+			t.Fatalf("expected 1 parent status, got %d", len(status.Parents))
+		}
+		cond := FindCondition(status.Parents[0].Conditions, string(gatewayv1.RouteConditionPartiallyInvalid))
+		if cond == nil {
+			t.Fatalf("expected PartiallyInvalid condition, got nil")
+		}
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected PartiallyInvalid Status=True, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+			t.Errorf("expected Reason=UnsupportedValue, got %s", cond.Reason)
+		}
+		if !strings.HasPrefix(cond.Message, "Dropped Rule") {
+			t.Errorf("expected Message to start with 'Dropped Rule', got %q", cond.Message)
+		}
+		if cond.ObservedGeneration != 1 {
+			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
 		}
 	})
 }

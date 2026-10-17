@@ -178,6 +178,16 @@ spec:
 		t.Errorf("Expected ClusterRole gari-dataplane to not exist, got: %s", crCheck)
 	}
 
+	// Verify GatewayClass has SupportedVersion=True condition
+	gcSupportedCond := h.runCmd("kubectl", "get", "gatewayclass", "reference-class", "-o", "jsonpath={.status.conditions[?(@.type==\"SupportedVersion\")].status}")
+	if strings.TrimSpace(gcSupportedCond) != "True" {
+		t.Errorf("Expected GatewayClass SupportedVersion=True, got: %s", gcSupportedCond)
+	}
+	gcSupportedReason := h.runCmd("kubectl", "get", "gatewayclass", "reference-class", "-o", "jsonpath={.status.conditions[?(@.type==\"SupportedVersion\")].reason}")
+	if strings.TrimSpace(gcSupportedReason) != "SupportedVersion" {
+		t.Errorf("Expected GatewayClass SupportedVersion reason=SupportedVersion, got: %s", gcSupportedReason)
+	}
+
 	// Delete second-gateway and verify Service, Deployment, ServiceAccount, Role, RoleBinding, and Secret are cleaned up
 	h.runCmd("kubectl", "delete", "gateway", "second-gateway", "--namespace=default")
 	h.WaitForResourceDeletion("svc", secondResName, "default", 30*time.Second)
