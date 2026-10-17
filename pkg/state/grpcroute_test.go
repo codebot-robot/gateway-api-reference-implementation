@@ -1303,4 +1303,40 @@ func TestCompileGRPCRoute_BackendTLSWithoutPolicy_ResolvedRefsMessage(t *testing
 			t.Errorf("expected message 'All references resolved', got %q", compiled.ResolvedRefsCondition.Message)
 		}
 	})
+
+	t.Run("mirror backend without policy is surfaced", func(t *testing.T) {
+		mirrorRoute := &gatewayv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "grpc-mirror-route",
+				Namespace:  "default",
+				Generation: 1,
+			},
+			Spec: gatewayv1.GRPCRouteSpec{
+				Rules: []gatewayv1.GRPCRouteRule{
+					{
+						Filters: []gatewayv1.GRPCRouteFilter{
+							{
+								Type: gatewayv1.GRPCRouteFilterRequestMirror,
+								RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
+									BackendRef: gatewayv1.BackendObjectReference{
+										Name: "grpc-https-svc",
+										Port: Ptr(gatewayv1.PortNumber(8443)),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		compiled := CompileGRPCRoute(mirrorRoute, services, nil, nil, nil)
+		if compiled == nil {
+			t.Fatalf("expected non-nil InternalGRPCRoute")
+		}
+		expectedMsg := "Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName grpc-https-svc.default.svc.cluster.local (backend Service specifies appProtocol: https without a BackendTLSPolicy)"
+		if compiled.ResolvedRefsCondition.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, compiled.ResolvedRefsCondition.Message)
+		}
+	})
 }

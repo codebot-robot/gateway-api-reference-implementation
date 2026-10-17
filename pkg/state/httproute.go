@@ -536,35 +536,11 @@ func CompileHTTPRoute(
 		compiledRules = append(compiledRules, iRule)
 	}
 
-	var noPolicyTLSBackends []string
-	seenNoPolicy := make(map[string]bool)
-	for _, rule := range compiledRules {
-		if rule.Error != nil {
-			continue
-		}
-		for _, b := range rule.Backends {
-			if b.AppProtocol != nil && strings.EqualFold(*b.AppProtocol, "https") && b.TLSConfig == nil {
-				if !seenNoPolicy[b.Host] {
-					seenNoPolicy[b.Host] = true
-					noPolicyTLSBackends = append(noPolicyTLSBackends, b.Host)
-				}
-			}
-		}
-		for _, m := range rule.Mirrors {
-			if m.Backend.AppProtocol != nil && strings.EqualFold(*m.Backend.AppProtocol, "https") && m.Backend.TLSConfig == nil {
-				if !seenNoPolicy[m.Backend.Host] {
-					seenNoPolicy[m.Backend.Host] = true
-					noPolicyTLSBackends = append(noPolicyTLSBackends, m.Backend.Host)
-				}
-			}
-		}
-	}
-
-	if resolvedRefsCondition.Status == metav1.ConditionTrue && len(noPolicyTLSBackends) > 0 {
-		if len(noPolicyTLSBackends) == 1 {
-			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName %s (backend Service specifies appProtocol: https without a BackendTLSPolicy)", noPolicyTLSBackends[0])
+	if noPolicyHosts := noPolicyTLSBackendHosts(compiledRules); len(noPolicyHosts) > 0 && resolvedRefsCondition.Status == metav1.ConditionTrue {
+		if len(noPolicyHosts) == 1 {
+			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName %s (backend Service specifies appProtocol: https without a BackendTLSPolicy)", noPolicyHosts[0])
 		} else {
-			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName for %s (backend Services specify appProtocol: https without a BackendTLSPolicy)", strings.Join(noPolicyTLSBackends, ", "))
+			resolvedRefsCondition.Message = fmt.Sprintf("Backend TLS without BackendTLSPolicy: verifying against system trust roots with ServerName for %s (backend Services specify appProtocol: https without a BackendTLSPolicy)", strings.Join(noPolicyHosts, ", "))
 		}
 	}
 
