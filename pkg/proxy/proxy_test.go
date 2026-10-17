@@ -2798,6 +2798,214 @@ func TestBackendTLSPolicy_ClientCertificateAuth(t *testing.T) {
 	})
 }
 
+func TestBackendTLSPolicy_MissingClientCertID_FailsClosed(t *testing.T) {
+	// 1. Generate server CA and server cert
+	serverCAPEM, serverCert := generateTestCAAndCert(t, []string{"backend.local"}, nil)
+
+	// 2. Generate client CA and client cert
+	clientCAKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate client CA key: %v", err)
+	}
+	clientCATemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(20),
+		Subject:               pkix.Name{CommonName: "Client Test CA 2"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(1 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+	}
+	clientCABytes, err := x509.CreateCertificate(rand.Reader, clientCATemplate, clientCATemplate, &clientCAKey.PublicKey, clientCAKey)
+	if err != nil {
+		t.Fatalf("failed to create client CA certificate: %v", err)
+	}
+	clientCACert, err := x509.ParseCertificate(clientCABytes)
+	if err != nil {
+		t.Fatalf("failed to parse client CA certificate: %v", err)
+	}
+	clientCAPool := x509.NewCertPool()
+	clientCAPool.AddCert(clientCACert)
+
+	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate client key: %v", err)
+	}
+	clientTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(21),
+		Subject:      pkix.Name{CommonName: "my-client"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(1 * time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	clientBytes, err := x509.CreateCertificate(rand.Reader, clientTemplate, clientCACert, &clientKey.PublicKey, clientCAKey)
+	if err != nil {
+		t.Fatalf("failed to create client certificate: %v", err)
+	}
+	clientPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientBytes})
+	clientKeyBytes, err := x509.MarshalECPrivateKey(clientKey)
+	if err != nil {
+		t.Fatalf("failed to marshal client key: %v", err)
+	}
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: clientKeyBytes})
+	clientTLSCert, err := tls.X509KeyPair(clientPEM, clientKeyPEM)
+	if err != nil {
+		t.Fatalf("failed to create client X509 key pair: %v", err)
+	}
+
+	// 3. Start test TLS server requiring client auth
+	var handshakeCompleted atomic.Bool
+	var connectionAttempts atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("authenticated"))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAPool,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			handshakeCompleted.Store(true)
+			return nil
+		},
+	}
+	server.Config.ConnState = func(conn net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connectionAttempts.Add(1)
+		}
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("failed to parse test server URL: %v", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	httpsProto := "https"
+
+	p := NewProxy()
+
+	// 4. Construct a DataplaneConfig with missing-ID
+	missingID := "missing-client-cert-id"
+	rule := state.InternalRule{
+		Matches: []state.InternalMatch{
+			{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchPathPrefix, Value: "/"}},
+		},
+		Backends: []state.InternalBackend{
+			{
+				Host:        host,
+				Port:        int32(port),
+				AppProtocol: &httpsProto,
+				TLSConfig: &state.InternalTLSConfig{
+					Hostname:     "backend.local",
+					CACerts:      [][]byte{serverCAPEM},
+					ClientCertID: missingID,
+				},
+				Weight: 1,
+			},
+		},
+	}
+	dpConfig := &state.DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "test-gw"},
+		Routes: []state.InternalRoute{
+			{
+				Hostnames: []string{"backend.local"},
+				Rules:     []state.InternalRule{rule},
+			},
+		},
+		Certificates: map[string]state.CertificateData{}, // missingID is absent
+	}
+
+	missingData, err := dpConfig.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal missing-ID config: %v", err)
+	}
+
+	// 5. ApplyDataplaneConfig must reject the config
+	if err := state.ApplyDataplaneConfig(p, missingData); err == nil {
+		t.Fatalf("expected ApplyDataplaneConfig to reject missing-ID config, got nil")
+	}
+
+	// 6. Request to that backend fails and no TLS connection is attempted
+	req := httptest.NewRequest("GET", "http://backend.local/", nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("expected request to unconfigured backend to fail, got 200 OK")
+	}
+	if handshakeCompleted.Load() {
+		t.Fatalf("expected no TLS handshake to complete, but handshake completed")
+	}
+	if connectionAttempts.Load() != 0 {
+		t.Fatalf("expected 0 TLS connection attempts to backend, got %d", connectionAttempts.Load())
+	}
+
+	// 7. Verify direct forward also fails closed without completing handshake if ClientCertID is set without ClientCert
+	t.Run("direct forward with unpopulated ClientCert fails closed without handshake", func(t *testing.T) {
+		handshakeCompleted.Store(false)
+		connectionAttempts.Store(0)
+
+		pDirect := NewProxy()
+		pDirect.UpdateConfig(nil, []state.InternalRoute{
+			{
+				Hostnames: []string{"backend.local"},
+				Rules:     []state.InternalRule{rule},
+			},
+		})
+
+		reqDirect := httptest.NewRequest("GET", "http://backend.local/", nil)
+		recDirect := httptest.NewRecorder()
+		pDirect.ServeHTTP(recDirect, reqDirect)
+
+		if recDirect.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 Bad Gateway, got %d", recDirect.Code)
+		}
+		if handshakeCompleted.Load() {
+			t.Fatalf("expected no TLS handshake to complete, but handshake completed")
+		}
+		if connectionAttempts.Load() != 0 {
+			t.Fatalf("expected 0 TLS connection attempts to backend, got %d", connectionAttempts.Load())
+		}
+	})
+
+	// 8. With valid certificate present in config, applying succeeds and handshake completes
+	t.Run("with valid certificate present in config handshake succeeds", func(t *testing.T) {
+		handshakeCompleted.Store(false)
+		connectionAttempts.Store(0)
+
+		pkcs8Key, err := x509.MarshalPKCS8PrivateKey(clientKey)
+		if err != nil {
+			t.Fatalf("failed to marshal private key to PKCS#8: %v", err)
+		}
+		dpConfig.Certificates[missingID] = state.CertificateData{
+			Certificate: clientTLSCert.Certificate,
+			PrivateKey:  pkcs8Key,
+		}
+
+		validData, err := dpConfig.Marshal()
+		if err != nil {
+			t.Fatalf("failed to marshal valid config: %v", err)
+		}
+		if err := state.ApplyDataplaneConfig(p, validData); err != nil {
+			t.Fatalf("expected ApplyDataplaneConfig to succeed with cert present: %v", err)
+		}
+
+		reqValid := httptest.NewRequest("GET", "http://backend.local/", nil)
+		recValid := httptest.NewRecorder()
+		p.ServeHTTP(recValid, reqValid)
+
+		if recValid.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", recValid.Code, recValid.Body.String())
+		}
+		if !handshakeCompleted.Load() {
+			t.Fatalf("expected TLS handshake to complete successfully")
+		}
+	})
+}
+
 func TestServeHTTP_PortlessHostMatching(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

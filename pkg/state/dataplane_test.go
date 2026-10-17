@@ -827,3 +827,182 @@ func TestInProcessDataplanePublisher_ConflictingHostnameCertificates(t *testing.
 		t.Errorf("expected winner (gw-a) certificate to be served for shared.example.com")
 	}
 }
+
+func TestApplyDataplaneConfig_MissingBackendClientCertID(t *testing.T) {
+	updater := &mockProxyUpdater{}
+
+	// 1. Apply initial valid config
+	initialCfg := &DataplaneConfig{
+		GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+		Routes: []InternalRoute{
+			{
+				Hostnames: []string{"initial.example.com"},
+				Rules: []InternalRule{
+					{
+						Backends: []InternalBackend{
+							{Host: "initial-backend", Port: 8080},
+						},
+					},
+				},
+			},
+		},
+	}
+	initialData, err := initialCfg.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal initial config: %v", err)
+	}
+	if err := ApplyDataplaneConfig(updater, initialData); err != nil {
+		t.Fatalf("failed to apply initial config: %v", err)
+	}
+	if len(updater.routes) != 1 || updater.routes[0].Hostnames[0] != "initial.example.com" {
+		t.Fatalf("expected initial config in updater")
+	}
+
+	clientCert := generateTestTLSCert(t, false, "client.example.com", nil)
+	h := sha256.Sum256(clientCert.Certificate[0])
+	clientCertID := hex.EncodeToString(h[:])
+	certData, err := tlsCertToData(clientCert)
+	if err != nil {
+		t.Fatalf("failed to convert client cert to data: %v", err)
+	}
+
+	t.Run("route backend with missing ClientCertID is rejected and previous config persists", func(t *testing.T) {
+		missingCfg := &DataplaneConfig{
+			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+			Routes: []InternalRoute{
+				{
+					Hostnames: []string{"secure.example.com"},
+					Rules: []InternalRule{
+						{
+							Backends: []InternalBackend{
+								{
+									Host: "secure-backend",
+									Port: 8443,
+									TLSConfig: &InternalTLSConfig{
+										Hostname:     "secure-backend",
+										ClientCertID: clientCertID,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Certificates: map[string]CertificateData{}, // clientCertID is absent
+		}
+		missingData, err := missingCfg.Marshal()
+		if err != nil {
+			t.Fatalf("failed to marshal missing config: %v", err)
+		}
+
+		err = ApplyDataplaneConfig(updater, missingData)
+		if err == nil {
+			t.Fatalf("expected ApplyDataplaneConfig to reject config with missing ClientCertID")
+		}
+
+		// Verify previously applied config stays in effect
+		if len(updater.routes) != 1 || updater.routes[0].Hostnames[0] != "initial.example.com" {
+			t.Fatalf("expected previously applied config to stay in effect, got routes: %+v", updater.routes)
+		}
+		if updater.routes[0].Rules[0].Backends[0].Host != "initial-backend" {
+			t.Fatalf("expected initial backend to stay in effect")
+		}
+
+		// The same config with the certificate present applies as today
+		missingCfg.Certificates[clientCertID] = certData
+		validData, err := missingCfg.Marshal()
+		if err != nil {
+			t.Fatalf("failed to marshal valid config: %v", err)
+		}
+		if err := ApplyDataplaneConfig(updater, validData); err != nil {
+			t.Fatalf("expected ApplyDataplaneConfig to succeed with certificate present: %v", err)
+		}
+		if len(updater.routes) != 1 || updater.routes[0].Hostnames[0] != "secure.example.com" {
+			t.Fatalf("expected updated config to be applied, got routes: %+v", updater.routes)
+		}
+		appliedBackend := updater.routes[0].Rules[0].Backends[0]
+		if appliedBackend.TLSConfig == nil || appliedBackend.TLSConfig.ClientCert == nil {
+			t.Fatalf("expected ClientCert to be wired when certificate is present")
+		}
+		if !bytes.Equal(appliedBackend.TLSConfig.ClientCert.Certificate[0], clientCert.Certificate[0]) {
+			t.Errorf("expected wired client certificate to match")
+		}
+	})
+
+	t.Run("listener backend with missing ClientCertID is rejected", func(t *testing.T) {
+		missingCfg := &DataplaneConfig{
+			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+			Listeners: []InternalListener{
+				{
+					Name: "https",
+					Routes: []InternalRoute{
+						{
+							Rules: []InternalRule{
+								{
+									Backends: []InternalBackend{
+										{
+											Host: "listener-backend",
+											Port: 8443,
+											TLSConfig: &InternalTLSConfig{
+												Hostname:     "listener-backend",
+												ClientCertID: "missing-cert-id",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Certificates: map[string]CertificateData{},
+		}
+		missingData, err := missingCfg.Marshal()
+		if err != nil {
+			t.Fatalf("failed to marshal missing config: %v", err)
+		}
+		if err := ApplyDataplaneConfig(updater, missingData); err == nil {
+			t.Fatalf("expected ApplyDataplaneConfig to reject listener config with missing ClientCertID")
+		}
+	})
+
+	t.Run("mirror backend with missing ClientCertID is rejected", func(t *testing.T) {
+		missingCfg := &DataplaneConfig{
+			GatewayName: types.NamespacedName{Namespace: "default", Name: "gw-1"},
+			Routes: []InternalRoute{
+				{
+					Hostnames: []string{"mirror.example.com"},
+					Rules: []InternalRule{
+						{
+							Backends: []InternalBackend{
+								{Host: "normal-backend", Port: 8080},
+							},
+							Mirrors: []InternalMirror{
+								{
+									Backend: InternalBackend{
+										Host: "mirror-backend",
+										Port: 8443,
+										TLSConfig: &InternalTLSConfig{
+											Hostname:     "mirror-backend",
+											ClientCertID: "missing-mirror-cert-id",
+										},
+									},
+									Numerator:   1,
+									Denominator: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+			Certificates: map[string]CertificateData{},
+		}
+		missingData, err := missingCfg.Marshal()
+		if err != nil {
+			t.Fatalf("failed to marshal missing config: %v", err)
+		}
+		if err := ApplyDataplaneConfig(updater, missingData); err == nil {
+			t.Fatalf("expected ApplyDataplaneConfig to reject mirror config with missing ClientCertID")
+		}
+	})
+}
