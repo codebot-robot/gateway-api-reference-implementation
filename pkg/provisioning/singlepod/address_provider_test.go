@@ -698,6 +698,7 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *te
 	st.UpsertGateway(gw)
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 	st.Recompute()
+	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
 	if !ok {
@@ -721,6 +722,7 @@ func TestSinglePodAddressProvider_PublishDataplaneConfig_OwnershipConflict(t *te
 	if err := cl.Delete(ctx, &fetchedSec); err != nil {
 		t.Fatalf("failed to delete conflicting secret: %v", err)
 	}
+	st.Recompute()
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)

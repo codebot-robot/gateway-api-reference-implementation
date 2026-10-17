@@ -21,7 +21,6 @@ import (
 	"errors"
 	"reflect"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -128,6 +127,7 @@ type State struct {
 
 	dataplanePublisher DataplanePublisher
 	lastWrittenConfigs map[types.NamespacedName][]byte
+	publishConflicts   map[types.NamespacedName]struct{}
 
 	previousOutputs *Outputs
 
@@ -177,6 +177,7 @@ func NewState() *State {
 		backendTLSPolicySource: NewEventSource(),
 		gatewayClassSource:     NewEventSource(),
 		lastWrittenConfigs:     make(map[types.NamespacedName][]byte),
+		publishConflicts:       make(map[types.NamespacedName]struct{}),
 		notifyCh:               make(chan struct{}, 1),
 		synced:                 true,
 		running:                false,
@@ -445,44 +446,24 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 			klog.Errorf("failed to publish dataplane config for %s: %v", gwKey, err)
 			var conflictErr *OwnershipConflictError
 			if errors.As(err, &conflictErr) {
-				s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
 				s.mu.Lock()
-				readiness := GatewayReadiness{Ready: true}
-				if r, ok := s.gatewayReadiness[gwKey]; ok {
-					readiness = r
-				}
-				addrs := s.gatewayAddresses[gwKey]
-				supportedTypes := s.supportedAddressTypes
+				s.publishConflicts[gwKey] = struct{}{}
 				s.mu.Unlock()
-
-				desiredStatus := ComputeDesiredGatewayStatus(cg.Gateway, cg, addrs, readiness, conflictErr.Error(), supportedTypes)
-				outputs.GatewayStatuses[gwKey] = desiredStatus
-				cg.Conditions = desiredStatus.Conditions
-				s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: gwKey})
+				s.SetGatewayProvisioningError(gwKey, conflictErr.Error())
 			}
 			continue
 		}
 
 		s.mu.Lock()
 		s.lastWrittenConfigs[gwKey] = data
-		curErr := s.provisioningErrors[gwKey]
+		_, hadConflict := s.publishConflicts[gwKey]
+		if hadConflict {
+			delete(s.publishConflicts, gwKey)
+		}
 		s.mu.Unlock()
 
-		if strings.Contains(curErr, "conflict: existing Secret") {
+		if hadConflict {
 			s.SetGatewayProvisioningError(gwKey, "")
-			s.mu.Lock()
-			readiness := GatewayReadiness{Ready: true}
-			if r, ok := s.gatewayReadiness[gwKey]; ok {
-				readiness = r
-			}
-			addrs := s.gatewayAddresses[gwKey]
-			supportedTypes := s.supportedAddressTypes
-			s.mu.Unlock()
-
-			desiredStatus := ComputeDesiredGatewayStatus(cg.Gateway, cg, addrs, readiness, "", supportedTypes)
-			outputs.GatewayStatuses[gwKey] = desiredStatus
-			cg.Conditions = desiredStatus.Conditions
-			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: gwKey})
 		}
 	}
 
@@ -491,6 +472,7 @@ func (s *State) publishDataplaneConfigs(outputs *Outputs, publisher DataplanePub
 	for gwKey := range s.lastWrittenConfigs {
 		if _, ok := outputs.DataplaneConfigs[gwKey]; !ok {
 			delete(s.lastWrittenConfigs, gwKey)
+			delete(s.publishConflicts, gwKey)
 			removedKeys = append(removedKeys, gwKey)
 		}
 	}
@@ -1121,6 +1103,7 @@ func (s *State) UpsertGateway(gw *gatewayv1.Gateway) {
 			delete(s.gatewayAddresses, key)
 			delete(s.gatewayReadiness, key)
 			delete(s.provisioningErrors, key)
+			delete(s.publishConflicts, key)
 			s.revision++
 			s.markDirtyLocked()
 		}
@@ -1148,6 +1131,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 		delete(s.gatewayAddresses, name)
 		delete(s.gatewayReadiness, name)
 		delete(s.provisioningErrors, name)
+		delete(s.publishConflicts, name)
 		s.revision++
 		s.markDirtyLocked()
 	}

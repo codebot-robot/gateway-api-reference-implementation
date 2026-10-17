@@ -833,7 +833,10 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
 	st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
 
-	// 1. Initial recompute publishes config -> encounters OwnershipConflictError -> Programmed=False
+	// 1. Initial recompute publishes config and encounters OwnershipConflictError,
+	// which records the provisioning error and marks state dirty.
+	st.Recompute()
+	// Next recompute folds the recorded conflict into Gateway status.
 	st.Recompute()
 
 	status, ok := st.GetDesiredGatewayStatus(gwKey)
@@ -854,8 +857,10 @@ func TestState_PublishDataplaneConfig_OwnershipConflict(t *testing.T) {
 		t.Errorf("expected Programmed=False Message=%q, got Status=%s Message=%q", mockPub.publishErr.Error(), progCond.Status, progCond.Message)
 	}
 
-	// 2. Conflict resolved: publisher succeeds -> Programmed=True restored
+	// 2. Conflict resolved: publisher succeeds, clearing the recorded error.
 	mockPub.publishErr = nil
+	st.Recompute()
+	// Next recompute folds the cleared error into Gateway status, restoring Programmed=True.
 	st.Recompute()
 
 	status, ok = st.GetDesiredGatewayStatus(gwKey)
