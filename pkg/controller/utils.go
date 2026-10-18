@@ -137,6 +137,7 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 
 	if err := (&GatewayClassReconciler{
 		Client:         mgr.GetClient(),
+		APIReader:      mgr.GetAPIReader(),
 		Scheme:         mgr.GetScheme(),
 		State:          st,
 		ControllerName: controllerName,

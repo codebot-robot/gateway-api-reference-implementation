@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
 
 func generateTestCertPEM(t *testing.T, hostnames ...string) ([]byte, []byte) {
@@ -5555,4 +5556,430 @@ func TestHTTPSAndTLSListener_AllInOneModeConflict(t *testing.T) {
 	if len(outputs.ProxyListeners) != 1 || outputs.ProxyListeners[0].GatewayName.String() != "default/gw1-https" {
 		t.Errorf("expected only gw1 proxy listener, got %+v", outputs.ProxyListeners)
 	}
+}
+
+func TestListener_OverlappingTLSConfig(t *testing.T) {
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	certPEM1, keyPEM1 := generateTestCertPEM(t, "*.example.com", "foo.example.com")
+	secret1 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cert-1"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM1,
+			corev1.TLSPrivateKeyKey: keyPEM1,
+		},
+	}
+	certPEM2, keyPEM2 := generateTestCertPEM(t, "foo.example.com")
+	secret2 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cert-2"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM2,
+			corev1.TLSPrivateKeyKey: keyPEM2,
+		},
+	}
+
+	t.Run("overlapping hostnames with same certificate: OverlappingHostnames", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-same-cert", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "exact",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		if len(gwStatus.Listeners) != 2 {
+			t.Fatalf("expected 2 listener statuses, got %d", len(gwStatus.Listeners))
+		}
+
+		for _, l := range gwStatus.Listeners {
+			accCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionAccepted))
+			if accCond == nil || accCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected Accepted=True, got %+v", l.Name, accCond)
+			}
+			progCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+			if progCond == nil || progCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected Programmed=True, got %+v", l.Name, progCond)
+			}
+
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond == nil {
+				t.Fatalf("listener %s expected OverlappingTLSConfig condition, got nil", l.Name)
+			}
+			if overlapCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected OverlappingTLSConfig Status=True, got %s", l.Name, overlapCond.Status)
+			}
+			if overlapCond.Reason != string(gatewayv1.ListenerReasonOverlappingHostnames) {
+				t.Errorf("listener %s expected Reason=OverlappingHostnames, got %s", l.Name, overlapCond.Reason)
+			}
+		}
+	})
+
+	t.Run("overlapping hostnames with differing certificates: OverlappingCertificates", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-diff-cert", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "exact",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-2"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+				{Namespace: "default", Name: "cert-2"}: secret2,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		if len(gwStatus.Listeners) != 2 {
+			t.Fatalf("expected 2 listener statuses, got %d", len(gwStatus.Listeners))
+		}
+
+		for _, l := range gwStatus.Listeners {
+			accCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionAccepted))
+			if accCond == nil || accCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected Accepted=True, got %+v", l.Name, accCond)
+			}
+			progCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+			if progCond == nil || progCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected Programmed=True, got %+v", l.Name, progCond)
+			}
+
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond == nil {
+				t.Fatalf("listener %s expected OverlappingTLSConfig condition, got nil", l.Name)
+			}
+			if overlapCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected OverlappingTLSConfig Status=True, got %s", l.Name, overlapCond.Status)
+			}
+			if overlapCond.Reason != string(gatewayv1.ListenerReasonOverlappingCertificates) {
+				t.Errorf("listener %s expected Reason=OverlappingCertificates, got %s", l.Name, overlapCond.Reason)
+			}
+		}
+	})
+
+	t.Run("non-overlapping listeners: OverlappingTLSConfig absent", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-distinct", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "foo",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "bar",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("bar.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-2"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+				{Namespace: "default", Name: "cert-2"}: secret2,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		for _, l := range gwStatus.Listeners {
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond != nil {
+				t.Errorf("listener %s expected OverlappingTLSConfig to be absent, got %+v", l.Name, overlapCond)
+			}
+		}
+	})
+
+	t.Run("HTTP listeners: OverlappingTLSConfig absent", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-http", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "http-wildcard",
+						Port:     80,
+						Protocol: gatewayv1.HTTPProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+					},
+					{
+						Name:     "http-exact",
+						Port:     80,
+						Protocol: gatewayv1.HTTPProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("foo.example.com")),
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		for _, l := range gwStatus.Listeners {
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond != nil {
+				t.Errorf("HTTP listener %s expected OverlappingTLSConfig to be absent, got %+v", l.Name, overlapCond)
+			}
+		}
+	})
+
+	t.Run("overlapping wildcard and multi-level subdomain (*.example.com and a.foo.example.com)", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-multi-level", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "subdomain",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("a.foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		if len(gwStatus.Listeners) != 2 {
+			t.Fatalf("expected 2 listener statuses, got %d", len(gwStatus.Listeners))
+		}
+
+		for _, l := range gwStatus.Listeners {
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond == nil {
+				t.Fatalf("listener %s expected OverlappingTLSConfig condition, got nil", l.Name)
+			}
+			if overlapCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected OverlappingTLSConfig Status=True, got %s", l.Name, overlapCond.Status)
+			}
+		}
+	})
+
+	t.Run("overlapping nested wildcards (*.example.com and *.foo.example.com)", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-nested-wildcard", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "nested-wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		if len(gwStatus.Listeners) != 2 {
+			t.Fatalf("expected 2 listener statuses, got %d", len(gwStatus.Listeners))
+		}
+
+		for _, l := range gwStatus.Listeners {
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond == nil {
+				t.Fatalf("listener %s expected OverlappingTLSConfig condition, got nil", l.Name)
+			}
+			if overlapCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected OverlappingTLSConfig Status=True, got %s", l.Name, overlapCond.Status)
+			}
+		}
+	})
+}
+
+func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class", Generation: 2},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	t.Run("matching version: SupportedVersion=True", func(t *testing.T) {
+		matchingVersion := gatewayconsts.BundleVersion
+		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &matchingVersion)
+		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond == nil {
+			t.Fatalf("expected SupportedVersion condition, got nil")
+		}
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected Status=True, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+			t.Errorf("expected Reason=SupportedVersion, got %s", cond.Reason)
+		}
+		if cond.ObservedGeneration != 2 {
+			t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
+		}
+	})
+
+	t.Run("mismatched version: SupportedVersion=False", func(t *testing.T) {
+		mismatchedVersion := "v1.5.0"
+		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &mismatchedVersion)
+		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond == nil {
+			t.Fatalf("expected SupportedVersion condition, got nil")
+		}
+		if cond.Status != metav1.ConditionFalse {
+			t.Errorf("expected Status=False, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.GatewayClassReasonUnsupportedVersion) {
+			t.Errorf("expected Reason=UnsupportedVersion, got %s", cond.Reason)
+		}
+		if cond.ObservedGeneration != 2 {
+			t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
+		}
+	})
+
+	t.Run("nil version: SupportedVersion absent", func(t *testing.T) {
+		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", nil)
+		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond != nil {
+			t.Errorf("expected SupportedVersion condition to be absent, got %+v", cond)
+		}
+	})
 }

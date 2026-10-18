@@ -1306,3 +1306,67 @@ func TestState_GatewayAddresses_NoSpecAddresses(t *testing.T) {
 		t.Errorf("expected status address 10.0.0.1, got %+v", status.Addresses)
 	}
 }
+
+func TestState_GatewayCRDBundleVersionEnqueuesGatewayClass(t *testing.T) {
+	st := NewState()
+	st.SetControllerName("test-controller")
+
+	qGC := newTestQueue()
+	ctx := t.Context()
+	_ = st.GatewayClassSource().Start(ctx, qGC)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc", Generation: 1},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gc)
+	st.Recompute()
+
+	// Initial reconcile without bundle version has Accepted=True, but no SupportedVersion condition
+	qGC.drain()
+	status, ok := st.GetDesiredGatewayClassStatus(types.NamespacedName{Name: "test-gc"})
+	if !ok {
+		t.Fatalf("expected desired GatewayClassStatus to be present")
+	}
+	if findCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion)) != nil {
+		t.Fatalf("expected SupportedVersion condition to be absent before bundle version is set")
+	}
+
+	// Setting bundle version and recomputing adds SupportedVersion to outputs and enqueues GatewayClass
+	bundleVersion := "v1.6.3"
+	st.SetGatewayCRDBundleVersion(&bundleVersion)
+	st.Recompute()
+
+	enqueued := qGC.drain()
+	if len(enqueued) != 1 || enqueued[0].Name != "test-gc" {
+		t.Errorf("expected GatewayClass test-gc to be enqueued, got %v", enqueued)
+	}
+
+	status, ok = st.GetDesiredGatewayClassStatus(types.NamespacedName{Name: "test-gc"})
+	if !ok {
+		t.Fatalf("expected desired GatewayClassStatus to be present after recompute")
+	}
+	cond := findCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+	if cond == nil {
+		t.Fatalf("expected SupportedVersion condition to be present after recompute, got nil")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+		t.Errorf("expected SupportedVersion=True/SupportedVersion, got %+v", cond)
+	}
+
+	// Changing to mismatched bundle version updates status and enqueues GatewayClass again
+	mismatched := "v1.5.0"
+	st.SetGatewayCRDBundleVersion(&mismatched)
+	st.Recompute()
+
+	enqueued = qGC.drain()
+	if len(enqueued) != 1 || enqueued[0].Name != "test-gc" {
+		t.Errorf("expected GatewayClass test-gc to be enqueued on version mismatch change, got %v", enqueued)
+	}
+
+	status, _ = st.GetDesiredGatewayClassStatus(types.NamespacedName{Name: "test-gc"})
+	cond = findCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != string(gatewayv1.GatewayClassReasonUnsupportedVersion) {
+		t.Errorf("expected SupportedVersion=False/UnsupportedVersion, got %+v", cond)
+	}
+}

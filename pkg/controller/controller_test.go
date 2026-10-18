@@ -29,6 +29,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -38,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
 
 func TestGatewayClassReconciler_CustomControllerName(t *testing.T) {
@@ -537,6 +539,219 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 	if cond.ObservedGeneration != 2 {
 		t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
 	}
+}
+
+func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = apiextensionsv1.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-gc",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	crdWithMatchingVersion := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gateways.gateway.networking.k8s.io",
+			Annotations: map[string]string{
+				gatewayconsts.BundleVersionAnnotation: gatewayconsts.BundleVersion,
+			},
+		},
+	}
+
+	crdWithMismatchedVersion := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gateways.gateway.networking.k8s.io",
+			Annotations: map[string]string{
+				gatewayconsts.BundleVersionAnnotation: "v1.5.0",
+			},
+		},
+	}
+
+	crdWithoutAnnotation := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gateways.gateway.networking.k8s.io",
+		},
+	}
+
+	t.Run("matching CRD annotation yields SupportedVersion=True", func(t *testing.T) {
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithMatchingVersion).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond == nil {
+			t.Fatalf("expected SupportedVersion condition, got nil")
+		}
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected Status=True, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+			t.Errorf("expected Reason=SupportedVersion, got %s", cond.Reason)
+		}
+		if cond.ObservedGeneration != 1 {
+			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
+		}
+	})
+
+	t.Run("mismatched CRD annotation yields SupportedVersion=False", func(t *testing.T) {
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithMismatchedVersion).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond == nil {
+			t.Fatalf("expected SupportedVersion condition, got nil")
+		}
+		if cond.Status != metav1.ConditionFalse {
+			t.Errorf("expected Status=False, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.GatewayClassReasonUnsupportedVersion) {
+			t.Errorf("expected Reason=UnsupportedVersion, got %s", cond.Reason)
+		}
+		if cond.ObservedGeneration != 1 {
+			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
+		}
+	})
+
+	t.Run("CRD without bundle-version annotation leaves SupportedVersion absent", func(t *testing.T) {
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithoutAnnotation).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond != nil {
+			t.Errorf("expected SupportedVersion condition to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("CRD cannot be read leaves SupportedVersion absent", func(t *testing.T) {
+		// CRD not in client objects -> Get will return NotFound
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy()).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond != nil {
+			t.Errorf("expected SupportedVersion condition to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("reconciliation syncs CRD bundle version to State", func(t *testing.T) {
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithMatchingVersion).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			State:          st,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != gatewayconsts.BundleVersion {
+			t.Errorf("expected State bundle version %s, got %v", gatewayconsts.BundleVersion, st.GatewayCRDBundleVersion())
+		}
+	})
 }
 
 func TestGatewayReconciler_InvalidParametersRef(t *testing.T) {

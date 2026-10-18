@@ -15,6 +15,7 @@
 package state
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
 
 // ListenerOwner identifies the resource (Gateway or ListenerSet) that defines a listener.
@@ -186,6 +188,172 @@ func (el *EffectiveListener) ToInternalListener() InternalListener {
 	}
 }
 
+// HostnamesOverlap returns true if two listener hostnames overlap (e.g. *.example.com and foo.example.com).
+// Duplicate exact hostnames return false because they represent conflicts handled by Conflicted status.
+func HostnamesOverlap(h1, h2 string) bool {
+	h1 = strings.ToLower(h1)
+	h2 = strings.ToLower(h2)
+
+	if h1 == h2 {
+		return false
+	}
+
+	_, ok := Intersect(h1, h2)
+	return ok
+}
+
+func getEffectiveListenerCertRefs(el *EffectiveListener) []gatewayv1.SecretObjectReference {
+	if el == nil || el.TLS == nil {
+		return nil
+	}
+	return el.TLS.CertificateRefs
+}
+
+func listenerCertificatesDiffer(el1, el2 *EffectiveListener, secrets map[types.NamespacedName]*corev1.Secret) bool {
+	refs1 := getEffectiveListenerCertRefs(el1)
+	refs2 := getEffectiveListenerCertRefs(el2)
+
+	if len(refs1) == 0 && len(refs2) == 0 {
+		return false
+	}
+	if len(refs1) != len(refs2) {
+		return true
+	}
+
+	allSecretsAvailable := true
+	var certs1, certs2 [][]byte
+	for _, ref := range refs1 {
+		secNs := el1.Owner.Namespace
+		if ref.Namespace != nil && string(*ref.Namespace) != "" {
+			secNs = string(*ref.Namespace)
+		}
+		secKey := types.NamespacedName{Namespace: secNs, Name: string(ref.Name)}
+		sec := secrets[secKey]
+		if sec == nil || len(sec.Data[corev1.TLSCertKey]) == 0 {
+			allSecretsAvailable = false
+			break
+		}
+		certs1 = append(certs1, sec.Data[corev1.TLSCertKey])
+	}
+	for _, ref := range refs2 {
+		secNs := el2.Owner.Namespace
+		if ref.Namespace != nil && string(*ref.Namespace) != "" {
+			secNs = string(*ref.Namespace)
+		}
+		secKey := types.NamespacedName{Namespace: secNs, Name: string(ref.Name)}
+		sec := secrets[secKey]
+		if sec == nil || len(sec.Data[corev1.TLSCertKey]) == 0 {
+			allSecretsAvailable = false
+			break
+		}
+		certs2 = append(certs2, sec.Data[corev1.TLSCertKey])
+	}
+
+	if allSecretsAvailable && len(certs1) == len(refs1) && len(certs2) == len(refs2) {
+		for i := range certs1 {
+			if !bytes.Equal(certs1[i], certs2[i]) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Fallback to comparing normalized secret reference namespace and name
+	for i := range refs1 {
+		ns1 := el1.Owner.Namespace
+		if refs1[i].Namespace != nil && string(*refs1[i].Namespace) != "" {
+			ns1 = string(*refs1[i].Namespace)
+		}
+		ns2 := el2.Owner.Namespace
+		if refs2[i].Namespace != nil && string(*refs2[i].Namespace) != "" {
+			ns2 = string(*refs2[i].Namespace)
+		}
+		if ns1 != ns2 || string(refs1[i].Name) != string(refs2[i].Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func computeOverlappingTLSConfig(gateways []*CompiledGateway, allInOneMode bool, secrets map[types.NamespacedName]*corev1.Secret) {
+	if allInOneMode {
+		var allListeners []*EffectiveListener
+		for _, cg := range gateways {
+			if cg == nil {
+				continue
+			}
+			for _, el := range cg.EffectiveListeners {
+				if (el.Protocol == gatewayv1.HTTPSProtocolType || el.Protocol == gatewayv1.TLSProtocolType) && !el.IsConflicted() {
+					allListeners = append(allListeners, el)
+				}
+			}
+		}
+		computeOverlappingTLSConfigForListeners(allListeners, secrets)
+	} else {
+		for _, cg := range gateways {
+			if cg == nil {
+				continue
+			}
+			var gwListeners []*EffectiveListener
+			for _, el := range cg.EffectiveListeners {
+				if (el.Protocol == gatewayv1.HTTPSProtocolType || el.Protocol == gatewayv1.TLSProtocolType) && !el.IsConflicted() {
+					gwListeners = append(gwListeners, el)
+				}
+			}
+			computeOverlappingTLSConfigForListeners(gwListeners, secrets)
+		}
+	}
+}
+
+func computeOverlappingTLSConfigForListeners(listeners []*EffectiveListener, secrets map[types.NamespacedName]*corev1.Secret) {
+	byPort := make(map[gatewayv1.PortNumber][]*EffectiveListener)
+	for _, el := range listeners {
+		byPort[el.Port] = append(byPort[el.Port], el)
+	}
+
+	for port, portListeners := range byPort {
+		n := len(portListeners)
+		if n < 2 {
+			continue
+		}
+		overlapping := make([]bool, n)
+		certsDiffer := make([]bool, n)
+
+		for i := 0; i < n; i++ {
+			h1 := string(ValueOf(portListeners[i].Hostname))
+			for j := i + 1; j < n; j++ {
+				h2 := string(ValueOf(portListeners[j].Hostname))
+				if HostnamesOverlap(h1, h2) {
+					overlapping[i] = true
+					overlapping[j] = true
+					if listenerCertificatesDiffer(portListeners[i], portListeners[j], secrets) {
+						certsDiffer[i] = true
+						certsDiffer[j] = true
+					}
+				}
+			}
+		}
+
+		for i := 0; i < n; i++ {
+			if overlapping[i] {
+				reason := gatewayv1.ListenerReasonOverlappingHostnames
+				msg := fmt.Sprintf("Overlapping TLS configuration: listener shares port %d and overlapping hostname with another listener", port)
+				if certsDiffer[i] {
+					reason = gatewayv1.ListenerReasonOverlappingCertificates
+					msg = fmt.Sprintf("Overlapping TLS configuration: listener shares port %d and overlapping hostname with another listener using differing certificates", port)
+				}
+				SetCondition(&portListeners[i].Conditions, NewCondition(
+					string(gatewayv1.ListenerConditionOverlappingTLSConfig),
+					metav1.ConditionTrue,
+					string(reason),
+					msg,
+					portListeners[i].Generation,
+				))
+			}
+		}
+	}
+}
+
 // CompiledGateway contains the compiled state for a single Gateway.
 type CompiledGateway struct {
 	Gateway               *gatewayv1.Gateway
@@ -283,28 +451,29 @@ type GatewayReadiness struct {
 
 // ModelInputs contains all inputs required to build a CompiledModel and ComputeOutputs.
 type ModelInputs struct {
-	Revision              uint64
-	Gateways              []*gatewayv1.Gateway
-	GatewayClasses        []*gatewayv1.GatewayClass
-	GatewayAddresses      map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
-	GatewayReadiness      map[types.NamespacedName]GatewayReadiness
-	ProvisioningErrors    map[types.NamespacedName]string
-	SupportedAddressTypes []gatewayv1.AddressType
-	ListenerSets          []*gatewayv1.ListenerSet
-	HTTPRoutes            []*gatewayv1.HTTPRoute
-	TLSRoutes             []*gatewayv1.TLSRoute
-	GRPCRoutes            []*gatewayv1.GRPCRoute
-	TCPRoutes             []*gatewayv1.TCPRoute
-	UDPRoutes             []*gatewayv1.UDPRoute
-	Services              map[types.NamespacedName]*corev1.Service
-	BackendTLSPolicies    []*gatewayv1.BackendTLSPolicy
-	ConfigMaps            map[types.NamespacedName]*corev1.ConfigMap
-	Secrets               map[types.NamespacedName]*corev1.Secret
-	Namespaces            map[string]*corev1.Namespace
-	ReferenceGrants       map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
-	RefValidator          ReferenceGrantValidator
-	ControllerName        string
-	AllInOneMode          bool
+	Revision                uint64
+	Gateways                []*gatewayv1.Gateway
+	GatewayClasses          []*gatewayv1.GatewayClass
+	GatewayAddresses        map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
+	GatewayReadiness        map[types.NamespacedName]GatewayReadiness
+	ProvisioningErrors      map[types.NamespacedName]string
+	SupportedAddressTypes   []gatewayv1.AddressType
+	ListenerSets            []*gatewayv1.ListenerSet
+	HTTPRoutes              []*gatewayv1.HTTPRoute
+	TLSRoutes               []*gatewayv1.TLSRoute
+	GRPCRoutes              []*gatewayv1.GRPCRoute
+	TCPRoutes               []*gatewayv1.TCPRoute
+	UDPRoutes               []*gatewayv1.UDPRoute
+	Services                map[types.NamespacedName]*corev1.Service
+	BackendTLSPolicies      []*gatewayv1.BackendTLSPolicy
+	ConfigMaps              map[types.NamespacedName]*corev1.ConfigMap
+	Secrets                 map[types.NamespacedName]*corev1.Secret
+	Namespaces              map[string]*corev1.Namespace
+	ReferenceGrants         map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
+	RefValidator            ReferenceGrantValidator
+	ControllerName          string
+	AllInOneMode            bool
+	GatewayCRDBundleVersion *string
 }
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
@@ -1376,6 +1545,12 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		cm.Gateways[gwKey] = cg
 	}
 
+	var allCGs []*CompiledGateway
+	for _, cg := range cm.Gateways {
+		allCGs = append(allCGs, cg)
+	}
+	computeOverlappingTLSConfig(allCGs, inputs.AllInOneMode, inputs.Secrets)
+
 	// 2. Compile HTTPRoutes and perform route binding
 	for _, route := range inputs.HTTPRoutes {
 		if route == nil {
@@ -2234,7 +2409,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		}
 		if inputs.ControllerName == "" || string(gc.Spec.ControllerName) == inputs.ControllerName {
 			gcKey := types.NamespacedName{Name: gc.Name}
-			outputs.GatewayClassStatuses[gcKey] = ComputeDesiredGatewayClassStatus(gc, inputs.ControllerName)
+			outputs.GatewayClassStatuses[gcKey] = ComputeDesiredGatewayClassStatus(gc, inputs.ControllerName, inputs.GatewayCRDBundleVersion)
 		}
 	}
 
@@ -2382,6 +2557,34 @@ func ComputeDesiredListenerSetStatus(
 	}
 }
 
+// isRoutePartiallyInvalid returns true when a route contains at least one valid and at least one invalid rule.
+func isRoutePartiallyInvalid(rules []InternalRule) bool {
+	var valid, invalid int
+	for _, r := range rules {
+		if r.Error != nil {
+			invalid++
+		} else {
+			valid++
+		}
+	}
+	return valid > 0 && invalid > 0
+}
+
+// routePartiallyInvalidMessage returns a spec-compliant condition message starting with "Dropped Rule".
+func routePartiallyInvalidMessage(rules []InternalRule) string {
+	var dropped []string
+	for i, r := range rules {
+		if r.Error != nil {
+			if r.Name != nil && *r.Name != "" {
+				dropped = append(dropped, fmt.Sprintf("rule %d (%s)", i, *r.Name))
+			} else {
+				dropped = append(dropped, fmt.Sprintf("rule %d", i))
+			}
+		}
+	}
+	return fmt.Sprintf("Dropped Rule(s): %s", strings.Join(dropped, ", "))
+}
+
 // ComputeDesiredHTTPRouteStatus computes the desired HTTPRouteStatus from the compiled model.
 func ComputeDesiredHTTPRouteStatus(
 	route *gatewayv1.HTTPRoute,
@@ -2395,13 +2598,25 @@ func ComputeDesiredHTTPRouteStatus(
 			if i < len(compiledRoute.ParentConditions) {
 				cond = compiledRoute.ParentConditions[i]
 			}
+			conditions := []metav1.Condition{
+				cond,
+				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+			}
+			if cond.Status == metav1.ConditionTrue && compiledRoute.RouteState != nil && compiledRoute.RouteState.Internal != nil {
+				if isRoutePartiallyInvalid(compiledRoute.RouteState.Internal.Rules) {
+					conditions = append(conditions, NewCondition(
+						string(gatewayv1.RouteConditionPartiallyInvalid),
+						metav1.ConditionTrue,
+						string(gatewayv1.RouteReasonUnsupportedValue),
+						routePartiallyInvalidMessage(compiledRoute.RouteState.Internal.Rules),
+						route.Generation,
+					))
+				}
+			}
 			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
 				ParentRef:      parentRef,
 				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions: []metav1.Condition{
-					cond,
-					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-				},
+				Conditions:     conditions,
 			})
 		}
 	}
@@ -2455,13 +2670,25 @@ func ComputeDesiredGRPCRouteStatus(
 			if i < len(compiledRoute.ParentConditions) {
 				cond = compiledRoute.ParentConditions[i]
 			}
+			conditions := []metav1.Condition{
+				cond,
+				compiledRoute.RouteState.Internal.ResolvedRefsCondition,
+			}
+			if cond.Status == metav1.ConditionTrue && compiledRoute.RouteState != nil && compiledRoute.RouteState.Internal != nil {
+				if isRoutePartiallyInvalid(compiledRoute.RouteState.Internal.Rules) {
+					conditions = append(conditions, NewCondition(
+						string(gatewayv1.RouteConditionPartiallyInvalid),
+						metav1.ConditionTrue,
+						string(gatewayv1.RouteReasonUnsupportedValue),
+						routePartiallyInvalidMessage(compiledRoute.RouteState.Internal.Rules),
+						route.Generation,
+					))
+				}
+			}
 			desiredParents = append(desiredParents, gatewayv1.RouteParentStatus{
 				ParentRef:      parentRef,
 				ControllerName: gatewayv1.GatewayController(controllerName),
-				Conditions: []metav1.Condition{
-					cond,
-					compiledRoute.RouteState.Internal.ResolvedRefsCondition,
-				},
+				Conditions:     conditions,
 			})
 		}
 	}
@@ -2741,8 +2968,28 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	return gatewayv1.PolicyStatus{Ancestors: ancestors}
 }
 
+// ComputeSupportedVersionCondition computes the SupportedVersion condition for a GatewayClass given a bundle version.
+func ComputeSupportedVersionCondition(bundleVersion string, generation int64) metav1.Condition {
+	if bundleVersion == gatewayconsts.BundleVersion {
+		return NewCondition(
+			string(gatewayv1.GatewayClassConditionStatusSupportedVersion),
+			metav1.ConditionTrue,
+			string(gatewayv1.GatewayClassReasonSupportedVersion),
+			fmt.Sprintf("Gateway API CRD bundle-version %q is supported", bundleVersion),
+			generation,
+		)
+	}
+	return NewCondition(
+		string(gatewayv1.GatewayClassConditionStatusSupportedVersion),
+		metav1.ConditionFalse,
+		string(gatewayv1.GatewayClassReasonUnsupportedVersion),
+		fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s)", bundleVersion, gatewayconsts.BundleVersion),
+		generation,
+	)
+}
+
 // ComputeDesiredGatewayClassStatus computes the desired GatewayClass status.
-func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string) gatewayv1.GatewayClassStatus {
+func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string, crdBundleVersion *string) gatewayv1.GatewayClassStatus {
 	acceptedStatus := metav1.ConditionTrue
 	acceptedReason := string(gatewayv1.GatewayClassReasonAccepted)
 	acceptedMessage := "GatewayClass accepted by reference implementation"
@@ -2753,16 +3000,22 @@ func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName
 		acceptedMessage = "Invalid parametersRef: parametersRef is not supported"
 	}
 
-	return gatewayv1.GatewayClassStatus{
-		Conditions: []metav1.Condition{
-			{
-				Type:               string(gatewayv1.GatewayClassConditionStatusAccepted),
-				Status:             acceptedStatus,
-				ObservedGeneration: gc.Generation,
-				Reason:             acceptedReason,
-				Message:            acceptedMessage,
-			},
+	conds := []metav1.Condition{
+		{
+			Type:               string(gatewayv1.GatewayClassConditionStatusAccepted),
+			Status:             acceptedStatus,
+			ObservedGeneration: gc.Generation,
+			Reason:             acceptedReason,
+			Message:            acceptedMessage,
 		},
+	}
+
+	if crdBundleVersion != nil && *crdBundleVersion != "" {
+		conds = append(conds, ComputeSupportedVersionCondition(*crdBundleVersion, gc.Generation))
+	}
+
+	return gatewayv1.GatewayClassStatus{
+		Conditions: conds,
 	}
 }
 
