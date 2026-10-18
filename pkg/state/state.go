@@ -204,13 +204,6 @@ func (s *State) SetGatewayCRDBundleVersion(v *string) {
 		val := *v
 		s.gatewayCRDBundleVersion = &val
 	}
-	if s.previousOutputs != nil && s.previousOutputs.GatewayClassStatuses != nil {
-		for gcKey, gc := range s.gatewayClasses {
-			if s.controllerName == "" || string(gc.Spec.ControllerName) == s.controllerName {
-				s.previousOutputs.GatewayClassStatuses[gcKey] = ComputeDesiredGatewayClassStatus(gc, s.controllerName, s.gatewayCRDBundleVersion)
-			}
-		}
-	}
 	s.revision++
 	s.markDirtyLocked()
 }

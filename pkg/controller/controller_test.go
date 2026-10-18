@@ -724,11 +724,9 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		}
 	})
 
-	t.Run("reconciliation with State sets condition and syncs State bundle version", func(t *testing.T) {
+	t.Run("reconciliation syncs CRD bundle version to State", func(t *testing.T) {
 		st := state.NewState()
 		st.SetControllerName("test-controller")
-		st.UpsertGatewayClass(gc.DeepCopy())
-		st.Recompute()
 
 		client := fake.NewClientBuilder().
 			WithScheme(scheme).
@@ -748,19 +746,6 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
-		}
-
-		var res gatewayv1.GatewayClass
-		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
-			t.Fatalf("failed to get GatewayClass: %v", err)
-		}
-
-		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
-		if cond == nil {
-			t.Fatalf("expected SupportedVersion condition, got nil")
-		}
-		if cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
-			t.Errorf("expected SupportedVersion=True/SupportedVersion, got %+v", cond)
 		}
 
 		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != gatewayconsts.BundleVersion {
