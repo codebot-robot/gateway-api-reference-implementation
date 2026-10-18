@@ -91,6 +91,8 @@ type issuerState struct {
 	keys        map[string]crypto.PublicKey // kid -> public key
 	keysLoaded  bool
 	lastRefresh time.Time
+	lastAttempt time.Time
+	lastError   error
 	refreshMu   sync.Mutex // ensures only one refresh at a time per issuer
 }
 
@@ -253,7 +255,6 @@ func (c *JWKSCache) GetKey(ctx context.Context, issuer string, kid string) (cryp
 
 	state.mu.RLock()
 	key, found := state.keys[kid]
-	loaded := state.keysLoaded
 	state.mu.RUnlock()
 
 	if found {
@@ -268,8 +269,9 @@ func (c *JWKSCache) GetKey(ctx context.Context, issuer string, kid string) (cryp
 	// Double-check under refreshMu
 	state.mu.RLock()
 	key, found = state.keys[kid]
-	last := state.lastRefresh
-	loaded = state.keysLoaded
+	lastAttempt := state.lastAttempt
+	loaded := state.keysLoaded
+	lastErr := state.lastError
 	state.mu.RUnlock()
 
 	if found {
@@ -278,8 +280,10 @@ func (c *JWKSCache) GetKey(ctx context.Context, issuer string, kid string) (cryp
 
 	now := c.timeNow()
 	var refreshErr error
-	// Allow refresh if keys haven't loaded yet, or if rateLimit has elapsed since last refresh
-	if !loaded || last.IsZero() || now.Sub(last) >= c.rateLimit {
+	// Rate limit unknown-kid refresh attempts to at most once per rateLimit interval (e.g. 1 minute).
+	// This applies to both successes and failures, ensuring unreachable issuers do not trigger outbound
+	// fetches for every unauthenticated token presented.
+	if lastAttempt.IsZero() || now.Sub(lastAttempt) >= c.rateLimit {
 		if err := c.refreshIssuerLocked(ctx, state); err != nil {
 			refreshErr = err
 			log.Printf("JWKS: refresh on unknown kid %q failed for issuer %s: %v", kid, state.issuerURL, err)
@@ -288,11 +292,18 @@ func (c *JWKSCache) GetKey(ctx context.Context, issuer string, kid string) (cryp
 
 	state.mu.RLock()
 	key, found = state.keys[kid]
+	loaded = state.keysLoaded
+	if state.lastError != nil {
+		lastErr = state.lastError
+	}
 	state.mu.RUnlock()
 
 	if !found {
 		if refreshErr != nil {
 			return nil, fmt.Errorf("key ID %q not found for issuer %q (refresh failed: %w)", kid, issuer, refreshErr)
+		}
+		if !loaded && lastErr != nil {
+			return nil, fmt.Errorf("key ID %q not found for issuer %q (issuer unavailable: %w)", kid, issuer, lastErr)
 		}
 		return nil, fmt.Errorf("key ID %q not found for issuer %q", kid, issuer)
 	}
@@ -306,6 +317,10 @@ func (c *JWKSCache) refreshIssuer(ctx context.Context, s *issuerState) error {
 }
 
 func (c *JWKSCache) refreshIssuerLocked(ctx context.Context, s *issuerState) error {
+	s.mu.Lock()
+	s.lastAttempt = c.timeNow()
+	s.mu.Unlock()
+
 	var jwksBytes []byte
 	var err error
 
@@ -317,11 +332,17 @@ func (c *JWKSCache) refreshIssuerLocked(ctx context.Context, s *issuerState) err
 
 	if err != nil {
 		// "A failed refresh keeps the previous key set and logs."
+		s.mu.Lock()
+		s.lastError = err
+		s.mu.Unlock()
 		return err
 	}
 
 	parsedKeys, err := parseJWKS(jwksBytes)
 	if err != nil {
+		s.mu.Lock()
+		s.lastError = err
+		s.mu.Unlock()
 		return fmt.Errorf("parsing JWKS document: %w", err)
 	}
 
@@ -329,6 +350,7 @@ func (c *JWKSCache) refreshIssuerLocked(ctx context.Context, s *issuerState) err
 	s.keys = parsedKeys
 	s.keysLoaded = true
 	s.lastRefresh = c.timeNow()
+	s.lastError = nil
 	s.mu.Unlock()
 
 	return nil

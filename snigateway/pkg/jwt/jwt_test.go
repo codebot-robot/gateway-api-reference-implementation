@@ -348,11 +348,13 @@ func TestJWKSCache_OIDCDiscoveryAndRateLimiting(t *testing.T) {
 
 	var discoveryRequests atomic.Int32
 	var jwksRequests atomic.Int32
+	var totalRequests atomic.Int32
 	var returnSecondKey atomic.Bool
 	var forceError atomic.Bool
 
 	var serverURL string
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		totalRequests.Add(1)
 		if forceError.Load() {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
@@ -441,13 +443,26 @@ func TestJWKSCache_OIDCDiscoveryAndRateLimiting(t *testing.T) {
 		t.Fatalf("expected rate-limit to prevent refresh on unknown kid, but requests increased to %d", jwksRequests.Load())
 	}
 
-	// 5. Test failed refresh keeps old keys
+	// 5. Test failed refresh keeps old keys and rate limits subsequent attempts
 	forceError.Store(true)
 	// Advance time to allow a refresh attempt that fails
 	simulatedTime = simulatedTime.Add(2 * time.Minute)
 
+	reqsBeforeFailedRefresh := totalRequests.Load()
+
 	// Try fetching another unknown key (will trigger refresh attempt and fail)
 	_, _ = cache.GetKey(ctx, serverURL, "key-unknown")
+
+	reqsAfterFailedRefresh := totalRequests.Load()
+	if reqsAfterFailedRefresh <= reqsBeforeFailedRefresh {
+		t.Fatalf("expected refresh attempt on unknown key, but totalRequests did not increase")
+	}
+
+	// Immediate subsequent request within rate limit window MUST NOT trigger another outbound fetch
+	_, _ = cache.GetKey(ctx, serverURL, "key-unknown-2")
+	if totalRequests.Load() != reqsAfterFailedRefresh {
+		t.Fatalf("expected failed refresh attempt to be rate-limited, but requests increased to %d", totalRequests.Load())
+	}
 
 	// Old keys key-1 and key-2 should STILL be present and working!
 	k1Still, err := cache.GetKey(ctx, serverURL, "key-1")

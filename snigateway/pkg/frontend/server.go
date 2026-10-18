@@ -47,6 +47,9 @@ const (
 
 	// DefaultMaxHostnamesPerSession is the default maximum number of hostnames a session may register.
 	DefaultMaxHostnamesPerSession = 1000
+
+	// DefaultLeaseReaperInterval is the default interval for checking expired registration leases.
+	DefaultLeaseReaperInterval = 10 * time.Second
 )
 
 // ServerConfig holds configuration options for the frontend server.
@@ -350,7 +353,7 @@ func (s *Server) Close() error {
 func (s *Server) runLeaseReaper() {
 	interval := s.config.LeaseReaperInterval
 	if interval <= 0 {
-		interval = 100 * time.Millisecond
+		interval = DefaultLeaseReaperInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

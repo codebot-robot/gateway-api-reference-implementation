@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,4 +148,32 @@ func TestFrontendCLI_JWTFlags(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for server shutdown")
 	}
+
+	t.Run("Bare jwks file without issuer fails", func(t *testing.T) {
+		badArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-jwks-file=" + jwksPath,
+		}
+		err := run(t.Context(), badArgs)
+		if err == nil || !strings.Contains(err.Error(), "only valid when exactly one --jwt-issuer is configured") {
+			t.Fatalf("expected bare jwks file without issuer to fail, got: %v", err)
+		}
+	})
+
+	t.Run("Bare jwks file with multiple issuers fails", func(t *testing.T) {
+		badArgs := []string{
+			"--listen=" + listenAddr,
+			"--server-cert=" + serverCertPath,
+			"--server-key=" + serverKeyPath,
+			"--jwt-issuer=https://issuer1.example.com",
+			"--jwt-issuer=https://issuer2.example.com",
+			"--jwt-jwks-file=" + jwksPath,
+		}
+		err := run(t.Context(), badArgs)
+		if err == nil || !strings.Contains(err.Error(), "only valid when exactly one --jwt-issuer is configured") {
+			t.Fatalf("expected bare jwks file with multiple issuers to fail, got: %v", err)
+		}
+	})
 }

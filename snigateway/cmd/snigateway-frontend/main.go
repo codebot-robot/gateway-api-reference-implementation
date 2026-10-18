@@ -19,7 +19,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -108,7 +107,7 @@ func run(ctx context.Context, args []string) error {
 				if len(jwtIssuers) == 1 {
 					jwksFileMap[jwt.NormalizeIssuer(jwtIssuers[0])] = entry
 				} else {
-					jwksFileMap[""] = entry
+					return fmt.Errorf("bare --jwt-jwks-file %q is only valid when exactly one --jwt-issuer is configured; specify format <issuer>=<path> instead", entry)
 				}
 			}
 		}
@@ -192,22 +191,8 @@ func run(ctx context.Context, args []string) error {
 		}
 		caAuthorizer = frontend.NewCAAuthorizer(allowedPatterns)
 	} else if jwtVerifier != nil {
-		caCertPEM, err := os.ReadFile(*caCertPath)
-		if err == nil {
-			parsedCerts, err := certs.ParseCertificatesFromPEM(caCertPEM)
-			if err != nil {
-				return fmt.Errorf("parsing CA cert from %s: %w", *caCertPath, err)
-			}
-			clientCAPool.AppendCertsFromPEM(caCertPEM)
-			allowedPatterns := make(map[string][]string)
-			for _, cert := range parsedCerts {
-				fp := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
-				allowedPatterns[fp] = []string{"*"}
-			}
-			caAuthorizer = frontend.NewCAAuthorizer(allowedPatterns)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("reading CA cert from %s: %w", *caCertPath, err)
-		}
+		// In token mode without --client-ca, do not create an implicit CA grant.
+		// Certificate clients alongside tokens must be explicitly authorized with --client-ca.
 	} else {
 		log.Printf("WARNING: No --client-ca flags specified. Registrations are unrestricted for CA %s", *caCertPath)
 		caCertPEM, err := os.ReadFile(*caCertPath)
