@@ -5813,6 +5813,122 @@ func TestListener_OverlappingTLSConfig(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("overlapping wildcard and multi-level subdomain (*.example.com and a.foo.example.com)", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-multi-level", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "subdomain",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("a.foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		if len(gwStatus.Listeners) != 2 {
+			t.Fatalf("expected 2 listener statuses, got %d", len(gwStatus.Listeners))
+		}
+
+		for _, l := range gwStatus.Listeners {
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond == nil {
+				t.Fatalf("listener %s expected OverlappingTLSConfig condition, got nil", l.Name)
+			}
+			if overlapCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected OverlappingTLSConfig Status=True, got %s", l.Name, overlapCond.Status)
+			}
+		}
+	})
+
+	t.Run("overlapping nested wildcards (*.example.com and *.foo.example.com)", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-nested-wildcard", Generation: 1},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "reference-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+					{
+						Name:     "nested-wildcard",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("*.foo.example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							CertificateRefs: []gatewayv1.SecretObjectReference{
+								{Name: "cert-1"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways:       []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{gc},
+			Secrets: map[types.NamespacedName]*corev1.Secret{
+				{Namespace: "default", Name: "cert-1"}: secret1,
+			},
+			ControllerName: "test-controller",
+		}
+
+		outputs := ComputeOutputs(inputs)
+		gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
+		if len(gwStatus.Listeners) != 2 {
+			t.Fatalf("expected 2 listener statuses, got %d", len(gwStatus.Listeners))
+		}
+
+		for _, l := range gwStatus.Listeners {
+			overlapCond := FindCondition(l.Conditions, string(gatewayv1.ListenerConditionOverlappingTLSConfig))
+			if overlapCond == nil {
+				t.Fatalf("listener %s expected OverlappingTLSConfig condition, got nil", l.Name)
+			}
+			if overlapCond.Status != metav1.ConditionTrue {
+				t.Errorf("listener %s expected OverlappingTLSConfig Status=True, got %s", l.Name, overlapCond.Status)
+			}
+		}
+	})
 }
 
 func TestGatewayClassStatus_SupportedVersion(t *testing.T) {

@@ -198,35 +198,8 @@ func HostnamesOverlap(h1, h2 string) bool {
 		return false
 	}
 
-	if h1 == "" || h1 == "*" {
-		return true
-	}
-	if h2 == "" || h2 == "*" {
-		return true
-	}
-
-	h1Wild := strings.HasPrefix(h1, "*.")
-	h2Wild := strings.HasPrefix(h2, "*.")
-
-	if h1Wild && !h2Wild {
-		domain := h1[1:] // .example.com
-		if strings.HasSuffix(h2, domain) {
-			prefix := h2[:len(h2)-len(domain)]
-			return len(prefix) > 0 && !strings.Contains(prefix, ".")
-		}
-		return false
-	}
-
-	if !h1Wild && h2Wild {
-		domain := h2[1:] // .example.com
-		if strings.HasSuffix(h1, domain) {
-			prefix := h1[:len(h1)-len(domain)]
-			return len(prefix) > 0 && !strings.Contains(prefix, ".")
-		}
-		return false
-	}
-
-	return false
+	_, ok := Intersect(h1, h2)
+	return ok
 }
 
 func getEffectiveListenerCertRefs(el *EffectiveListener) []gatewayv1.SecretObjectReference {
@@ -3016,7 +2989,7 @@ func ComputeSupportedVersionCondition(bundleVersion string, generation int64) me
 }
 
 // ComputeDesiredGatewayClassStatus computes the desired GatewayClass status.
-func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string, crdBundleVersion ...*string) gatewayv1.GatewayClassStatus {
+func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string, crdBundleVersion *string) gatewayv1.GatewayClassStatus {
 	acceptedStatus := metav1.ConditionTrue
 	acceptedReason := string(gatewayv1.GatewayClassReasonAccepted)
 	acceptedMessage := "GatewayClass accepted by reference implementation"
@@ -3037,8 +3010,8 @@ func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName
 		},
 	}
 
-	if len(crdBundleVersion) > 0 && crdBundleVersion[0] != nil && *crdBundleVersion[0] != "" {
-		conds = append(conds, ComputeSupportedVersionCondition(*crdBundleVersion[0], gc.Generation))
+	if crdBundleVersion != nil && *crdBundleVersion != "" {
+		conds = append(conds, ComputeSupportedVersionCondition(*crdBundleVersion, gc.Generation))
 	}
 
 	return gatewayv1.GatewayClassStatus{

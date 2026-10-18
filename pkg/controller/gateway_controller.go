@@ -84,12 +84,6 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		desired = state.ComputeDesiredGatewayClassStatus(&gc, r.ControllerName, crdBundleVersion)
 	}
 
-	if crdBundleVersion != nil {
-		state.SetCondition(&desired.Conditions, state.ComputeSupportedVersionCondition(*crdBundleVersion, gc.Generation))
-	} else {
-		state.RemoveCondition(&desired.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
-	}
-
 	if state.MergeGatewayClassStatus(&gc.Status, desired) {
 		if err := r.Status().Update(ctx, &gc); err != nil {
 			l.Error(err, "unable to update GatewayClass status")
