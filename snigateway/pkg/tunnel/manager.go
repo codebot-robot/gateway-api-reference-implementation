@@ -32,6 +32,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"
@@ -174,6 +175,7 @@ type Manager struct {
 	registeredHostnames     []string
 	lastRegisteredSessionID string
 	stateChangeListeners    []func()
+	reRegTimer              *time.Timer
 }
 
 // NewManager creates a new Manager using the given client.
@@ -288,10 +290,51 @@ func (m *Manager) triggerRegistration() {
 	}
 }
 
+func (m *Manager) scheduleTokenReRegistration(token string) {
+	exp, err := jwt.ParseTokenExpiry(token)
+	if err != nil {
+		return
+	}
+	remaining := time.Until(exp)
+	if remaining <= 0 {
+		return
+	}
+
+	reRegDuration := remaining * 7 / 10
+	if remaining > 5*time.Minute && remaining-2*time.Minute < reRegDuration {
+		reRegDuration = remaining - 2*time.Minute
+	}
+	if reRegDuration < 100*time.Millisecond {
+		reRegDuration = 100 * time.Millisecond
+	}
+	if reRegDuration > 12*time.Hour {
+		reRegDuration = 12 * time.Hour
+	}
+
+	m.mu.Lock()
+	if m.reRegTimer != nil {
+		m.reRegTimer.Stop()
+	}
+	m.reRegTimer = time.AfterFunc(reRegDuration, func() {
+		m.mu.Lock()
+		m.generation++
+		m.mu.Unlock()
+		m.triggerRegistration()
+	})
+	m.mu.Unlock()
+}
+
 // Run starts the session, transport, and registration loops, maintaining connectivity to the frontend
 // and feeding connections into the tunnel Listener until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
 	defer closeConn(m.listener)
+	defer func() {
+		m.mu.Lock()
+		if m.reRegTimer != nil {
+			m.reRegTimer.Stop()
+		}
+		m.mu.Unlock()
+	}()
 
 	g, ctx := errgroup.WithContext(ctx)
 
@@ -328,7 +371,14 @@ func (m *Manager) Run(ctx context.Context) error {
 
 				if isQUIC && ctrlStream != nil && ctrlReader != nil {
 					m.regWorkerMu.Lock()
-					reqBytes, err := json.Marshal(api.RegistrationRequest{Hostnames: curr})
+					token, err := m.client.GetToken()
+					if err != nil {
+						klog.V(2).Infof("Reading token for QUIC registration: %v", err)
+					}
+					reqBytes, err := json.Marshal(api.RegistrationRequest{
+						Hostnames: curr,
+						Token:     token,
+					})
 					if err != nil {
 						m.regWorkerMu.Unlock()
 						klog.Errorf("Failed to marshal registration request: %v", err)
@@ -410,8 +460,15 @@ func (m *Manager) Run(ctx context.Context) error {
 					m.registeredHostnames = slices.Clone(curr)
 					m.lastRegisteredSessionID = sessID
 					m.mu.Unlock()
+					if token != "" {
+						m.scheduleTokenReRegistration(token)
+					}
 					m.notifyListeners()
 				} else if !isQUIC {
+					token, err := m.client.GetToken()
+					if err != nil {
+						klog.V(2).Infof("Reading token for registration: %v", err)
+					}
 					regCtx, cancel := context.WithTimeout(ctx, m.registerTimeout)
 					resp, err := m.client.Register(regCtx, sessID, curr)
 					cancel()
@@ -438,6 +495,9 @@ func (m *Manager) Run(ctx context.Context) error {
 						m.registeredHostnames = slices.Clone(curr)
 						m.lastRegisteredSessionID = sessID
 						m.mu.Unlock()
+						if token != "" {
+							m.scheduleTokenReRegistration(token)
+						}
 						m.notifyListeners()
 					}
 				}
@@ -706,7 +766,21 @@ func (m *Manager) handshakeQUICSession(ctx context.Context, qConn *quic.Conn) (*
 		closeConn(ctrlStream)
 		return nil, fmt.Errorf("setting write deadline on QUIC control stream: %w", err)
 	}
-	if _, err := ctrlStream.Write([]byte("{\"type\":\"session\"}\n")); err != nil {
+
+	token, err := m.client.GetToken()
+	if err != nil {
+		klog.V(2).Infof("Reading token for QUIC session handshake: %v", err)
+	}
+	initReq := api.SessionInitRequest{
+		Type:  "session",
+		Token: token,
+	}
+	initBytes, err := json.Marshal(initReq)
+	if err != nil {
+		closeConn(ctrlStream)
+		return nil, fmt.Errorf("marshaling QUIC session init: %w", err)
+	}
+	if _, err := ctrlStream.Write(append(initBytes, '\n')); err != nil {
 		closeConn(ctrlStream)
 		return nil, fmt.Errorf("initiating QUIC control stream: %w", err)
 	}

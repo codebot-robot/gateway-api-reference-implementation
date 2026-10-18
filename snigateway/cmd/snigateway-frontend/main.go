@@ -17,7 +17,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -30,6 +32,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
 )
 
 type stringSliceFlag []string
@@ -75,6 +78,14 @@ func run(ctx context.Context, args []string) error {
 	idleTimeout := fs.Duration("tcp-idle-timeout", 0, "Idle timeout for spliced client connections (disabled by default)")
 	maxHostnames := fs.Int("max-hostnames-per-session", frontend.DefaultMaxHostnamesPerSession, "Maximum number of hostnames a session may register")
 
+	var jwtIssuers stringSliceFlag
+	fs.Var(&jwtIssuers, "jwt-issuer", "JWT issuer URL for ServiceAccount token verification (repeatable)")
+	var jwtJWKSFiles stringSliceFlag
+	fs.Var(&jwtJWKSFiles, "jwt-jwks-file", "Path to JWKS file per issuer in format [<issuer>=]<path> (repeatable)")
+	jwtAudience := fs.String("jwt-audience", jwt.DefaultAudience, "Required audience for ServiceAccount tokens")
+	var clientSubjects stringSliceFlag
+	fs.Var(&clientSubjects, "client-subject", "Client subject allowlist in format system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...] (repeatable, <ns>:* allowed)")
+
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -86,8 +97,60 @@ func run(ctx context.Context, args []string) error {
 		tunnelListenUDP = listenAddrs
 	}
 
+	var jwtVerifier jwt.TokenVerifier
+	if len(jwtIssuers) > 0 || len(jwtJWKSFiles) > 0 {
+		var issuerConfigs []jwt.IssuerConfig
+		jwksFileMap := make(map[string]string)
+		for _, entry := range jwtJWKSFiles {
+			if iss, filePath, ok := strings.Cut(entry, "="); ok && iss != "" && filePath != "" {
+				jwksFileMap[jwt.NormalizeIssuer(iss)] = filePath
+			} else {
+				if len(jwtIssuers) == 1 {
+					jwksFileMap[jwt.NormalizeIssuer(jwtIssuers[0])] = entry
+				} else {
+					jwksFileMap[""] = entry
+				}
+			}
+		}
+
+		for _, iss := range jwtIssuers {
+			norm := jwt.NormalizeIssuer(iss)
+			filePath := jwksFileMap[norm]
+			delete(jwksFileMap, norm)
+			issuerConfigs = append(issuerConfigs, jwt.IssuerConfig{
+				IssuerURL: iss,
+				JWKSFile:  filePath,
+			})
+		}
+		for iss, filePath := range jwksFileMap {
+			issuerConfigs = append(issuerConfigs, jwt.IssuerConfig{
+				IssuerURL: iss,
+				JWKSFile:  filePath,
+			})
+		}
+
+		jwksCache, err := jwt.NewJWKSCache(issuerConfigs)
+		if err != nil {
+			return fmt.Errorf("initializing JWKS cache: %w", err)
+		}
+		jwtVerifier = jwt.NewVerifier(jwksCache, jwt.WithAudience(*jwtAudience))
+	}
+
+	var subjectAuthorizer frontend.Authorizer
+	if len(clientSubjects) > 0 {
+		var subjectRules []frontend.SubjectRule
+		for _, entry := range clientSubjects {
+			rule, err := frontend.ParseSubjectRule(entry)
+			if err != nil {
+				return fmt.Errorf("invalid --client-subject flag: %w", err)
+			}
+			subjectRules = append(subjectRules, rule)
+		}
+		subjectAuthorizer = frontend.NewSubjectAuthorizer(subjectRules)
+	}
+
 	clientCAPool := x509.NewCertPool()
-	var authorizer frontend.Authorizer
+	var caAuthorizer frontend.Authorizer
 
 	if len(clientCAs) > 0 {
 		allowedPatterns := make(map[string][]string)
@@ -127,7 +190,24 @@ func run(ctx context.Context, args []string) error {
 				allowedPatterns[fp] = append(allowedPatterns[fp], patterns...)
 			}
 		}
-		authorizer = frontend.NewCAAuthorizer(allowedPatterns)
+		caAuthorizer = frontend.NewCAAuthorizer(allowedPatterns)
+	} else if jwtVerifier != nil {
+		caCertPEM, err := os.ReadFile(*caCertPath)
+		if err == nil {
+			parsedCerts, err := certs.ParseCertificatesFromPEM(caCertPEM)
+			if err != nil {
+				return fmt.Errorf("parsing CA cert from %s: %w", *caCertPath, err)
+			}
+			clientCAPool.AppendCertsFromPEM(caCertPEM)
+			allowedPatterns := make(map[string][]string)
+			for _, cert := range parsedCerts {
+				fp := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
+				allowedPatterns[fp] = []string{"*"}
+			}
+			caAuthorizer = frontend.NewCAAuthorizer(allowedPatterns)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("reading CA cert from %s: %w", *caCertPath, err)
+		}
 	} else {
 		log.Printf("WARNING: No --client-ca flags specified. Registrations are unrestricted for CA %s", *caCertPath)
 		caCertPEM, err := os.ReadFile(*caCertPath)
@@ -149,8 +229,10 @@ func run(ctx context.Context, args []string) error {
 			fp := fmt.Sprintf("%x", sha256.Sum256(cert.Raw))
 			allowedPatterns[fp] = []string{"*"}
 		}
-		authorizer = frontend.NewCAAuthorizer(allowedPatterns)
+		caAuthorizer = frontend.NewCAAuthorizer(allowedPatterns)
 	}
+
+	authorizer := frontend.NewCombinedAuthorizer(caAuthorizer, subjectAuthorizer)
 
 	serverCertPEM, err := os.ReadFile(*serverCertPath)
 	if err != nil {
@@ -167,6 +249,12 @@ func run(ctx context.Context, args []string) error {
 		return fmt.Errorf("creating server TLS config: %w", err)
 	}
 
+	if jwtVerifier != nil {
+		serverTLS.ClientAuth = tls.VerifyClientCertIfGiven
+	} else {
+		serverTLS.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
 	srv, err := frontend.NewServer(frontend.ServerConfig{
 		ListenAddrs:            listenAddrs,
 		UDPListenAddrs:         tunnelListenUDP,
@@ -177,6 +265,7 @@ func run(ctx context.Context, args []string) error {
 		MaxConnections:         *maxConnections,
 		IdleTimeout:            *idleTimeout,
 		MaxHostnamesPerSession: *maxHostnames,
+		JWTVerifier:            jwtVerifier,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing frontend server: %w", err)

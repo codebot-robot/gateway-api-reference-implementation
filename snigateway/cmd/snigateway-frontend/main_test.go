@@ -89,3 +89,62 @@ func TestFrontendCLI_ClientCAFlags(t *testing.T) {
 		t.Fatal("timeout waiting for server shutdown")
 	}
 }
+
+func TestFrontendCLI_JWTFlags(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "frontend-jwt-cli-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	certsA, err := certs.GenerateAll("snigateway.internal", "unused-client")
+	if err != nil {
+		t.Fatalf("GenerateAll certsA: %v", err)
+	}
+
+	serverCertPath := filepath.Join(tempDir, "server.crt")
+	if err := os.WriteFile(serverCertPath, certsA.Server.CertPEM, 0644); err != nil {
+		t.Fatalf("writing server.crt: %v", err)
+	}
+	serverKeyPath := filepath.Join(tempDir, "server.key")
+	if err := os.WriteFile(serverKeyPath, certsA.Server.KeyPEM, 0600); err != nil {
+		t.Fatalf("writing server.key: %v", err)
+	}
+
+	jwksPath := filepath.Join(tempDir, "jwks.json")
+	if err := os.WriteFile(jwksPath, []byte(`{"keys":[]}`), 0644); err != nil {
+		t.Fatalf("writing jwks.json: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	listenAddr := "127.0.0.1:0"
+
+	args := []string{
+		"--listen=" + listenAddr,
+		"--server-cert=" + serverCertPath,
+		"--server-key=" + serverKeyPath,
+		"--jwt-issuer=https://kubernetes.default.svc",
+		"--jwt-jwks-file=" + jwksPath,
+		"--jwt-audience=snigateway",
+		"--client-subject=system:serviceaccount:default:*=*.example.com",
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, args)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server shutdown")
+	}
+}

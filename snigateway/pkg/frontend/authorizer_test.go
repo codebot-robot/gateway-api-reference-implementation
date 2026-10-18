@@ -202,3 +202,100 @@ func TestCAAuthorizer(t *testing.T) {
 		}
 	})
 }
+
+func TestSubjectAuthorizer(t *testing.T) {
+	ctx := t.Context()
+
+	rule1, err := ParseSubjectRule("system:serviceaccount:prod:snigateway-agent=*.prod.example.com,app.prod.example.com")
+	if err != nil {
+		t.Fatalf("ParseSubjectRule failed: %v", err)
+	}
+	rule2, err := ParseSubjectRule("system:serviceaccount:staging:*=*.staging.example.com")
+	if err != nil {
+		t.Fatalf("ParseSubjectRule failed: %v", err)
+	}
+
+	authorizer := NewSubjectAuthorizer([]SubjectRule{rule1, rule2})
+
+	t.Run("authorized exact SA subject", func(t *testing.T) {
+		identity := ClientIdentity{
+			ID:      "jwt/https://issuer/system:serviceaccount:prod:snigateway-agent",
+			Subject: "system:serviceaccount:prod:snigateway-agent",
+		}
+		if err := authorizer.Authorize(ctx, identity, []string{"foo.prod.example.com", "app.prod.example.com"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("authorized namespace wildcard <ns>:* rule", func(t *testing.T) {
+		identity := ClientIdentity{
+			ID:      "jwt/https://issuer/system:serviceaccount:staging:any-agent",
+			Subject: "system:serviceaccount:staging:any-agent",
+		}
+		if err := authorizer.Authorize(ctx, identity, []string{"foo.staging.example.com"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("disallowed hostname for matching subject", func(t *testing.T) {
+		identity := ClientIdentity{
+			ID:      "jwt/https://issuer/system:serviceaccount:prod:snigateway-agent",
+			Subject: "system:serviceaccount:prod:snigateway-agent",
+		}
+		err := authorizer.Authorize(ctx, identity, []string{"foo.prod.example.com", "disallowed.example.com"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "disallowed hostnames: disallowed.example.com") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("subject not in rules", func(t *testing.T) {
+		identity := ClientIdentity{
+			ID:      "jwt/https://issuer/system:serviceaccount:other-ns:sa",
+			Subject: "system:serviceaccount:other-ns:sa",
+		}
+		err := authorizer.Authorize(ctx, identity, []string{"foo.prod.example.com"})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "disallowed hostnames: foo.prod.example.com") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+}
+
+func TestCombinedAuthorizer(t *testing.T) {
+	ctx := t.Context()
+
+	caAuth := NewCAAuthorizer(map[string][]string{
+		"ca1": {"*.ca.example.com"},
+	})
+	subjRule, _ := ParseSubjectRule("system:serviceaccount:ns1:sa1=*.jwt.example.com")
+	subjAuth := NewSubjectAuthorizer([]SubjectRule{subjRule})
+
+	combined := NewCombinedAuthorizer(caAuth, subjAuth)
+
+	t.Run("cert identity uses ca rules", func(t *testing.T) {
+		certID := ClientIdentity{CAFingerprint: "ca1", CommonName: "client"}
+		if err := combined.Authorize(ctx, certID, []string{"app.ca.example.com"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Must not be allowed for jwt pattern
+		if err := combined.Authorize(ctx, certID, []string{"app.jwt.example.com"}); err == nil {
+			t.Fatal("expected error: ca rule should not be widened by subject rule")
+		}
+	})
+
+	t.Run("jwt identity uses subject rules", func(t *testing.T) {
+		jwtID := ClientIdentity{Subject: "system:serviceaccount:ns1:sa1"}
+		if err := combined.Authorize(ctx, jwtID, []string{"app.jwt.example.com"}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Must not be allowed for ca pattern
+		if err := combined.Authorize(ctx, jwtID, []string{"app.ca.example.com"}); err == nil {
+			t.Fatal("expected error: subject rule should not be widened by ca rule")
+		}
+	})
+}

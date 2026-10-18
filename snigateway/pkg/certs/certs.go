@@ -280,31 +280,38 @@ func NewServerTLSConfigWithCertPool(clientCAPool *x509.CertPool, serverCertPEM, 
 // for TLS session resumption across connections.
 var DefaultClientSessionCache = tls.NewLRUClientSessionCache(128)
 
-// NewClientTLSConfig creates a *tls.Config for mTLS clients connecting to the frontend.
+// NewClientTLSConfig creates a *tls.Config for clients connecting to the frontend.
+// If clientCertPEM and clientKeyPEM are non-empty, mTLS is configured.
+// If both are empty, TLS is configured without a client certificate (e.g. for token authentication).
 func NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM []byte, serverName string) (*tls.Config, error) {
-	clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("parsing client cert/key: %w", err)
-	}
-
 	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caCertPEM) {
-		return nil, fmt.Errorf("failed to parse CA cert PEM")
+	if len(caCertPEM) > 0 {
+		if !caPool.AppendCertsFromPEM(caCertPEM) {
+			return nil, fmt.Errorf("failed to parse CA cert PEM")
+		}
 	}
 
 	if serverName == "" {
 		serverName = "snigateway.internal"
 	}
 
+	var clientCerts []tls.Certificate
 	var clientCertKey string
-	if len(clientCert.Certificate) > 0 {
-		h := sha256.Sum256(clientCert.Certificate[0])
-		clientCertKey = hex.EncodeToString(h[:])
+	if len(clientCertPEM) > 0 || len(clientKeyPEM) > 0 {
+		clientCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("parsing client cert/key: %w", err)
+		}
+		clientCerts = []tls.Certificate{clientCert}
+		if len(clientCert.Certificate) > 0 {
+			h := sha256.Sum256(clientCert.Certificate[0])
+			clientCertKey = hex.EncodeToString(h[:])
+		}
 	}
 	sessionCache := sni.NewPrefixedClientSessionCache("client-cert:"+clientCertKey+":", DefaultClientSessionCache)
 
 	return &tls.Config{
-		Certificates:       []tls.Certificate{clientCert},
+		Certificates:       clientCerts,
 		RootCAs:            caPool,
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS12,

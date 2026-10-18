@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -50,6 +51,8 @@ type Client struct {
 	httpClient       *http.Client
 	dialFunc         func(ctx context.Context, network, addr string) (net.Conn, error)
 	quicDialFunc     func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error)
+	tokenFile        string
+	tokenProvider    func() (string, error)
 }
 
 // ClientOption configures a Client.
@@ -74,6 +77,39 @@ func WithQUICDialFunc(fn func(ctx context.Context, addr string, tlsConf *tls.Con
 	return func(c *Client) {
 		c.quicDialFunc = fn
 	}
+}
+
+// WithTokenFile configures the client to authenticate with a token file (re-read on each call).
+func WithTokenFile(path string) ClientOption {
+	return func(c *Client) {
+		c.tokenFile = path
+	}
+}
+
+// WithTokenProvider configures the client with a dynamic token provider function.
+func WithTokenProvider(provider func() (string, error)) ClientOption {
+	return func(c *Client) {
+		c.tokenProvider = provider
+	}
+}
+
+// GetToken reads and returns the current authentication token, re-reading the token file if configured.
+func (c *Client) GetToken() (string, error) {
+	if c.tokenProvider != nil {
+		return c.tokenProvider()
+	}
+	if c.tokenFile != "" {
+		data, err := os.ReadFile(c.tokenFile)
+		if err != nil {
+			return "", fmt.Errorf("reading token file %s: %w", c.tokenFile, err)
+		}
+		token := strings.TrimSpace(string(data))
+		if token == "" {
+			return "", fmt.Errorf("token file %s is empty", c.tokenFile)
+		}
+		return token, nil
+	}
+	return "", nil
 }
 
 // NewClient creates a new Client connecting to serverAddr using mTLS.
@@ -133,6 +169,14 @@ func (c *Client) StartSession(ctx context.Context) (string, <-chan error, error)
 		return "", nil, fmt.Errorf("creating session request: %w", err)
 	}
 
+	token, err := c.GetToken()
+	if err != nil {
+		return "", nil, fmt.Errorf("resolving token for session: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", nil, fmt.Errorf("opening session: %w", err)
@@ -187,8 +231,14 @@ func (c *Client) StartSession(ctx context.Context) (string, <-chan error, error)
 
 // Register registers the given hostnames with the frontend server for the specified session.
 func (c *Client) Register(ctx context.Context, sessionID string, hostnames []string) (*api.RegistrationResponse, error) {
+	token, err := c.GetToken()
+	if err != nil {
+		return nil, fmt.Errorf("resolving token for registration: %w", err)
+	}
+
 	reqBody, err := json.Marshal(api.RegistrationRequest{
 		Hostnames: hostnames,
+		Token:     token,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshaling registration request: %w", err)
@@ -201,6 +251,9 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(api.HeaderSessionID, sessionID)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -277,6 +330,15 @@ func (c *Client) dialTunnelWithProtocol(ctx context.Context, sessionID, upgradeP
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", upgradeProtocol)
 	req.Header.Set(api.HeaderSessionID, sessionID)
+
+	token, err := c.GetToken()
+	if err != nil {
+		closeConn(tlsConn)
+		return nil, fmt.Errorf("resolving token for tunnel dial: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	if err := req.Write(tlsConn); err != nil {
 		closeConn(tlsConn)

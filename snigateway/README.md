@@ -134,6 +134,91 @@ kubectl create secret generic snigateway-client-cert \
 
 ---
 
+### Alternative: ServiceAccount Token Authentication (Projected Volumes & JWKS)
+
+Instead of provisioning client certificates and private keys, you can authenticate registrations using projected Kubernetes `ServiceAccount` tokens verified via JWKS:
+
+- **Zero cluster credentials on frontend**: The frontend verifies tokens offline using JWKS (via public OIDC discovery or a local JWKS file).
+- **Automatic rotation**: Kubelet rotates projected tokens at 80% of token lifetime. `snigateway` re-reads `--token-file` on every session start, registration, and tunnel dial without restarting the pod.
+- **Registration Leases**: Registrations under a token are valid until the token's `exp` (capped at 24h). The client re-registers before expiry; lapsed registrations are dropped and idle sessions are closed.
+
+#### 1. Configure `snigateway-frontend`
+
+Run `snigateway-frontend` with `--jwt-issuer` and `--client-subject`:
+
+##### GKE Clusters (Public OIDC Discovery)
+On GKE, the cluster issuer serves `/.well-known/openid-configuration` and JWKS publicly:
+
+```bash
+snigateway-frontend \
+  --listen :443 \
+  --server-cert certs/server.crt \
+  --server-key certs/server.key \
+  --jwt-issuer "https://container.googleapis.com/v1/projects/PROJECT/locations/LOCATION/clusters/CLUSTER" \
+  --jwt-audience "snigateway" \
+  --client-subject "system:serviceaccount:default:snigateway-controller=*.example.com"
+```
+
+##### Non-GKE Clusters (Static JWKS File)
+For clusters without public OIDC discovery, supply the cluster's JWKS public keys file using `--jwt-jwks-file`:
+
+```bash
+snigateway-frontend \
+  --listen :443 \
+  --server-cert certs/server.crt \
+  --server-key certs/server.key \
+  --jwt-issuer "https://kubernetes.default.svc" \
+  --jwt-jwks-file "/etc/snigateway/cluster-jwks.json" \
+  --jwt-audience "snigateway" \
+  --client-subject "system:serviceaccount:prod:*=*.prod.example.com"
+```
+
+> **Note**: In `--client-subject`, `<ns>:*` can be used to authorize any ServiceAccount in that namespace.
+
+#### 2. Pod Spec with Projected ServiceAccount Token
+
+Mount the projected token volume with `audience: snigateway` and pass `--token-file` to `snigateway`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snigateway-controller
+spec:
+  template:
+    spec:
+      serviceAccountName: snigateway-controller
+      containers:
+      - name: snigateway
+        image: gari-controller:latest
+        args:
+        - --frontend=frontend.example.com:443
+        - --ca-cert=/etc/snigateway/ca.crt
+        - --token-file=/var/run/secrets/tokens/snigateway-token
+        volumeMounts:
+        - name: ca-cert
+          mountPath: /etc/snigateway
+          readOnly: true
+        - name: token
+          mountPath: /var/run/secrets/tokens
+          readOnly: true
+      volumes:
+      - name: ca-cert
+        secret:
+          secretName: snigateway-ca
+      - name: token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: snigateway-token
+              audience: snigateway
+              expirationSeconds: 3600
+```
+
+When `--token-file` is specified, `--client-cert` and `--client-key` are optional.
+
+---
+
 ### 4. Deploy `snigateway` Controller
 
 #### Using the Dev Task (Kind / Local Cluster)

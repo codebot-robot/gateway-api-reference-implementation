@@ -18,6 +18,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // RegistrationTable maps registered hostnames to backend session identifiers.
@@ -27,6 +28,7 @@ type RegistrationTable struct {
 	mu              sync.RWMutex
 	sessionHosts    map[string][]string       // sessionID -> registered host patterns
 	sessionIdentity map[string]ClientIdentity // sessionID -> client identity
+	sessionLease    map[string]time.Time      // sessionID -> lease expiration time
 	exact           map[string][]string       // normalized exact hostname -> slice of sessionIDs
 	wildcard        map[string][]string       // normalized wildcard pattern (*.example.com) -> slice of sessionIDs
 	exactRR         map[string]int            // round-robin counter per exact hostname
@@ -38,6 +40,7 @@ func NewRegistrationTable() *RegistrationTable {
 	return &RegistrationTable{
 		sessionHosts:    make(map[string][]string),
 		sessionIdentity: make(map[string]ClientIdentity),
+		sessionLease:    make(map[string]time.Time),
 		exact:           make(map[string][]string),
 		wildcard:        make(map[string][]string),
 		exactRR:         make(map[string]int),
@@ -76,6 +79,11 @@ func (t *RegistrationTable) GetSessionIdentity(sessionID string) (ClientIdentity
 
 // Register sets the full list of hostnames served by sessionID, replacing any previous list for that session.
 func (t *RegistrationTable) Register(sessionID string, hostnames []string) {
+	t.RegisterWithLease(sessionID, hostnames, time.Time{})
+}
+
+// RegisterWithLease sets the hostnames served by sessionID with an optional lease expiration time.
+func (t *RegistrationTable) RegisterWithLease(sessionID string, hostnames []string, leaseExpiry time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -96,6 +104,36 @@ func (t *RegistrationTable) Register(sessionID string, hostnames []string) {
 		}
 	}
 	t.sessionHosts[sessionID] = registered
+	if !leaseExpiry.IsZero() {
+		t.sessionLease[sessionID] = leaseExpiry
+	} else {
+		delete(t.sessionLease, sessionID)
+	}
+}
+
+// GetSessionLease returns the lease expiration time for a session, if set.
+func (t *RegistrationTable) GetSessionLease(sessionID string) (time.Time, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	exp, ok := t.sessionLease[sessionID]
+	return exp, ok
+}
+
+// DropExpiredLeases unregisters hostnames for any sessions whose lease has expired before or at now.
+// It returns the list of sessionIDs whose registrations expired.
+func (t *RegistrationTable) DropExpiredLeases(now time.Time) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var expiredSessions []string
+	for sessID, exp := range t.sessionLease {
+		if !exp.IsZero() && !now.Before(exp) {
+			t.unregisterLocked(sessID)
+			delete(t.sessionLease, sessID)
+			expiredSessions = append(expiredSessions, sessID)
+		}
+	}
+	return expiredSessions
 }
 
 // Unregister removes all hostname registrations and identity for sessionID.
@@ -104,6 +142,7 @@ func (t *RegistrationTable) Unregister(sessionID string) {
 	defer t.mu.Unlock()
 	t.unregisterLocked(sessionID)
 	delete(t.sessionIdentity, sessionID)
+	delete(t.sessionLease, sessionID)
 }
 
 func removeFromSlice(slice []string, val string) []string {

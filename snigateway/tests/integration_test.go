@@ -16,9 +16,16 @@ package tests
 
 import (
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -29,6 +36,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/tunnel"
 )
 
@@ -384,5 +392,230 @@ func TestTunnelListenerH2TransportIntegration(t *testing.T) {
 	}
 	if resp.Header.Get("X-Tunnel-Transport") != "h2" {
 		t.Errorf("expected X-Tunnel-Transport header 'h2', got %q", resp.Header.Get("X-Tunnel-Transport"))
+	}
+}
+
+func signTestJWT(t *testing.T, iss, sub, aud string, exp time.Time, key *rsa.PrivateKey, kid string) string {
+	t.Helper()
+	hdrJSON, _ := json.Marshal(map[string]string{
+		"alg": "RS256",
+		"kid": kid,
+		"typ": "JWT",
+	})
+	hdrB64 := base64.RawURLEncoding.EncodeToString(hdrJSON)
+
+	payload := map[string]any{
+		"iss": iss,
+		"sub": sub,
+		"aud": []string{aud},
+		"exp": exp.Unix(),
+	}
+	payloadJSON, _ := json.Marshal(payload)
+	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
+
+	toSign := hdrB64 + "." + payloadB64
+	hashed := sha256.Sum256([]byte(toSign))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hashed[:])
+	if err != nil {
+		t.Fatalf("rsa.SignPKCS1v15 failed: %v", err)
+	}
+	return toSign + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+func TestTokenAuthentication_ProjectedVolumeAndRotationIntegration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "snigateway-token-integration-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// 1. Generate RSA key for JWKS and tokens
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuerURL := "https://kubernetes.default.svc"
+	nBytes := rsaKey.N.Bytes()
+	eBytes := big.NewInt(int64(rsaKey.E)).Bytes()
+	jwksDoc := map[string]any{
+		"keys": []any{
+			map[string]any{
+				"kty": "RSA",
+				"kid": "key-1",
+				"use": "sig",
+				"alg": "RS256",
+				"n":   base64.RawURLEncoding.EncodeToString(nBytes),
+				"e":   base64.RawURLEncoding.EncodeToString(eBytes),
+			},
+		},
+	}
+	jwksJSON, err := json.Marshal(jwksDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwksFilePath := filepath.Join(tempDir, "jwks.json")
+	if err := os.WriteFile(jwksFilePath, jwksJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Generate server TLS certs
+	certsBundle, err := certs.GenerateAll("snigateway.internal", "unused-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jwksCache, err := jwt.NewJWKSCache([]jwt.IssuerConfig{
+		{IssuerURL: issuerURL, JWKSFile: jwksFilePath},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jwksCache.Close()
+
+	verifier := jwt.NewVerifier(jwksCache, jwt.WithAudience("snigateway"))
+
+	subjRule, err := frontend.ParseSubjectRule("system:serviceaccount:default:test-sa=service.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer := frontend.NewSubjectAuthorizer([]frontend.SubjectRule{subjRule})
+
+	serverTLS, err := certs.NewServerTLSConfig(certsBundle.CA.CertPEM, certsBundle.Server.CertPEM, certsBundle.Server.KeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLS.ClientAuth = tls.VerifyClientCertIfGiven
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontendAddr := ln.Addr().String()
+
+	frontendUDP, err := net.ListenPacket("udp", frontendAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frontendServer, err := frontend.NewServer(frontend.ServerConfig{
+		ServerTLSConfig:     serverTLS,
+		InternalHostname:    "snigateway.internal",
+		Authorizer:          authorizer,
+		JWTVerifier:         verifier,
+		LeaseReaperInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer frontendServer.Close()
+
+	go func() {
+		_ = frontendServer.ServeAll([]net.Listener{ln}, []net.PacketConn{frontendUDP})
+	}()
+
+	// 3. Write initial token to projected token file
+	tokenFilePath := filepath.Join(tempDir, "token")
+	now := time.Now()
+	exp1 := now.Add(1 * time.Hour)
+	token1 := signTestJWT(t, issuerURL, "system:serviceaccount:default:test-sa", "snigateway", exp1, rsaKey, "key-1")
+	if err := os.WriteFile(tokenFilePath, []byte(token1), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Client configured with CA cert only (no client cert) + token file
+	clientTLS, err := certs.NewClientTLSConfig(certsBundle.CA.CertPEM, nil, nil, "snigateway.internal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := client.NewClient(frontendAddr, clientTLS, client.WithTokenFile(tokenFilePath))
+	mgr := tunnel.NewManager(c, tunnel.WithBackoff(50*time.Millisecond, 200*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = mgr.Run(ctx)
+	}()
+
+	// 5. Start HTTPS backend on mgr.Listener()
+	backendCert, err := generateBackendCert("service.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backendLis := tls.NewListener(mgr.Listener(), &tls.Config{
+		Certificates: []tls.Certificate{backendCert},
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token-test", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "Hello via token-authenticated tunnel!")
+	})
+	httpServer := &http.Server{Handler: mux}
+	defer httpServer.Close()
+	go func() {
+		_ = httpServer.Serve(backendLis)
+	}()
+
+	mgr.UpdateHostnames([]string{"service.example.com"})
+
+	// Verify request works
+	sendRequest := func() (*http.Response, string, error) {
+		clientTransport := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         "service.example.com",
+				InsecureSkipVerify: true,
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(network, frontendAddr)
+			},
+		}
+		httpClient := &http.Client{Transport: clientTransport, Timeout: 5 * time.Second}
+		resp, err := httpClient.Get("https://service.example.com/token-test")
+		if err != nil {
+			return nil, "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return resp, string(body), err
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var resp *http.Response
+	var body string
+	for time.Now().Before(deadline) {
+		resp, body, err = sendRequest()
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("first request failed: err=%v, status=%v", err, resp)
+	}
+	if body != "Hello via token-authenticated tunnel!" {
+		t.Fatalf("unexpected body: %q", body)
+	}
+
+	// 6. Simulate Kubelet rotating the token file
+	exp2 := time.Now().Add(2 * time.Hour)
+	token2 := signTestJWT(t, issuerURL, "system:serviceaccount:default:test-sa", "snigateway", exp2, rsaKey, "key-1")
+	if err := os.WriteFile(tokenFilePath, []byte(token2), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger registration or dial tunnel with rotated token
+	mgr.UpdateHostnames([]string{"service.example.com"})
+	time.Sleep(100 * time.Millisecond)
+
+	// Second request after token rotation
+	resp, body, err = sendRequest()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("request after token rotation failed: err=%v, status=%v", err, resp)
+	}
+	if body != "Hello via token-authenticated tunnel!" {
+		t.Fatalf("unexpected body after token rotation: %q", body)
 	}
 }

@@ -35,6 +35,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
+	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/quic-go/quic-go"
 	"k8s.io/klog/v2"
@@ -63,6 +64,8 @@ type ServerConfig struct {
 	IdleTimeout              time.Duration
 	MaxHostnamesPerSession   int
 	MaxRegistrationBodyBytes int64
+	JWTVerifier              jwt.TokenVerifier
+	LeaseReaperInterval      time.Duration
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -78,13 +81,17 @@ type Server struct {
 	internalListener *chanListener
 	httpServer       *http.Server
 
-	listenersMu   sync.Mutex
-	listeners     []net.Listener
-	udpListeners  []net.PacketConn
-	quicListeners []*quic.Listener
-	closed        bool
-	shutdownCh    chan struct{}
-	activeConns   atomic.Int64
+	listenersMu    sync.Mutex
+	listeners      []net.Listener
+	udpListeners   []net.PacketConn
+	quicListeners  []*quic.Listener
+	closed         bool
+	shutdownCh     chan struct{}
+	activeConns    atomic.Int64
+	jwtVerifier    jwt.TokenVerifier
+	sessionsMu     sync.Mutex
+	sessionCancels map[string]context.CancelFunc
+	sessionClosers map[string][]func()
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -139,6 +146,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		h2:               comp.H2(),
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
+		jwtVerifier:      cfg.JWTVerifier,
+		sessionCancels:   make(map[string]context.CancelFunc),
+		sessionClosers:   make(map[string][]func()),
 	}
 
 	mux := http.NewServeMux()
@@ -241,6 +251,9 @@ func (s *Server) ServeAll(listeners []net.Listener, udpConns []net.PacketConn) e
 		}
 	}()
 
+	// Start background lease reaper for periodic token expiration
+	go s.runLeaseReaper()
+
 	// Accept connections on each TCP listener
 	for _, ln := range listeners {
 		go func(l net.Listener) {
@@ -332,6 +345,70 @@ func (s *Server) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
+}
+
+func (s *Server) runLeaseReaper() {
+	interval := s.config.LeaseReaperInterval
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.shutdownCh:
+			return
+		case now := <-ticker.C:
+			expired := s.table.DropExpiredLeases(now)
+			for _, sessID := range expired {
+				log.Printf("Frontend: lease expired for session %s, closing session", sessID)
+				s.CloseSession(sessID)
+			}
+		}
+	}
+}
+
+func (s *Server) registerSessionCancel(sessionID string, cancel context.CancelFunc) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	s.sessionCancels[sessionID] = cancel
+}
+
+func (s *Server) unregisterSessionCancel(sessionID string) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	delete(s.sessionCancels, sessionID)
+}
+
+func (s *Server) registerSessionCloser(sessionID string, closer func()) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	s.sessionClosers[sessionID] = append(s.sessionClosers[sessionID], closer)
+}
+
+// CloseSession closes an active backend session and any associated connections.
+func (s *Server) CloseSession(sessionID string) {
+	s.sessionsMu.Lock()
+	cancel, hasCancel := s.sessionCancels[sessionID]
+	delete(s.sessionCancels, sessionID)
+	closers := s.sessionClosers[sessionID]
+	delete(s.sessionClosers, sessionID)
+	s.sessionsMu.Unlock()
+
+	s.table.Unregister(sessionID)
+	s.pool.UnregisterSession(sessionID)
+	s.h2.UnregisterSession(sessionID)
+	s.quic.UnregisterSession(sessionID)
+
+	if hasCancel && cancel != nil {
+		cancel()
+	}
+	for _, c := range closers {
+		if c != nil {
+			c()
+		}
+	}
 }
 
 func setTCPKeepAlive(conn net.Conn) {
@@ -590,17 +667,60 @@ func extractIdentityFromTLSState(tlsState tls.ConnectionState) (ClientIdentity, 
 	}, nil
 }
 
-func extractClientIdentity(r *http.Request) (ClientIdentity, error) {
-	if r.TLS == nil {
-		return ClientIdentity{}, errors.New("TLS connection required")
+func (s *Server) extractClientIdentity(r *http.Request) (ClientIdentity, error) {
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		return extractIdentityFromTLSState(*r.TLS)
 	}
-	return extractIdentityFromTLSState(*r.TLS)
+
+	if s.jwtVerifier == nil {
+		if r.TLS == nil {
+			return ClientIdentity{}, errors.New("TLS connection required")
+		}
+		return ClientIdentity{}, errors.New("client certificate required")
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return ClientIdentity{}, errors.New("missing Authorization header")
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return ClientIdentity{}, errors.New("invalid Authorization header format, expected Bearer <token>")
+	}
+	tokenStr := strings.TrimSpace(parts[1])
+	if tokenStr == "" {
+		return ClientIdentity{}, errors.New("empty bearer token")
+	}
+
+	claims, err := s.jwtVerifier.Verify(r.Context(), tokenStr)
+	if err != nil {
+		return ClientIdentity{}, fmt.Errorf("token verification failed: %w", err)
+	}
+
+	return ClientIdentity{
+		ID:          fmt.Sprintf("jwt/%s/%s", claims.Issuer, claims.Subject),
+		Issuer:      claims.Issuer,
+		Subject:     claims.Subject,
+		TokenExpiry: claims.Expiry,
+	}, nil
 }
 
 func (s *Server) handleQUICConnection(qConn *quic.Conn) {
-	clientIdentity, err := extractIdentityFromTLSState(qConn.ConnectionState().TLS)
-	if err != nil {
-		log.Printf("Frontend: rejecting QUIC connection: %v", err)
+	var clientIdentity ClientIdentity
+	tlsState := qConn.ConnectionState().TLS
+	hasCert := len(tlsState.PeerCertificates) > 0
+
+	if hasCert {
+		var err error
+		clientIdentity, err = extractIdentityFromTLSState(tlsState)
+		if err != nil {
+			log.Printf("Frontend: rejecting QUIC connection: %v", err)
+			closeQUICConn(qConn, 1, "unauthorized")
+			return
+		}
+	} else if s.jwtVerifier == nil {
+		log.Printf("Frontend: rejecting QUIC connection: client certificate required")
 		closeQUICConn(qConn, 1, "unauthorized")
 		return
 	}
@@ -623,7 +743,8 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 		closeQUICConn(qConn, 1, "control stream deadline error")
 		return
 	}
-	if _, err := api.ReadControlLine(reader); err != nil {
+	initLine, err := api.ReadControlLine(reader)
+	if err != nil {
 		handshakeCancel()
 		log.Printf("Frontend: error reading initial line from QUIC control stream: %v", err)
 		closeQUICConn(qConn, 1, "control stream handshake failed")
@@ -637,9 +758,35 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 	}
 	handshakeCancel()
 
+	if !hasCert {
+		var initReq api.SessionInitRequest
+		if err := json.Unmarshal(bytes.TrimSpace(initLine), &initReq); err != nil || initReq.Token == "" {
+			log.Printf("Frontend: rejecting QUIC connection: missing or invalid session init token")
+			closeQUICConn(qConn, 1, "unauthorized")
+			return
+		}
+
+		claims, err := s.jwtVerifier.Verify(context.Background(), initReq.Token)
+		if err != nil {
+			log.Printf("Frontend: rejecting QUIC connection: token verification failed: %v", err)
+			closeQUICConn(qConn, 1, "unauthorized")
+			return
+		}
+
+		clientIdentity = ClientIdentity{
+			ID:          fmt.Sprintf("jwt/%s/%s", claims.Issuer, claims.Subject),
+			Issuer:      claims.Issuer,
+			Subject:     claims.Subject,
+			TokenExpiry: claims.Expiry,
+		}
+	}
+
 	sessionID := generateConnID()
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.quic.RegisterSession(sessionID, qConn)
+	s.registerSessionCloser(sessionID, func() {
+		closeQUICConn(qConn, 0, "session closed")
+	})
 	log.Printf("Frontend: created QUIC session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
@@ -674,6 +821,39 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 			continue
 		}
 
+		if clientIdentity.Issuer != "" && regReq.Token != "" {
+			regClaims, err := s.jwtVerifier.Verify(context.Background(), regReq.Token)
+			if err != nil {
+				log.Printf("Frontend: token verification failed during QUIC registration for %s: %v", sessionID, err)
+				errResp, merr := json.Marshal(api.RegistrationResponse{
+					Status: fmt.Sprintf("error: token verification failed: %v", err),
+				})
+				if merr != nil {
+					log.Printf("Frontend: failed to marshal registration error: %v", merr)
+					continue
+				}
+				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
+					log.Printf("Frontend: failed to write error response: %v", werr)
+				}
+				continue
+			}
+			if regClaims.Issuer != clientIdentity.Issuer || regClaims.Subject != clientIdentity.Subject {
+				log.Printf("Frontend: session identity mismatch during QUIC registration for %s", sessionID)
+				errResp, merr := json.Marshal(api.RegistrationResponse{
+					Status: "error: session identity mismatch",
+				})
+				if merr != nil {
+					log.Printf("Frontend: failed to marshal registration error: %v", merr)
+					continue
+				}
+				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
+					log.Printf("Frontend: failed to write error response: %v", werr)
+				}
+				continue
+			}
+			clientIdentity.TokenExpiry = regClaims.Expiry
+		}
+
 		if err := validateRegistrationHostnames(regReq.Hostnames, s.config.MaxHostnamesPerSession); err != nil {
 			log.Printf("Frontend: validation failed for QUIC session %s (%s) registering hostnames: %v", sessionID, clientIdentity.ID, err)
 			errResp, err := json.Marshal(api.RegistrationResponse{
@@ -704,7 +884,16 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 			continue
 		}
 
-		s.table.Register(sessionID, regReq.Hostnames)
+		var leaseExpiry time.Time
+		if clientIdentity.Issuer != "" {
+			leaseExpiry = clientIdentity.TokenExpiry
+			maxLease := time.Now().Add(24 * time.Hour)
+			if leaseExpiry.After(maxLease) {
+				leaseExpiry = maxLease
+			}
+		}
+
+		s.table.RegisterWithLease(sessionID, regReq.Hostnames, leaseExpiry)
 		registered := s.table.GetRegisteredHostnames(sessionID)
 		log.Printf("Frontend: QUIC session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
 
@@ -746,7 +935,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIdentity, err := extractClientIdentity(r)
+	clientIdentity, err := s.extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -759,6 +948,11 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := generateConnID()
+	sessCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	s.registerSessionCancel(sessionID, cancel)
+	defer s.unregisterSessionCancel(sessionID)
+
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.pool.RegisterSession(sessionID)
 	s.h2.RegisterSession(sessionID)
@@ -785,7 +979,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	<-r.Context().Done()
+	<-sessCtx.Done()
 }
 
 func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
@@ -794,7 +988,7 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIdentity, err := extractClientIdentity(r)
+	clientIdentity, err := s.extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -855,7 +1049,16 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.table.Register(sessionID, req.Hostnames)
+	var leaseExpiry time.Time
+	if clientIdentity.Issuer != "" {
+		leaseExpiry = clientIdentity.TokenExpiry
+		maxLease := time.Now().Add(24 * time.Hour)
+		if leaseExpiry.After(maxLease) {
+			leaseExpiry = maxLease
+		}
+	}
+
+	s.table.RegisterWithLease(sessionID, req.Hostnames, leaseExpiry)
 	registered := s.table.GetRegisteredHostnames(sessionID)
 	log.Printf("Frontend: session %s (client %q) registered hostnames: %v", sessionID, clientIdentity.ID, registered)
 
@@ -875,7 +1078,7 @@ func (s *Server) handleConnectionUpgrade(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	clientIdentity, err := extractClientIdentity(r)
+	clientIdentity, err := s.extractClientIdentity(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

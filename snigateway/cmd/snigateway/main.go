@@ -67,6 +67,7 @@ func main() {
 		leaderElection    bool
 		leaderElectionID  string
 		gatewayAddresses  stringSliceFlag
+		tokenFilePath     string
 	)
 
 	flag.StringVar(&frontendAddr, "frontend", "127.0.0.1:443", "Address of the snigateway-frontend server (<ip-or-host>:<port>).")
@@ -74,6 +75,7 @@ func main() {
 	flag.StringVar(&caCertPath, "ca-cert", "", "Path to the CA certificate PEM file used to verify snigateway-frontend.")
 	flag.StringVar(&clientCertPath, "client-cert", "", "Path to the client certificate PEM file for mTLS authentication.")
 	flag.StringVar(&clientKeyPath, "client-key", "", "Path to the client private key PEM file for mTLS authentication.")
+	flag.StringVar(&tokenFilePath, "token-file", "", "Path to ServiceAccount token file for authentication.")
 	flag.StringVar(&internalHostname, "internal-hostname", "snigateway.internal", "TLS ServerName for the snigateway-frontend mTLS management API.")
 	flag.StringVar(&controllerName, "controller-name", DefaultControllerName, "The GatewayClass controller name managed by this instance.")
 	flag.StringVar(&tunnelTransport, "tunnel-transport", tunnel.TransportModeAuto, "Tunnel transport to use (auto, quic, tcp, h2).")
@@ -96,13 +98,15 @@ func main() {
 		setupLog.Error(fmt.Errorf("--ca-cert is required"), "missing required flag")
 		os.Exit(1)
 	}
-	if clientCertPath == "" {
-		setupLog.Error(fmt.Errorf("--client-cert is required"), "missing required flag")
-		os.Exit(1)
-	}
-	if clientKeyPath == "" {
-		setupLog.Error(fmt.Errorf("--client-key is required"), "missing required flag")
-		os.Exit(1)
+	if tokenFilePath == "" {
+		if clientCertPath == "" {
+			setupLog.Error(fmt.Errorf("--client-cert is required when --token-file is not specified"), "missing required flag")
+			os.Exit(1)
+		}
+		if clientKeyPath == "" {
+			setupLog.Error(fmt.Errorf("--client-key is required when --token-file is not specified"), "missing required flag")
+			os.Exit(1)
+		}
 	}
 
 	caCertPEM, err := os.ReadFile(caCertPath)
@@ -111,16 +115,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	clientCertPEM, err := os.ReadFile(clientCertPath)
-	if err != nil {
-		setupLog.Error(err, "failed to read client certificate", "path", clientCertPath)
-		os.Exit(1)
+	var clientCertPEM, clientKeyPEM []byte
+	if clientCertPath != "" {
+		clientCertPEM, err = os.ReadFile(clientCertPath)
+		if err != nil {
+			setupLog.Error(err, "failed to read client certificate", "path", clientCertPath)
+			os.Exit(1)
+		}
 	}
 
-	clientKeyPEM, err := os.ReadFile(clientKeyPath)
-	if err != nil {
-		setupLog.Error(err, "failed to read client private key", "path", clientKeyPath)
-		os.Exit(1)
+	if clientKeyPath != "" {
+		clientKeyPEM, err = os.ReadFile(clientKeyPath)
+		if err != nil {
+			setupLog.Error(err, "failed to read client private key", "path", clientKeyPath)
+			os.Exit(1)
+		}
 	}
 
 	clientTLS, err := certs.NewClientTLSConfig(caCertPEM, clientCertPEM, clientKeyPEM, internalHostname)
@@ -129,7 +138,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	snigatewayClient := client.NewClient(frontendAddr, clientTLS, client.WithInternalHostname(internalHostname))
+	clientOpts := []client.ClientOption{
+		client.WithInternalHostname(internalHostname),
+	}
+	if tokenFilePath != "" {
+		clientOpts = append(clientOpts, client.WithTokenFile(tokenFilePath))
+	}
+
+	snigatewayClient := client.NewClient(frontendAddr, clientTLS, clientOpts...)
 	tunnelMgr := tunnel.NewManager(snigatewayClient,
 		tunnel.WithTransport(tunnelTransport),
 		tunnel.WithPoolSize(tunnelPoolSize),
