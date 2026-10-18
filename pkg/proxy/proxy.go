@@ -1381,6 +1381,12 @@ func (p *Proxy) getClientSessionCache() *sni.LRUClientSessionCache {
 	return p.clientSessionCache
 }
 
+var errMissingClientCert = errors.New("backend specifies ClientCertID but has no client certificate")
+
+func backendMissingClientCert(backend state.InternalBackend) bool {
+	return backend.TLSConfig != nil && backend.TLSConfig.ClientCertID != "" && backend.TLSConfig.ClientCert == nil
+}
+
 func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config {
 	var clientCertKey string
 	if backend.TLSConfig != nil {
@@ -1401,6 +1407,8 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 		}
 	}
 
+	serverName := backend.TLSConfig.Hostname
+
 	var rootCAs *x509.CertPool
 	if backend.TLSConfig.WellKnownCACertificates != nil && *backend.TLSConfig.WellKnownCACertificates == gatewayv1.WellKnownCACertificatesSystem {
 		// Leave RootCAs nil so the system pool is used
@@ -1414,7 +1422,20 @@ func (p *Proxy) buildBackendTLSConfig(backend state.InternalBackend) *tls.Config
 		rootCAs = x509.NewCertPool()
 	}
 
-	serverName := backend.TLSConfig.Hostname
+	if backendMissingClientCert(backend) {
+		return &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: false,
+			RootCAs:            rootCAs,
+			ClientSessionCache: sessionCache,
+			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				return nil, errMissingClientCert
+			},
+			VerifyConnection: func(tls.ConnectionState) error {
+				return errMissingClientCert
+			},
+		}
+	}
 
 	var clientCerts []tls.Certificate
 	if backend.TLSConfig.ClientCert != nil {
@@ -1655,6 +1676,18 @@ func (p *Proxy) buildTransport(backend state.InternalBackend) http.RoundTripper 
 }
 
 func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, timeouts *state.InternalTimeouts) {
+	if backendMissingClientCert(backend) {
+		klog.Errorf("backend %s:%d specifies ClientCertID %q but has no resolved client certificate", backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		http.Error(w, "missing client certificate", http.StatusBadGateway)
+		return
+	}
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		if backend.ResponseHeaderModifier != nil {
@@ -1854,6 +1887,18 @@ func (p *Proxy) forwardWebSocket(w http.ResponseWriter, r *http.Request, backend
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter, timeouts *state.InternalTimeouts, retry *state.CompiledHTTPRouteRetry) {
+	if backendMissingClientCert(backend) {
+		klog.Errorf("backend %s:%d specifies ClientCertID %q but has no resolved client certificate", backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
+		if backend.ResponseHeaderModifier != nil {
+			modifyHeaders(w.Header(), *backend.ResponseHeaderModifier)
+		}
+		if respHeaderModifier != nil {
+			modifyHeaders(w.Header(), *respHeaderModifier)
+		}
+		http.Error(w, "missing client certificate", http.StatusBadGateway)
+		return
+	}
+
 	if isWebSocketRequest(r) {
 		p.forwardWebSocket(w, r, backend, respHeaderModifier, timeouts)
 		return
@@ -2273,6 +2318,11 @@ func pickBackend(backends []state.InternalBackend) (state.InternalBackend, error
 }
 
 func (p *Proxy) mirror(r *http.Request, bodyBytes []byte, backend state.InternalBackend, timeouts *state.InternalTimeouts) {
+	if backendMissingClientCert(backend) {
+		klog.Errorf("mirror backend %s:%d specifies ClientCertID %q but has no resolved client certificate", backend.Host, backend.Port, backend.TLSConfig.ClientCertID)
+		return
+	}
+
 	go func() {
 		timeout := 30 * time.Second
 		if timeouts != nil && timeouts.BackendRequest != nil && *timeouts.BackendRequest > 0 {
