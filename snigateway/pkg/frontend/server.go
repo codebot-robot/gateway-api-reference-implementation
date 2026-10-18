@@ -40,19 +40,29 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	// DefaultMaxRegistrationBodyBytes is the default maximum allowed size (256 KiB) for a registration request body.
+	DefaultMaxRegistrationBodyBytes = 256 * 1024
+
+	// DefaultMaxHostnamesPerSession is the default maximum number of hostnames a session may register.
+	DefaultMaxHostnamesPerSession = 1000
+)
+
 // ServerConfig holds configuration options for the frontend server.
 type ServerConfig struct {
-	ListenAddrs        []string
-	UDPListenAddrs     []string
-	InternalHostname   string
-	ServerTLSConfig    *tls.Config
-	ConnectTimeout     time.Duration
-	PerAttemptTimeout  time.Duration
-	ReadSNITimeout     time.Duration
-	Authorizer         Authorizer
-	CompositeTransport *CompositeTransport
-	MaxConnections     int
-	IdleTimeout        time.Duration
+	ListenAddrs              []string
+	UDPListenAddrs           []string
+	InternalHostname         string
+	ServerTLSConfig          *tls.Config
+	ConnectTimeout           time.Duration
+	PerAttemptTimeout        time.Duration
+	ReadSNITimeout           time.Duration
+	Authorizer               Authorizer
+	CompositeTransport       *CompositeTransport
+	MaxConnections           int
+	IdleTimeout              time.Duration
+	MaxHostnamesPerSession   int
+	MaxRegistrationBodyBytes int64
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -98,6 +108,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.MaxConnections = 10000
 	} else if cfg.MaxConnections < 0 {
 		cfg.MaxConnections = 0
+	}
+	if cfg.MaxHostnamesPerSession <= 0 {
+		cfg.MaxHostnamesPerSession = DefaultMaxHostnamesPerSession
+	}
+	if cfg.MaxRegistrationBodyBytes <= 0 {
+		cfg.MaxRegistrationBodyBytes = DefaultMaxRegistrationBodyBytes
 	}
 	if cfg.ServerTLSConfig == nil {
 		return nil, errors.New("ServerTLSConfig is required")
@@ -658,6 +674,21 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 			continue
 		}
 
+		if err := validateRegistrationHostnames(regReq.Hostnames, s.config.MaxHostnamesPerSession); err != nil {
+			log.Printf("Frontend: validation failed for QUIC session %s (%s) registering hostnames: %v", sessionID, clientIdentity.ID, err)
+			errResp, err := json.Marshal(api.RegistrationResponse{
+				Status: fmt.Sprintf("error: %v", err),
+			})
+			if err != nil {
+				log.Printf("Frontend: failed to marshal registration error response: %v", err)
+				return
+			}
+			if _, err := ctrlStream.Write(append(errResp, '\n')); err != nil {
+				return
+			}
+			continue
+		}
+
 		if err := s.authorizer.Authorize(context.Background(), clientIdentity, regReq.Hostnames); err != nil {
 			log.Printf("Frontend: authorization failed for QUIC session %s (%s) registering %v: %v", sessionID, clientIdentity.ID, regReq.Hostnames, err)
 			errResp, err := json.Marshal(api.RegistrationResponse{
@@ -689,6 +720,24 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 			return
 		}
 	}
+}
+
+func validateRegistrationHostnames(hostnames []string, maxHostnames int) error {
+	seen := make(map[string]struct{}, len(hostnames))
+	for _, rawHost := range hostnames {
+		h := CleanHostname(rawHost)
+		if h == "" {
+			h = rawHost
+		}
+		if _, exists := seen[h]; exists {
+			return fmt.Errorf("duplicate hostname %q in request", rawHost)
+		}
+		seen[h] = struct{}{}
+	}
+	if maxHostnames > 0 && len(hostnames) > maxHostnames {
+		return fmt.Errorf("number of hostnames (%d) exceeds limit of %d", len(hostnames), maxHostnames)
+	}
+	return nil
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
@@ -771,9 +820,33 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.ContentLength > s.config.MaxRegistrationBodyBytes {
+		http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxRegistrationBodyBytes)
 	var req api.RegistrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
+
+	if err := validateRegistrationHostnames(req.Hostnames, s.config.MaxHostnamesPerSession); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

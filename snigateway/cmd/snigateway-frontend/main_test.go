@@ -61,6 +61,7 @@ func TestFrontendCLI_ClientCAFlags(t *testing.T) {
 		fmt.Sprintf("--client-ca=%s=*.a.example.com,a.example.org", caPathA),
 		"--server-cert=" + serverCertPath,
 		"--server-key=" + serverKeyPath,
+		"--max-hostnames-per-session=500",
 	}
 
 	// Run frontend in background
