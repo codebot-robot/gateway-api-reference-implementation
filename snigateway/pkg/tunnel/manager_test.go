@@ -273,11 +273,17 @@ func TestManager_Transports(t *testing.T) {
 				t.Fatalf("net.ListenPacket failed: %v", err)
 			}
 
+			var wgListen string
+			if mode == TransportModeWireGuard {
+				wgListen = "127.0.0.1:0"
+			}
+
 			srv, err := frontend.NewServer(frontend.ServerConfig{
-				ServerTLSConfig:  serverTLS,
-				InternalHostname: "snigateway.internal",
-				ConnectTimeout:   5 * time.Second,
-				ReadSNITimeout:   2 * time.Second,
+				ServerTLSConfig:     serverTLS,
+				InternalHostname:    "snigateway.internal",
+				ConnectTimeout:      5 * time.Second,
+				ReadSNITimeout:      2 * time.Second,
+				WireGuardListenAddr: wgListen,
 			})
 			if err != nil {
 				t.Fatalf("NewServer failed: %v", err)

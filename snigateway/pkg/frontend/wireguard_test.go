@@ -231,4 +231,44 @@ func TestWireGuardTransport_PeerLifecycle(t *testing.T) {
 	if strings.Contains(outAfter, clientPubHex) {
 		t.Fatalf("expected device to no longer contain peer %s, got:\n%s", clientPubHex, outAfter)
 	}
+
+	// 3. Reject client key that equals frontend public key
+	fePub := tr.PublicKey()
+	if err := tr.RegisterPeer("sess-self", fePub, netip.MustParseAddr("fd00::20")); err == nil {
+		t.Fatal("expected error when registering frontend's own public key, got nil")
+	}
+
+	// 4. Reject client key that is already bound to another session
+	if err := tr.RegisterPeer("sess-1", clientPub, netip.MustParseAddr("fd00::30")); err != nil {
+		t.Fatalf("registering sess-1: %v", err)
+	}
+	if err := tr.RegisterPeer("sess-2", clientPub, netip.MustParseAddr("fd00::40")); err == nil {
+		t.Fatal("expected error when registering duplicate public key to different session, got nil")
+	}
+
+	// 5. Updating address on same session replaces allowed_ips (ensures exactly one /128)
+	if err := tr.RegisterPeer("sess-1", clientPub, netip.MustParseAddr("fd00::31")); err != nil {
+		t.Fatalf("updating sess-1 address: %v", err)
+	}
+	outUpdate, err := tr.Device().IpcGet()
+	if err != nil {
+		t.Fatalf("IpcGet after update failed: %v", err)
+	}
+	if strings.Contains(outUpdate, "allowed_ip=fd00::30/128") {
+		t.Fatalf("expected old allowed_ip fd00::30/128 to be replaced, got:\n%s", outUpdate)
+	}
+	if !strings.Contains(outUpdate, "allowed_ip=fd00::31/128") {
+		t.Fatalf("expected new allowed_ip fd00::31/128, got:\n%s", outUpdate)
+	}
+
+	// 6. TryGetConn skips peer whose handshake is zero without blocking
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
+	defer cancel()
+	conn, err := tr.TryGetConn(ctx, "sess-1")
+	if err != nil {
+		t.Fatalf("expected nil error for unestablished peer, got: %v", err)
+	}
+	if conn != nil {
+		t.Fatal("expected nil conn for unestablished peer")
+	}
 }

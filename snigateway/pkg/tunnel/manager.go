@@ -1702,6 +1702,20 @@ func (m *Manager) runWireGuardSessionWithBackoff(ctx context.Context, backoff *t
 	defer dev.Close()
 
 	endpoint := wgResp.Endpoint
+	epHost, epPort, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		epPort = strings.TrimPrefix(endpoint, ":")
+		epHost = ""
+	}
+
+	if epHost == "" || epHost == "0.0.0.0" || epHost == "::" {
+		feHost := ParseFrontendHost(m.client.ServerAddr())
+		if feHost == "" {
+			feHost = "127.0.0.1"
+		}
+		endpoint = net.JoinHostPort(feHost, epPort)
+	}
+
 	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
 		klog.V(2).Infof("Could not resolve UDP endpoint %s: %v", endpoint, err)

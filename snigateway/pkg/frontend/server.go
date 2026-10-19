@@ -29,7 +29,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,18 +92,19 @@ type Server struct {
 	internalListener *chanListener
 	httpServer       *http.Server
 
-	listenersMu    sync.Mutex
-	listeners      []net.Listener
-	udpListeners   []net.PacketConn
-	quicListeners  []*quic.Listener
-	closed         bool
-	shutdownCh     chan struct{}
-	activeConns    atomic.Int64
-	jwtVerifier    jwt.TokenVerifier
-	sessionsMu     sync.Mutex
-	sessionCancels map[string]context.CancelFunc
-	sessionClosers map[string][]func()
-	timeNow        func() time.Time
+	listenersMu      sync.Mutex
+	listeners        []net.Listener
+	udpListeners     []net.PacketConn
+	quicListeners    []*quic.Listener
+	closed           bool
+	shutdownCh       chan struct{}
+	activeConns      atomic.Int64
+	jwtVerifier      jwt.TokenVerifier
+	sessionsMu       sync.Mutex
+	sessionCancels   map[string]context.CancelFunc
+	sessionClosers   map[string][]func()
+	wgSessionClosers map[string]bool
+	timeNow          func() time.Time
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -155,15 +155,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	var wgTr *WireGuardTransport
-	if !cfg.WireGuardDisabled {
+	if !cfg.WireGuardDisabled && (cfg.WireGuardListenAddr != "" || comp.WireGuard() != nil) {
 		if comp.WireGuard() != nil {
 			wgTr = comp.WireGuard()
 		} else {
 			var err error
 			wgTr, err = NewWireGuardTransport(WireGuardTransportConfig{
-				ListenAddr: cfg.WireGuardListenAddr,
-				Prefix:     cfg.WireGuardPrefix,
-				Endpoint:   cfg.WireGuardEndpoint,
+				ListenAddr:        cfg.WireGuardListenAddr,
+				Prefix:            cfg.WireGuardPrefix,
+				Endpoint:          cfg.WireGuardEndpoint,
+				PerAttemptTimeout: cfg.PerAttemptTimeout,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("initializing wireguard transport: %w", err)
@@ -186,6 +187,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		jwtVerifier:      cfg.JWTVerifier,
 		sessionCancels:   make(map[string]context.CancelFunc),
 		sessionClosers:   make(map[string][]func()),
+		wgSessionClosers: make(map[string]bool),
 		timeNow:          timeNow,
 	}
 
@@ -196,7 +198,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	mux.HandleFunc("/v1/connections/", s.handleConnectionUpgrade)
 	mux.HandleFunc("/v1/tunnel", s.handleConnectionUpgrade)
 	mux.HandleFunc("PUT /v1/sessions/{id}/wireguard", s.handleWireGuardExchange)
-	mux.HandleFunc("/v1/sessions/", s.handleSessionsRouter)
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -432,6 +433,24 @@ func (s *Server) registerSessionCloser(sessionID string, closer func()) {
 	s.sessionClosers[sessionID] = append(s.sessionClosers[sessionID], closer)
 }
 
+func (s *Server) registerWireGuardSessionCloser(sessionID string) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if s.wgSessionClosers == nil {
+		s.wgSessionClosers = make(map[string]bool)
+	}
+	if s.wgSessionClosers[sessionID] {
+		return
+	}
+	s.wgSessionClosers[sessionID] = true
+	s.sessionClosers[sessionID] = append(s.sessionClosers[sessionID], func() {
+		if s.wireguard != nil {
+			s.wireguard.UnregisterSession(sessionID)
+		}
+		s.table.ReleaseWireGuardAddress(sessionID)
+	})
+}
+
 // CloseSession closes an active backend session and any associated connections.
 func (s *Server) CloseSession(sessionID string) {
 	s.sessionsMu.Lock()
@@ -439,6 +458,7 @@ func (s *Server) CloseSession(sessionID string) {
 	delete(s.sessionCancels, sessionID)
 	closers := s.sessionClosers[sessionID]
 	delete(s.sessionClosers, sessionID)
+	delete(s.wgSessionClosers, sessionID)
 	s.sessionsMu.Unlock()
 
 	s.table.Unregister(sessionID)
@@ -870,7 +890,7 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 
 		// Check if this is a WireGuard key exchange request
 		var wgReq api.WireGuardExchangeRequest
-		if err := json.Unmarshal(trimmed, &wgReq); err == nil && (wgReq.Type == "wireguard" || (wgReq.PublicKey != "" && !bytes.Contains(trimmed, []byte("hostnames")))) {
+		if err := json.Unmarshal(trimmed, &wgReq); err == nil && wgReq.Type == "wireguard" {
 			if s.wireguard == nil {
 				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
 					Status: "error: wireguard transport not enabled",
@@ -918,7 +938,7 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 
 			if err := s.wireguard.RegisterPeer(sessionID, clientPubKey, peerAddr); err != nil {
 				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
-					Status: "error: failed to configure wireguard peer",
+					Status: fmt.Sprintf("error: %v", err),
 				})
 				if merr != nil {
 					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
@@ -930,18 +950,11 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 				continue
 			}
 
-			s.registerSessionCloser(sessionID, func() {
-				s.wireguard.UnregisterSession(sessionID)
-				s.table.ReleaseWireGuardAddress(sessionID)
-			})
+			s.registerWireGuardSessionCloser(sessionID)
 
 			endpoint := s.wireguard.AdvertisedEndpoint()
 			if endpoint == "" {
-				host, _, err := net.SplitHostPort(qConn.LocalAddr().String())
-				if err != nil || host == "" || host == "::" || host == "0.0.0.0" {
-					host = "127.0.0.1"
-				}
-				endpoint = net.JoinHostPort(host, strconv.Itoa(int(s.wireguard.ActualPort())))
+				endpoint = fmt.Sprintf(":%d", s.wireguard.ActualPort())
 			}
 
 			fePub := s.wireguard.PublicKey()
@@ -1419,14 +1432,6 @@ func closeQUICConn(c *quic.Conn, code quic.ApplicationErrorCode, msg string) {
 	}
 }
 
-func (s *Server) handleSessionsRouter(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/wireguard") {
-		s.handleWireGuardExchange(w, r)
-		return
-	}
-	http.NotFound(w, r)
-}
-
 func (s *Server) handleWireGuardExchange(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1515,31 +1520,15 @@ func (s *Server) handleWireGuardExchange(w http.ResponseWriter, r *http.Request)
 
 	if err := s.wireguard.RegisterPeer(sessionID, clientPubKey, peerAddr); err != nil {
 		log.Printf("Frontend: failed to register wireguard peer for session %s: %v", sessionID, err)
-		http.Error(w, "failed to configure wireguard peer", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	s.registerSessionCloser(sessionID, func() {
-		s.wireguard.UnregisterSession(sessionID)
-		s.table.ReleaseWireGuardAddress(sessionID)
-	})
+	s.registerWireGuardSessionCloser(sessionID)
 
 	endpoint := s.wireguard.AdvertisedEndpoint()
 	if endpoint == "" {
-		host := stripPort(r.Host)
-		if host == "" || host == "localhost" || host == s.config.InternalHostname {
-			if localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-				localHost, _, err := net.SplitHostPort(localAddr.String())
-				if err == nil && localHost != "" && localHost != "0.0.0.0" && localHost != "::" {
-					host = localHost
-				} else {
-					host = "127.0.0.1"
-				}
-			} else {
-				host = "127.0.0.1"
-			}
-		}
-		endpoint = net.JoinHostPort(host, strconv.Itoa(int(s.wireguard.ActualPort())))
+		endpoint = fmt.Sprintf(":%d", s.wireguard.ActualPort())
 	}
 
 	fePub := s.wireguard.PublicKey()

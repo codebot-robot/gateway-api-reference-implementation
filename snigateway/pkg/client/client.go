@@ -112,6 +112,11 @@ func (c *Client) GetToken() (string, error) {
 	return "", nil
 }
 
+// ServerAddr returns the configured server address.
+func (c *Client) ServerAddr() string {
+	return c.serverAddr
+}
+
 // NewClient creates a new Client connecting to serverAddr using mTLS.
 func NewClient(serverAddr string, tlsConfig *tls.Config, opts ...ClientOption) *Client {
 	c := &Client{
@@ -237,6 +242,7 @@ func (c *Client) Register(ctx context.Context, sessionID string, hostnames []str
 	}
 
 	reqBody, err := json.Marshal(api.RegistrationRequest{
+		Type:      "registration",
 		Hostnames: hostnames,
 		Token:     token,
 	})
@@ -285,6 +291,7 @@ func (c *Client) WireGuardExchange(ctx context.Context, sessionID string, pubKey
 	}
 
 	reqBody, err := json.Marshal(api.WireGuardExchangeRequest{
+		Type:      "wireguard",
 		PublicKey: pubKeyBase64,
 		Token:     token,
 	})

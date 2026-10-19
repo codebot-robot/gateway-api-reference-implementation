@@ -436,9 +436,7 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 
 		var wgNotify <-chan struct{}
 		if c.wireguard != nil {
-			c.wireguard.mu.Lock()
-			wgNotify = c.wireguard.notifyCh
-			c.wireguard.mu.Unlock()
+			wgNotify = c.wireguard.Notify()
 		}
 
 		for _, sid := range sessionIDs {

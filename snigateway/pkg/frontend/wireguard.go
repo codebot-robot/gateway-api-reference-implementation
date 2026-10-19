@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"golang.zx2c4.com/wireguard/conn"
@@ -43,12 +44,13 @@ type wireguardPeer struct {
 
 // WireGuardTransportConfig configures the frontend WireGuard transport device.
 type WireGuardTransportConfig struct {
-	ListenAddr string // UDP listen address, e.g. ":51820" or ":0"
-	Prefix     string // IPv6 prefix, e.g. "fd00::/64"
-	Endpoint   string // Optional advertised endpoint "<host:port>"
-	TunnelPort int    // Target TCP port on controller netstack inside the tunnel
-	MTU        int    // Tunnel MTU
-	Logger     *device.Logger
+	ListenAddr        string // UDP listen address, e.g. ":51820" or ":0"
+	Prefix            string // IPv6 prefix, e.g. "fd00::/64"
+	Endpoint          string // Optional advertised endpoint "<host:port>"
+	TunnelPort        int    // Target TCP port on controller netstack inside the tunnel
+	MTU               int    // Tunnel MTU
+	PerAttemptTimeout time.Duration
+	Logger            *device.Logger
 }
 
 // WireGuardTransport implements Transport forwarding client connections over WireGuard.
@@ -67,6 +69,7 @@ type WireGuardTransport struct {
 	advertisedEndpoint string
 	tunnelPort         int
 	mtu                int
+	perAttemptTimeout  time.Duration
 	sessions           map[string]*wireguardPeer
 	pubKeyToSession    map[[32]byte]string
 	notifyCh           chan struct{}
@@ -172,6 +175,7 @@ func NewWireGuardTransport(cfg WireGuardTransportConfig) (*WireGuardTransport, e
 		advertisedEndpoint: cfg.Endpoint,
 		tunnelPort:         cfg.TunnelPort,
 		mtu:                cfg.MTU,
+		perAttemptTimeout:  cfg.PerAttemptTimeout,
 		sessions:           make(map[string]*wireguardPeer),
 		pubKeyToSession:    make(map[[32]byte]string),
 		notifyCh:           make(chan struct{}),
@@ -183,6 +187,13 @@ func NewWireGuardTransport(cfg WireGuardTransportConfig) (*WireGuardTransport, e
 func (w *WireGuardTransport) broadcastLocked() {
 	close(w.notifyCh)
 	w.notifyCh = make(chan struct{})
+}
+
+// Notify returns a receive-only channel that is closed and recreated when session registrations change.
+func (w *WireGuardTransport) Notify() <-chan struct{} {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.notifyCh
 }
 
 // PublicKey returns the frontend's 32-byte WireGuard public key.
@@ -234,6 +245,16 @@ func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byt
 		return net.ErrClosed
 	}
 
+	// Reject if client public key equals frontend's own public key
+	if clientPubKey == w.publicKey {
+		return fmt.Errorf("client public key cannot equal frontend public key")
+	}
+
+	// Reject if public key is already bound to a different session
+	if existingSession, ok := w.pubKeyToSession[clientPubKey]; ok && existingSession != sessionID {
+		return fmt.Errorf("public key is already bound to session %s", existingSession)
+	}
+
 	if existing, ok := w.sessions[sessionID]; ok {
 		if existing.publicKey == clientPubKey && existing.peerAddr == peerAddr {
 			return nil
@@ -246,7 +267,8 @@ func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byt
 	}
 
 	// Limits: AllowedIPs is exactly one /128 per peer; never a wider prefix.
-	peerUAPI := fmt.Sprintf("public_key=%s\nallowed_ip=%s/128\n",
+	// replace_allowed_ips=true ensures no prior allowed IPs remain on the peer.
+	peerUAPI := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s/128\n",
 		hex.EncodeToString(clientPubKey[:]), peerAddr.String())
 	if err := w.device.IpcSet(peerUAPI); err != nil {
 		return fmt.Errorf("configuring wireguard peer for session %s: %w", sessionID, err)
@@ -272,6 +294,10 @@ func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byt
 // UnregisterSession removes the peer from the wireguard device and frees session state.
 func (w *WireGuardTransport) UnregisterSession(sessionID string) {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return
+	}
 	p, ok := w.sessions[sessionID]
 	if !ok {
 		w.mu.Unlock()
@@ -297,6 +323,8 @@ func (w *WireGuardTransport) HasSession(sessionID string) bool {
 }
 
 // TryGetConn dials the backend netstack over WireGuard for sessionID.
+// It skips peers whose handshake is zero (not established) or older than 180s,
+// and bounds the dial attempt to PerAttemptTimeout so other candidates are not starved.
 func (w *WireGuardTransport) TryGetConn(ctx context.Context, sessionID string) (net.Conn, error) {
 	w.mu.RLock()
 	p, ok := w.sessions[sessionID]
@@ -306,9 +334,26 @@ func (w *WireGuardTransport) TryGetConn(ctx context.Context, sessionID string) (
 		return nil, nil
 	}
 
-	conn, err := w.netstackNet.DialContextTCP(ctx, p.tcpAddr)
+	// Skip peer if last handshake is zero (never completed) or older than 180s
+	hsTime, err := getPeerLastHandshake(w.device, hex.EncodeToString(p.publicKey[:]))
+	if err != nil || hsTime.IsZero() || time.Since(hsTime) > 180*time.Second {
+		return nil, nil
+	}
+
+	attemptTimeout := w.perAttemptTimeout
+	if attemptTimeout <= 0 {
+		attemptTimeout = 500 * time.Millisecond
+	}
+	dialCtx, dialCancel := context.WithTimeout(ctx, attemptTimeout)
+	defer dialCancel()
+
+	conn, err := w.netstackNet.DialContextTCP(dialCtx, p.tcpAddr)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// Connection attempt timed out or failed on this candidate; return nil to try next
+		return nil, nil
 	}
 	return conn, nil
 }
@@ -366,6 +411,32 @@ func (w *WireGuardTransport) Close() error {
 
 	w.device.Close()
 	return nil
+}
+
+func getPeerLastHandshake(d *device.Device, peerPubKeyHex string) (time.Time, error) {
+	out, err := d.IpcGet()
+	if err != nil {
+		return time.Time{}, err
+	}
+	lines := strings.Split(out, "\n")
+	var inPeer bool
+	for _, line := range lines {
+		if strings.HasPrefix(line, "public_key=") {
+			pk := strings.TrimPrefix(line, "public_key=")
+			inPeer = strings.EqualFold(pk, peerPubKeyHex)
+		} else if inPeer && strings.HasPrefix(line, "last_handshake_time_sec=") {
+			var sec int64
+			_, err := fmt.Sscanf(line, "last_handshake_time_sec=%d", &sec)
+			if err != nil {
+				return time.Time{}, err
+			}
+			if sec == 0 {
+				return time.Time{}, nil
+			}
+			return time.Unix(sec, 0), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("peer not found in ipc output")
 }
 
 func getDeviceListenPort(d *device.Device) (uint16, error) {

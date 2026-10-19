@@ -1045,34 +1045,37 @@ func TestWireGuard_HandshakeTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
-	start := time.Now()
 	go func() {
 		_ = mgr.Run(ctx)
 	}()
 
-	// Since endpoint is unreachable, manager should never become connected
-	time.Sleep(1 * time.Second)
-	elapsed := time.Since(start)
-
-	if mgr.IsConnected() {
-		t.Fatal("expected manager not to be connected with unreachable endpoint")
-	}
-
-	// Verify failure reported within reasonable bound (it timed out in ~500ms)
-	if elapsed < handshakeTimeout {
-		t.Fatalf("elapsed %v was less than handshake timeout %v", elapsed, handshakeTimeout)
+	// Since endpoint is unreachable, manager should never become connected.
+	// Poll to confirm it remains disconnected past the handshake timeout.
+	deadline := time.Now().Add(handshakeTimeout + 500*time.Millisecond)
+	for time.Now().Before(deadline) {
+		if mgr.IsConnected() {
+			t.Fatal("expected manager not to be connected with unreachable endpoint")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	// Stop manager
 	cancel()
-	time.Sleep(100 * time.Millisecond)
 
-	// Verify no peer is left behind on the frontend device
-	out, err := frontendServer.WireGuardTransport().Device().IpcGet()
-	if err != nil {
-		t.Fatalf("IpcGet failed: %v", err)
+	// Poll until no peer remains on the frontend device
+	cleanDeadline := time.Now().Add(2 * time.Second)
+	var peerCleaned bool
+	for time.Now().Before(cleanDeadline) {
+		out, err := frontendServer.WireGuardTransport().Device().IpcGet()
+		if err == nil && !strings.Contains(out, "public_key=") {
+			peerCleaned = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if strings.Contains(out, "public_key=") {
+
+	if !peerCleaned {
+		out, _ := frontendServer.WireGuardTransport().Device().IpcGet()
 		t.Fatalf("expected no peer left on frontend device after timeout, got:\n%s", out)
 	}
 }
