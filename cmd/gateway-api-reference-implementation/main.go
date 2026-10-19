@@ -15,12 +15,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2/textlogger"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -37,15 +39,10 @@ func main() {
 		dataplaneImage   string
 	)
 
-	defaultImg := os.Getenv("GARI_IMAGE")
-	if defaultImg == "" {
-		defaultImg = singlepod.DefaultDataplaneImage
-	}
-
 	flag.BoolVar(&dataplaneMode, "dataplane-mode", false, "Run in data-plane mode serving a single Gateway.")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
 	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
-	flag.StringVar(&dataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
+	flag.StringVar(&dataplaneImage, "dataplane-image", "", "The container image to use for provisioned per-Gateway data-plane Deployments.")
 	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to.")
@@ -73,6 +70,8 @@ func main() {
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
+	ctx := ctrl.SetupSignalHandler()
+
 	if dataplaneMode {
 		if gatewayNamespace == "" || gatewayName == "" {
 			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
@@ -86,18 +85,30 @@ func main() {
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
 		opts.AddressProvider = nil
 	} else {
+		resolvedImage, source, warning := resolveDataplaneImage(
+			ctx,
+			dataplaneImage,
+			os.Getenv,
+			func(ctx context.Context) (*corev1.Pod, error) {
+				return fetchOwnPod(ctx, os.Getenv, opts.RestConfig)
+			},
+		)
+		if warning != nil {
+			setupLog.Info("warning: unable to determine dataplane image from own pod, falling back to default", "warning", warning.Error())
+		}
+		setupLog.Info("using dataplane image", "image", resolvedImage, "source", source)
+
 		opts.ProxyAddr = ""
 		opts.ProxyHTTPSAddr = ""
 		opts.ProxyHTTP3Addr = ""
 		opts.AddressProvider = singlepod.NewAddressProvider(
 			nil,
-			singlepod.WithDataplaneImage(dataplaneImage),
+			singlepod.WithDataplaneImage(resolvedImage),
 			singlepod.WithEnableH2C(opts.EnableH2C),
 			singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
 		)
 	}
 
-	ctx := ctrl.SetupSignalHandler()
 	if err := gari.Run(ctx, opts); err != nil {
 		setupLog.Error(err, "fatal error")
 		os.Exit(1)
