@@ -71,11 +71,12 @@ type ServerConfig struct {
 	JWTVerifier              jwt.TokenVerifier
 	LeaseReaperInterval      time.Duration
 	// TimeNow overrides time.Now for deterministic testing of lease expiration.
-	TimeNow             func() time.Time
-	WireGuardListenAddr string
-	WireGuardPrefix     string
-	WireGuardEndpoint   string
-	WireGuardDisabled   bool
+	TimeNow                        func() time.Time
+	WireGuardListenAddr            string
+	WireGuardPrefix                string
+	WireGuardEndpoint              string
+	WireGuardDisabled              bool
+	WireGuardHandshakeSyncInterval time.Duration
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -161,10 +162,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		} else {
 			var err error
 			wgTr, err = NewWireGuardTransport(WireGuardTransportConfig{
-				ListenAddr:        cfg.WireGuardListenAddr,
-				Prefix:            cfg.WireGuardPrefix,
-				Endpoint:          cfg.WireGuardEndpoint,
-				PerAttemptTimeout: cfg.PerAttemptTimeout,
+				ListenAddr:            cfg.WireGuardListenAddr,
+				Prefix:                cfg.WireGuardPrefix,
+				Endpoint:              cfg.WireGuardEndpoint,
+				PerAttemptTimeout:     cfg.PerAttemptTimeout,
+				HandshakeSyncInterval: cfg.WireGuardHandshakeSyncInterval,
+				Now:                   timeNow,
 			})
 			if err != nil {
 				return nil, fmt.Errorf("initializing wireguard transport: %w", err)
