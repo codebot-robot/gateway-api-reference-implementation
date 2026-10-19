@@ -78,7 +78,7 @@ func main() {
 	flag.StringVar(&tokenFilePath, "token-file", "", "Path to ServiceAccount token file for authentication.")
 	flag.StringVar(&internalHostname, "internal-hostname", "snigateway.internal", "TLS ServerName for the snigateway-frontend mTLS management API.")
 	flag.StringVar(&controllerName, "controller-name", DefaultControllerName, "The GatewayClass controller name managed by this instance.")
-	flag.StringVar(&tunnelTransport, "tunnel-transport", tunnel.TransportModeAuto, "Tunnel transport to use (auto, quic, tcp, h2).")
+	flag.StringVar(&tunnelTransport, "tunnel-transport", tunnel.TransportModeAuto, "Tunnel transport to use (auto, quic, tcp, h2, wireguard).")
 	flag.IntVar(&tunnelPoolSize, "tunnel-pool-size", tunnel.DefaultPoolSize, "Number of idle pre-dialed reverse tunnel connections to maintain with the frontend when using TCP pool or H2 transport.")
 	flag.DurationVar(&quicDialTimeout, "quic-dial-timeout", 3*time.Second, "Timeout for dialing QUIC connections.")
 	flag.DurationVar(&quicProbeInterval, "quic-probe-interval", 30*time.Second, "Interval for probing QUIC availability when in TCP fallback.")

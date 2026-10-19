@@ -381,6 +381,10 @@ func BenchmarkLatency_H2(b *testing.B) {
 	runLatencyBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "bench-h2.example.com")
 }
 
+func BenchmarkLatency_WireGuard(b *testing.B) {
+	runLatencyBenchmark(b, benchConfig{Transport: "wireguard"}, "bench-wg.example.com")
+}
+
 func BenchmarkThroughput_QUIC(b *testing.B) {
 	runThroughputBenchmark(b, benchConfig{Transport: "quic"}, "tput-quic.example.com")
 }
@@ -393,6 +397,10 @@ func BenchmarkThroughput_H2(b *testing.B) {
 	runThroughputBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "tput-h2.example.com")
 }
 
+func BenchmarkThroughput_WireGuard(b *testing.B) {
+	runThroughputBenchmark(b, benchConfig{Transport: "wireguard"}, "tput-wg.example.com")
+}
+
 func BenchmarkThroughput_Concurrent_QUIC(b *testing.B) {
 	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "quic"}, "c-tput-quic.example.com", 8)
 }
@@ -403,6 +411,10 @@ func BenchmarkThroughput_Concurrent_TCPPool(b *testing.B) {
 
 func BenchmarkThroughput_Concurrent_H2(b *testing.B) {
 	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "h2", PoolSize: 4}, "c-tput-h2.example.com", 8)
+}
+
+func BenchmarkThroughput_Concurrent_WireGuard(b *testing.B) {
+	runConcurrentThroughputBenchmark(b, benchConfig{Transport: "wireguard"}, "c-tput-wg.example.com", 8)
 }
 
 func BenchmarkMatrix(b *testing.B) {
