@@ -239,7 +239,7 @@ func TestManager_EndToEnd(t *testing.T) {
 }
 
 func TestManager_Transports(t *testing.T) {
-	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto, TransportModeH2} {
+	for _, mode := range []string{TransportModeQUIC, TransportModeTCP, TransportModeAuto, TransportModeH2, TransportModeWireGuard} {
 		t.Run("Mode_"+mode, func(t *testing.T) {
 			tempDir, err := os.MkdirTemp("", "snigateway-mgr-transports-*")
 			if err != nil {
