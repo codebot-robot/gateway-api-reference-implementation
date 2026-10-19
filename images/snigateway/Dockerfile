@@ -19,7 +19,7 @@ COPY snigateway/go.mod snigateway/go.sum snigateway/go.work ./snigateway/
 RUN go mod download
 COPY . .
 WORKDIR /app/snigateway
-RUN CGO_ENABLED=0 go build -o snigateway cmd/snigateway/main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o snigateway cmd/snigateway/main.go
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /

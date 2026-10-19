@@ -17,7 +17,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /
