@@ -31,6 +31,12 @@ const (
 	TunnelALPN = "snigateway-tunnel/1"
 )
 
+// SessionInitRequest is the initial message sent on the QUIC control stream.
+type SessionInitRequest struct {
+	Type  string `json:"type"`
+	Token string `json:"token,omitempty"`
+}
+
 // SessionResponse is returned upon establishing a backend session.
 type SessionResponse struct {
 	SessionID string `json:"sessionId"`
@@ -40,6 +46,7 @@ type SessionResponse struct {
 // RegistrationRequest contains hostnames to be served by the session.
 type RegistrationRequest struct {
 	Hostnames []string `json:"hostnames"`
+	Token     string   `json:"token,omitempty"`
 }
 
 // RegistrationResponse is returned upon successful registration.

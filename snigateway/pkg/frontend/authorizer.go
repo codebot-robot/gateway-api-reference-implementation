@@ -18,13 +18,17 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ClientIdentity represents the authenticated identity of a connecting client.
 type ClientIdentity struct {
-	ID            string // Unique identifier, e.g. "<ca-fingerprint>/<cn>"
-	CAFingerprint string // Hex-encoded SHA256 of the root CA certificate
-	CommonName    string // Client certificate CommonName
+	ID            string    // Unique identifier, e.g. "<ca-fingerprint>/<cn>" or "jwt/<issuer>/<sub>"
+	CAFingerprint string    // Hex-encoded SHA256 of the root CA certificate
+	CommonName    string    // Client certificate CommonName
+	Issuer        string    // Issuer URL if authenticated via JWT
+	Subject       string    // Subject (system:serviceaccount:<ns>:<sa>) if authenticated via JWT
+	TokenExpiry   time.Time // Token expiration time for lease tracking
 }
 
 // Authorizer determines if a client identity is permitted to register the requested hostnames.
@@ -119,4 +123,153 @@ func (a *CAAuthorizer) Authorize(ctx context.Context, identity ClientIdentity, h
 		return fmt.Errorf("disallowed hostnames: %s", strings.Join(disallowed, ", "))
 	}
 	return nil
+}
+
+// SubjectRule grants hostname registration permissions to a Kubernetes ServiceAccount subject.
+type SubjectRule struct {
+	Namespace      string   // Namespace (e.g. "default")
+	ServiceAccount string   // ServiceAccount name (e.g. "my-sa") or "*" for any SA in Namespace
+	Patterns       []string // Allowed hostname patterns
+}
+
+// ParseSubjectRule parses an entry in the format "system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...]".
+// "<ns>:*" is allowed for the service account part to authorize any ServiceAccount in that namespace.
+func ParseSubjectRule(entry string) (SubjectRule, error) {
+	subjectPattern, patternsStr, ok := strings.Cut(entry, "=")
+	if !ok || subjectPattern == "" || patternsStr == "" {
+		return SubjectRule{}, fmt.Errorf("invalid format %q: expected system:serviceaccount:<ns>:<sa>=<pattern>[,<pattern>...]", entry)
+	}
+
+	const prefix = "system:serviceaccount:"
+	if !strings.HasPrefix(subjectPattern, prefix) {
+		return SubjectRule{}, fmt.Errorf("subject pattern %q must begin with %q", subjectPattern, prefix)
+	}
+
+	subRest := strings.TrimPrefix(subjectPattern, prefix)
+	ns, sa, ok := strings.Cut(subRest, ":")
+	if !ok || ns == "" || sa == "" {
+		return SubjectRule{}, fmt.Errorf("subject pattern %q must be in format %s<ns>:<sa> (or <ns>:*)", subjectPattern, prefix)
+	}
+
+	var patterns []string
+	for _, p := range strings.Split(patternsStr, ",") {
+		p = strings.Trim(strings.TrimSpace(p), "'\"")
+		if p != "" {
+			patterns = append(patterns, p)
+		}
+	}
+	if len(patterns) == 0 {
+		return SubjectRule{}, fmt.Errorf("no patterns specified in %q", entry)
+	}
+
+	return SubjectRule{
+		Namespace:      ns,
+		ServiceAccount: sa,
+		Patterns:       patterns,
+	}, nil
+}
+
+// SubjectAuthorizer authorizes registrations based on JWT ServiceAccount subject rules.
+type SubjectAuthorizer struct {
+	rules []SubjectRule
+}
+
+// NewSubjectAuthorizer creates a SubjectAuthorizer with the provided rules.
+func NewSubjectAuthorizer(rules []SubjectRule) *SubjectAuthorizer {
+	var cleanRules []SubjectRule
+	for _, r := range rules {
+		var patterns []string
+		for _, p := range r.Patterns {
+			if cp := CleanHostname(p); cp != "" {
+				patterns = append(patterns, cp)
+			}
+		}
+		if len(patterns) > 0 {
+			cleanRules = append(cleanRules, SubjectRule{
+				Namespace:      strings.TrimSpace(r.Namespace),
+				ServiceAccount: strings.TrimSpace(r.ServiceAccount),
+				Patterns:       patterns,
+			})
+		}
+	}
+	return &SubjectAuthorizer{rules: cleanRules}
+}
+
+// Authorize checks if all requested hostnames are covered by matching subject rules.
+func (a *SubjectAuthorizer) Authorize(ctx context.Context, identity ClientIdentity, hostnames []string) error {
+	const prefix = "system:serviceaccount:"
+	if !strings.HasPrefix(identity.Subject, prefix) {
+		return fmt.Errorf("disallowed hostnames: %s", strings.Join(hostnames, ", "))
+	}
+
+	subRest := strings.TrimPrefix(identity.Subject, prefix)
+	tokenNS, tokenSA, ok := strings.Cut(subRest, ":")
+	if !ok || tokenNS == "" || tokenSA == "" {
+		return fmt.Errorf("disallowed hostnames: %s", strings.Join(hostnames, ", "))
+	}
+
+	var allowedPatterns []string
+	for _, rule := range a.rules {
+		if rule.Namespace == tokenNS && (rule.ServiceAccount == "*" || rule.ServiceAccount == tokenSA) {
+			allowedPatterns = append(allowedPatterns, rule.Patterns...)
+		}
+	}
+
+	if len(allowedPatterns) == 0 {
+		return fmt.Errorf("disallowed hostnames: %s", strings.Join(hostnames, ", "))
+	}
+
+	var disallowed []string
+	for _, rawHost := range hostnames {
+		h := CleanHostname(rawHost)
+		if h == "" {
+			continue
+		}
+		matched := false
+		for _, pattern := range allowedPatterns {
+			if MatchHostnamePattern(pattern, h) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			disallowed = append(disallowed, rawHost)
+		}
+	}
+
+	if len(disallowed) > 0 {
+		return fmt.Errorf("disallowed hostnames: %s", strings.Join(disallowed, ", "))
+	}
+	return nil
+}
+
+// CombinedAuthorizer routes authorization requests to CAAuthorizer for certificate identities
+// and SubjectAuthorizer for JWT identities. A subject rule never widens a certificate rule and vice versa.
+type CombinedAuthorizer struct {
+	caAuthorizer      Authorizer
+	subjectAuthorizer Authorizer
+}
+
+// NewCombinedAuthorizer creates a new CombinedAuthorizer.
+func NewCombinedAuthorizer(caAuth, subjectAuth Authorizer) *CombinedAuthorizer {
+	return &CombinedAuthorizer{
+		caAuthorizer:      caAuth,
+		subjectAuthorizer: subjectAuth,
+	}
+}
+
+// Authorize delegates to SubjectAuthorizer for JWT identities and CAAuthorizer for cert identities.
+func (a *CombinedAuthorizer) Authorize(ctx context.Context, identity ClientIdentity, hostnames []string) error {
+	if identity.Subject != "" {
+		if a.subjectAuthorizer == nil {
+			return fmt.Errorf("disallowed hostnames: %s", strings.Join(hostnames, ", "))
+		}
+		return a.subjectAuthorizer.Authorize(ctx, identity, hostnames)
+	}
+
+	if a.caAuthorizer != nil {
+		return a.caAuthorizer.Authorize(ctx, identity, hostnames)
+	}
+
+	return fmt.Errorf("disallowed hostnames: %s", strings.Join(hostnames, ", "))
 }

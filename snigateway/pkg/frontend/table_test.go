@@ -16,6 +16,7 @@ package frontend
 
 import (
 	"testing"
+	"time"
 )
 
 func TestRegistrationTable(t *testing.T) {
@@ -158,5 +159,53 @@ func TestRegistrationTable_MultipleClientsPerHostname(t *testing.T) {
 	_, uok3 := tbl.Match("shared.example.com")
 	if uok3 {
 		t.Fatalf("expected not found after all clients unregistered")
+	}
+}
+
+func TestRegistrationTable_Lease(t *testing.T) {
+	tbl := NewRegistrationTable()
+	now := time.Now()
+
+	// 1. Register with lease in future
+	tbl.RegisterWithLease("sess-1", []string{"foo.example.com"}, now.Add(10*time.Second))
+	tbl.RegisterWithLease("sess-2", []string{"bar.example.com"}, now.Add(2*time.Second))
+
+	// Match succeeds
+	if _, ok := tbl.Match("foo.example.com"); !ok {
+		t.Fatal("expected match for foo.example.com")
+	}
+	if _, ok := tbl.Match("bar.example.com"); !ok {
+		t.Fatal("expected match for bar.example.com")
+	}
+
+	// 2. DropExpiredLeases at now + 5s (sess-2 expires, sess-1 still valid)
+	expired := tbl.DropExpiredLeases(now.Add(5 * time.Second))
+	if len(expired) != 1 || expired[0] != "sess-2" {
+		t.Fatalf("expected expired [sess-2], got %v", expired)
+	}
+
+	if _, ok := tbl.Match("bar.example.com"); ok {
+		t.Fatal("expected bar.example.com to no longer match after lease expired")
+	}
+	if _, ok := tbl.Match("foo.example.com"); !ok {
+		t.Fatal("expected foo.example.com to still match")
+	}
+
+	// 3. Extend sess-1 before it expires
+	tbl.RegisterWithLease("sess-1", []string{"foo.example.com"}, now.Add(20*time.Second))
+
+	// DropExpiredLeases at now + 15s (sess-1 should NOT expire because extended to 20s)
+	expired = tbl.DropExpiredLeases(now.Add(15 * time.Second))
+	if len(expired) != 0 {
+		t.Fatalf("expected no expired sessions, got %v", expired)
+	}
+
+	// DropExpiredLeases at now + 25s (sess-1 now expires)
+	expired = tbl.DropExpiredLeases(now.Add(25 * time.Second))
+	if len(expired) != 1 || expired[0] != "sess-1" {
+		t.Fatalf("expected expired [sess-1], got %v", expired)
+	}
+	if _, ok := tbl.Match("foo.example.com"); ok {
+		t.Fatal("expected foo.example.com to no longer match after lease expired")
 	}
 }
