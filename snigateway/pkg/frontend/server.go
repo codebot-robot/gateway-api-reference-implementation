@@ -69,6 +69,8 @@ type ServerConfig struct {
 	MaxRegistrationBodyBytes int64
 	JWTVerifier              jwt.TokenVerifier
 	LeaseReaperInterval      time.Duration
+	// TimeNow overrides time.Now for deterministic testing of lease expiration.
+	TimeNow func() time.Time
 }
 
 // Server implements the SNI proxy frontend with mTLS API and reverse tunnels.
@@ -95,6 +97,7 @@ type Server struct {
 	sessionsMu     sync.Mutex
 	sessionCancels map[string]context.CancelFunc
 	sessionClosers map[string][]func()
+	timeNow        func() time.Time
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -139,6 +142,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		comp = NewCompositeTransport(NewPoolTransport(), NewQUICTransport(), nil)
 	}
 
+	timeNow := cfg.TimeNow
+	if timeNow == nil {
+		timeNow = time.Now
+	}
+
 	s := &Server{
 		config:           cfg,
 		authorizer:       auth,
@@ -152,6 +160,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		jwtVerifier:      cfg.JWTVerifier,
 		sessionCancels:   make(map[string]context.CancelFunc),
 		sessionClosers:   make(map[string][]func()),
+		timeNow:          timeNow,
 	}
 
 	mux := http.NewServeMux()
@@ -362,8 +371,8 @@ func (s *Server) runLeaseReaper() {
 		select {
 		case <-s.shutdownCh:
 			return
-		case now := <-ticker.C:
-			expired := s.table.DropExpiredLeases(now)
+		case <-ticker.C:
+			expired := s.table.DropExpiredLeases(s.timeNow())
 			for _, sessID := range expired {
 				log.Printf("Frontend: lease expired for session %s, closing session", sessID)
 				s.CloseSession(sessID)
@@ -890,7 +899,7 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 		var leaseExpiry time.Time
 		if clientIdentity.Issuer != "" {
 			leaseExpiry = clientIdentity.TokenExpiry
-			maxLease := time.Now().Add(24 * time.Hour)
+			maxLease := s.timeNow().Add(24 * time.Hour)
 			if leaseExpiry.After(maxLease) {
 				leaseExpiry = maxLease
 			}
@@ -1055,7 +1064,7 @@ func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request) {
 	var leaseExpiry time.Time
 	if clientIdentity.Issuer != "" {
 		leaseExpiry = clientIdentity.TokenExpiry
-		maxLease := time.Now().Add(24 * time.Hour)
+		maxLease := s.timeNow().Add(24 * time.Hour)
 		if leaseExpiry.After(maxLease) {
 			leaseExpiry = maxLease
 		}
