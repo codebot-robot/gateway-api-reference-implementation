@@ -421,12 +421,6 @@ func (s *Server) registerSessionCancel(sessionID string, cancel context.CancelFu
 	s.sessionCancels[sessionID] = cancel
 }
 
-func (s *Server) unregisterSessionCancel(sessionID string) {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	delete(s.sessionCancels, sessionID)
-}
-
 func (s *Server) registerSessionCloser(sessionID string, closer func()) {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
@@ -440,6 +434,16 @@ func (s *Server) registerWireGuardSessionCloser(sessionID string) {
 		s.wgSessionClosers = make(map[string]bool)
 	}
 	if s.wgSessionClosers[sessionID] {
+		return
+	}
+	// Do not register closer if session has already been closed.
+	_, hasCancel := s.sessionCancels[sessionID]
+	closers, hasClosers := s.sessionClosers[sessionID]
+	if !hasCancel && (!hasClosers || len(closers) == 0) {
+		if s.wireguard != nil {
+			s.wireguard.UnregisterSession(sessionID)
+		}
+		s.table.ReleaseWireGuardAddress(sessionID)
 		return
 	}
 	s.wgSessionClosers[sessionID] = true
@@ -477,6 +481,14 @@ func (s *Server) CloseSession(sessionID string) {
 			c()
 		}
 	}
+}
+
+// sessionMapCounts returns the number of entries in sessionCancels, sessionClosers, and wgSessionClosers.
+// Intended for tests to verify that no per-session entries leak.
+func (s *Server) sessionMapCounts() (cancels, closers, wgClosers int) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	return len(s.sessionCancels), len(s.sessionClosers), len(s.wgSessionClosers)
 }
 
 func setTCPKeepAlive(conn net.Conn) {
@@ -858,12 +870,7 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 	log.Printf("Frontend: created QUIC session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
-		s.table.Unregister(sessionID)
-		s.quic.UnregisterSession(sessionID)
-		if s.wireguard != nil {
-			s.wireguard.UnregisterSession(sessionID)
-		}
-		closeQUICConn(qConn, 0, "session closed")
+		s.CloseSession(sessionID)
 		log.Printf("Frontend: QUIC session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 
@@ -1113,7 +1120,6 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	sessCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	s.registerSessionCancel(sessionID, cancel)
-	defer s.unregisterSessionCancel(sessionID)
 
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.pool.RegisterSession(sessionID)
@@ -1121,12 +1127,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
-		s.table.Unregister(sessionID)
-		s.pool.UnregisterSession(sessionID)
-		s.h2.UnregisterSession(sessionID)
-		if s.wireguard != nil {
-			s.wireguard.UnregisterSession(sessionID)
-		}
+		s.CloseSession(sessionID)
 		log.Printf("Frontend: session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 

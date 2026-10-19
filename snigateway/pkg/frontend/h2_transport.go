@@ -171,9 +171,11 @@ func (h *H2Transport) RegisterSession(sessionID string) {
 // UnregisterSession removes a session and drains its pooled H2 connections.
 func (h *H2Transport) UnregisterSession(sessionID string) {
 	h.mu.Lock()
-	conns := h.sessions[sessionID]
+	conns, exists := h.sessions[sessionID]
 	delete(h.sessions, sessionID)
-	h.broadcastLocked()
+	if exists {
+		h.broadcastLocked()
+	}
 	h.mu.Unlock()
 
 	for _, c := range conns {
