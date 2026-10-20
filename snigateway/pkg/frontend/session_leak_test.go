@@ -119,26 +119,25 @@ func randomWireGuardPubKey(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(key[:])
 }
 
-// sessionMapCounts returns the number of entries in sessionCancels, sessionClosers, and wgSessionClosers.
+// sessionCount returns the number of active session records in Server.sessions.
 // Intended for tests to verify that no per-session entries leak.
-func sessionMapCounts(s *Server) (cancels, closers, wgClosers int) {
+func sessionCount(s *Server) int {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	return len(s.sessionCancels), len(s.sessionClosers), len(s.wgSessionClosers)
+	return len(s.sessions)
 }
 
 func waitForEmptySessionMaps(t *testing.T, srv *Server) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		cancels, closers, wgClosers := sessionMapCounts(srv)
-		if cancels == 0 && closers == 0 && wgClosers == 0 {
+		if sessionCount(srv) == 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	cancels, closers, wgClosers := sessionMapCounts(srv)
-	t.Fatalf("session maps not empty after deadline: cancels=%d, closers=%d, wgClosers=%d", cancels, closers, wgClosers)
+	count := sessionCount(srv)
+	t.Fatalf("session map not empty after deadline: count=%d", count)
 }
 
 func TestSessionTeardown_MapCleanup_NormalEnd(t *testing.T) {
@@ -490,4 +489,106 @@ func TestSessionTeardown_IdempotentCloseSession(t *testing.T) {
 	wg.Wait()
 
 	waitForEmptySessionMaps(t, srv)
+}
+
+func TestSessionTeardown_WireGuardExchangeRace(t *testing.T) {
+	srv, serverAddr, generated, cleanup := setupTestServerForLeakTests(t, nil)
+	defer cleanup()
+
+	clientTLS, err := certs.NewClientTLSConfig(generated.CA.CertPEM, generated.Client.CertPEM, generated.Client.KeyPEM, "snigateway.internal")
+	if err != nil {
+		t.Fatalf("NewClientTLSConfig failed: %v", err)
+	}
+	c := client.NewClient(serverAddr, clientTLS)
+
+	t.Run("close before RegisterPeer", func(t *testing.T) {
+		sessCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		sessID, errCh, err := c.StartSession(sessCtx)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+
+		// Close the session before peer registration completes
+		srv.CloseSession(sessID)
+		cancel()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+		}
+
+		// Verify WireGuardExchange over HTTP fails cleanly for closed session
+		pubKey := randomWireGuardPubKey(t)
+		_, err = c.WireGuardExchange(sessCtx, sessID, pubKey)
+		if err == nil {
+			t.Fatal("expected WireGuardExchange to fail on closed session")
+		}
+
+		// Also verify direct handler sequence: AssignWireGuardAddress + RegisterPeer + registerWireGuardSessionCloser
+		prefix, _ := netip.ParsePrefix("fd00::/64")
+		peerAddr, _ := srv.RegistrationTable().AssignWireGuardAddress(sessID, prefix)
+		var clientKey [32]byte
+		_ = srv.wireguard.RegisterPeer(sessID, clientKey, peerAddr)
+		if srv.registerWireGuardSessionCloser(sessID) {
+			t.Fatal("expected registerWireGuardSessionCloser to return false for closed session")
+		}
+		// Caller cleanup
+		srv.wireguard.UnregisterSession(sessID)
+		srv.RegistrationTable().ReleaseWireGuardAddress(sessID)
+
+		if srv.wireguard.HasSession(sessID) {
+			t.Fatal("expected WireGuard session to be unregistered")
+		}
+		if _, ok := srv.RegistrationTable().GetWireGuardAddress(sessID); ok {
+			t.Fatal("expected WireGuard address to be released")
+		}
+		waitForEmptySessionMaps(t, srv)
+	})
+
+	t.Run("close between RegisterPeer and closer registration", func(t *testing.T) {
+		sessCtx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		sessID, errCh, err := c.StartSession(sessCtx)
+		if err != nil {
+			t.Fatalf("StartSession failed: %v", err)
+		}
+
+		// Assign address and register peer while session is active
+		prefix, _ := netip.ParsePrefix("fd00::/64")
+		peerAddr, err := srv.RegistrationTable().AssignWireGuardAddress(sessID, prefix)
+		if err != nil {
+			t.Fatalf("AssignWireGuardAddress failed: %v", err)
+		}
+		var clientKey [32]byte
+		copy(clientKey[:], "test-key-32-bytes-race-ordering-")
+		if err := srv.wireguard.RegisterPeer(sessID, clientKey, peerAddr); err != nil {
+			t.Fatalf("RegisterPeer failed: %v", err)
+		}
+
+		// Simulate session close interleaving right after RegisterPeer but before registerWireGuardSessionCloser
+		srv.CloseSession(sessID)
+		cancel()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+		}
+
+		// Now attempt to register closer: must return false because session is gone
+		if srv.registerWireGuardSessionCloser(sessID) {
+			t.Fatal("expected registerWireGuardSessionCloser to return false when closed before registration")
+		}
+		// Caller cleanup
+		srv.wireguard.UnregisterSession(sessID)
+		srv.RegistrationTable().ReleaseWireGuardAddress(sessID)
+
+		if srv.wireguard.HasSession(sessID) {
+			t.Fatal("expected WireGuard session to be unregistered")
+		}
+		if _, ok := srv.RegistrationTable().GetWireGuardAddress(sessID); ok {
+			t.Fatal("expected WireGuard address to be released")
+		}
+		waitForEmptySessionMaps(t, srv)
+	})
 }
