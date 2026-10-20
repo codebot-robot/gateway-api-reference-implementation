@@ -43,9 +43,10 @@ func TestSNIGateway(t *testing.T) {
 
 	// 2. Build images and load into kind
 	gitRoot := h.GetGitRoot()
-	h.DockerBuild("snigateway:e2e", filepath.Join(gitRoot, "images/snigateway/Dockerfile"), gitRoot)
+	snigatewayRoot := filepath.Join(gitRoot, "snigateway")
+	h.DockerBuild("snigateway:e2e", filepath.Join(snigatewayRoot, "images/snigateway/Dockerfile"), snigatewayRoot)
 	h.KindLoad("snigateway:e2e")
-	h.DockerBuild("snigateway-frontend:e2e", filepath.Join(gitRoot, "images/snigateway-frontend/Dockerfile"), gitRoot)
+	h.DockerBuild("snigateway-frontend:e2e", filepath.Join(snigatewayRoot, "images/snigateway-frontend/Dockerfile"), snigatewayRoot)
 	h.KindLoad("snigateway-frontend:e2e")
 
 	// 3. Deploy Backend (Toolbox Server)

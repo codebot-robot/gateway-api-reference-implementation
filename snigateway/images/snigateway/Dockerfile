@@ -15,18 +15,16 @@
 FROM --platform=$BUILDPLATFORM golang:1.27.2 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
-COPY snigateway/go.mod snigateway/go.sum snigateway/go.work ./snigateway/
 RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+    GOWORK=off go mod download
 COPY . .
-WORKDIR /app/snigateway
 ARG TARGETOS TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o snigateway-frontend cmd/snigateway-frontend/main.go
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOWORK=off go build -o snigateway cmd/snigateway/main.go
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /
-COPY --from=builder /app/snigateway/snigateway-frontend .
+COPY --from=builder /app/snigateway .
 USER 65532:65532
-ENTRYPOINT ["/snigateway-frontend"]
+ENTRYPOINT ["/snigateway"]

@@ -27,16 +27,16 @@ Container images for `snigateway` and `snigateway-frontend` are built from the r
 
 ```bash
 # In-cluster controller
-docker build -f images/snigateway/Dockerfile -t snigateway:latest .
+docker build -f snigateway/images/snigateway/Dockerfile -t snigateway:latest snigateway
 
 # External frontend proxy
-docker build -f images/snigateway-frontend/Dockerfile -t snigateway-frontend:latest .
+docker build -f snigateway/images/snigateway-frontend/Dockerfile -t snigateway-frontend:latest snigateway
 ```
 
 Or using `ap`:
 
 ```bash
-go run github.com/gke-labs/gke-labs-infra/ap@latest build //...
+go run github.com/gke-labs/gke-labs-infra/ap@latest build ./snigateway
 ```
 
 Both images are based on `distroless/static-debian12` and run as an unprivileged non-root user (`65532:65532`).
