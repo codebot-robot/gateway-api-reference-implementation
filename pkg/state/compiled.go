@@ -1173,6 +1173,9 @@ func ComputeGatewayConditions(
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonAddressNotAssigned
 		gwProgrammedMessage = "Waiting for address to be assigned to the Gateway"
+		if readiness.Reason == string(gatewayv1.GatewayReasonAddressNotAssigned) && readiness.Message != "" {
+			gwProgrammedMessage = readiness.Message
+		}
 	} else if !readiness.Ready {
 		gwProgrammedStatus = metav1.ConditionFalse
 		gwProgrammedReason = gatewayv1.GatewayReasonPending

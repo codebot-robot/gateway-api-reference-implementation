@@ -2248,3 +2248,264 @@ func TestSinglePodAddressProvider_ForwardedForModeArg(t *testing.T) {
 		t.Errorf("expected container args to include '--forwarded-for-mode=replace', got %v", args)
 	}
 }
+
+func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-gw",
+			Namespace:  "test-ns",
+			UID:        types.UID("gw-uid-123"),
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc, gw).
+		WithStatusSubresource(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
+
+	r := &controller.GatewayReconciler{
+		Client:          c,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: p,
+	}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}}
+
+	// 1. Initial reconcile creates resources: Service has an LB IP, but Deployment has no ready replicas.
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	resName := ResourceNameForGateway("test-gw")
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	// Simulate MetalLB assigning an LB IP to the Service
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.100"}}
+	if err := c.Status().Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to update Service status: %v", err)
+	}
+
+	// Verify at the provider level: Service has an LB IP but Deployment has 0 ready replicas
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("expected no addresses when data plane is not ready, got %d", len(addrs))
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false when deployment has no ready replicas")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected readiness.Reason=AddressNotAssigned, got %s", readiness.Reason)
+	}
+	if readiness.Message != "Waiting for data-plane deployment to become available" {
+		t.Fatalf("expected readiness.Message='Waiting for data-plane deployment to become available', got %q", readiness.Message)
+	}
+
+	// Reconcile through GatewayReconciler and verify status:
+	// Programmed=False with reason AddressNotAssigned and deployment-waiting message, status.addresses empty.
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+	st.Recompute()
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway second time: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := c.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get reconciled gateway: %v", err)
+	}
+	if len(reconciledGW.Status.Addresses) != 0 {
+		t.Fatalf("expected 0 addresses in status, got %+v", reconciledGW.Status.Addresses)
+	}
+	progCond := state.FindCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected Programmed=False/AddressNotAssigned, got %+v", progCond)
+	}
+	if progCond.Message != "Waiting for data-plane deployment to become available" {
+		t.Fatalf("expected Programmed message 'Waiting for data-plane deployment to become available', got %q", progCond.Message)
+	}
+
+	// 2. Deployment is ready, but Service has no LB IP yet:
+	// Programmed=False with reason AddressNotAssigned and address-waiting message.
+	svc.Status.LoadBalancer.Ingress = nil
+	if err := c.Status().Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to clear Service LB Ingress: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	deploy.Status.ReadyReplicas = 1
+	if err := c.Status().Update(ctx, &deploy); err != nil {
+		t.Fatalf("failed to update Deployment status: %v", err)
+	}
+
+	// Provider level check
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("expected 0 addresses before LB ingress is assigned, got %d", len(addrs))
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false before LB ingress is assigned")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected readiness.Reason=AddressNotAssigned, got %s", readiness.Reason)
+	}
+	if readiness.Message != "Waiting for address to be assigned to the Gateway" {
+		t.Fatalf("expected readiness.Message='Waiting for address to be assigned to the Gateway', got %q", readiness.Message)
+	}
+
+	// Controller reconcile check
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+	st.Recompute()
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	if err := c.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get reconciled gateway: %v", err)
+	}
+	if len(reconciledGW.Status.Addresses) != 0 {
+		t.Fatalf("expected 0 addresses in status, got %+v", reconciledGW.Status.Addresses)
+	}
+	progCond = state.FindCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+		t.Fatalf("expected Programmed=False/AddressNotAssigned, got %+v", progCond)
+	}
+	if progCond.Message != "Waiting for address to be assigned to the Gateway" {
+		t.Fatalf("expected Programmed message 'Waiting for address to be assigned to the Gateway', got %q", progCond.Message)
+	}
+
+	// 3. Service gets LB IP while Deployment is ready -> address present, Programmed=True
+	svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "192.0.2.100"}}
+	if err := c.Status().Update(ctx, &svc); err != nil {
+		t.Fatalf("failed to update Service status with LB IP: %v", err)
+	}
+
+	// Provider level check
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0].Value != "192.0.2.100" {
+		t.Fatalf("expected 1 address 192.0.2.100, got %+v", addrs)
+	}
+	if !readiness.Ready {
+		t.Fatalf("expected readiness.Ready=true when deployment is ready and LB IP is bound")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Fatalf("expected readiness.Reason=Programmed, got %s", readiness.Reason)
+	}
+
+	// Controller reconcile check
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+	st.Recompute()
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	if err := c.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get reconciled gateway: %v", err)
+	}
+	if len(reconciledGW.Status.Addresses) != 1 || reconciledGW.Status.Addresses[0].Value != "192.0.2.100" {
+		t.Fatalf("expected address 192.0.2.100 in status, got %+v", reconciledGW.Status.Addresses)
+	}
+	progCond = state.FindCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Fatalf("expected Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	// 4. Requested-IP-not-bound case unchanged: Programmed=False/AddressNotUsable
+	reconciledGW.Spec.Addresses = []gatewayv1.GatewaySpecAddress{
+		{
+			Type:  state.Ptr(gatewayv1.IPAddressType),
+			Value: "192.0.2.200", // different from Service's 192.0.2.100
+		},
+	}
+	if err := c.Update(ctx, &reconciledGW); err != nil {
+		t.Fatalf("failed to update gateway with requested address: %v", err)
+	}
+	st.UpsertGateway(&reconciledGW)
+	st.Recompute()
+
+	addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, &reconciledGW, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from GatewayAddressesWithReadiness: %v", err)
+	}
+	if readiness.Ready {
+		t.Fatalf("expected readiness.Ready=false when requested IP is not bound")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Fatalf("expected readiness.Reason=AddressNotUsable, got %s", readiness.Reason)
+	}
+
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+	st.Recompute()
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	if err := c.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get reconciled gateway: %v", err)
+	}
+	progCond = state.FindCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonAddressNotUsable) {
+		t.Fatalf("expected Programmed=False/AddressNotUsable, got %+v", progCond)
+	}
+}

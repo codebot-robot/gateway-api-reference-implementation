@@ -647,10 +647,22 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	if !deployReady {
-		return addresses, state.GatewayReadiness{
+		// Withhold addresses until the data-plane Deployment has at least one ready replica.
+		// If an address is published before the data plane is ready, traffic may reach an IP
+		// that does not yet route to this Gateway's data plane (e.g. after IP reuse, kube-proxy
+		// can still route to another Gateway's data plane until kube-proxy converges).
+		return nil, state.GatewayReadiness{
 			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonPending),
+			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
 			Message: "Waiting for data-plane deployment to become available",
+		}, nil
+	}
+
+	if len(addresses) == 0 {
+		return nil, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+			Message: "Waiting for address to be assigned to the Gateway",
 		}, nil
 	}
 
