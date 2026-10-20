@@ -353,10 +353,10 @@ func TestWireGuardTransport_TryGetConn_HandshakeLifecycle(t *testing.T) {
 	}
 
 	// Check 1: No handshake yet -> skipped
-	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
-	defer cancel()
+	ctx1, cancel1 := context.WithTimeout(t.Context(), 1*time.Second)
+	defer cancel1()
 
-	conn1, err := tr.TryGetConn(ctx, sessionID)
+	conn1, err := tr.TryGetConn(ctx1, sessionID)
 	if err != nil {
 		t.Fatalf("TryGetConn error: %v", err)
 	}
@@ -391,7 +391,10 @@ func TestWireGuardTransport_TryGetConn_HandshakeLifecycle(t *testing.T) {
 	nowUnixNano.Store(hsCached.Add(5 * time.Second).UnixNano())
 
 	// Check 2: Fresh handshake -> dialled
-	conn2, err := tr.TryGetConn(ctx, sessionID)
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel2()
+
+	conn2, err := tr.TryGetConn(ctx2, sessionID)
 	if err != nil {
 		t.Fatalf("TryGetConn failed for fresh handshake: %v", err)
 	}
@@ -417,13 +420,144 @@ func TestWireGuardTransport_TryGetConn_HandshakeLifecycle(t *testing.T) {
 
 	// Check 3: Handshake older than 180s -> skipped
 	advance(181 * time.Second) // now is hsCached + 5s + 181s = hsCached + 186s > 180s
-	conn3, err := tr.TryGetConn(ctx, sessionID)
+	ctx3, cancel3 := context.WithTimeout(t.Context(), 1*time.Second)
+	defer cancel3()
+
+	conn3, err := tr.TryGetConn(ctx3, sessionID)
 	if err != nil {
 		t.Fatalf("TryGetConn error on expired handshake: %v", err)
 	}
 	if conn3 != nil {
 		conn3.Close()
 		t.Fatal("expected nil conn for handshake older than 180s, got active connection")
+	}
+}
+
+// TestWireGuardTransport_GetConnForSessions_WokenOnUsableHandshake verifies that a connection waiter
+// waiting for an unestablished session is promptly woken up when the session's handshake completes.
+func TestWireGuardTransport_GetConnForSessions_WokenOnUsableHandshake(t *testing.T) {
+	tr, err := NewWireGuardTransport(WireGuardTransportConfig{
+		ListenAddr:            "127.0.0.1:0",
+		Prefix:                "fd00::/64",
+		HandshakeSyncInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewWireGuardTransport failed: %v", err)
+	}
+	defer tr.Close()
+
+	// Setup backend netstack device with loopback UDP
+	backendPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating backend key: %v", err)
+	}
+	var backendPub [32]byte
+	copy(backendPub[:], backendPriv.PublicKey().Bytes())
+	backendIP := netip.MustParseAddr("fd00::2")
+
+	backendTun, backendNet, err := netstack.CreateNetTUN([]netip.Addr{backendIP}, nil, api.DefaultWireGuardMTU)
+	if err != nil {
+		t.Fatalf("backend CreateNetTUN: %v", err)
+	}
+	backendDev := device.NewDevice(backendTun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	defer backendDev.Close()
+
+	if err := backendDev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=0\n", hex.EncodeToString(backendPriv.Bytes()))); err != nil {
+		t.Fatalf("backendDev IpcSet: %v", err)
+	}
+	if err := backendDev.Up(); err != nil {
+		t.Fatalf("backendDev Up: %v", err)
+	}
+
+	// Listen TCP on backend netstack
+	tcpAddr := &net.TCPAddr{IP: net.ParseIP(backendIP.String()), Port: api.DefaultWireGuardTunnelPort}
+	lis, err := backendNet.ListenTCP(tcpAddr)
+	if err != nil {
+		t.Fatalf("backend ListenTCP: %v", err)
+	}
+	defer lis.Close()
+
+	go func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// Register peer on frontend (no handshake yet)
+	sessionID := "test-wake-sess"
+	if err := tr.RegisterPeer(sessionID, backendPub, backendIP); err != nil {
+		t.Fatalf("RegisterPeer failed: %v", err)
+	}
+
+	// Start GetConnForSessions waiter in background with an 8s context
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+
+	type result struct {
+		conn net.Conn
+		sid  string
+		err  error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		c, sid, err := tr.GetConnForSessions(ctx, []string{sessionID})
+		resCh <- result{conn: c, sid: sid, err: err}
+	}()
+
+	// Verify waiter is waiting (not immediately returning)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case res := <-resCh:
+		if res.conn != nil {
+			res.conn.Close()
+		}
+		t.Fatalf("expected GetConnForSessions to block while handshake is unestablished, got: conn=%v, err=%v", res.conn, res.err)
+	default:
+	}
+
+	// Now initiate handshake on backend
+	fePub := tr.PublicKey()
+	peerCfg := fmt.Sprintf("public_key=%s\nendpoint=127.0.0.1:%d\nallowed_ip=fd00::1/128\npersistent_keepalive_interval=25\n",
+		hex.EncodeToString(fePub[:]), tr.ActualPort())
+	if err := backendDev.IpcSet(peerCfg); err != nil {
+		t.Fatalf("backend add frontend peer: %v", err)
+	}
+
+	// The waiter should wake up promptly (within 3s) once handshake completes
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("GetConnForSessions failed: %v", res.err)
+		}
+		if res.conn == nil {
+			t.Fatal("expected non-nil conn")
+		}
+		defer res.conn.Close()
+		if res.sid != sessionID {
+			t.Fatalf("got session %q, want %q", res.sid, sessionID)
+		}
+
+		// Verify connection is working
+		msg := []byte("handshake-wakeup-ok")
+		if _, err := res.conn.Write(msg); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		buf := make([]byte, len(msg))
+		if _, err := io.ReadFull(res.conn, buf); err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(buf) != string(msg) {
+			t.Fatalf("got %q, want %q", string(buf), string(msg))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("GetConnForSessions was not woken up promptly after handshake completed")
 	}
 }
 

@@ -323,9 +323,6 @@ func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byt
 	w.broadcastLocked()
 	w.mu.Unlock()
 
-	if err := w.syncHandshakes(); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Printf("Frontend: failed to sync wireguard handshakes after registering peer %s: %v", sessionID, err)
-	}
 	w.triggerSync()
 	return nil
 }
@@ -361,6 +358,12 @@ func (w *WireGuardTransport) HasSession(sessionID string) bool {
 	return ok
 }
 
+const maxWireGuardHandshakeAge = 180 * time.Second
+
+func isHandshakeUsable(hs time.Time, now time.Time) bool {
+	return !hs.IsZero() && now.Sub(hs) <= maxWireGuardHandshakeAge
+}
+
 // TryGetConn dials the backend netstack over WireGuard for sessionID.
 // It skips peers whose cached handshake is zero (not established) or older than 180s,
 // and bounds the dial attempt to PerAttemptTimeout so other candidates are not starved.
@@ -375,7 +378,7 @@ func (w *WireGuardTransport) TryGetConn(ctx context.Context, sessionID string) (
 	w.mu.RUnlock()
 
 	// Skip peer if last handshake is zero (never completed) or older than 180s
-	if hsTime.IsZero() || w.now().Sub(hsTime) > 180*time.Second {
+	if !isHandshakeUsable(hsTime, w.now()) {
 		return nil, nil
 	}
 
@@ -568,12 +571,21 @@ func (w *WireGuardTransport) syncHandshakes() error {
 		return net.ErrClosed
 	}
 
+	now := w.now()
+	becameUsable := false
 	for pubKey, hsTime := range handshakes {
 		if sid, ok := w.pubKeyToSession[pubKey]; ok {
 			if p, ok := w.sessions[sid]; ok {
+				wasUsable := isHandshakeUsable(p.lastHandshake, now)
 				p.lastHandshake = hsTime
+				if !wasUsable && isHandshakeUsable(hsTime, now) {
+					becameUsable = true
+				}
 			}
 		}
+	}
+	if becameUsable {
+		w.broadcastLocked()
 	}
 	return nil
 }
