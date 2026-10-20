@@ -41,9 +41,43 @@ func parseDigestReference(imageID string) (string, bool) {
 	return "", false
 }
 
+// extractRepository returns the repository portion of an image reference, stripping
+// any scheme (docker://, docker-pullable://), digest (@sha256:...), or tag (:tag).
+func extractRepository(imageRef string) string {
+	ref := strings.TrimPrefix(imageRef, "docker-pullable://")
+	ref = strings.TrimPrefix(ref, "docker://")
+
+	if i := strings.Index(ref, "@"); i != -1 {
+		ref = ref[:i]
+	}
+
+	lastColon := strings.LastIndex(ref, ":")
+	lastSlash := strings.LastIndex(ref, "/")
+	if lastColon > lastSlash {
+		ref = ref[:lastColon]
+	}
+
+	return ref
+}
+
+// normalizeRepository strips default Docker registry prefixes for comparison.
+func normalizeRepository(repo string) string {
+	repo = strings.TrimPrefix(repo, "docker.io/library/")
+	repo = strings.TrimPrefix(repo, "docker.io/")
+	return repo
+}
+
+// repositoryMatches checks whether the repository of statusImage matches that of specImage.
+func repositoryMatches(specImage, statusImage string) bool {
+	specRepo := normalizeRepository(extractRepository(specImage))
+	statusRepo := normalizeRepository(extractRepository(statusImage))
+	return specRepo != "" && specRepo == statusRepo
+}
+
 // extractPodImage returns the container image from the given Pod.
 // It looks for a container named "controller", falling back to the only container if there is exactly one.
-// It prefers status.containerStatuses[].imageID when it is a digest reference; otherwise it returns spec.containers[].image.
+// It prefers status.containerStatuses[].imageID when it is a digest reference whose repository matches
+// the container's spec image; otherwise it returns spec.containers[].image.
 func extractPodImage(pod *corev1.Pod) (string, error) {
 	if pod == nil {
 		return "", errors.New("pod is nil")
@@ -65,7 +99,9 @@ func extractPodImage(pod *corev1.Pod) (string, error) {
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.Name == targetContainer.Name {
 			if ref, ok := parseDigestReference(cs.ImageID); ok {
-				return ref, nil
+				if repositoryMatches(targetContainer.Image, ref) {
+					return ref, nil
+				}
 			}
 			break
 		}

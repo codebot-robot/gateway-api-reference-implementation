@@ -111,6 +111,125 @@ func TestParseDigestReference(t *testing.T) {
 	}
 }
 
+func TestExtractRepository(t *testing.T) {
+	tests := []struct {
+		name     string
+		imageRef string
+		wantRepo string
+	}{
+		{
+			name:     "bare image name",
+			imageRef: "gari-controller",
+			wantRepo: "gari-controller",
+		},
+		{
+			name:     "image name with tag",
+			imageRef: "gari-controller:e2e",
+			wantRepo: "gari-controller",
+		},
+		{
+			name:     "image name with digest",
+			imageRef: "gari-controller@sha256:0123456789abcdef",
+			wantRepo: "gari-controller",
+		},
+		{
+			name:     "image with docker-pullable prefix and digest",
+			imageRef: "docker-pullable://gcr.io/gke-labs/gari-controller@sha256:0123456789abcdef",
+			wantRepo: "gcr.io/gke-labs/gari-controller",
+		},
+		{
+			name:     "image with docker prefix and tag",
+			imageRef: "docker://gcr.io/gke-labs/gari-controller:v1",
+			wantRepo: "gcr.io/gke-labs/gari-controller",
+		},
+		{
+			name:     "custom registry with port and tag",
+			imageRef: "localhost:5000/my-image:v1",
+			wantRepo: "localhost:5000/my-image",
+		},
+		{
+			name:     "custom registry with port without tag",
+			imageRef: "localhost:5000/my-image",
+			wantRepo: "localhost:5000/my-image",
+		},
+		{
+			name:     "custom registry with port and digest",
+			imageRef: "localhost:5000/my-image@sha256:0123456789abcdef",
+			wantRepo: "localhost:5000/my-image",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractRepository(tt.imageRef)
+			if got != tt.wantRepo {
+				t.Errorf("extractRepository(%q) = %q, want %q", tt.imageRef, got, tt.wantRepo)
+			}
+		})
+	}
+}
+
+func TestRepositoryMatches(t *testing.T) {
+	tests := []struct {
+		name        string
+		specImage   string
+		statusImage string
+		wantMatch   bool
+	}{
+		{
+			name:        "exact match",
+			specImage:   "gcr.io/gke-labs/gari-controller:v1",
+			statusImage: "docker-pullable://gcr.io/gke-labs/gari-controller@sha256:abcdef",
+			wantMatch:   true,
+		},
+		{
+			name:        "unqualified spec matches docker.io/library status",
+			specImage:   "gari-controller:e2e",
+			statusImage: "docker-pullable://docker.io/library/gari-controller@sha256:abcdef",
+			wantMatch:   true,
+		},
+		{
+			name:        "unqualified spec matches unqualified status",
+			specImage:   "gari-controller:e2e",
+			statusImage: "docker-pullable://gari-controller@sha256:abcdef",
+			wantMatch:   true,
+		},
+		{
+			name:        "docker.io/library spec matches unqualified status",
+			specImage:   "docker.io/library/gari-controller:latest",
+			statusImage: "docker-pullable://gari-controller@sha256:abcdef",
+			wantMatch:   true,
+		},
+		{
+			name:        "repository mismatch with imported image ID",
+			specImage:   "gari-controller:e2e",
+			statusImage: "docker-pullable://docker.io/library/import-2026-10-20@sha256:abcdef",
+			wantMatch:   false,
+		},
+		{
+			name:        "registry mismatch",
+			specImage:   "gcr.io/gke-labs/gari-controller:v1",
+			statusImage: "docker-pullable://quay.io/gke-labs/gari-controller@sha256:abcdef",
+			wantMatch:   false,
+		},
+		{
+			name:        "empty spec image",
+			specImage:   "",
+			statusImage: "docker-pullable://gari-controller@sha256:abcdef",
+			wantMatch:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := repositoryMatches(tt.specImage, tt.statusImage)
+			if got != tt.wantMatch {
+				t.Errorf("repositoryMatches(%q, %q) = %v, want %v", tt.specImage, tt.statusImage, got, tt.wantMatch)
+			}
+		})
+	}
+}
+
 func TestExtractPodImage(t *testing.T) {
 	t.Run("nil pod", func(t *testing.T) {
 		_, err := extractPodImage(nil)
@@ -137,7 +256,7 @@ func TestExtractPodImage(t *testing.T) {
 					},
 					{
 						Name:  "controller",
-						Image: "gari-controller:v1",
+						Image: "gcr.io/gke-labs/gari-controller:v1",
 					},
 				},
 			},
@@ -189,6 +308,64 @@ func TestExtractPodImage(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if want := "gcr.io/gke-labs/gari-controller:v2"; img != want {
+			t.Errorf("extractPodImage() = %q, want %q", img, want)
+		}
+	})
+
+	t.Run("controller container falls back to spec image when imageID repository does not match", func(t *testing.T) {
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "controller",
+						Image: "gari-controller:e2e",
+					},
+				},
+			},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name:    "controller",
+						ImageID: "docker-pullable://docker.io/library/import-2026-10-20@sha256:cccc",
+					},
+				},
+			},
+		}
+
+		img, err := extractPodImage(pod)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := "gari-controller:e2e"; img != want {
+			t.Errorf("extractPodImage() = %q, want %q", img, want)
+		}
+	})
+
+	t.Run("controller container matches repository with docker.io/library prefix in imageID", func(t *testing.T) {
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  "controller",
+						Image: "gari-controller:e2e",
+					},
+				},
+			},
+			Status: corev1.PodStatus{
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Name:    "controller",
+						ImageID: "docker-pullable://docker.io/library/gari-controller@sha256:dddd",
+					},
+				},
+			},
+		}
+
+		img, err := extractPodImage(pod)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := "docker.io/library/gari-controller@sha256:dddd"; img != want {
 			t.Errorf("extractPodImage() = %q, want %q", img, want)
 		}
 	})
@@ -253,7 +430,7 @@ func TestResolveDataplaneImage_SelectionOrder(t *testing.T) {
 			Containers: []corev1.Container{
 				{
 					Name:  "controller",
-					Image: "controller-spec:tag",
+					Image: "gcr.io/gke-labs/gari-controller:tag",
 				},
 			},
 		},
