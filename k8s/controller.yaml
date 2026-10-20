@@ -78,4 +78,5 @@ spec:
       containers:
       - name: controller
         image: gari-controller:latest
-        args: []
+        args:
+        - --dataplane-image=${IMAGE_PREFIX}/gari-controller
