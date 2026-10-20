@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.27.2 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.2 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /

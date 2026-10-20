@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.27.2 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.2 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 COPY snigateway/go.mod snigateway/go.sum snigateway/go.work ./snigateway/
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY . .
 WORKDIR /app/snigateway
-RUN CGO_ENABLED=0 go build -o snigateway-frontend cmd/snigateway-frontend/main.go
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o snigateway-frontend cmd/snigateway-frontend/main.go
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /
