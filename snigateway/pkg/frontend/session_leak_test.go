@@ -119,17 +119,25 @@ func randomWireGuardPubKey(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(key[:])
 }
 
+// sessionMapCounts returns the number of entries in sessionCancels, sessionClosers, and wgSessionClosers.
+// Intended for tests to verify that no per-session entries leak.
+func sessionMapCounts(s *Server) (cancels, closers, wgClosers int) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	return len(s.sessionCancels), len(s.sessionClosers), len(s.wgSessionClosers)
+}
+
 func waitForEmptySessionMaps(t *testing.T, srv *Server) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		cancels, closers, wgClosers := srv.sessionMapCounts()
+		cancels, closers, wgClosers := sessionMapCounts(srv)
 		if cancels == 0 && closers == 0 && wgClosers == 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	cancels, closers, wgClosers := srv.sessionMapCounts()
+	cancels, closers, wgClosers := sessionMapCounts(srv)
 	t.Fatalf("session maps not empty after deadline: cancels=%d, closers=%d, wgClosers=%d", cancels, closers, wgClosers)
 }
 

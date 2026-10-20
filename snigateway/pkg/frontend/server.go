@@ -483,14 +483,6 @@ func (s *Server) CloseSession(sessionID string) {
 	}
 }
 
-// sessionMapCounts returns the number of entries in sessionCancels, sessionClosers, and wgSessionClosers.
-// Intended for tests to verify that no per-session entries leak.
-func (s *Server) sessionMapCounts() (cancels, closers, wgClosers int) {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	return len(s.sessionCancels), len(s.sessionClosers), len(s.wgSessionClosers)
-}
-
 func setTCPKeepAlive(conn net.Conn) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		if err := tcp.SetKeepAlive(true); err != nil {
