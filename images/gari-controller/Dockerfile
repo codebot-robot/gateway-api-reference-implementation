@@ -21,7 +21,7 @@ COPY . .
 ARG TARGETOS TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o gateway-api-reference-implementation cmd/gateway-api-reference-implementation/main.go
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o gateway-api-reference-implementation ./cmd/gateway-api-reference-implementation
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /
