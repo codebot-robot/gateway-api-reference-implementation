@@ -92,19 +92,17 @@ type Server struct {
 	internalListener *chanListener
 	httpServer       *http.Server
 
-	listenersMu      sync.Mutex
-	listeners        []net.Listener
-	udpListeners     []net.PacketConn
-	quicListeners    []*quic.Listener
-	closed           bool
-	shutdownCh       chan struct{}
-	activeConns      atomic.Int64
-	jwtVerifier      jwt.TokenVerifier
-	sessionsMu       sync.Mutex
-	sessionCancels   map[string]context.CancelFunc
-	sessionClosers   map[string][]func()
-	wgSessionClosers map[string]bool
-	timeNow          func() time.Time
+	listenersMu   sync.Mutex
+	listeners     []net.Listener
+	udpListeners  []net.PacketConn
+	quicListeners []*quic.Listener
+	closed        bool
+	shutdownCh    chan struct{}
+	activeConns   atomic.Int64
+	jwtVerifier   jwt.TokenVerifier
+	sessionsMu    sync.Mutex
+	sessions      map[string]*frontendSession
+	timeNow       func() time.Time
 }
 
 // NewServer creates a new frontend Server with the given configuration.
@@ -185,9 +183,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		internalListener: newChanListener(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0}),
 		shutdownCh:       make(chan struct{}),
 		jwtVerifier:      cfg.JWTVerifier,
-		sessionCancels:   make(map[string]context.CancelFunc),
-		sessionClosers:   make(map[string][]func()),
-		wgSessionClosers: make(map[string]bool),
+		sessions:         make(map[string]*frontendSession),
 		timeNow:          timeNow,
 	}
 
@@ -415,50 +411,53 @@ func (s *Server) runLeaseReaper() {
 	}
 }
 
-func (s *Server) registerSessionCancel(sessionID string, cancel context.CancelFunc) {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	s.sessionCancels[sessionID] = cancel
+type frontendSession struct {
+	cancel              context.CancelFunc // HTTP sessions only
+	closers             []func()
+	wireguardRegistered bool
 }
 
-func (s *Server) unregisterSessionCancel(sessionID string) {
+func (s *Server) createSession(sessionID string, cancel context.CancelFunc, closer func()) {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	delete(s.sessionCancels, sessionID)
-}
-
-func (s *Server) registerSessionCloser(sessionID string, closer func()) {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	s.sessionClosers[sessionID] = append(s.sessionClosers[sessionID], closer)
-}
-
-func (s *Server) registerWireGuardSessionCloser(sessionID string) {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	if s.wgSessionClosers == nil {
-		s.wgSessionClosers = make(map[string]bool)
+	sess := &frontendSession{
+		cancel: cancel,
 	}
-	if s.wgSessionClosers[sessionID] {
-		return
+	if closer != nil {
+		sess.closers = append(sess.closers, closer)
 	}
-	s.wgSessionClosers[sessionID] = true
-	s.sessionClosers[sessionID] = append(s.sessionClosers[sessionID], func() {
+	s.sessions[sessionID] = sess
+}
+
+func (s *Server) registerWireGuardSessionCloser(sessionID string) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	if sess.wireguardRegistered {
+		return true
+	}
+	sess.wireguardRegistered = true
+	sess.closers = append(sess.closers, func() {
 		if s.wireguard != nil {
 			s.wireguard.UnregisterSession(sessionID)
 		}
 		s.table.ReleaseWireGuardAddress(sessionID)
 	})
+	return true
 }
 
 // CloseSession closes an active backend session and any associated connections.
 func (s *Server) CloseSession(sessionID string) {
 	s.sessionsMu.Lock()
-	cancel, hasCancel := s.sessionCancels[sessionID]
-	delete(s.sessionCancels, sessionID)
-	closers := s.sessionClosers[sessionID]
-	delete(s.sessionClosers, sessionID)
-	delete(s.wgSessionClosers, sessionID)
+	sess, ok := s.sessions[sessionID]
+	if !ok {
+		s.sessionsMu.Unlock()
+		return
+	}
+	delete(s.sessions, sessionID)
 	s.sessionsMu.Unlock()
 
 	s.table.Unregister(sessionID)
@@ -469,10 +468,10 @@ func (s *Server) CloseSession(sessionID string) {
 		s.wireguard.UnregisterSession(sessionID)
 	}
 
-	if hasCancel && cancel != nil {
-		cancel()
+	if sess.cancel != nil {
+		sess.cancel()
 	}
-	for _, c := range closers {
+	for _, c := range sess.closers {
 		if c != nil {
 			c()
 		}
@@ -850,20 +849,15 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 	}
 
 	sessionID := generateConnID()
-	s.table.RegisterSession(sessionID, clientIdentity)
-	s.quic.RegisterSession(sessionID, qConn)
-	s.registerSessionCloser(sessionID, func() {
+	s.createSession(sessionID, nil, func() {
 		closeQUICConn(qConn, 0, "session closed")
 	})
+	s.table.RegisterSession(sessionID, clientIdentity)
+	s.quic.RegisterSession(sessionID, qConn)
 	log.Printf("Frontend: created QUIC session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
-		s.table.Unregister(sessionID)
-		s.quic.UnregisterSession(sessionID)
-		if s.wireguard != nil {
-			s.wireguard.UnregisterSession(sessionID)
-		}
-		closeQUICConn(qConn, 0, "session closed")
+		s.CloseSession(sessionID)
 		log.Printf("Frontend: QUIC session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 
@@ -937,6 +931,7 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 			}
 
 			if err := s.wireguard.RegisterPeer(sessionID, clientPubKey, peerAddr); err != nil {
+				s.table.ReleaseWireGuardAddress(sessionID)
 				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
 					Status: fmt.Sprintf("error: %v", err),
 				})
@@ -950,7 +945,23 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 				continue
 			}
 
-			s.registerWireGuardSessionCloser(sessionID)
+			if !s.registerWireGuardSessionCloser(sessionID) {
+				if s.wireguard != nil {
+					s.wireguard.UnregisterSession(sessionID)
+				}
+				s.table.ReleaseWireGuardAddress(sessionID)
+				errResp, merr := json.Marshal(api.WireGuardExchangeResponse{
+					Status: "error: session closed",
+				})
+				if merr != nil {
+					log.Printf("Frontend: failed to marshal wireguard error: %v", merr)
+					continue
+				}
+				if _, werr := ctrlStream.Write(append(errResp, '\n')); werr != nil {
+					log.Printf("Frontend: failed to write wireguard error: %v", werr)
+				}
+				continue
+			}
 
 			endpoint := s.wireguard.AdvertisedEndpoint()
 			if endpoint == "" {
@@ -1112,8 +1123,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := generateConnID()
 	sessCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	s.registerSessionCancel(sessionID, cancel)
-	defer s.unregisterSessionCancel(sessionID)
+	s.createSession(sessionID, cancel, nil)
 
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.pool.RegisterSession(sessionID)
@@ -1121,12 +1131,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Frontend: created session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
-		s.table.Unregister(sessionID)
-		s.pool.UnregisterSession(sessionID)
-		s.h2.UnregisterSession(sessionID)
-		if s.wireguard != nil {
-			s.wireguard.UnregisterSession(sessionID)
-		}
+		s.CloseSession(sessionID)
 		log.Printf("Frontend: session %s closed and unregistered for client %q", sessionID, clientIdentity.ID)
 	}()
 
@@ -1520,11 +1525,19 @@ func (s *Server) handleWireGuardExchange(w http.ResponseWriter, r *http.Request)
 
 	if err := s.wireguard.RegisterPeer(sessionID, clientPubKey, peerAddr); err != nil {
 		log.Printf("Frontend: failed to register wireguard peer for session %s: %v", sessionID, err)
+		s.table.ReleaseWireGuardAddress(sessionID)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	s.registerWireGuardSessionCloser(sessionID)
+	if !s.registerWireGuardSessionCloser(sessionID) {
+		if s.wireguard != nil {
+			s.wireguard.UnregisterSession(sessionID)
+		}
+		s.table.ReleaseWireGuardAddress(sessionID)
+		http.Error(w, "session closed", http.StatusGone)
+		return
+	}
 
 	endpoint := s.wireguard.AdvertisedEndpoint()
 	if endpoint == "" {

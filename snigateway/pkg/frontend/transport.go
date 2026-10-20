@@ -72,9 +72,11 @@ func (p *PoolTransport) RegisterSession(sessionID string) {
 // UnregisterSession removes a session and closes any idle pooled connections for it.
 func (p *PoolTransport) UnregisterSession(sessionID string) {
 	p.mu.Lock()
-	conns := p.pools[sessionID]
+	conns, exists := p.pools[sessionID]
 	delete(p.pools, sessionID)
-	p.broadcastLocked()
+	if exists {
+		p.broadcastLocked()
+	}
 	p.mu.Unlock()
 
 	for _, c := range conns {
