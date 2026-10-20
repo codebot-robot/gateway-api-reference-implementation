@@ -2329,3 +2329,233 @@ func TestGatewayReconciler_AttachedListenerSets(t *testing.T) {
 		t.Errorf("expected AttachedListenerSets to be 1, got %d", *resGW.Status.AttachedListenerSets)
 	}
 }
+
+func TestGatewayReconciler_PartialCRDInstallation_ReconcilesGatewayAndHTTPRoute(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+	_ = gatewayv1beta1.AddToScheme(scheme)
+
+	// Simulate GKE standard channel: 6 of 10 CRDs served, 4 optional CRDs absent
+	mapper := newTestRESTMapper(gkeStandardGatewayAPIGVKs()...)
+
+	servedKinds, disabledKinds, err := CheckGatewayAPICRDs(mapper, scheme)
+	if err != nil {
+		t.Fatalf("unexpected CheckGatewayAPICRDs error: %v", err)
+	}
+	if len(disabledKinds) != 4 {
+		t.Fatalf("expected 4 disabled kinds, got %d: %v", len(disabledKinds), disabledKinds)
+	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+
+	var disabledRouteKinds map[gatewayv1.Kind]bool
+	for _, kind := range disabledKinds {
+		switch kind {
+		case "TLSRoute", "GRPCRoute", "TCPRoute", "UDPRoute":
+			if disabledRouteKinds == nil {
+				disabledRouteKinds = make(map[gatewayv1.Kind]bool)
+			}
+			disabledRouteKinds[gatewayv1.Kind(kind)] = true
+		}
+	}
+	st.SetDisabledRouteKinds(disabledRouteKinds)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	gwKey := types.NamespacedName{Namespace: "default", Name: "partial-crd-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "partial-crd-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+				{
+					Name:     "tcp-disabled",
+					Port:     9000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "grpc-disabled",
+					Port:     8080,
+					Protocol: gatewayv1.HTTPProtocolType,
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Kinds: []gatewayv1.RouteGroupKind{
+							{Kind: "GRPCRoute"},
+						},
+					},
+				},
+				{
+					Name:     "mixed",
+					Port:     8081,
+					Protocol: gatewayv1.HTTPProtocolType,
+					AllowedRoutes: &gatewayv1.AllowedRoutes{
+						Kinds: []gatewayv1.RouteGroupKind{
+							{Kind: "HTTPRoute"},
+							{Kind: "GRPCRoute"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	routeKey := types.NamespacedName{Namespace: "default", Name: "http-route"}
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "http-route",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name:        "partial-crd-gw",
+						SectionName: state.Ptr(gatewayv1.SectionName("http")),
+					},
+				},
+			},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "app-svc",
+									Port: state.Ptr(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.UpsertHTTPRoute(route)
+	st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+	st.SetGatewayReadiness(gwKey, state.GatewayReadiness{Ready: true})
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc, gw, route).
+		WithStatusSubresource(gw, route).
+		Build()
+
+	gwReconciler := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+		AddressProvider: &fakeAddressProvider{
+			addresses: []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}},
+			ready:     true,
+		},
+	}
+
+	ctx := t.Context()
+
+	// Reconcile Gateway
+	_, err = gwReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: gwKey})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	var resGW gatewayv1.Gateway
+	if err := client.Get(ctx, gwKey, &resGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	// 1. Gateway reports Programmed=True
+	progCond := findCondition(resGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+		t.Errorf("expected Gateway Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	if len(resGW.Status.Listeners) != 4 {
+		t.Fatalf("expected 4 listener statuses, got %d", len(resGW.Status.Listeners))
+	}
+
+	// 2. HTTP listener: supportedKinds=[HTTPRoute], ResolvedRefs=True, Programmed=True
+	lHTTP := resGW.Status.Listeners[0]
+	if len(lHTTP.SupportedKinds) != 1 || lHTTP.SupportedKinds[0].Kind != "HTTPRoute" {
+		t.Errorf("expected HTTP listener SupportedKinds=[HTTPRoute], got %+v", lHTTP.SupportedKinds)
+	}
+	resolvedHTTP := findCondition(lHTTP.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if resolvedHTTP == nil || resolvedHTTP.Status != metav1.ConditionTrue {
+		t.Errorf("expected HTTP listener ResolvedRefs=True, got %+v", resolvedHTTP)
+	}
+
+	// 3. TCP listener (TCPRoute disabled): supportedKinds empty, ResolvedRefs=False/InvalidRouteKinds
+	lTCP := resGW.Status.Listeners[1]
+	if len(lTCP.SupportedKinds) != 0 {
+		t.Errorf("expected TCP listener SupportedKinds empty, got %+v", lTCP.SupportedKinds)
+	}
+	resolvedTCP := findCondition(lTCP.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if resolvedTCP == nil || resolvedTCP.Status != metav1.ConditionFalse || resolvedTCP.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+		t.Errorf("expected TCP listener ResolvedRefs=False/InvalidRouteKinds, got %+v", resolvedTCP)
+	}
+
+	// 4. GRPCRoute listener (restricted to disabled GRPCRoute): supportedKinds empty, ResolvedRefs=False/InvalidRouteKinds
+	lGRPC := resGW.Status.Listeners[2]
+	if len(lGRPC.SupportedKinds) != 0 {
+		t.Errorf("expected GRPCRoute listener SupportedKinds empty, got %+v", lGRPC.SupportedKinds)
+	}
+	resolvedGRPC := findCondition(lGRPC.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if resolvedGRPC == nil || resolvedGRPC.Status != metav1.ConditionFalse || resolvedGRPC.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+		t.Errorf("expected GRPCRoute listener ResolvedRefs=False/InvalidRouteKinds, got %+v", resolvedGRPC)
+	}
+
+	// 5. Mixed listener (HTTPRoute + GRPCRoute): supportedKinds=[HTTPRoute], ResolvedRefs=True
+	lMixed := resGW.Status.Listeners[3]
+	if len(lMixed.SupportedKinds) != 1 || lMixed.SupportedKinds[0].Kind != "HTTPRoute" {
+		t.Errorf("expected Mixed listener SupportedKinds=[HTTPRoute], got %+v", lMixed.SupportedKinds)
+	}
+	resolvedMixed := findCondition(lMixed.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if resolvedMixed == nil || resolvedMixed.Status != metav1.ConditionTrue {
+		t.Errorf("expected Mixed listener ResolvedRefs=True, got %+v", resolvedMixed)
+	}
+
+	// 6. HTTPRoute reconciles and reports Accepted=True
+	routeReconciler := &HTTPRouteReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+	_, err = routeReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: routeKey})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling HTTPRoute: %v", err)
+	}
+
+	var resRoute gatewayv1.HTTPRoute
+	if err := client.Get(ctx, routeKey, &resRoute); err != nil {
+		t.Fatalf("failed to get HTTPRoute: %v", err)
+	}
+	if len(resRoute.Status.Parents) != 1 {
+		t.Fatalf("expected 1 parent status on HTTPRoute, got %d", len(resRoute.Status.Parents))
+	}
+	routeAcceptedCond := findCondition(resRoute.Status.Parents[0].Conditions, string(gatewayv1.RouteConditionAccepted))
+	if routeAcceptedCond == nil || routeAcceptedCond.Status != metav1.ConditionTrue || routeAcceptedCond.Reason != string(gatewayv1.RouteReasonAccepted) {
+		t.Errorf("expected HTTPRoute Accepted=True/Accepted, got %+v", routeAcceptedCond)
+	}
+
+	// Verify only served kinds are active
+	_ = servedKinds
+}

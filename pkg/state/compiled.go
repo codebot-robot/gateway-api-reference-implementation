@@ -477,6 +477,7 @@ type ModelInputs struct {
 	ControllerName          string
 	AllInOneMode            bool
 	GatewayCRDBundleVersion *string
+	DisabledRouteKinds      map[gatewayv1.Kind]bool
 }
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
@@ -588,9 +589,18 @@ func ValidateListener(
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	frontendValidation *gatewayv1.FrontendTLSValidation,
 	refValidator ReferenceGrantValidator,
+	disabledRouteKinds ...map[gatewayv1.Kind]bool,
 ) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation) {
 	if gwNamespace == "" {
 		gwNamespace = owner.Namespace
+	}
+
+	var disabledKinds map[gatewayv1.Kind]bool
+	if len(disabledRouteKinds) > 0 {
+		disabledKinds = disabledRouteKinds[0]
+	}
+	isKindDisabled := func(kind gatewayv1.Kind) bool {
+		return disabledKinds != nil && disabledKinds[kind]
 	}
 
 	isSupported := isSupportedProtocol(listener.Protocol)
@@ -619,8 +629,15 @@ func ValidateListener(
 	hasInvalidRouteKind := false
 	if listener.AllowedRoutes != nil && len(listener.AllowedRoutes.Kinds) > 0 {
 		supportedKinds = []gatewayv1.RouteGroupKind{}
+		hasValidEnabledKind := false
+		hasValidDisabledKind := false
 		for _, k := range listener.AllowedRoutes.Kinds {
 			if isValidRouteKindForProtocol(listener.Protocol, k.Group, k.Kind) {
+				if isKindDisabled(k.Kind) {
+					hasValidDisabledKind = true
+					continue
+				}
+				hasValidEnabledKind = true
 				alreadyPresent := false
 				for _, sk := range supportedKinds {
 					if sk.Kind == k.Kind && ValueOf(sk.Group) == gatewayv1.GroupName {
@@ -638,8 +655,24 @@ func ValidateListener(
 				hasInvalidRouteKind = true
 			}
 		}
+		if hasValidDisabledKind && !hasValidEnabledKind && !hasInvalidRouteKind {
+			hasInvalidRouteKind = true
+		}
 	} else {
-		supportedKinds = defaultSupportedKindsForProtocol(listener.Protocol)
+		defaultKinds := defaultSupportedKindsForProtocol(listener.Protocol)
+		supportedKinds = []gatewayv1.RouteGroupKind{}
+		hasDefaultKind := len(defaultKinds) > 0
+		hasDefaultEnabledKind := false
+		for _, k := range defaultKinds {
+			if isKindDisabled(k.Kind) {
+				continue
+			}
+			hasDefaultEnabledKind = true
+			supportedKinds = append(supportedKinds, k)
+		}
+		if hasDefaultKind && !hasDefaultEnabledKind {
+			hasInvalidRouteKind = true
+		}
 	}
 
 	var tlsInvalidReason string
@@ -876,6 +909,7 @@ func BuildEffectiveListener(
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	frontendValidation *gatewayv1.FrontendTLSValidation,
 	refValidator ReferenceGrantValidator,
+	disabledRouteKinds ...map[gatewayv1.Kind]bool,
 ) *EffectiveListener {
 	supportedKinds, conditions, clientValidation := ValidateListener(
 		listener,
@@ -886,6 +920,7 @@ func BuildEffectiveListener(
 		configMaps,
 		frontendValidation,
 		refValidator,
+		disabledRouteKinds...,
 	)
 	return &EffectiveListener{
 		Owner:            owner,
@@ -1376,6 +1411,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				inputs.ConfigMaps,
 				frontendVal,
 				refValidator,
+				inputs.DisabledRouteKinds,
 			)
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 		}
@@ -1415,6 +1451,7 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 					inputs.ConfigMaps,
 					frontendVal,
 					refValidator,
+					inputs.DisabledRouteKinds,
 				)
 				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 			}
