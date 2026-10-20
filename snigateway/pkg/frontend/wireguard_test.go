@@ -295,6 +295,7 @@ func TestWireGuardTransport_TryGetConn_HandshakeLifecycle(t *testing.T) {
 		ListenAddr:            "127.0.0.1:0",
 		Prefix:                "fd00::/64",
 		HandshakeSyncInterval: 20 * time.Millisecond,
+		PerAttemptTimeout:     5 * time.Second,
 		Now:                   nowFunc,
 	})
 	if err != nil {
@@ -558,6 +559,144 @@ func TestWireGuardTransport_GetConnForSessions_WokenOnUsableHandshake(t *testing
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("GetConnForSessions was not woken up promptly after handshake completed")
+	}
+}
+
+// TestCompositeTransport_GetConnForSessions_DialRetryOnUsablePeer verifies that when dialing a usable
+// peer fails (e.g. backend listener is not yet accepting), CompositeTransport retries after backoff
+// rather than parking indefinitely on notification channels.
+func TestCompositeTransport_GetConnForSessions_DialRetryOnUsablePeer(t *testing.T) {
+	tr, err := NewWireGuardTransport(WireGuardTransportConfig{
+		ListenAddr:            "127.0.0.1:0",
+		Prefix:                "fd00::/64",
+		HandshakeSyncInterval: 20 * time.Millisecond,
+		PerAttemptTimeout:     50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewWireGuardTransport failed: %v", err)
+	}
+	defer tr.Close()
+
+	// Setup backend netstack device with loopback UDP
+	backendPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating backend key: %v", err)
+	}
+	var backendPub [32]byte
+	copy(backendPub[:], backendPriv.PublicKey().Bytes())
+	backendIP := netip.MustParseAddr("fd00::2")
+
+	backendTun, backendNet, err := netstack.CreateNetTUN([]netip.Addr{backendIP}, nil, api.DefaultWireGuardMTU)
+	if err != nil {
+		t.Fatalf("backend CreateNetTUN: %v", err)
+	}
+	backendDev := device.NewDevice(backendTun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	defer backendDev.Close()
+
+	if err := backendDev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=0\n", hex.EncodeToString(backendPriv.Bytes()))); err != nil {
+		t.Fatalf("backendDev IpcSet: %v", err)
+	}
+	if err := backendDev.Up(); err != nil {
+		t.Fatalf("backendDev Up: %v", err)
+	}
+
+	// Register peer on frontend
+	sessionID := "test-dial-retry-sess"
+	if err := tr.RegisterPeer(sessionID, backendPub, backendIP); err != nil {
+		t.Fatalf("RegisterPeer failed: %v", err)
+	}
+
+	// Initiate handshake from backend to frontend
+	fePub := tr.PublicKey()
+	peerCfg := fmt.Sprintf("public_key=%s\nendpoint=127.0.0.1:%d\nallowed_ip=fd00::1/128\npersistent_keepalive_interval=25\n",
+		hex.EncodeToString(fePub[:]), tr.ActualPort())
+	if err := backendDev.IpcSet(peerCfg); err != nil {
+		t.Fatalf("backend add frontend peer: %v", err)
+	}
+
+	// Wait for handshake to complete and be cached on frontend
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !tr.PeerLastHandshake(sessionID).IsZero() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tr.PeerLastHandshake(sessionID).IsZero() {
+		t.Fatal("handshake was not cached within deadline")
+	}
+
+	// Note: backend TCP listener is deliberately NOT started yet, so initial dial will fail.
+	comp := NewCompositeTransport(nil, nil, nil)
+	comp.SetWireGuard(tr)
+	defer comp.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	type result struct {
+		conn net.Conn
+		sid  string
+		err  error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		c, sid, err := comp.GetConnForSessions(ctx, []string{sessionID})
+		resCh <- result{conn: c, sid: sid, err: err}
+	}()
+
+	// Wait a moment so the first dial attempt fails on the unopened port
+	time.Sleep(100 * time.Millisecond)
+
+	// Now start the backend TCP listener so subsequent retries can succeed
+	tcpAddr := &net.TCPAddr{IP: net.ParseIP(backendIP.String()), Port: api.DefaultWireGuardTunnelPort}
+	lis, err := backendNet.ListenTCP(tcpAddr)
+	if err != nil {
+		t.Fatalf("backend ListenTCP: %v", err)
+	}
+	defer lis.Close()
+
+	go func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// The waiter should retry after backoff and be served promptly (well before context deadline)
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("GetConnForSessions returned error: %v", res.err)
+		}
+		if res.conn == nil {
+			t.Fatal("expected non-nil connection")
+		}
+		defer res.conn.Close()
+		if res.sid != sessionID {
+			t.Fatalf("got session %q, want %q", res.sid, sessionID)
+		}
+
+		// Verify connection works via echo
+		msg := []byte("retry-success")
+		if _, err := res.conn.Write(msg); err != nil {
+			t.Fatalf("echo write failed: %v", err)
+		}
+		buf := make([]byte, len(msg))
+		if _, err := io.ReadFull(res.conn, buf); err != nil {
+			t.Fatalf("echo read failed: %v", err)
+		}
+		if string(buf) != string(msg) {
+			t.Fatalf("got %q, want %q", string(buf), string(msg))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetConnForSessions parked and did not retry failed dial to usable peer")
 	}
 }
 

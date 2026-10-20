@@ -360,6 +360,10 @@ func (w *WireGuardTransport) HasSession(sessionID string) bool {
 
 const maxWireGuardHandshakeAge = 180 * time.Second
 
+// ErrDialFailed indicates that a dial attempt to a registered, usable peer failed (or timed out)
+// and may be retried.
+var ErrDialFailed = errors.New("wireguard dial failed")
+
 func isHandshakeUsable(hs time.Time, now time.Time) bool {
 	return !hs.IsZero() && now.Sub(hs) <= maxWireGuardHandshakeAge
 }
@@ -394,8 +398,8 @@ func (w *WireGuardTransport) TryGetConn(ctx context.Context, sessionID string) (
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		// Connection attempt timed out or failed on this candidate; return nil to try next
-		return nil, nil
+		// Connection attempt timed out or failed on this candidate; return sentinel error so caller can retry
+		return nil, fmt.Errorf("%w: %w", ErrDialFailed, err)
 	}
 	return conn, nil
 }
@@ -417,12 +421,16 @@ func (w *WireGuardTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		notify := w.notifyCh
 		w.mu.Unlock()
 
+		var hasRetryableDial bool
 		for _, sid := range sessionIDs {
 			if w.HasSession(sid) {
 				conn, err := w.TryGetConn(ctx, sid)
 				if err != nil {
 					if ctx.Err() != nil {
 						return nil, "", ctx.Err()
+					}
+					if errors.Is(err, ErrDialFailed) {
+						hasRetryableDial = true
 					}
 					continue
 				}
@@ -432,10 +440,24 @@ func (w *WireGuardTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 			}
 		}
 
+		var retryCh <-chan time.Time
+		var retryTimer *time.Timer
+		if hasRetryableDial {
+			retryTimer = time.NewTimer(100 * time.Millisecond)
+			retryCh = retryTimer.C
+		}
+
 		select {
 		case <-ctx.Done():
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 			return nil, "", ctx.Err()
+		case <-retryCh:
 		case <-notify:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		}
 	}
 }
