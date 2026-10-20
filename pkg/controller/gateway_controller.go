@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -81,7 +82,21 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		desired = d
 	} else {
-		desired = state.ComputeDesiredGatewayClassStatus(&gc, r.ControllerName, crdBundleVersion)
+		var configMaps map[types.NamespacedName]*corev1.ConfigMap
+		if gc.Spec.ParametersRef != nil && gc.Spec.ParametersRef.Namespace != nil && gc.Spec.ParametersRef.Name != "" {
+			reader := r.APIReader
+			if reader == nil {
+				reader = r.Client
+			}
+			if reader != nil {
+				var cm corev1.ConfigMap
+				cmKey := types.NamespacedName{Namespace: string(*gc.Spec.ParametersRef.Namespace), Name: gc.Spec.ParametersRef.Name}
+				if err := reader.Get(ctx, cmKey, &cm); err == nil {
+					configMaps = map[types.NamespacedName]*corev1.ConfigMap{cmKey: &cm}
+				}
+			}
+		}
+		desired = state.ComputeDesiredGatewayClassStatus(&gc, r.ControllerName, crdBundleVersion, configMaps)
 	}
 
 	if state.MergeGatewayClassStatus(&gc.Status, desired) {

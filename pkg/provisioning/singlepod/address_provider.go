@@ -194,11 +194,101 @@ func requestedIPAddresses(gw *gatewayv1.Gateway) []string {
 	return ips
 }
 
-// GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
-// and returns the Service's LoadBalancer ingress addresses and detailed readiness state.
+func requestedHostnameAddresses(gw *gatewayv1.Gateway) []string {
+	var hosts []string
+	if gw == nil {
+		return nil
+	}
+	for _, addr := range gw.Spec.Addresses {
+		if addr.Type != nil && *addr.Type == gatewayv1.HostnameAddressType && addr.Value != "" {
+			hosts = append(hosts, addr.Value)
+		}
+	}
+	return hosts
+}
+
+func (p *AddressProvider) resolveParameters(ctx context.Context, gw *gatewayv1.Gateway) (*state.Parameters, error) {
+	if p.client == nil || gw == nil {
+		return state.MergeParameters(nil, nil), nil
+	}
+
+	reader := p.apiReader
+	if reader == nil {
+		reader = p.client
+	}
+
+	var gcParams *state.Parameters
+	if gw.Spec.GatewayClassName != "" {
+		var gc gatewayv1.GatewayClass
+		if err := reader.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &gc); err == nil {
+			if gc.Spec.ParametersRef != nil {
+				if gc.Spec.ParametersRef.Group != "" {
+					return nil, fmt.Errorf("unsupported group %q on GatewayClass: only core group (\"\") is supported", gc.Spec.ParametersRef.Group)
+				}
+				if gc.Spec.ParametersRef.Kind != "ConfigMap" {
+					return nil, fmt.Errorf("unsupported kind %q on GatewayClass: only ConfigMap is supported", gc.Spec.ParametersRef.Kind)
+				}
+				if gc.Spec.ParametersRef.Namespace == nil || *gc.Spec.ParametersRef.Namespace == "" {
+					return nil, fmt.Errorf("namespace is required for ConfigMap parametersRef on GatewayClass")
+				}
+				if gc.Spec.ParametersRef.Name == "" {
+					return nil, fmt.Errorf("name is required for ConfigMap parametersRef on GatewayClass")
+				}
+				var cm corev1.ConfigMap
+				cmKey := types.NamespacedName{Namespace: string(*gc.Spec.ParametersRef.Namespace), Name: gc.Spec.ParametersRef.Name}
+				if err := reader.Get(ctx, cmKey, &cm); err != nil {
+					return nil, fmt.Errorf("ConfigMap %s/%s referenced by GatewayClass not found: %w", cmKey.Namespace, cmKey.Name, err)
+				}
+				parsed, err := state.ParseConfigMapParameters(&cm)
+				if err != nil {
+					return nil, fmt.Errorf("invalid parameters in ConfigMap %s/%s on GatewayClass: %w", cmKey.Namespace, cmKey.Name, err)
+				}
+				gcParams = parsed
+			}
+		}
+	}
+
+	var gwParams *state.Parameters
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+		ref := gw.Spec.Infrastructure.ParametersRef
+		if ref.Group != "" {
+			return nil, fmt.Errorf("unsupported group %q: only core group (\"\") is supported", ref.Group)
+		}
+		if ref.Kind != "ConfigMap" {
+			return nil, fmt.Errorf("unsupported kind %q: only ConfigMap is supported", ref.Kind)
+		}
+		if ref.Name == "" {
+			return nil, fmt.Errorf("name is required for ConfigMap parametersRef")
+		}
+		var cm corev1.ConfigMap
+		cmKey := types.NamespacedName{Namespace: gw.Namespace, Name: ref.Name}
+		if err := reader.Get(ctx, cmKey, &cm); err != nil {
+			return nil, fmt.Errorf("ConfigMap %s/%s not found: %w", cmKey.Namespace, cmKey.Name, err)
+		}
+		parsed, err := state.ParseConfigMapParameters(&cm)
+		if err != nil {
+			return nil, fmt.Errorf("invalid parameters in ConfigMap %s/%s: %w", cmKey.Namespace, cmKey.Name, err)
+		}
+		gwParams = parsed
+	}
+
+	return state.MergeParameters(gcParams, gwParams), nil
+}
+
+// GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and Service,
+// and returns the Service's ingress addresses and detailed readiness state.
 func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	if p.client == nil {
 		return nil, state.GatewayReadiness{}, nil
+	}
+
+	params, err := p.resolveParameters(ctx, gw)
+	if err != nil {
+		return nil, state.GatewayReadiness{
+			Ready:   false,
+			Reason:  string(gatewayv1.GatewayReasonInvalidParameters),
+			Message: err.Error(),
+		}, nil
 	}
 
 	name := ResourceNameForGateway(gw.Name)
@@ -216,7 +306,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 
 	// 1. Reconcile per-Gateway ServiceAccount in Gateway namespace
 	var existingSA corev1.ServiceAccount
-	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
+	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
 	if err == nil {
 		if !isOwnedByGateway(&existingSA, gw) {
 			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{
@@ -565,24 +655,38 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	requestedIPs := requestedIPAddresses(gw)
+	requestedHostnames := requestedHostnameAddresses(gw)
 
 	if len(svcPorts) > 0 {
 		svcSpec := corev1ac.ServiceSpec().
-			WithType(corev1.ServiceTypeLoadBalancer).
+			WithType(params.ServiceType).
 			WithSelector(map[string]string{
 				LabelGatewayName: gw.Name,
 				LabelAppName:     AppNameValue,
 			}).
 			WithPorts(svcPorts...)
-		if len(requestedIPs) > 0 {
-			svcSpec.WithLoadBalancerIP(requestedIPs[0])
+		if params.ServiceType == corev1.ServiceTypeLoadBalancer {
+			if params.ExternalTrafficPolicy != "" {
+				svcSpec.WithExternalTrafficPolicy(params.ExternalTrafficPolicy)
+			}
+			if len(requestedIPs) > 0 {
+				svcSpec.WithLoadBalancerIP(requestedIPs[0])
+			}
 		}
 		svcApply := corev1ac.Service(name, gwNamespace).
 			WithOwnerReferences(ownerRef).
 			WithLabels(labels).
 			WithSpec(svcSpec)
-		if len(annotations) > 0 {
-			svcApply.WithAnnotations(annotations)
+
+		svcAnnos := make(map[string]string)
+		for k, v := range annotations {
+			svcAnnos[k] = v
+		}
+		for k, v := range params.ServiceAnnotations {
+			svcAnnos[k] = v
+		}
+		if len(svcAnnos) > 0 {
+			svcApply.WithAnnotations(svcAnnos)
 		}
 		if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
@@ -601,8 +705,47 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 	}
 
+	if params.ServiceType == corev1.ServiceTypeClusterIP {
+		var addresses []gatewayv1.GatewayStatusAddress
+		for _, addr := range gw.Spec.Addresses {
+			if addr.Value != "" {
+				addrType := gatewayv1.IPAddressType
+				if addr.Type != nil && *addr.Type != "" {
+					addrType = *addr.Type
+				}
+				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
+					Type:  state.Ptr(addrType),
+					Value: addr.Value,
+				})
+			}
+		}
+
+		if len(addresses) == 0 {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: "ClusterIP Gateway requires a static address in spec.addresses",
+			}, nil
+		}
+
+		if !deployReady {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: "Waiting for data-plane deployment to become available",
+			}, nil
+		}
+
+		return addresses, state.GatewayReadiness{
+			Ready:   true,
+			Reason:  string(gatewayv1.GatewayReasonProgrammed),
+			Message: "Gateway programmed by reference implementation",
+		}, nil
+	}
+
 	var addresses []gatewayv1.GatewayStatusAddress
 	var ingressIPs []string
+	var ingressHostnames []string
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
@@ -617,6 +760,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				})
 			}
 			if ingress.Hostname != "" {
+				ingressHostnames = append(ingressHostnames, ingress.Hostname)
 				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
 					Type:  state.Ptr(gatewayv1.HostnameAddressType),
 					Value: ingress.Hostname,
@@ -642,6 +786,23 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				Ready:   false,
 				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 				Message: msg,
+			}, nil
+		}
+	}
+
+	for _, reqHost := range requestedHostnames {
+		bound := false
+		for _, ingressHost := range ingressHostnames {
+			if ingressHost == reqHost {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+				Message: fmt.Sprintf("Requested address %s could not be bound to Service", reqHost),
 			}, nil
 		}
 	}
@@ -682,7 +843,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 
 // SupportedAddressTypes returns the address types supported by singlepod.
 func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
-	return []gatewayv1.AddressType{gatewayv1.IPAddressType}
+	return []gatewayv1.AddressType{gatewayv1.IPAddressType, gatewayv1.HostnameAddressType}
 }
 
 func managedByPredicate() predicate.Predicate {

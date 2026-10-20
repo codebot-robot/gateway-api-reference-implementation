@@ -782,7 +782,13 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 	for k := range allGWKeys {
 		cur, curOk := outputs.GatewayStatuses[k]
 		old, oldOk := prevGWStatuses[k]
-		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) {
+		curP := outputs.GatewayParameters[k]
+		var oldP *Parameters
+		if prev != nil && prev.GatewayParameters != nil {
+			oldP = prev.GatewayParameters[k]
+		}
+		paramsChanged := !ParametersEqual(curP, oldP)
+		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) || paramsChanged {
 			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
