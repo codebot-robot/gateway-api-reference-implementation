@@ -17,17 +17,24 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
+
+var setupLog = ctrl.Log.WithName("setup")
 
 // ResolveNamespacedName resolves an optional namespace pointer and a name against a source object.
 // If namespace is nil or empty, src.GetNamespace() is used.
@@ -54,6 +61,63 @@ type ReconcilerOptions struct {
 	DisableStatusUpdates bool
 }
 
+// CheckGatewayAPICRDs inspects the cluster's served API resources using the RESTMapper.
+// It verifies that all required Gateway API CRDs (GatewayClass, Gateway, HTTPRoute) are served,
+// and returns the set of served GroupKinds and the names of any disabled optional kinds.
+func CheckGatewayAPICRDs(mapper meta.RESTMapper, scheme *runtime.Scheme) (map[schema.GroupKind]bool, []string, error) {
+	if mapper == nil {
+		return nil, nil, fmt.Errorf("RESTMapper is required")
+	}
+	if scheme == nil {
+		return nil, nil, fmt.Errorf("scheme is required")
+	}
+
+	requiredObjects := []client.Object{
+		&gatewayv1.GatewayClass{},
+		&gatewayv1.Gateway{},
+		&gatewayv1.HTTPRoute{},
+	}
+	optionalObjects := []client.Object{
+		&gatewayv1.TLSRoute{},
+		&gatewayv1.GRPCRoute{},
+		&gatewayv1.TCPRoute{},
+		&gatewayv1.UDPRoute{},
+		&gatewayv1.BackendTLSPolicy{},
+		&gatewayv1.ListenerSet{},
+		&gatewayv1beta1.ReferenceGrant{},
+	}
+
+	served := make(map[schema.GroupKind]bool)
+	for _, obj := range requiredObjects {
+		gvk, err := apiutil.GVKForObject(obj, scheme)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error getting GVK for %T: %w", obj, err)
+		}
+		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
+			return nil, nil, fmt.Errorf("required Gateway API CRD %s (%s) is not installed: %w", gvk.Kind, gvk.GroupKind().String(), err)
+		}
+		served[gvk.GroupKind()] = true
+	}
+
+	var disabledKinds []string
+	for _, obj := range optionalObjects {
+		gvk, err := apiutil.GVKForObject(obj, scheme)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error getting GVK for %T: %w", obj, err)
+		}
+		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
+			if meta.IsNoMatchError(err) {
+				disabledKinds = append(disabledKinds, gvk.Kind)
+				continue
+			}
+			return nil, nil, fmt.Errorf("failed to check CRD for %s (%s): %w", gvk.Kind, gvk.GroupKind().String(), err)
+		}
+		served[gvk.GroupKind()] = true
+	}
+
+	return served, disabledKinds, nil
+}
+
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
 func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts ReconcilerOptions) error {
 	controllerName := opts.ControllerName
@@ -61,7 +125,28 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		controllerName = DefaultControllerName
 	}
 
+	servedKinds, disabledKinds, err := CheckGatewayAPICRDs(mgr.GetRESTMapper(), mgr.GetScheme())
+	if err != nil {
+		return err
+	}
+	if len(disabledKinds) > 0 {
+		sort.Strings(disabledKinds)
+		setupLog.Info("optional Gateway API CRDs disabled (not served by cluster)", "kinds", disabledKinds)
+	}
+
+	var disabledRouteKinds map[gatewayv1.Kind]bool
+	for _, kind := range disabledKinds {
+		switch kind {
+		case "TLSRoute", "GRPCRoute", "TCPRoute", "UDPRoute":
+			if disabledRouteKinds == nil {
+				disabledRouteKinds = make(map[gatewayv1.Kind]bool)
+			}
+			disabledRouteKinds[gatewayv1.Kind(kind)] = true
+		}
+	}
+
 	if st != nil {
+		st.SetDisabledRouteKinds(disabledRouteKinds)
 		st.SetControllerName(controllerName)
 		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
 		st.SetGatewayFilter(opts.GatewayFilter)
@@ -77,7 +162,7 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 			st.SetProxy(p)
 		}
 
-		if err := registerInformerHandlers(context.Background(), mgr, st); err != nil {
+		if err := registerInformerHandlers(context.Background(), mgr, st, servedKinds); err != nil {
 			return fmt.Errorf("error registering informer event handlers: %w", err)
 		}
 
@@ -99,40 +184,48 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		return fmt.Errorf("error creating HTTPRoute controller: %w", err)
 	}
 
-	if err := (&TLSRouteReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		State:          st,
-		ControllerName: controllerName,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating TLSRoute controller: %w", err)
+	if servedKinds[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}] {
+		if err := (&TLSRouteReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			State:          st,
+			ControllerName: controllerName,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("error creating TLSRoute controller: %w", err)
+		}
 	}
 
-	if err := (&GRPCRouteReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		State:          st,
-		ControllerName: controllerName,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating GRPCRoute controller: %w", err)
+	if servedKinds[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GRPCRoute"}] {
+		if err := (&GRPCRouteReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			State:          st,
+			ControllerName: controllerName,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("error creating GRPCRoute controller: %w", err)
+		}
 	}
 
-	if err := (&TCPRouteReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		State:          st,
-		ControllerName: controllerName,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating TCPRoute controller: %w", err)
+	if servedKinds[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TCPRoute"}] {
+		if err := (&TCPRouteReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			State:          st,
+			ControllerName: controllerName,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("error creating TCPRoute controller: %w", err)
+		}
 	}
 
-	if err := (&UDPRouteReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		State:          st,
-		ControllerName: controllerName,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating UDPRoute controller: %w", err)
+	if servedKinds[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "UDPRoute"}] {
+		if err := (&UDPRouteReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			State:          st,
+			ControllerName: controllerName,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("error creating UDPRoute controller: %w", err)
+		}
 	}
 
 	if err := (&GatewayClassReconciler{
@@ -155,28 +248,32 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}
 
-	if err := (&BackendTLSPolicyReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		State:          st,
-		ControllerName: controllerName,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
+	if servedKinds[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "BackendTLSPolicy"}] {
+		if err := (&BackendTLSPolicyReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			State:          st,
+			ControllerName: controllerName,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("error creating BackendTLSPolicy controller: %w", err)
+		}
 	}
 
-	if err := (&ListenerSetReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		State:          st,
-		ControllerName: controllerName,
-	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("error creating ListenerSet controller: %w", err)
+	if servedKinds[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"}] {
+		if err := (&ListenerSetReconciler{
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			State:          st,
+			ControllerName: controllerName,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("error creating ListenerSet controller: %w", err)
+		}
 	}
 
 	return nil
 }
 
-func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.State) error {
+func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.State, servedKinds map[schema.GroupKind]bool) error {
 	type registrationEntry struct {
 		obj    client.Object
 		add    func(obj any)
@@ -491,6 +588,14 @@ func registerInformerHandlers(ctx context.Context, mgr ctrl.Manager, st *state.S
 	}
 
 	for _, entry := range entries {
+		gvk, err := apiutil.GVKForObject(entry.obj, mgr.GetScheme())
+		if err != nil {
+			return fmt.Errorf("error getting GVK for %T: %w", entry.obj, err)
+		}
+		if gvk.Group == gatewayv1.GroupName && !servedKinds[gvk.GroupKind()] {
+			continue
+		}
+
 		informer, err := mgr.GetCache().GetInformer(ctx, entry.obj)
 		if err != nil {
 			return fmt.Errorf("error getting informer for %T: %w", entry.obj, err)

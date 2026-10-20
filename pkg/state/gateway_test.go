@@ -2479,3 +2479,177 @@ func TestMatchRouteCORSPreflightMethod(t *testing.T) {
 		t.Errorf("expected post-backend, got %s", rule.Backends[0].Host)
 	}
 }
+
+func TestGateway_DisabledRouteKinds(t *testing.T) {
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.net/gateway-controller"},
+	}
+
+	t.Run("default supported kinds omits disabled kinds", func(t *testing.T) {
+		st := NewState()
+		st.SetControllerName("example.net/gateway-controller")
+		st.SetDisabledRouteKinds(map[gatewayv1.Kind]bool{
+			gatewayv1.Kind("TCPRoute"): true,
+			gatewayv1.Kind("UDPRoute"): true,
+		})
+
+		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-defaults"}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-defaults"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "my-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+					{Name: "tcp", Port: 9000, Protocol: gatewayv1.TCPProtocolType},
+					{Name: "udp", Port: 9001, Protocol: gatewayv1.UDPProtocolType},
+				},
+			},
+		}
+
+		st.UpsertGatewayClass(gc)
+		st.UpsertGateway(gw)
+		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+		st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+		outputs := st.Recompute()
+
+		cg := outputs.CompiledGateways[gwKey]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+
+		status, ok := outputs.GatewayStatuses[gwKey]
+		if !ok {
+			t.Fatalf("expected gateway status")
+		}
+
+		if len(status.Listeners) != 3 {
+			t.Fatalf("expected 3 listener statuses, got %d", len(status.Listeners))
+		}
+
+		// HTTP listener: default HTTPRoute is enabled
+		lHTTP := status.Listeners[0]
+		if len(lHTTP.SupportedKinds) != 1 || lHTTP.SupportedKinds[0].Kind != "HTTPRoute" {
+			t.Errorf("expected HTTP listener SupportedKinds=[HTTPRoute], got %+v", lHTTP.SupportedKinds)
+		}
+		condHTTP := findCondition(lHTTP.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if condHTTP == nil || condHTTP.Status != metav1.ConditionTrue {
+			t.Errorf("expected HTTP listener ResolvedRefs=True, got %+v", condHTTP)
+		}
+
+		// TCP listener: default TCPRoute is disabled -> supportedKinds empty, ResolvedRefs=False/InvalidRouteKinds
+		lTCP := status.Listeners[1]
+		if len(lTCP.SupportedKinds) != 0 {
+			t.Errorf("expected TCP listener SupportedKinds to be empty, got %+v", lTCP.SupportedKinds)
+		}
+		condTCP := findCondition(lTCP.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if condTCP == nil || condTCP.Status != metav1.ConditionFalse || condTCP.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+			t.Errorf("expected TCP listener ResolvedRefs=False/InvalidRouteKinds, got %+v", condTCP)
+		}
+		progTCP := findCondition(lTCP.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		if progTCP == nil || progTCP.Status != metav1.ConditionFalse || progTCP.Reason != string(gatewayv1.ListenerReasonInvalid) {
+			t.Errorf("expected TCP listener Programmed=False/Invalid, got %+v", progTCP)
+		}
+
+		// UDP listener: default UDPRoute is disabled -> supportedKinds empty, ResolvedRefs=False/InvalidRouteKinds
+		lUDP := status.Listeners[2]
+		if len(lUDP.SupportedKinds) != 0 {
+			t.Errorf("expected UDP listener SupportedKinds to be empty, got %+v", lUDP.SupportedKinds)
+		}
+		condUDP := findCondition(lUDP.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if condUDP == nil || condUDP.Status != metav1.ConditionFalse || condUDP.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+			t.Errorf("expected UDP listener ResolvedRefs=False/InvalidRouteKinds, got %+v", condUDP)
+		}
+	})
+
+	t.Run("explicit allowed routes excludes disabled kinds and flags listeners restricted to only disabled kinds", func(t *testing.T) {
+		st := NewState()
+		st.SetControllerName("example.net/gateway-controller")
+		st.SetDisabledRouteKinds(map[gatewayv1.Kind]bool{
+			gatewayv1.Kind("GRPCRoute"): true,
+			gatewayv1.Kind("TCPRoute"):  true,
+		})
+
+		gwKey := types.NamespacedName{Namespace: "default", Name: "gw-explicit"}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw-explicit"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "my-class",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "mixed",
+						Port:     80,
+						Protocol: gatewayv1.HTTPProtocolType,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Kinds: []gatewayv1.RouteGroupKind{
+								{Kind: "HTTPRoute"},
+								{Kind: "GRPCRoute"},
+							},
+						},
+					},
+					{
+						Name:     "only-disabled-grpc",
+						Port:     8080,
+						Protocol: gatewayv1.HTTPProtocolType,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Kinds: []gatewayv1.RouteGroupKind{
+								{Kind: "GRPCRoute"},
+							},
+						},
+					},
+					{
+						Name:     "only-disabled-tcp",
+						Port:     9000,
+						Protocol: gatewayv1.TCPProtocolType,
+						AllowedRoutes: &gatewayv1.AllowedRoutes{
+							Kinds: []gatewayv1.RouteGroupKind{
+								{Kind: "TCPRoute"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		st.UpsertGatewayClass(gc)
+		st.UpsertGateway(gw)
+		st.SetGatewayAddresses(gwKey, []gatewayv1.GatewayStatusAddress{{Value: "192.0.2.1"}})
+		st.SetGatewayReadiness(gwKey, GatewayReadiness{Ready: true})
+		outputs := st.Recompute()
+
+		status, ok := outputs.GatewayStatuses[gwKey]
+		if !ok {
+			t.Fatalf("expected gateway status")
+		}
+
+		// Listener 0: mixed (HTTPRoute + GRPCRoute). SupportedKinds has only HTTPRoute. ResolvedRefs=True.
+		lMixed := status.Listeners[0]
+		if len(lMixed.SupportedKinds) != 1 || lMixed.SupportedKinds[0].Kind != "HTTPRoute" {
+			t.Errorf("expected mixed listener SupportedKinds=[HTTPRoute], got %+v", lMixed.SupportedKinds)
+		}
+		condMixed := findCondition(lMixed.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if condMixed == nil || condMixed.Status != metav1.ConditionTrue {
+			t.Errorf("expected mixed listener ResolvedRefs=True, got %+v", condMixed)
+		}
+
+		// Listener 1: only disabled GRPCRoute. SupportedKinds empty. ResolvedRefs=False/InvalidRouteKinds.
+		lOnlyGRPC := status.Listeners[1]
+		if len(lOnlyGRPC.SupportedKinds) != 0 {
+			t.Errorf("expected only-disabled-grpc SupportedKinds to be empty, got %+v", lOnlyGRPC.SupportedKinds)
+		}
+		condGRPC := findCondition(lOnlyGRPC.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if condGRPC == nil || condGRPC.Status != metav1.ConditionFalse || condGRPC.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+			t.Errorf("expected only-disabled-grpc ResolvedRefs=False/InvalidRouteKinds, got %+v", condGRPC)
+		}
+
+		// Listener 2: only disabled TCPRoute. SupportedKinds empty. ResolvedRefs=False/InvalidRouteKinds.
+		lOnlyTCP := status.Listeners[2]
+		if len(lOnlyTCP.SupportedKinds) != 0 {
+			t.Errorf("expected only-disabled-tcp SupportedKinds to be empty, got %+v", lOnlyTCP.SupportedKinds)
+		}
+		condTCP := findCondition(lOnlyTCP.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if condTCP == nil || condTCP.Status != metav1.ConditionFalse || condTCP.Reason != string(gatewayv1.ListenerReasonInvalidRouteKinds) {
+			t.Errorf("expected only-disabled-tcp ResolvedRefs=False/InvalidRouteKinds, got %+v", condTCP)
+		}
+	})
+}

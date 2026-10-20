@@ -15,12 +15,27 @@
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 func TestResolveNamespacedName(t *testing.T) {
@@ -90,5 +105,301 @@ func TestResolveNamespacedName(t *testing.T) {
 				t.Errorf("ResolveNamespacedName() = %v, want %v", actual, tt.expected)
 			}
 		})
+	}
+}
+
+var (
+	gwV1      = schema.GroupVersion{Group: gatewayv1.GroupName, Version: "v1"}
+	gwV1Beta1 = schema.GroupVersion{Group: gatewayv1beta1.GroupName, Version: "v1beta1"}
+)
+
+func newTestScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+	_ = gatewayv1beta1.AddToScheme(scheme)
+	return scheme
+}
+
+func newTestRESTMapper(servedGVKs ...schema.GroupVersionKind) *meta.DefaultRESTMapper {
+	gvList := []schema.GroupVersion{
+		gwV1,
+		gwV1Beta1,
+		corev1.SchemeGroupVersion,
+	}
+	mapper := meta.NewDefaultRESTMapper(gvList)
+	for _, gvk := range servedGVKs {
+		mapper.Add(gvk, meta.RESTScopeNamespace)
+	}
+	return mapper
+}
+
+func allGatewayAPIGVKs() []schema.GroupVersionKind {
+	return []schema.GroupVersionKind{
+		gwV1.WithKind("GatewayClass"),
+		gwV1.WithKind("Gateway"),
+		gwV1.WithKind("HTTPRoute"),
+		gwV1.WithKind("TLSRoute"),
+		gwV1.WithKind("GRPCRoute"),
+		gwV1.WithKind("TCPRoute"),
+		gwV1.WithKind("UDPRoute"),
+		gwV1.WithKind("BackendTLSPolicy"),
+		gwV1.WithKind("ListenerSet"),
+		gwV1Beta1.WithKind("ReferenceGrant"),
+	}
+}
+
+func gkeStandardGatewayAPIGVKs() []schema.GroupVersionKind {
+	return []schema.GroupVersionKind{
+		gwV1.WithKind("GatewayClass"),
+		gwV1.WithKind("Gateway"),
+		gwV1.WithKind("HTTPRoute"),
+		gwV1.WithKind("TLSRoute"),
+		gwV1.WithKind("BackendTLSPolicy"),
+		gwV1Beta1.WithKind("ReferenceGrant"),
+	}
+}
+
+func TestCheckGatewayAPICRDs(t *testing.T) {
+	scheme := newTestScheme()
+
+	t.Run("all CRDs served", func(t *testing.T) {
+		mapper := newTestRESTMapper(allGatewayAPIGVKs()...)
+		served, disabled, err := CheckGatewayAPICRDs(mapper, scheme)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(disabled) != 0 {
+			t.Errorf("expected 0 disabled kinds, got %v", disabled)
+		}
+		if len(served) != 10 {
+			t.Errorf("expected 10 served kinds, got %d", len(served))
+		}
+	})
+
+	t.Run("partial installation with 4 optional CRDs missing", func(t *testing.T) {
+		mapper := newTestRESTMapper(gkeStandardGatewayAPIGVKs()...)
+		served, disabled, err := CheckGatewayAPICRDs(mapper, scheme)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(served) != 6 {
+			t.Errorf("expected 6 served kinds, got %d", len(served))
+		}
+		expectedDisabled := map[string]bool{
+			"GRPCRoute":   true,
+			"ListenerSet": true,
+			"TCPRoute":    true,
+			"UDPRoute":    true,
+		}
+		if len(disabled) != len(expectedDisabled) {
+			t.Fatalf("expected %d disabled kinds, got %d: %v", len(expectedDisabled), len(disabled), disabled)
+		}
+		for _, d := range disabled {
+			if !expectedDisabled[d] {
+				t.Errorf("unexpected disabled kind: %s", d)
+			}
+		}
+	})
+
+	t.Run("fails fast when GatewayClass is missing", func(t *testing.T) {
+		// Only Gateway and HTTPRoute, missing GatewayClass
+		mapper := newTestRESTMapper(
+			gwV1.WithKind("Gateway"),
+			gwV1.WithKind("HTTPRoute"),
+		)
+		_, _, err := CheckGatewayAPICRDs(mapper, scheme)
+		if err == nil {
+			t.Fatalf("expected error when GatewayClass is missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "GatewayClass") {
+			t.Errorf("expected error to name 'GatewayClass', got %v", err)
+		}
+	})
+
+	t.Run("fails fast when Gateway is missing", func(t *testing.T) {
+		// Only GatewayClass and HTTPRoute, missing Gateway
+		mapper := newTestRESTMapper(
+			gwV1.WithKind("GatewayClass"),
+			gwV1.WithKind("HTTPRoute"),
+		)
+		_, _, err := CheckGatewayAPICRDs(mapper, scheme)
+		if err == nil {
+			t.Fatalf("expected error when Gateway is missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "Gateway") {
+			t.Errorf("expected error to name 'Gateway', got %v", err)
+		}
+	})
+
+	t.Run("fails fast when HTTPRoute is missing", func(t *testing.T) {
+		// Only GatewayClass and Gateway, missing HTTPRoute
+		mapper := newTestRESTMapper(
+			gwV1.WithKind("GatewayClass"),
+			gwV1.WithKind("Gateway"),
+		)
+		_, _, err := CheckGatewayAPICRDs(mapper, scheme)
+		if err == nil {
+			t.Fatalf("expected error when HTTPRoute is missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "HTTPRoute") {
+			t.Errorf("expected error to name 'HTTPRoute', got %v", err)
+		}
+	})
+}
+
+type fakeInformer struct {
+	toolscache.SharedIndexInformer
+}
+
+func (f *fakeInformer) AddEventHandler(handler toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
+	return &fakeRegistration{}, nil
+}
+
+type fakeRegistration struct{}
+
+func (f *fakeRegistration) HasSynced() bool { return true }
+func (f *fakeRegistration) HasSyncedChecker() toolscache.DoneChecker {
+	return fakeDoneChecker{}
+}
+
+type fakeDoneChecker struct{}
+
+func (f fakeDoneChecker) Name() string { return "fake" }
+func (f fakeDoneChecker) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+type fakeCache struct {
+	cache.Cache
+	scheme *runtime.Scheme
+	served map[schema.GroupKind]bool
+}
+
+func (f *fakeCache) GetInformer(ctx context.Context, obj client.Object, opts ...cache.InformerGetOption) (cache.Informer, error) {
+	gvk, err := apiutil.GVKForObject(obj, f.scheme)
+	if err != nil {
+		return nil, err
+	}
+	if gvk.Group == gatewayv1.GroupName && !f.served[gvk.GroupKind()] {
+		return nil, &meta.NoKindMatchError{GroupKind: gvk.GroupKind()}
+	}
+	return &fakeInformer{}, nil
+}
+
+type mockManager struct {
+	ctrl.Manager
+	client    client.Client
+	reader    client.Reader
+	scheme    *runtime.Scheme
+	mapper    meta.RESTMapper
+	cache     cache.Cache
+	runnables []manager.Runnable
+}
+
+func (m *mockManager) Add(r manager.Runnable) error {
+	m.runnables = append(m.runnables, r)
+	return nil
+}
+func (m *mockManager) GetCache() cache.Cache          { return m.cache }
+func (m *mockManager) GetScheme() *runtime.Scheme     { return m.scheme }
+func (m *mockManager) GetClient() client.Client       { return m.client }
+func (m *mockManager) GetRESTMapper() meta.RESTMapper { return m.mapper }
+func (m *mockManager) GetAPIReader() client.Reader    { return m.reader }
+func (m *mockManager) GetEventRecorderFor(name string) record.EventRecorder {
+	return &record.FakeRecorder{}
+}
+
+func TestRegisterReconcilers_RequiredCRDMissing(t *testing.T) {
+	scheme := newTestScheme()
+
+	requiredCases := []struct {
+		missingKind string
+		gvks        []schema.GroupVersionKind
+	}{
+		{
+			missingKind: "GatewayClass",
+			gvks: []schema.GroupVersionKind{
+				gwV1.WithKind("Gateway"),
+				gwV1.WithKind("HTTPRoute"),
+			},
+		},
+		{
+			missingKind: "Gateway",
+			gvks: []schema.GroupVersionKind{
+				gwV1.WithKind("GatewayClass"),
+				gwV1.WithKind("HTTPRoute"),
+			},
+		},
+		{
+			missingKind: "HTTPRoute",
+			gvks: []schema.GroupVersionKind{
+				gwV1.WithKind("GatewayClass"),
+				gwV1.WithKind("Gateway"),
+			},
+		},
+	}
+
+	for _, tc := range requiredCases {
+		t.Run("missing "+tc.missingKind, func(t *testing.T) {
+			mapper := newTestRESTMapper(tc.gvks...)
+			mgr := &mockManager{
+				scheme: scheme,
+				mapper: mapper,
+			}
+			err := RegisterReconcilers(mgr, nil, nil, ReconcilerOptions{})
+			if err == nil {
+				t.Fatalf("expected error when %s is missing, got nil", tc.missingKind)
+			}
+			if !strings.Contains(err.Error(), tc.missingKind) {
+				t.Errorf("expected error to name %q, got %v", tc.missingKind, err)
+			}
+		})
+	}
+}
+
+func TestRegisterReconcilers_PartialCRDs(t *testing.T) {
+	scheme := newTestScheme()
+	mapper := newTestRESTMapper(gkeStandardGatewayAPIGVKs()...)
+
+	servedMap := make(map[schema.GroupKind]bool)
+	for _, gvk := range gkeStandardGatewayAPIGVKs() {
+		servedMap[gvk.GroupKind()] = true
+	}
+
+	mgr := &mockManager{
+		scheme: scheme,
+		mapper: mapper,
+		cache: &fakeCache{
+			scheme: scheme,
+			served: servedMap,
+		},
+	}
+
+	st := state.NewState()
+	err := RegisterReconcilers(mgr, st, nil, ReconcilerOptions{
+		DisableStatusUpdates: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error registering reconcilers with partial CRDs: %v", err)
+	}
+
+	disabledKinds := st.DisabledRouteKinds()
+	if !disabledKinds[gatewayv1.Kind("GRPCRoute")] {
+		t.Errorf("expected GRPCRoute to be disabled")
+	}
+	if !disabledKinds[gatewayv1.Kind("TCPRoute")] {
+		t.Errorf("expected TCPRoute to be disabled")
+	}
+	if !disabledKinds[gatewayv1.Kind("UDPRoute")] {
+		t.Errorf("expected UDPRoute to be disabled")
+	}
+	if disabledKinds[gatewayv1.Kind("HTTPRoute")] {
+		t.Errorf("expected HTTPRoute NOT to be disabled")
+	}
+	if disabledKinds[gatewayv1.Kind("TLSRoute")] {
+		t.Errorf("expected TLSRoute NOT to be disabled")
 	}
 }

@@ -123,6 +123,7 @@ type State struct {
 
 	controllerName          string
 	gatewayCRDBundleVersion *string
+	disabledRouteKinds      map[gatewayv1.Kind]bool
 	onGatewaysUpdate        func([]*gatewayv1.Gateway)
 	gatewayFilter           func(gw *gatewayv1.Gateway) bool
 
@@ -216,6 +217,34 @@ func (s *State) GatewayCRDBundleVersion() *string {
 	}
 	val := *s.gatewayCRDBundleVersion
 	return &val
+}
+
+func (s *State) SetDisabledRouteKinds(kinds map[gatewayv1.Kind]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if kinds == nil {
+		s.disabledRouteKinds = nil
+	} else {
+		s.disabledRouteKinds = make(map[gatewayv1.Kind]bool, len(kinds))
+		for k, v := range kinds {
+			s.disabledRouteKinds[k] = v
+		}
+	}
+	s.revision++
+	s.markDirtyLocked()
+}
+
+func (s *State) DisabledRouteKinds() map[gatewayv1.Kind]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.disabledRouteKinds == nil {
+		return nil
+	}
+	res := make(map[gatewayv1.Kind]bool, len(s.disabledRouteKinds))
+	for k, v := range s.disabledRouteKinds {
+		res[k] = v
+	}
+	return res
 }
 
 func (s *State) SetProxy(p ProxyConfigUpdater) {
@@ -735,6 +764,14 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		allInOne = true
 	}
 
+	var disabledRouteKinds map[gatewayv1.Kind]bool
+	if len(s.disabledRouteKinds) > 0 {
+		disabledRouteKinds = make(map[gatewayv1.Kind]bool, len(s.disabledRouteKinds))
+		for k, v := range s.disabledRouteKinds {
+			disabledRouteKinds[k] = v
+		}
+	}
+
 	return ModelInputs{
 		Revision:                s.revision,
 		Gateways:                gws,
@@ -759,6 +796,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		ControllerName:          s.controllerName,
 		AllInOneMode:            allInOne,
 		GatewayCRDBundleVersion: s.gatewayCRDBundleVersion,
+		DisabledRouteKinds:      disabledRouteKinds,
 	}
 }
 

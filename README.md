@@ -102,6 +102,15 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 | `--proxy-http3-bind-address` | `""` (disabled) | UDP address the proxy binds to for HTTP/3. |
 | `--proxy-http3-advertised-port` | `0` (inferred) | Port advertised in the `Alt-Svc` header for HTTP/3. |
 
+### Partial Gateway API CRD Installation
+
+GARI tolerates partial Gateway API CRD installations (for example, on GKE standard channel clusters where only core Gateway API CRDs are installed). At startup, GARI checks the cluster for served Gateway API CRDs using the controller REST mapper:
+- `GatewayClass`, `Gateway`, and `HTTPRoute` are required. If any of these CRDs is absent, the controller fails fast at startup with an error naming the missing CRD.
+- Optional Gateway API CRDs (`TLSRoute`, `GRPCRoute`, `TCPRoute`, `UDPRoute`, `BackendTLSPolicy`, `ListenerSet`, and `ReferenceGrant`) are dynamically disabled when not served by the cluster.
+- Informers, event handlers, and reconcilers are only registered for served CRDs.
+- Listener `supportedKinds` excludes disabled kinds. A listener restricted (explicitly or by default) to only disabled route kinds reports `ResolvedRefs=False` with reason `InvalidRouteKinds`.
+- If a CRD is installed after the controller has started, restarting the controller is required to discover and enable support for the newly installed CRD.
+
 ## Contributing
 
 This project is licensed under the [Apache 2.0 License](LICENSE).
