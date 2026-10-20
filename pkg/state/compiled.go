@@ -484,6 +484,7 @@ type Outputs struct {
 	Revision                 uint64
 	GatewayStatuses          map[types.NamespacedName]gatewayv1.GatewayStatus
 	GatewayParameters        map[types.NamespacedName]*Parameters
+	GatewayParametersErrors  map[types.NamespacedName]error
 	HTTPRouteStatuses        map[types.NamespacedName]gatewayv1.HTTPRouteStatus
 	TLSRouteStatuses         map[types.NamespacedName]gatewayv1.TLSRouteStatus
 	GRPCRouteStatuses        map[types.NamespacedName]gatewayv1.GRPCRouteStatus
@@ -1133,12 +1134,10 @@ func ComputeGatewayConditions(
 	gwAcceptedReason := gatewayv1.GatewayReasonAccepted
 	gwAcceptedMessage := "Gateway accepted by reference implementation"
 
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
-		if paramsErr != nil {
-			gwAcceptedStatus = metav1.ConditionFalse
-			gwAcceptedReason = gatewayv1.GatewayReasonInvalidParameters
-			gwAcceptedMessage = fmt.Sprintf("Invalid infrastructure parametersRef: %v", paramsErr)
-		}
+	if paramsErr != nil {
+		gwAcceptedStatus = metav1.ConditionFalse
+		gwAcceptedReason = gatewayv1.GatewayReasonInvalidParameters
+		gwAcceptedMessage = paramsErr.Error()
 	}
 	if gwAcceptedStatus == metav1.ConditionTrue {
 		if unsupp, unsuppType := HasUnsupportedAddress(gw.Spec.Addresses, supportedAddressTypes); unsupp {
@@ -1552,22 +1551,35 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			provErr = inputs.ProvisioningErrors[gwKey]
 		}
 		var gcParams *Parameters
+		var paramsErr error
 		for _, gc := range inputs.GatewayClasses {
 			if gc != nil && gc.Name == string(gw.Spec.GatewayClassName) {
 				if gc.Spec.ParametersRef != nil {
-					p, _ := ValidateGatewayClassParametersRef(gc.Spec.ParametersRef, inputs.ConfigMaps)
-					gcParams = p
+					p, err := ValidateGatewayClassParametersRef(gc.Spec.ParametersRef, inputs.ConfigMaps)
+					if err != nil {
+						paramsErr = fmt.Errorf("invalid GatewayClass parametersRef: %w", err)
+					} else {
+						gcParams = p
+					}
 				}
 				break
 			}
 		}
 		var gwParams *Parameters
-		var paramsErr error
-		if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
-			gwParams, paramsErr = ValidateGatewayParametersRef(gw.Spec.Infrastructure.ParametersRef, gw.Namespace, inputs.ConfigMaps)
+		if paramsErr == nil && gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+			p, err := ValidateGatewayParametersRef(gw.Spec.Infrastructure.ParametersRef, gw.Namespace, inputs.ConfigMaps)
+			if err != nil {
+				paramsErr = fmt.Errorf("invalid infrastructure parametersRef: %w", err)
+			} else {
+				gwParams = p
+			}
 		}
-		cg.Parameters = MergeParameters(gcParams, gwParams)
 		cg.ParametersRefError = paramsErr
+		if paramsErr == nil {
+			cg.Parameters = MergeParameters(gcParams, gwParams)
+		} else {
+			cg.Parameters = nil
+		}
 
 		clientCert, resolvedRefsCond := resolveGatewayBackendClientCert(gw, inputs.Secrets, refValidator)
 		cg.BackendClientCert = clientCert
@@ -2318,6 +2330,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		BackendTLSPolicyStatuses: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
 		GatewayClassStatuses:     make(map[types.NamespacedName]gatewayv1.GatewayClassStatus),
 		GatewayParameters:        make(map[types.NamespacedName]*Parameters),
+		GatewayParametersErrors:  make(map[types.NamespacedName]error),
 	}
 
 	// 1. Gateway Statuses
@@ -2329,6 +2342,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		cg := compiled.Gateways[gwKey]
 		if cg != nil {
 			outputs.GatewayParameters[gwKey] = cg.Parameters
+			outputs.GatewayParametersErrors[gwKey] = cg.ParametersRefError
 			var addrs []gatewayv1.GatewayStatusAddress
 			if inputs.GatewayAddresses != nil {
 				addrs = inputs.GatewayAddresses[gwKey]

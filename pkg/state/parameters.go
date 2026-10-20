@@ -38,6 +38,15 @@ type Parameters struct {
 	ServiceAnnotations    map[string]string
 }
 
+// DefaultParameters returns default parameters (LoadBalancer, Cluster).
+func DefaultParameters() *Parameters {
+	return &Parameters{
+		ServiceType:           corev1.ServiceTypeLoadBalancer,
+		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster,
+		ServiceAnnotations:    make(map[string]string),
+	}
+}
+
 // ParseConfigMapParameters parses and validates parameters from a ConfigMap.
 // Unknown keys or invalid values return an error.
 func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {

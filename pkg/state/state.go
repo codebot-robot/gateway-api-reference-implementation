@@ -787,7 +787,13 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 		if prev != nil && prev.GatewayParameters != nil {
 			oldP = prev.GatewayParameters[k]
 		}
-		paramsChanged := !ParametersEqual(curP, oldP)
+		curErr := outputs.GatewayParametersErrors[k]
+		var oldErr error
+		if prev != nil && prev.GatewayParametersErrors != nil {
+			oldErr = prev.GatewayParametersErrors[k]
+		}
+		errChanged := (curErr == nil) != (oldErr == nil) || (curErr != nil && oldErr != nil && curErr.Error() != oldErr.Error())
+		paramsChanged := !ParametersEqual(curP, oldP) || errChanged
 		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) || paramsChanged {
 			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
@@ -990,6 +996,20 @@ func (s *State) GetDesiredGatewayStatus(key types.NamespacedName) (gatewayv1.Gat
 	}
 	st, ok := s.previousOutputs.GatewayStatuses[key]
 	return st, ok
+}
+
+// GetGatewayParameters returns the resolved Parameters for a Gateway.
+// If parameter resolution failed (on Gateway or GatewayClass), it returns nil and the error.
+func (s *State) GetGatewayParameters(key types.NamespacedName) (*Parameters, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.previousOutputs == nil {
+		return nil, nil
+	}
+	if err, ok := s.previousOutputs.GatewayParametersErrors[key]; ok && err != nil {
+		return nil, err
+	}
+	return s.previousOutputs.GatewayParameters[key], nil
 }
 
 func (s *State) GetDesiredHTTPRouteStatus(key types.NamespacedName) (gatewayv1.HTTPRouteStatus, bool) {

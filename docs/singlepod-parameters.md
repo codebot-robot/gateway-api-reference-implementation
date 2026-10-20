@@ -51,8 +51,10 @@ metadata:
 data:
   serviceType: ClusterIP
   serviceAnnotations: |
-    cloud.google.com/neg: '{"exposed_ports": {"80": {}, "443": {}}}'
+    cloud.google.com/neg: '{"exposed_ports": {"80": {"name": "my-gateway-80"}, "443": {"name": "my-gateway-443"}}}'
 ```
+
+> **Note:** GKE backend services reference NEGs by name, so specifying fixed NEG names simplifies backend service configuration. Two Services cannot claim the same NEG name within the same cluster and region.
 
 ### 2. Define the Gateway
 

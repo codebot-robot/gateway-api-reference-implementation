@@ -121,6 +121,19 @@ type AddressProvider struct {
 	dataplaneImage   string
 	enableH2C        bool
 	forwardedForMode string
+	state            *state.State
+}
+
+// WithState sets the State reference for the AddressProvider.
+func WithState(s *state.State) Option {
+	return func(p *AddressProvider) {
+		p.state = s
+	}
+}
+
+// SetState sets the State reference for the AddressProvider.
+func (p *AddressProvider) SetState(s *state.State) {
+	p.state = s
 }
 
 // NewAddressProvider creates a new singlepod AddressProvider.
@@ -207,74 +220,6 @@ func requestedHostnameAddresses(gw *gatewayv1.Gateway) []string {
 	return hosts
 }
 
-func (p *AddressProvider) resolveParameters(ctx context.Context, gw *gatewayv1.Gateway) (*state.Parameters, error) {
-	if p.client == nil || gw == nil {
-		return state.MergeParameters(nil, nil), nil
-	}
-
-	reader := p.apiReader
-	if reader == nil {
-		reader = p.client
-	}
-
-	var gcParams *state.Parameters
-	if gw.Spec.GatewayClassName != "" {
-		var gc gatewayv1.GatewayClass
-		if err := reader.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &gc); err == nil {
-			if gc.Spec.ParametersRef != nil {
-				if gc.Spec.ParametersRef.Group != "" {
-					return nil, fmt.Errorf("unsupported group %q on GatewayClass: only core group (\"\") is supported", gc.Spec.ParametersRef.Group)
-				}
-				if gc.Spec.ParametersRef.Kind != "ConfigMap" {
-					return nil, fmt.Errorf("unsupported kind %q on GatewayClass: only ConfigMap is supported", gc.Spec.ParametersRef.Kind)
-				}
-				if gc.Spec.ParametersRef.Namespace == nil || *gc.Spec.ParametersRef.Namespace == "" {
-					return nil, fmt.Errorf("namespace is required for ConfigMap parametersRef on GatewayClass")
-				}
-				if gc.Spec.ParametersRef.Name == "" {
-					return nil, fmt.Errorf("name is required for ConfigMap parametersRef on GatewayClass")
-				}
-				var cm corev1.ConfigMap
-				cmKey := types.NamespacedName{Namespace: string(*gc.Spec.ParametersRef.Namespace), Name: gc.Spec.ParametersRef.Name}
-				if err := reader.Get(ctx, cmKey, &cm); err != nil {
-					return nil, fmt.Errorf("ConfigMap %s/%s referenced by GatewayClass not found: %w", cmKey.Namespace, cmKey.Name, err)
-				}
-				parsed, err := state.ParseConfigMapParameters(&cm)
-				if err != nil {
-					return nil, fmt.Errorf("invalid parameters in ConfigMap %s/%s on GatewayClass: %w", cmKey.Namespace, cmKey.Name, err)
-				}
-				gcParams = parsed
-			}
-		}
-	}
-
-	var gwParams *state.Parameters
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
-		ref := gw.Spec.Infrastructure.ParametersRef
-		if ref.Group != "" {
-			return nil, fmt.Errorf("unsupported group %q: only core group (\"\") is supported", ref.Group)
-		}
-		if ref.Kind != "ConfigMap" {
-			return nil, fmt.Errorf("unsupported kind %q: only ConfigMap is supported", ref.Kind)
-		}
-		if ref.Name == "" {
-			return nil, fmt.Errorf("name is required for ConfigMap parametersRef")
-		}
-		var cm corev1.ConfigMap
-		cmKey := types.NamespacedName{Namespace: gw.Namespace, Name: ref.Name}
-		if err := reader.Get(ctx, cmKey, &cm); err != nil {
-			return nil, fmt.Errorf("ConfigMap %s/%s not found: %w", cmKey.Namespace, cmKey.Name, err)
-		}
-		parsed, err := state.ParseConfigMapParameters(&cm)
-		if err != nil {
-			return nil, fmt.Errorf("invalid parameters in ConfigMap %s/%s: %w", cmKey.Namespace, cmKey.Name, err)
-		}
-		gwParams = parsed
-	}
-
-	return state.MergeParameters(gcParams, gwParams), nil
-}
-
 // GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and Service,
 // and returns the Service's ingress addresses and detailed readiness state.
 func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
@@ -282,13 +227,20 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		return nil, state.GatewayReadiness{}, nil
 	}
 
-	params, err := p.resolveParameters(ctx, gw)
-	if err != nil {
-		return nil, state.GatewayReadiness{
-			Ready:   false,
-			Reason:  string(gatewayv1.GatewayReasonInvalidParameters),
-			Message: err.Error(),
-		}, nil
+	var params *state.Parameters
+	if p.state != nil && gw != nil {
+		prms, err := p.state.GetGatewayParameters(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		if err != nil {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonInvalidParameters),
+				Message: err.Error(),
+			}, nil
+		}
+		params = prms
+	}
+	if params == nil {
+		params = state.DefaultParameters()
 	}
 
 	name := ResourceNameForGateway(gw.Name)
@@ -306,7 +258,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 
 	// 1. Reconcile per-Gateway ServiceAccount in Gateway namespace
 	var existingSA corev1.ServiceAccount
-	err = p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
+	err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSA)
 	if err == nil {
 		if !isOwnedByGateway(&existingSA, gw) {
 			return nil, state.GatewayReadiness{}, &controller.OwnershipConflictError{

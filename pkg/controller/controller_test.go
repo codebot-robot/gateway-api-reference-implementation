@@ -486,9 +486,15 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 		WithStatusSubresource(gcInvalidParams).
 		Build()
 
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gcInvalidParams)
+	st.Recompute()
+
 	r := &GatewayClassReconciler{
 		Client:         client,
 		Scheme:         scheme,
+		State:          st,
 		ControllerName: "test-controller",
 	}
 
@@ -521,6 +527,8 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 	if err := client.Update(ctx, &res); err != nil {
 		t.Fatalf("failed to update GatewayClass: %v", err)
 	}
+	st.UpsertGatewayClass(&res)
+	st.Recompute()
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "invalid-params-gc"}})
 	if err != nil {
@@ -562,6 +570,9 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 	if err := client.Update(ctx, &res); err != nil {
 		t.Fatalf("failed to update GatewayClass: %v", err)
 	}
+	st.UpsertConfigMap(validCM)
+	st.UpsertGatewayClass(&res)
+	st.Recompute()
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "invalid-params-gc"}})
 	if err != nil {

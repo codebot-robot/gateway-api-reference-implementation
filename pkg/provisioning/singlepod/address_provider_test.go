@@ -2575,7 +2575,15 @@ func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
-	p := NewAddressProvider(c)
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.UpsertConfigMap(gcCM)
+	st.UpsertConfigMap(gwCM)
+	st.Recompute()
+
+	p := NewAddressProvider(c, WithState(st))
 	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2661,7 +2669,17 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
 
-		p := NewAddressProvider(c)
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(gwCM)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
 		_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2720,7 +2738,17 @@ func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
 
-		p := NewAddressProvider(c)
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(gwCM)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
 		_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2803,7 +2831,17 @@ func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
 				WithInterceptorFuncs(ssaNoOpInterceptor()).
 				Build()
 
-			p := NewAddressProvider(c)
+			st := state.NewState()
+			st.SetControllerName("test-controller")
+			st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+				Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+			})
+			st.UpsertGateway(gw)
+			st.UpsertConfigMap(cm)
+			st.Recompute()
+
+			p := NewAddressProvider(c, WithState(st))
 			addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 			if err != nil {
 				t.Fatalf("expected nil error (reported via readiness), got: %v", err)
@@ -2864,7 +2902,16 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
 
-		p := NewAddressProvider(c)
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
 		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
@@ -2913,7 +2960,13 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
 
-		p := NewAddressProvider(c)
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(gc)
+		st.UpsertGateway(gw)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
 		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("expected nil error, got: %v", err)
@@ -2923,6 +2976,95 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 		}
 		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
 			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		}
+
+		// Verify Gateway status has Accepted=False/InvalidParameters
+		status, ok := st.GetDesiredGatewayStatus(types.NamespacedName{Namespace: "test-ns", Name: "gw-class-missing-cm"})
+		if !ok {
+			t.Fatalf("expected Gateway status in State")
+		}
+		acceptedCond := state.FindCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected Gateway Accepted=False/InvalidParameters for missing class ConfigMap, got %+v", acceptedCond)
+		}
+	})
+
+	t.Run("GatewayClass invalid ConfigMap keys or values", func(t *testing.T) {
+		gcNS := gatewayv1.Namespace("default")
+		badCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "bad-gc-cm"},
+			Data: map[string]string{
+				state.ParameterKeyServiceType: "NodePort",
+			},
+		}
+		gc := &gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-class"},
+			Spec: gatewayv1.GatewayClassSpec{
+				ControllerName: "test-controller",
+				ParametersRef: &gatewayv1.ParametersReference{
+					Group:     "",
+					Kind:      "ConfigMap",
+					Namespace: &gcNS,
+					Name:      "bad-gc-cm",
+				},
+			},
+		}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-class-bad-cm",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-class-bad"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "bad-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc, badCM, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(gc)
+		st.UpsertConfigMap(badCM)
+		st.UpsertGateway(gw)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		if readiness.Ready {
+			t.Errorf("expected readiness.Ready=false")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		}
+
+		// Verify Gateway status has Accepted=False/InvalidParameters
+		status, ok := st.GetDesiredGatewayStatus(types.NamespacedName{Namespace: "test-ns", Name: "gw-class-bad-cm"})
+		if !ok {
+			t.Fatalf("expected Gateway status in State")
+		}
+		acceptedCond := state.FindCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected Gateway Accepted=False/InvalidParameters for invalid class ConfigMap, got %+v", acceptedCond)
+		}
+
+		// Verify no Service was created
+		var svc corev1.Service
+		resName := ResourceNameForGateway("gw-class-bad-cm")
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+			t.Errorf("expected NotFound for Service, got err: %v", err)
 		}
 	})
 }
@@ -2970,7 +3112,17 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
 
-		p := NewAddressProvider(c)
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(cm)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
 		addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -3029,7 +3181,17 @@ func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 			WithInterceptorFuncs(ssaNoOpInterceptor()).
 			Build()
 
-		p := NewAddressProvider(c)
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(cm)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
 
 		// 1. Initial reconcile: Deployment has 0 available replicas -> addresses withheld
 		addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
@@ -3134,7 +3296,7 @@ func TestSinglePodAddressProvider_LiveSwitch_LoadBalancer_To_ClusterIP(t *testin
 		WithInterceptorFuncs(ssaNoOpInterceptor()).
 		Build()
 
-	p := NewAddressProvider(c)
+	p := NewAddressProvider(c, WithState(st))
 	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
 
 	r := &controller.GatewayReconciler{
