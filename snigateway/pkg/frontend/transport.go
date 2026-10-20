@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/quic-go/quic-go"
@@ -441,6 +442,7 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 			wgNotify = c.wireguard.Notify()
 		}
 
+		var hasRetryableDial bool
 		for _, sid := range sessionIDs {
 			// Check QUIC transport first with non-blocking TryGetConn
 			if c.quic.HasSession(sid) {
@@ -463,6 +465,9 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 				if err != nil {
 					if ctx.Err() != nil {
 						return nil, "", ctx.Err()
+					}
+					if errors.Is(err, ErrDialFailed) {
+						hasRetryableDial = true
 					}
 					continue
 				}
@@ -492,13 +497,36 @@ func (c *CompositeTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 			}
 		}
 
+		var retryCh <-chan time.Time
+		var retryTimer *time.Timer
+		if hasRetryableDial {
+			retryTimer = time.NewTimer(100 * time.Millisecond)
+			retryCh = retryTimer.C
+		}
+
 		select {
 		case <-ctx.Done():
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 			return nil, "", ctx.Err()
+		case <-retryCh:
 		case <-poolNotify:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		case <-quicNotify:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		case <-h2Notify:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		case <-wgNotify:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		}
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -36,21 +37,25 @@ import (
 )
 
 type wireguardPeer struct {
-	sessionID string
-	publicKey [32]byte
-	peerAddr  netip.Addr
-	tcpAddr   *net.TCPAddr
+	sessionID     string
+	publicKey     [32]byte
+	peerAddr      netip.Addr
+	tcpAddr       *net.TCPAddr
+	registeredAt  time.Time
+	lastHandshake time.Time
 }
 
 // WireGuardTransportConfig configures the frontend WireGuard transport device.
 type WireGuardTransportConfig struct {
-	ListenAddr        string // UDP listen address, e.g. ":51820" or ":0"
-	Prefix            string // IPv6 prefix, e.g. "fd00::/64"
-	Endpoint          string // Optional advertised endpoint "<host:port>"
-	TunnelPort        int    // Target TCP port on controller netstack inside the tunnel
-	MTU               int    // Tunnel MTU
-	PerAttemptTimeout time.Duration
-	Logger            *device.Logger
+	ListenAddr            string // UDP listen address, e.g. ":51820" or ":0"
+	Prefix                string // IPv6 prefix, e.g. "fd00::/64"
+	Endpoint              string // Optional advertised endpoint "<host:port>"
+	TunnelPort            int    // Target TCP port on controller netstack inside the tunnel
+	MTU                   int    // Tunnel MTU
+	PerAttemptTimeout     time.Duration
+	HandshakeSyncInterval time.Duration    // Interval to refresh cached peer handshakes (default: 5s)
+	Now                   func() time.Time // Clock function for tests (default: time.Now)
+	Logger                *device.Logger
 }
 
 // WireGuardTransport implements Transport forwarding client connections over WireGuard.
@@ -70,9 +75,14 @@ type WireGuardTransport struct {
 	tunnelPort         int
 	mtu                int
 	perAttemptTimeout  time.Duration
+	syncInterval       time.Duration
+	now                func() time.Time
 	sessions           map[string]*wireguardPeer
 	pubKeyToSession    map[[32]byte]string
 	notifyCh           chan struct{}
+	syncCh             chan struct{}
+	stopCh             chan struct{}
+	doneCh             chan struct{}
 	closed             bool
 }
 
@@ -161,6 +171,16 @@ func NewWireGuardTransport(cfg WireGuardTransportConfig) (*WireGuardTransport, e
 		actualPort = uint16(listenPort)
 	}
 
+	timeNow := cfg.Now
+	if timeNow == nil {
+		timeNow = time.Now
+	}
+
+	syncInterval := cfg.HandshakeSyncInterval
+	if syncInterval <= 0 {
+		syncInterval = 5 * time.Second
+	}
+
 	tr := &WireGuardTransport{
 		device:             dev,
 		netstackNet:        netstackNet,
@@ -176,10 +196,17 @@ func NewWireGuardTransport(cfg WireGuardTransportConfig) (*WireGuardTransport, e
 		tunnelPort:         cfg.TunnelPort,
 		mtu:                cfg.MTU,
 		perAttemptTimeout:  cfg.PerAttemptTimeout,
+		syncInterval:       syncInterval,
+		now:                timeNow,
 		sessions:           make(map[string]*wireguardPeer),
 		pubKeyToSession:    make(map[[32]byte]string),
 		notifyCh:           make(chan struct{}),
+		syncCh:             make(chan struct{}, 1),
+		stopCh:             make(chan struct{}),
+		doneCh:             make(chan struct{}),
 	}
+
+	go tr.syncLoop()
 
 	return tr, nil
 }
@@ -239,28 +266,32 @@ func (w *WireGuardTransport) Device() *device.Device {
 // RegisterPeer adds or updates a WireGuard peer for sessionID with AllowedIPs exactly peerAddr/128.
 func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byte, peerAddr netip.Addr) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	if w.closed {
+		w.mu.Unlock()
 		return net.ErrClosed
 	}
 
 	// Reject if client public key equals frontend's own public key
 	if clientPubKey == w.publicKey {
+		w.mu.Unlock()
 		return fmt.Errorf("client public key cannot equal frontend public key")
 	}
 
 	// Reject if public key is already bound to a different session
 	if existingSession, ok := w.pubKeyToSession[clientPubKey]; ok && existingSession != sessionID {
+		w.mu.Unlock()
 		return fmt.Errorf("public key is already bound to session %s", existingSession)
 	}
 
 	if existing, ok := w.sessions[sessionID]; ok {
 		if existing.publicKey == clientPubKey && existing.peerAddr == peerAddr {
+			w.mu.Unlock()
 			return nil
 		}
 		// If key changed, remove old peer first
 		if err := w.device.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", hex.EncodeToString(existing.publicKey[:]))); err != nil {
+			w.mu.Unlock()
 			return fmt.Errorf("removing previous wireguard peer key: %w", err)
 		}
 		delete(w.pubKeyToSession, existing.publicKey)
@@ -271,6 +302,7 @@ func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byt
 	peerUAPI := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s/128\n",
 		hex.EncodeToString(clientPubKey[:]), peerAddr.String())
 	if err := w.device.IpcSet(peerUAPI); err != nil {
+		w.mu.Unlock()
 		return fmt.Errorf("configuring wireguard peer for session %s: %w", sessionID, err)
 	}
 
@@ -280,14 +312,18 @@ func (w *WireGuardTransport) RegisterPeer(sessionID string, clientPubKey [32]byt
 	}
 
 	p := &wireguardPeer{
-		sessionID: sessionID,
-		publicKey: clientPubKey,
-		peerAddr:  peerAddr,
-		tcpAddr:   tcpAddr,
+		sessionID:    sessionID,
+		publicKey:    clientPubKey,
+		peerAddr:     peerAddr,
+		tcpAddr:      tcpAddr,
+		registeredAt: w.now(),
 	}
 	w.sessions[sessionID] = p
 	w.pubKeyToSession[clientPubKey] = sessionID
 	w.broadcastLocked()
+	w.mu.Unlock()
+
+	w.triggerSync()
 	return nil
 }
 
@@ -322,21 +358,31 @@ func (w *WireGuardTransport) HasSession(sessionID string) bool {
 	return ok
 }
 
+const maxWireGuardHandshakeAge = 180 * time.Second
+
+// ErrDialFailed indicates that a dial attempt to a registered, usable peer failed (or timed out)
+// and may be retried.
+var ErrDialFailed = errors.New("wireguard dial failed")
+
+func isHandshakeUsable(hs time.Time, now time.Time) bool {
+	return !hs.IsZero() && now.Sub(hs) <= maxWireGuardHandshakeAge
+}
+
 // TryGetConn dials the backend netstack over WireGuard for sessionID.
-// It skips peers whose handshake is zero (not established) or older than 180s,
+// It skips peers whose cached handshake is zero (not established) or older than 180s,
 // and bounds the dial attempt to PerAttemptTimeout so other candidates are not starved.
 func (w *WireGuardTransport) TryGetConn(ctx context.Context, sessionID string) (net.Conn, error) {
 	w.mu.RLock()
 	p, ok := w.sessions[sessionID]
-	w.mu.RUnlock()
-
 	if !ok {
+		w.mu.RUnlock()
 		return nil, nil
 	}
+	hsTime := p.lastHandshake
+	w.mu.RUnlock()
 
 	// Skip peer if last handshake is zero (never completed) or older than 180s
-	hsTime, err := getPeerLastHandshake(w.device, hex.EncodeToString(p.publicKey[:]))
-	if err != nil || hsTime.IsZero() || time.Since(hsTime) > 180*time.Second {
+	if !isHandshakeUsable(hsTime, w.now()) {
 		return nil, nil
 	}
 
@@ -352,8 +398,8 @@ func (w *WireGuardTransport) TryGetConn(ctx context.Context, sessionID string) (
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		// Connection attempt timed out or failed on this candidate; return nil to try next
-		return nil, nil
+		// Connection attempt timed out or failed on this candidate; return sentinel error so caller can retry
+		return nil, fmt.Errorf("%w: %w", ErrDialFailed, err)
 	}
 	return conn, nil
 }
@@ -375,12 +421,16 @@ func (w *WireGuardTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 		notify := w.notifyCh
 		w.mu.Unlock()
 
+		var hasRetryableDial bool
 		for _, sid := range sessionIDs {
 			if w.HasSession(sid) {
 				conn, err := w.TryGetConn(ctx, sid)
 				if err != nil {
 					if ctx.Err() != nil {
 						return nil, "", ctx.Err()
+					}
+					if errors.Is(err, ErrDialFailed) {
+						hasRetryableDial = true
 					}
 					continue
 				}
@@ -390,10 +440,24 @@ func (w *WireGuardTransport) GetConnForSessions(ctx context.Context, sessionIDs 
 			}
 		}
 
+		var retryCh <-chan time.Time
+		var retryTimer *time.Timer
+		if hasRetryableDial {
+			retryTimer = time.NewTimer(100 * time.Millisecond)
+			retryCh = retryTimer.C
+		}
+
 		select {
 		case <-ctx.Done():
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 			return nil, "", ctx.Err()
+		case <-retryCh:
 		case <-notify:
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 		}
 	}
 }
@@ -406,37 +470,161 @@ func (w *WireGuardTransport) Close() error {
 		return nil
 	}
 	w.closed = true
+	close(w.stopCh)
 	w.broadcastLocked()
 	w.mu.Unlock()
 
+	<-w.doneCh
 	w.device.Close()
 	return nil
 }
 
-func getPeerLastHandshake(d *device.Device, peerPubKeyHex string) (time.Time, error) {
-	out, err := d.IpcGet()
-	if err != nil {
-		return time.Time{}, err
+func (w *WireGuardTransport) triggerSync() {
+	select {
+	case w.syncCh <- struct{}{}:
+	default:
 	}
-	lines := strings.Split(out, "\n")
-	var inPeer bool
-	for _, line := range lines {
-		if strings.HasPrefix(line, "public_key=") {
-			pk := strings.TrimPrefix(line, "public_key=")
-			inPeer = strings.EqualFold(pk, peerPubKeyHex)
-		} else if inPeer && strings.HasPrefix(line, "last_handshake_time_sec=") {
-			var sec int64
-			_, err := fmt.Sscanf(line, "last_handshake_time_sec=%d", &sec)
-			if err != nil {
-				return time.Time{}, err
+}
+
+func (w *WireGuardTransport) syncLoop() {
+	defer close(w.doneCh)
+
+	timer := time.NewTimer(w.syncInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-w.stopCh:
+			return
+		case <-w.syncCh:
+		case <-timer.C:
+		}
+
+		if err := w.syncHandshakes(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("Frontend: failed to sync wireguard handshakes: %v", err)
+		}
+
+		w.mu.RLock()
+		hasZeroHandshake := false
+		now := w.now()
+		for _, p := range w.sessions {
+			if p.lastHandshake.IsZero() && now.Sub(p.registeredAt) <= w.syncInterval {
+				hasZeroHandshake = true
+				break
 			}
-			if sec == 0 {
-				return time.Time{}, nil
+		}
+		w.mu.RUnlock()
+
+		nextInterval := w.syncInterval
+		if hasZeroHandshake && nextInterval > 50*time.Millisecond {
+			nextInterval = 50 * time.Millisecond
+		}
+
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
 			}
-			return time.Unix(sec, 0), nil
+		}
+		timer.Reset(nextInterval)
+	}
+}
+
+func parseIpcHandshakes(out string) map[[32]byte]time.Time {
+	result := make(map[[32]byte]time.Time)
+	var currentKey [32]byte
+	var hasKey bool
+	var sec, nsec int64
+
+	saveCurrent := func() {
+		if hasKey {
+			if sec > 0 {
+				result[currentKey] = time.Unix(sec, nsec)
+			} else {
+				result[currentKey] = time.Time{}
+			}
 		}
 	}
-	return time.Time{}, fmt.Errorf("peer not found in ipc output")
+
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "public_key=") {
+			saveCurrent()
+			pkHex := strings.TrimPrefix(line, "public_key=")
+			b, err := hex.DecodeString(pkHex)
+			if err == nil && len(b) == 32 {
+				copy(currentKey[:], b)
+				hasKey = true
+			} else {
+				hasKey = false
+			}
+			sec = 0
+			nsec = 0
+		} else if hasKey && strings.HasPrefix(line, "last_handshake_time_sec=") {
+			if _, err := fmt.Sscanf(line, "last_handshake_time_sec=%d", &sec); err != nil {
+				sec = 0
+			}
+		} else if hasKey && strings.HasPrefix(line, "last_handshake_time_nsec=") {
+			if _, err := fmt.Sscanf(line, "last_handshake_time_nsec=%d", &nsec); err != nil {
+				nsec = 0
+			}
+		}
+	}
+	saveCurrent()
+	return result
+}
+
+func (w *WireGuardTransport) syncHandshakes() error {
+	w.mu.RLock()
+	if w.closed {
+		w.mu.RUnlock()
+		return net.ErrClosed
+	}
+	w.mu.RUnlock()
+
+	out, err := w.device.IpcGet()
+	if err != nil {
+		return err
+	}
+	handshakes := parseIpcHandshakes(out)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return net.ErrClosed
+	}
+
+	now := w.now()
+	becameUsable := false
+	for pubKey, hsTime := range handshakes {
+		if sid, ok := w.pubKeyToSession[pubKey]; ok {
+			if p, ok := w.sessions[sid]; ok {
+				wasUsable := isHandshakeUsable(p.lastHandshake, now)
+				p.lastHandshake = hsTime
+				if !wasUsable && isHandshakeUsable(hsTime, now) {
+					becameUsable = true
+				}
+			}
+		}
+	}
+	if becameUsable {
+		w.broadcastLocked()
+	}
+	return nil
+}
+
+// SyncHandshakes immediately queries the WireGuard device and updates cached handshake timestamps for all sessions.
+func (w *WireGuardTransport) SyncHandshakes() error {
+	return w.syncHandshakes()
+}
+
+// PeerLastHandshake returns the cached last-handshake time for sessionID, or zero time if not registered.
+func (w *WireGuardTransport) PeerLastHandshake(sessionID string) time.Time {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if p, ok := w.sessions[sessionID]; ok {
+		return p.lastHandshake
+	}
+	return time.Time{}
 }
 
 func getDeviceListenPort(d *device.Device) (uint16, error) {
