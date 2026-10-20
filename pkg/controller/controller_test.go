@@ -22,6 +22,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -708,11 +709,9 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		if cond.ObservedGeneration != 1 {
 			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
 		}
-		if !strings.Contains(cond.Message, "v1.5.0") {
-			t.Errorf("expected message to contain detected version %q, got %q", "v1.5.0", cond.Message)
-		}
-		if !strings.Contains(cond.Message, gatewayconsts.BundleVersion) {
-			t.Errorf("expected message to contain supported version %q, got %q", gatewayconsts.BundleVersion, cond.Message)
+		expectedMsg := fmt.Sprintf("Gateway API CRD bundle-version \"v1.5.0\" is not supported (controller supports v1.6.x, built against %s)", gatewayconsts.BundleVersion)
+		if cond.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, cond.Message)
 		}
 	})
 

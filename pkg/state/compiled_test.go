@@ -5936,64 +5936,74 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 	generation := int64(3)
 
 	tests := []struct {
-		name           string
-		bundleVersion  string
-		expectedStatus metav1.ConditionStatus
-		expectedReason gatewayv1.GatewayClassConditionReason
+		name            string
+		bundleVersion   string
+		expectedStatus  metav1.ConditionStatus
+		expectedReason  gatewayv1.GatewayClassConditionReason
+		expectedMessage string
 	}{
 		{
-			name:           "same minor version v1.6.0",
-			bundleVersion:  "v1.6.0",
-			expectedStatus: metav1.ConditionTrue,
-			expectedReason: gatewayv1.GatewayClassReasonSupportedVersion,
+			name:            "same minor version v1.6.0",
+			bundleVersion:   "v1.6.0",
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.0" is supported`,
 		},
 		{
-			name:           "matching version v1.6.3",
-			bundleVersion:  "v1.6.3",
-			expectedStatus: metav1.ConditionTrue,
-			expectedReason: gatewayv1.GatewayClassReasonSupportedVersion,
+			name:            "matching version v1.6.3",
+			bundleVersion:   "v1.6.3",
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.3" is supported`,
 		},
 		{
-			name:           "same minor higher patch v1.6.9",
-			bundleVersion:  "v1.6.9",
-			expectedStatus: metav1.ConditionTrue,
-			expectedReason: gatewayv1.GatewayClassReasonSupportedVersion,
+			name:            "same minor higher patch v1.6.9",
+			bundleVersion:   "v1.6.9",
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.9" is supported`,
 		},
 		{
-			name:           "older minor v1.5.2",
-			bundleVersion:  "v1.5.2",
-			expectedStatus: metav1.ConditionFalse,
-			expectedReason: gatewayv1.GatewayClassReasonUnsupportedVersion,
+			name:            "older minor v1.5.2",
+			bundleVersion:   "v1.5.2",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.5.2" is not supported (controller supports v1.6.x, built against v1.6.3)`,
 		},
 		{
-			name:           "newer minor v1.7.0",
-			bundleVersion:  "v1.7.0",
-			expectedStatus: metav1.ConditionFalse,
-			expectedReason: gatewayv1.GatewayClassReasonUnsupportedVersion,
+			name:            "newer minor v1.7.0",
+			bundleVersion:   "v1.7.0",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.7.0" is not supported (controller supports v1.6.x, built against v1.6.3)`,
 		},
 		{
-			name:           "garbage version",
-			bundleVersion:  "garbage",
-			expectedStatus: metav1.ConditionFalse,
-			expectedReason: gatewayv1.GatewayClassReasonUnsupportedVersion,
+			name:            "garbage version",
+			bundleVersion:   "garbage",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "garbage" is not supported (controller supports v1.6.x, built against v1.6.3)`,
 		},
 		{
-			name:           "empty version",
-			bundleVersion:  "",
-			expectedStatus: metav1.ConditionFalse,
-			expectedReason: gatewayv1.GatewayClassReasonUnsupportedVersion,
+			name:            "empty version",
+			bundleVersion:   "",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "" is not supported (controller supports v1.6.x, built against v1.6.3)`,
 		},
 		{
-			name:           "pre-release version v1.6.0-rc1",
-			bundleVersion:  "v1.6.0-rc1",
-			expectedStatus: metav1.ConditionFalse,
-			expectedReason: gatewayv1.GatewayClassReasonUnsupportedVersion,
+			name:            "pre-release version v1.6.0-rc1",
+			bundleVersion:   "v1.6.0-rc1",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.0-rc1" is not supported (controller supports v1.6.x, built against v1.6.3)`,
 		},
 		{
-			name:           "different major v2.6.0",
-			bundleVersion:  "v2.6.0",
-			expectedStatus: metav1.ConditionFalse,
-			expectedReason: gatewayv1.GatewayClassReasonUnsupportedVersion,
+			name:            "different major v2.6.0",
+			bundleVersion:   "v2.6.0",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v2.6.0" is not supported (controller supports v1.6.x, built against v1.6.3)`,
 		},
 	}
 
@@ -6012,17 +6022,29 @@ func TestComputeSupportedVersionCondition(t *testing.T) {
 			if cond.ObservedGeneration != generation {
 				t.Errorf("expected ObservedGeneration=%d, got %d", generation, cond.ObservedGeneration)
 			}
-			if tc.expectedStatus == metav1.ConditionFalse {
-				// False message must include both detected and supported versions
-				if !strings.Contains(cond.Message, tc.bundleVersion) {
-					t.Errorf("expected message %q to contain detected version %q", cond.Message, tc.bundleVersion)
-				}
-				if !strings.Contains(cond.Message, gatewayconsts.BundleVersion) {
-					t.Errorf("expected message %q to contain supported version %q", cond.Message, gatewayconsts.BundleVersion)
-				}
+			if cond.Message != tc.expectedMessage {
+				t.Errorf("expected Message=%q, got %q", tc.expectedMessage, cond.Message)
 			}
 		})
 	}
+}
+
+func TestUnsupportedBundleVersionMessage(t *testing.T) {
+	t.Run("parsed compiled version derives minor range", func(t *testing.T) {
+		msg := unsupportedBundleVersionMessage("v1.7.0", "v1.6.3")
+		expected := `Gateway API CRD bundle-version "v1.7.0" is not supported (controller supports v1.6.x, built against v1.6.3)`
+		if msg != expected {
+			t.Errorf("expected %q, got %q", expected, msg)
+		}
+	})
+
+	t.Run("unparsable compiled version falls back to exact version", func(t *testing.T) {
+		msg := unsupportedBundleVersionMessage("v1.7.0", "invalid-version")
+		expected := `Gateway API CRD bundle-version "v1.7.0" is not supported (controller supports invalid-version)`
+		if msg != expected {
+			t.Errorf("expected %q, got %q", expected, msg)
+		}
+	})
 }
 
 func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
@@ -6070,11 +6092,9 @@ func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
 			if cond.ObservedGeneration != 2 {
 				t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
 			}
-			if !strings.Contains(cond.Message, ver) {
-				t.Errorf("expected message to contain detected version %q, got %q", ver, cond.Message)
-			}
-			if !strings.Contains(cond.Message, gatewayconsts.BundleVersion) {
-				t.Errorf("expected message to contain supported version %q, got %q", gatewayconsts.BundleVersion, cond.Message)
+			expectedMsg := fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v1.6.x, built against %s)", ver, gatewayconsts.BundleVersion)
+			if cond.Message != expectedMsg {
+				t.Errorf("expected Message=%q, got %q", expectedMsg, cond.Message)
 			}
 		})
 	}

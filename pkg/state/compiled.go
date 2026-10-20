@@ -2989,6 +2989,17 @@ func isSupportedBundleVersion(bundleVersion string) bool {
 	return bundleV.Major() == compiledV.Major() && bundleV.Minor() == compiledV.Minor()
 }
 
+// unsupportedBundleVersionMessage returns the condition message for an unsupported bundle version,
+// deriving the supported minor range from compiledVersion.
+// If compiledVersion cannot be parsed, it falls back to naming compiledVersion directly.
+func unsupportedBundleVersionMessage(bundleVersion, compiledVersion string) string {
+	compiledV, err := version.ParseSemantic(compiledVersion)
+	if err != nil {
+		return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s)", bundleVersion, compiledVersion)
+	}
+	return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v%d.%d.x, built against %s)", bundleVersion, compiledV.Major(), compiledV.Minor(), compiledVersion)
+}
+
 // ComputeSupportedVersionCondition computes the SupportedVersion condition for a GatewayClass given a bundle version.
 func ComputeSupportedVersionCondition(bundleVersion string, generation int64) metav1.Condition {
 	if isSupportedBundleVersion(bundleVersion) {
@@ -3004,7 +3015,7 @@ func ComputeSupportedVersionCondition(bundleVersion string, generation int64) me
 		string(gatewayv1.GatewayClassConditionStatusSupportedVersion),
 		metav1.ConditionFalse,
 		string(gatewayv1.GatewayClassReasonUnsupportedVersion),
-		fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s)", bundleVersion, gatewayconsts.BundleVersion),
+		unsupportedBundleVersionMessage(bundleVersion, gatewayconsts.BundleVersion),
 		generation,
 	)
 }
