@@ -80,3 +80,12 @@ spec:
         image: gari-controller:latest
         args:
         - --dataplane-image=${IMAGE_PREFIX}/gari-controller
+        ports:
+        - name: metrics
+          containerPort: 8999
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8999
+          initialDelaySeconds: 1
+          periodSeconds: 2

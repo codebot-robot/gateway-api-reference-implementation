@@ -1024,13 +1024,28 @@ func TestTCPListener_ConflictReservedPorts(t *testing.T) {
 			GatewayClassName: "reference-class",
 			Listeners: []gatewayv1.Listener{
 				{
-					Name:     "tcp-8000",
-					Port:     8000,
+					Name:     "tcp-8080",
+					Port:     8080,
 					Protocol: gatewayv1.TCPProtocolType,
 				},
 				{
 					Name:     "tcp-8443",
 					Port:     8443,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-8999",
+					Port:     8999,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-8000",
+					Port:     8000,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-8081",
+					Port:     8081,
 					Protocol: gatewayv1.TCPProtocolType,
 				},
 				{
@@ -1063,7 +1078,7 @@ func TestTCPListener_ConflictReservedPorts(t *testing.T) {
 		listenerStatusMap[ls.Name] = ls
 	}
 
-	for _, name := range []gatewayv1.SectionName{"tcp-8000", "tcp-8443"} {
+	for _, name := range []gatewayv1.SectionName{"tcp-8080", "tcp-8443", "tcp-8999"} {
 		ls, ok := listenerStatusMap[name]
 		if !ok {
 			t.Fatalf("listener %s status not found", name)
@@ -1079,41 +1094,43 @@ func TestTCPListener_ConflictReservedPorts(t *testing.T) {
 				progCond = &c
 			}
 		}
-		if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(gatewayv1.ListenerReasonProtocolConflict) {
-			t.Errorf("listener %s expected Conflicted=True ProtocolConflict, got %+v", name, confCond)
+		if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+			t.Errorf("listener %s expected Conflicted=True PortUnavailable, got %+v", name, confCond)
 		}
-		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse {
-			t.Errorf("listener %s expected Accepted=False, got %+v", name, acceptedCond)
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+			t.Errorf("listener %s expected Accepted=False PortUnavailable, got %+v", name, acceptedCond)
 		}
-		if progCond == nil || progCond.Status != metav1.ConditionFalse {
-			t.Errorf("listener %s expected Programmed=False, got %+v", name, progCond)
+		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+			t.Errorf("listener %s expected Programmed=False PortUnavailable, got %+v", name, progCond)
 		}
 	}
 
-	// tcp-valid must be accepted and programmed
-	validLS, ok := listenerStatusMap["tcp-valid"]
-	if !ok {
-		t.Fatalf("listener tcp-valid status not found")
-	}
-	var validAccepted, validProg *metav1.Condition
-	for _, c := range validLS.Conditions {
-		switch c.Type {
-		case string(gatewayv1.ListenerConditionAccepted):
-			validAccepted = &c
-		case string(gatewayv1.ListenerConditionProgrammed):
-			validProg = &c
+	// Unreserved ports (8000, 8081, 9000) must be accepted and programmed
+	for _, name := range []gatewayv1.SectionName{"tcp-8000", "tcp-8081", "tcp-valid"} {
+		ls, ok := listenerStatusMap[name]
+		if !ok {
+			t.Fatalf("listener %s status not found", name)
+		}
+		var validAccepted, validProg *metav1.Condition
+		for _, c := range ls.Conditions {
+			switch c.Type {
+			case string(gatewayv1.ListenerConditionAccepted):
+				validAccepted = &c
+			case string(gatewayv1.ListenerConditionProgrammed):
+				validProg = &c
+			}
+		}
+		if validAccepted == nil || validAccepted.Status != metav1.ConditionTrue {
+			t.Errorf("listener %s expected Accepted=True, got %+v", name, validAccepted)
+		}
+		if validProg == nil || validProg.Status != metav1.ConditionTrue {
+			t.Errorf("listener %s expected Programmed=True, got %+v", name, validProg)
 		}
 	}
-	if validAccepted == nil || validAccepted.Status != metav1.ConditionTrue {
-		t.Errorf("listener tcp-valid expected Accepted=True, got %+v", validAccepted)
-	}
-	if validProg == nil || validProg.Status != metav1.ConditionTrue {
-		t.Errorf("listener tcp-valid expected Programmed=True, got %+v", validProg)
-	}
 
-	// In outputs.ProxyListeners, only tcp-valid should appear
-	if len(outputs.ProxyListeners) != 1 || outputs.ProxyListeners[0].Port != 9000 {
-		t.Errorf("expected 1 proxy listener on port 9000, got %+v", outputs.ProxyListeners)
+	// In outputs.ProxyListeners, all 3 unreserved listeners should appear
+	if len(outputs.ProxyListeners) != 3 {
+		t.Errorf("expected 3 proxy listeners on unreserved ports, got %+v", outputs.ProxyListeners)
 	}
 }
 

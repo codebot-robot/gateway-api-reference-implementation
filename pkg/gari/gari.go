@@ -100,15 +100,16 @@ type Options struct {
 	ControllerName string
 
 	// MetricsAddr is the address the metrics endpoint binds to.
-	// Defaults to ":8080". Set to "0" or empty to disable metrics.
+	// Defaults to ":8999". Set to "0" or empty to disable metrics.
 	MetricsAddr string
 
 	// HealthProbeBindAddress is the address the health probe endpoint binds to.
-	// Defaults to ":8081". Set to "0" or empty to disable.
+	// Defaults to "" (health checks are served together with metrics on port 8999).
+	// Set to a host:port to serve health probes from a separate server, or "0" to disable.
 	HealthProbeBindAddress string
 
 	// ProxyAddr is the address the HTTP proxy server binds to.
-	// Defaults to ":8000". Ignored if HTTPListener is provided.
+	// Defaults to ":8080". Ignored if HTTPListener is provided.
 	ProxyAddr string
 
 	// ProxyHTTPSAddr is the address the HTTPS proxy server binds to.
@@ -224,9 +225,9 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		ControllerName:         controller.DefaultControllerName,
-		MetricsAddr:            ":8080",
-		HealthProbeBindAddress: ":8081",
-		ProxyAddr:              ":8000",
+		MetricsAddr:            ":8999",
+		HealthProbeBindAddress: "",
+		ProxyAddr:              ":8080",
 		ProxyHTTPSAddr:         ":8443",
 		LeaderElectionID:       "gateway-api-reference-implementation",
 		UDPIdleTimeout:         proxy.DefaultUDPIdleTimeout,
@@ -331,6 +332,12 @@ func New(opts Options) (*Server, error) {
 		p.SetForwardedForMode(opts.ForwardedForMode)
 	}
 
+	s := &Server{
+		opts:  opts,
+		state: st,
+		proxy: p,
+	}
+
 	mgr := opts.Manager
 	if mgr == nil {
 		cfg := opts.RestConfig
@@ -342,14 +349,25 @@ func New(opts Options) (*Server, error) {
 			}
 		}
 
+		readyzHandler, healthzHandler := s.healthzHandlers()
+		metricsOpts := metricsserver.Options{
+			BindAddress: opts.MetricsAddr,
+		}
+		if (opts.HealthProbeBindAddress == "" || opts.HealthProbeBindAddress == "0") && opts.MetricsAddr != "0" {
+			metricsOpts.ExtraHandlers = map[string]http.Handler{
+				"/healthz":  http.StripPrefix("/healthz", healthzHandler),
+				"/healthz/": http.StripPrefix("/healthz", healthzHandler),
+				"/readyz":   http.StripPrefix("/readyz", readyzHandler),
+				"/readyz/":  http.StripPrefix("/readyz", readyzHandler),
+			}
+		}
+
 		var err error
 		if opts.DataplaneMode {
 			secretName := singlepod.ResourceNameForGateway(opts.DataplaneGatewayName)
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-				Scheme: opts.Scheme,
-				Metrics: metricsserver.Options{
-					BindAddress: opts.MetricsAddr,
-				},
+				Scheme:                 opts.Scheme,
+				Metrics:                metricsOpts,
 				HealthProbeBindAddress: opts.HealthProbeBindAddress,
 				LeaderElection:         false,
 				Cache: cache.Options{
@@ -366,10 +384,8 @@ func New(opts Options) (*Server, error) {
 			})
 		} else {
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
-				Scheme: opts.Scheme,
-				Metrics: metricsserver.Options{
-					BindAddress: opts.MetricsAddr,
-				},
+				Scheme:  opts.Scheme,
+				Metrics: metricsOpts,
 				WebhookServer: webhook.NewServer(webhook.Options{
 					Port: 9443,
 				}),
@@ -383,12 +399,7 @@ func New(opts Options) (*Server, error) {
 		}
 	}
 
-	s := &Server{
-		opts:    opts,
-		manager: mgr,
-		state:   st,
-		proxy:   p,
-	}
+	s.manager = mgr
 
 	if err := s.SetupWithManager(mgr); err != nil {
 		return nil, err
@@ -403,18 +414,46 @@ func NewWithManager(mgr ctrl.Manager, opts Options) (*Server, error) {
 	return New(opts)
 }
 
+func (s *Server) readyzChecker() healthz.Checker {
+	return func(req *http.Request) error {
+		if !s.proxySynced.Load() {
+			return errors.New("proxy configuration not yet applied")
+		}
+		return nil
+	}
+}
+
+func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Handler) {
+	rHandler := &healthz.Handler{Checks: map[string]healthz.Checker{"readyz": s.readyzChecker()}}
+	hHandler := &healthz.Handler{Checks: map[string]healthz.Checker{"ping": healthz.Ping}}
+	return rHandler, hHandler
+}
+
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
-	if s.opts.DataplaneMode {
-		if err := mgr.AddReadyzCheck("readyz", healthz.Checker(func(req *http.Request) error {
-			if !s.proxySynced.Load() {
-				return errors.New("proxy configuration not yet applied")
-			}
-			return nil
-		})); err != nil {
-			return fmt.Errorf("failed to register readyz check: %w", err)
+	if s.opts.Manager != nil && (s.opts.HealthProbeBindAddress == "" || s.opts.HealthProbeBindAddress == "0") && s.opts.MetricsAddr != "0" {
+		readyzHandler, healthzHandler := s.healthzHandlers()
+		if err := mgr.AddMetricsServerExtraHandler("/healthz", http.StripPrefix("/healthz", healthzHandler)); err != nil {
+			return fmt.Errorf("failed to register /healthz metrics extra handler: %w", err)
 		}
+		if err := mgr.AddMetricsServerExtraHandler("/healthz/", http.StripPrefix("/healthz", healthzHandler)); err != nil {
+			return fmt.Errorf("failed to register /healthz/ metrics extra handler: %w", err)
+		}
+		if err := mgr.AddMetricsServerExtraHandler("/readyz", http.StripPrefix("/readyz", readyzHandler)); err != nil {
+			return fmt.Errorf("failed to register /readyz metrics extra handler: %w", err)
+		}
+		if err := mgr.AddMetricsServerExtraHandler("/readyz/", http.StripPrefix("/readyz", readyzHandler)); err != nil {
+			return fmt.Errorf("failed to register /readyz/ metrics extra handler: %w", err)
+		}
+	}
+	if err := mgr.AddReadyzCheck("readyz", s.readyzChecker()); err != nil {
+		return fmt.Errorf("failed to register readyz check: %w", err)
+	}
+	if err := mgr.AddHealthzCheck("ping", healthz.Ping); err != nil {
+		return fmt.Errorf("failed to register healthz check: %w", err)
+	}
 
+	if s.opts.DataplaneMode {
 		secretName := singlepod.ResourceNameForGateway(s.opts.DataplaneGatewayName)
 		reconciler := &dataplaneSecretReconciler{
 			Client:           mgr.GetClient(),
@@ -437,15 +476,6 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		if userHook != nil {
 			userHook(gateways)
 		}
-	}
-
-	if err := mgr.AddReadyzCheck("readyz", healthz.Checker(func(req *http.Request) error {
-		if !s.proxySynced.Load() {
-			return errors.New("proxy configuration not yet applied")
-		}
-		return nil
-	})); err != nil {
-		return fmt.Errorf("failed to register readyz check: %w", err)
 	}
 
 	return controller.RegisterReconcilers(mgr, s.state, s.proxy, controller.ReconcilerOptions{
