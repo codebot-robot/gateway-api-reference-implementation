@@ -21,6 +21,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net/http"
 	"strings"
@@ -5931,6 +5932,121 @@ func TestListener_OverlappingTLSConfig(t *testing.T) {
 	})
 }
 
+func TestComputeSupportedVersionCondition(t *testing.T) {
+	generation := int64(3)
+
+	tests := []struct {
+		name            string
+		bundleVersion   string
+		expectedStatus  metav1.ConditionStatus
+		expectedReason  gatewayv1.GatewayClassConditionReason
+		expectedMessage string
+	}{
+		{
+			name:            "same minor version v1.6.0",
+			bundleVersion:   "v1.6.0",
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.0" is supported`,
+		},
+		{
+			name:            "matching version v1.6.3",
+			bundleVersion:   "v1.6.3",
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.3" is supported`,
+		},
+		{
+			name:            "same minor higher patch v1.6.9",
+			bundleVersion:   "v1.6.9",
+			expectedStatus:  metav1.ConditionTrue,
+			expectedReason:  gatewayv1.GatewayClassReasonSupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.9" is supported`,
+		},
+		{
+			name:            "older minor v1.5.2",
+			bundleVersion:   "v1.5.2",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.5.2" is not supported (controller supports v1.6.x, built against v1.6.3)`,
+		},
+		{
+			name:            "newer minor v1.7.0",
+			bundleVersion:   "v1.7.0",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.7.0" is not supported (controller supports v1.6.x, built against v1.6.3)`,
+		},
+		{
+			name:            "garbage version",
+			bundleVersion:   "garbage",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "garbage" is not supported (controller supports v1.6.x, built against v1.6.3)`,
+		},
+		{
+			name:            "empty version",
+			bundleVersion:   "",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "" is not supported (controller supports v1.6.x, built against v1.6.3)`,
+		},
+		{
+			name:            "pre-release version v1.6.0-rc1",
+			bundleVersion:   "v1.6.0-rc1",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v1.6.0-rc1" is not supported (controller supports v1.6.x, built against v1.6.3)`,
+		},
+		{
+			name:            "different major v2.6.0",
+			bundleVersion:   "v2.6.0",
+			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  gatewayv1.GatewayClassReasonUnsupportedVersion,
+			expectedMessage: `Gateway API CRD bundle-version "v2.6.0" is not supported (controller supports v1.6.x, built against v1.6.3)`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cond := ComputeSupportedVersionCondition(tc.bundleVersion, generation)
+			if cond.Type != string(gatewayv1.GatewayClassConditionStatusSupportedVersion) {
+				t.Errorf("expected Type=%s, got %s", gatewayv1.GatewayClassConditionStatusSupportedVersion, cond.Type)
+			}
+			if cond.Status != tc.expectedStatus {
+				t.Errorf("expected Status=%s, got %s", tc.expectedStatus, cond.Status)
+			}
+			if cond.Reason != string(tc.expectedReason) {
+				t.Errorf("expected Reason=%s, got %s", tc.expectedReason, cond.Reason)
+			}
+			if cond.ObservedGeneration != generation {
+				t.Errorf("expected ObservedGeneration=%d, got %d", generation, cond.ObservedGeneration)
+			}
+			if cond.Message != tc.expectedMessage {
+				t.Errorf("expected Message=%q, got %q", tc.expectedMessage, cond.Message)
+			}
+		})
+	}
+}
+
+func TestUnsupportedBundleVersionMessage(t *testing.T) {
+	t.Run("parsed compiled version derives minor range", func(t *testing.T) {
+		msg := unsupportedBundleVersionMessage("v1.7.0", "v1.6.3")
+		expected := `Gateway API CRD bundle-version "v1.7.0" is not supported (controller supports v1.6.x, built against v1.6.3)`
+		if msg != expected {
+			t.Errorf("expected %q, got %q", expected, msg)
+		}
+	})
+
+	t.Run("unparsable compiled version falls back to exact version", func(t *testing.T) {
+		msg := unsupportedBundleVersionMessage("v1.7.0", "invalid-version")
+		expected := `Gateway API CRD bundle-version "v1.7.0" is not supported (controller supports invalid-version)`
+		if msg != expected {
+			t.Errorf("expected %q, got %q", expected, msg)
+		}
+	})
+}
+
 func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
 	gc := &gatewayv1.GatewayClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-class", Generation: 2},
@@ -5939,44 +6055,61 @@ func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
 		},
 	}
 
-	t.Run("matching version: SupportedVersion=True", func(t *testing.T) {
-		matchingVersion := gatewayconsts.BundleVersion
-		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &matchingVersion)
-		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
-		if cond == nil {
-			t.Fatalf("expected SupportedVersion condition, got nil")
-		}
-		if cond.Status != metav1.ConditionTrue {
-			t.Errorf("expected Status=True, got %s", cond.Status)
-		}
-		if cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
-			t.Errorf("expected Reason=SupportedVersion, got %s", cond.Reason)
-		}
-		if cond.ObservedGeneration != 2 {
-			t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
-		}
-	})
+	for _, v := range []string{"v1.6.0", "v1.6.3", "v1.6.9"} {
+		t.Run(fmt.Sprintf("supported version %s yields SupportedVersion=True", v), func(t *testing.T) {
+			ver := v
+			status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &ver)
+			cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+			if cond == nil {
+				t.Fatalf("expected SupportedVersion condition, got nil")
+			}
+			if cond.Status != metav1.ConditionTrue {
+				t.Errorf("expected Status=True, got %s", cond.Status)
+			}
+			if cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+				t.Errorf("expected Reason=SupportedVersion, got %s", cond.Reason)
+			}
+			if cond.ObservedGeneration != 2 {
+				t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
+			}
+		})
+	}
 
-	t.Run("mismatched version: SupportedVersion=False", func(t *testing.T) {
-		mismatchedVersion := "v1.5.0"
-		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &mismatchedVersion)
-		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
-		if cond == nil {
-			t.Fatalf("expected SupportedVersion condition, got nil")
-		}
-		if cond.Status != metav1.ConditionFalse {
-			t.Errorf("expected Status=False, got %s", cond.Status)
-		}
-		if cond.Reason != string(gatewayv1.GatewayClassReasonUnsupportedVersion) {
-			t.Errorf("expected Reason=UnsupportedVersion, got %s", cond.Reason)
-		}
-		if cond.ObservedGeneration != 2 {
-			t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
-		}
-	})
+	for _, v := range []string{"v1.5.2", "v1.7.0", "garbage", "v1.6.0-rc1"} {
+		t.Run(fmt.Sprintf("unsupported version %s yields SupportedVersion=False", v), func(t *testing.T) {
+			ver := v
+			status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &ver)
+			cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+			if cond == nil {
+				t.Fatalf("expected SupportedVersion condition, got nil")
+			}
+			if cond.Status != metav1.ConditionFalse {
+				t.Errorf("expected Status=False, got %s", cond.Status)
+			}
+			if cond.Reason != string(gatewayv1.GatewayClassReasonUnsupportedVersion) {
+				t.Errorf("expected Reason=UnsupportedVersion, got %s", cond.Reason)
+			}
+			if cond.ObservedGeneration != 2 {
+				t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
+			}
+			expectedMsg := fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v1.6.x, built against %s)", ver, gatewayconsts.BundleVersion)
+			if cond.Message != expectedMsg {
+				t.Errorf("expected Message=%q, got %q", expectedMsg, cond.Message)
+			}
+		})
+	}
 
 	t.Run("nil version: SupportedVersion absent", func(t *testing.T) {
 		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", nil)
+		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond != nil {
+			t.Errorf("expected SupportedVersion condition to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("empty version: SupportedVersion absent", func(t *testing.T) {
+		empty := ""
+		status := ComputeDesiredGatewayClassStatus(gc, "test-controller", &empty)
 		cond := FindCondition(status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
 		if cond != nil {
 			t.Errorf("expected SupportedVersion condition to be absent, got %+v", cond)

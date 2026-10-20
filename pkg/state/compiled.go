@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -2971,9 +2972,37 @@ func ComputeDesiredBackendTLSPolicyStatus(
 	return gatewayv1.PolicyStatus{Ancestors: ancestors}
 }
 
+// isSupportedBundleVersion returns true if bundleVersion has the same major and minor
+// version as the compiled-in Gateway API bundle version, is valid semver, and is not a pre-release.
+func isSupportedBundleVersion(bundleVersion string) bool {
+	compiledV, err := version.ParseSemantic(gatewayconsts.BundleVersion)
+	if err != nil {
+		return bundleVersion == gatewayconsts.BundleVersion
+	}
+	bundleV, err := version.ParseSemantic(bundleVersion)
+	if err != nil {
+		return false
+	}
+	if bundleV.PreRelease() != "" {
+		return false
+	}
+	return bundleV.Major() == compiledV.Major() && bundleV.Minor() == compiledV.Minor()
+}
+
+// unsupportedBundleVersionMessage returns the condition message for an unsupported bundle version,
+// deriving the supported minor range from compiledVersion.
+// If compiledVersion cannot be parsed, it falls back to naming compiledVersion directly.
+func unsupportedBundleVersionMessage(bundleVersion, compiledVersion string) string {
+	compiledV, err := version.ParseSemantic(compiledVersion)
+	if err != nil {
+		return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s)", bundleVersion, compiledVersion)
+	}
+	return fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports v%d.%d.x, built against %s)", bundleVersion, compiledV.Major(), compiledV.Minor(), compiledVersion)
+}
+
 // ComputeSupportedVersionCondition computes the SupportedVersion condition for a GatewayClass given a bundle version.
 func ComputeSupportedVersionCondition(bundleVersion string, generation int64) metav1.Condition {
-	if bundleVersion == gatewayconsts.BundleVersion {
+	if isSupportedBundleVersion(bundleVersion) {
 		return NewCondition(
 			string(gatewayv1.GatewayClassConditionStatusSupportedVersion),
 			metav1.ConditionTrue,
@@ -2986,7 +3015,7 @@ func ComputeSupportedVersionCondition(bundleVersion string, generation int64) me
 		string(gatewayv1.GatewayClassConditionStatusSupportedVersion),
 		metav1.ConditionFalse,
 		string(gatewayv1.GatewayClassReasonUnsupportedVersion),
-		fmt.Sprintf("Gateway API CRD bundle-version %q is not supported (controller supports %s)", bundleVersion, gatewayconsts.BundleVersion),
+		unsupportedBundleVersionMessage(bundleVersion, gatewayconsts.BundleVersion),
 		generation,
 	)
 }

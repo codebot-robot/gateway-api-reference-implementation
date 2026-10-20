@@ -22,6 +22,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -566,6 +567,15 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		},
 	}
 
+	crdWithDifferentPatchVersion := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gateways.gateway.networking.k8s.io",
+			Annotations: map[string]string{
+				gatewayconsts.BundleVersionAnnotation: "v1.6.0",
+			},
+		},
+	}
+
 	crdWithMismatchedVersion := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "gateways.gateway.networking.k8s.io",
@@ -585,6 +595,46 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		client := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(gc.DeepCopy(), crdWithMatchingVersion).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond == nil {
+			t.Fatalf("expected SupportedVersion condition, got nil")
+		}
+		if cond.Status != metav1.ConditionTrue {
+			t.Errorf("expected Status=True, got %s", cond.Status)
+		}
+		if cond.Reason != string(gatewayv1.GatewayClassReasonSupportedVersion) {
+			t.Errorf("expected Reason=SupportedVersion, got %s", cond.Reason)
+		}
+		if cond.ObservedGeneration != 1 {
+			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
+		}
+	})
+
+	t.Run("different patch CRD annotation yields SupportedVersion=True", func(t *testing.T) {
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithDifferentPatchVersion).
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
@@ -659,12 +709,56 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		if cond.ObservedGeneration != 1 {
 			t.Errorf("expected ObservedGeneration=1, got %d", cond.ObservedGeneration)
 		}
+		expectedMsg := fmt.Sprintf("Gateway API CRD bundle-version \"v1.5.0\" is not supported (controller supports v1.6.x, built against %s)", gatewayconsts.BundleVersion)
+		if cond.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, cond.Message)
+		}
 	})
 
 	t.Run("CRD without bundle-version annotation leaves SupportedVersion absent", func(t *testing.T) {
 		client := fake.NewClientBuilder().
 			WithScheme(scheme).
 			WithObjects(gc.DeepCopy(), crdWithoutAnnotation).
+			WithStatusSubresource(gc.DeepCopy()).
+			Build()
+
+		r := &GatewayClassReconciler{
+			Client:         client,
+			APIReader:      client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+		}
+
+		ctx := t.Context()
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		if err != nil {
+			t.Fatalf("unexpected reconcile error: %v", err)
+		}
+
+		var res gatewayv1.GatewayClass
+		if err := client.Get(ctx, types.NamespacedName{Name: "test-gc"}, &res); err != nil {
+			t.Fatalf("failed to get GatewayClass: %v", err)
+		}
+
+		cond := findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusSupportedVersion))
+		if cond != nil {
+			t.Errorf("expected SupportedVersion condition to be absent, got %+v", cond)
+		}
+	})
+
+	t.Run("CRD with empty bundle-version annotation leaves SupportedVersion absent", func(t *testing.T) {
+		crdWithEmptyAnnotation := &apiextensionsv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "gateways.gateway.networking.k8s.io",
+				Annotations: map[string]string{
+					gatewayconsts.BundleVersionAnnotation: "",
+				},
+			},
+		}
+
+		client := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc.DeepCopy(), crdWithEmptyAnnotation).
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
