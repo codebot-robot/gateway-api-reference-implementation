@@ -24,7 +24,7 @@ IMAGE_TAG=${IMAGE_TAG:-latest}
 IMAGE_NAME=${IMAGE_NAME:-gari-controller}
 
 echo "Building docker image ${IMAGE_NAME}:${IMAGE_TAG}..."
-docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+docker build -f images/gari-controller/Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" .
 
 if [[ "${KUBERNETES_CLUSTER:-}" == "kind" ]]; then
     KIND_CLUSTER_NAME=${KIND_CLUSTER_NAME:-kind}
@@ -38,5 +38,6 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/downloa
 echo "Deploying controller..."
 kubectl apply -f k8s/controller.yaml
 kubectl set image deployment/gari-controller controller="${IMAGE_NAME}:${IMAGE_TAG}"
+kubectl patch deployment gari-controller -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"controller\",\"imagePullPolicy\":\"IfNotPresent\",\"args\":[\"--dataplane-image=${IMAGE_NAME}:${IMAGE_TAG}\"]}]}}}}"
 
 echo "Deployment complete."
