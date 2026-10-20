@@ -66,8 +66,8 @@ func TestDefaultOptions(t *testing.T) {
 	if opts.MetricsAddr != ":8999" {
 		t.Errorf("expected metrics addr :8999, got %q", opts.MetricsAddr)
 	}
-	if opts.HealthProbeBindAddress != "" {
-		t.Errorf("expected probe addr to be empty by default, got %q", opts.HealthProbeBindAddress)
+	if opts.HealthProbeBindAddress != ":8999" {
+		t.Errorf("expected probe addr :8999, got %q", opts.HealthProbeBindAddress)
 	}
 	if opts.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("expected read header timeout 10s, got %v", opts.ReadHeaderTimeout)
@@ -210,6 +210,30 @@ func TestMetricsAndHealthServer(t *testing.T) {
 	metricsBody, _ := io.ReadAll(respMetrics.Body)
 	if !strings.Contains(string(metricsBody), "promhttp_metric_handler_requests_total") && !strings.Contains(string(metricsBody), "go_goroutines") {
 		t.Errorf("expected prometheus metrics in response, got %s", string(metricsBody[:min(len(metricsBody), 200)]))
+	}
+}
+
+func TestSamePortOrAddr(t *testing.T) {
+	tests := []struct {
+		addr1    string
+		addr2    string
+		expected bool
+	}{
+		{":8999", ":8999", true},
+		{"0.0.0.0:8999", ":8999", true},
+		{":8999", "127.0.0.1:8999", true},
+		{"127.0.0.1:8999", "127.0.0.1:8999", true},
+		{":8999", ":8081", false},
+		{":8999", "127.0.0.1:8081", false},
+		{"", "", false},
+		{"0", "0", false},
+		{":0", ":0", false},
+		{"127.0.0.1:0", "127.0.0.1:0", false},
+	}
+	for _, tc := range tests {
+		if actual := samePortOrAddr(tc.addr1, tc.addr2); actual != tc.expected {
+			t.Errorf("samePortOrAddr(%q, %q) = %v, want %v", tc.addr1, tc.addr2, actual, tc.expected)
+		}
 	}
 }
 

@@ -47,7 +47,7 @@ func main() {
 	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
 	flag.StringVar(&dataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
 	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
-	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to (disabled by default; probes are served on the metrics endpoint).")
+	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to for HTTP.")
 	flag.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "The address the proxy binds to for HTTPS.")
 	flag.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (disabled by default).")

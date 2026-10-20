@@ -104,8 +104,9 @@ type Options struct {
 	MetricsAddr string
 
 	// HealthProbeBindAddress is the address the health probe endpoint binds to.
-	// Defaults to "" (health checks are served together with metrics on port 8999).
-	// Set to a host:port to serve health probes from a separate server, or "0" to disable.
+	// Defaults to ":8999". If configured to the same port as MetricsAddr, health checks
+	// and metrics share a single listener. Set to a separate host:port to serve health probes
+	// from a separate server, or "0" to disable.
 	HealthProbeBindAddress string
 
 	// ProxyAddr is the address the HTTP proxy server binds to.
@@ -226,7 +227,7 @@ func DefaultOptions() Options {
 	return Options{
 		ControllerName:         controller.DefaultControllerName,
 		MetricsAddr:            ":8999",
-		HealthProbeBindAddress: "",
+		HealthProbeBindAddress: ":8999",
 		ProxyAddr:              ":8080",
 		ProxyHTTPSAddr:         ":8443",
 		LeaderElectionID:       "gateway-api-reference-implementation",
@@ -353,13 +354,15 @@ func New(opts Options) (*Server, error) {
 		metricsOpts := metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
 		}
-		if (opts.HealthProbeBindAddress == "" || opts.HealthProbeBindAddress == "0") && opts.MetricsAddr != "0" {
+		healthProbeBindAddress := opts.HealthProbeBindAddress
+		if samePortOrAddr(opts.MetricsAddr, opts.HealthProbeBindAddress) && opts.MetricsAddr != "" && opts.MetricsAddr != "0" && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
 			metricsOpts.ExtraHandlers = map[string]http.Handler{
 				"/healthz":  http.StripPrefix("/healthz", healthzHandler),
 				"/healthz/": http.StripPrefix("/healthz", healthzHandler),
 				"/readyz":   http.StripPrefix("/readyz", readyzHandler),
 				"/readyz/":  http.StripPrefix("/readyz", readyzHandler),
 			}
+			healthProbeBindAddress = ""
 		}
 
 		var err error
@@ -368,7 +371,7 @@ func New(opts Options) (*Server, error) {
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
 				Scheme:                 opts.Scheme,
 				Metrics:                metricsOpts,
-				HealthProbeBindAddress: opts.HealthProbeBindAddress,
+				HealthProbeBindAddress: healthProbeBindAddress,
 				LeaderElection:         false,
 				Cache: cache.Options{
 					ByObject: map[client.Object]cache.ByObject{
@@ -389,7 +392,7 @@ func New(opts Options) (*Server, error) {
 				WebhookServer: webhook.NewServer(webhook.Options{
 					Port: 9443,
 				}),
-				HealthProbeBindAddress: opts.HealthProbeBindAddress,
+				HealthProbeBindAddress: healthProbeBindAddress,
 				LeaderElection:         opts.LeaderElection,
 				LeaderElectionID:       opts.LeaderElectionID,
 			})
@@ -414,6 +417,22 @@ func NewWithManager(mgr ctrl.Manager, opts Options) (*Server, error) {
 	return New(opts)
 }
 
+func samePortOrAddr(addr1, addr2 string) bool {
+	if addr1 == addr2 && addr1 != "0" && addr1 != ":0" && addr1 != "" {
+		_, port, err := net.SplitHostPort(addr1)
+		if err == nil && port == "0" {
+			return false
+		}
+		return true
+	}
+	_, port1, err1 := net.SplitHostPort(addr1)
+	_, port2, err2 := net.SplitHostPort(addr2)
+	if err1 == nil && err2 == nil && port1 == port2 && port1 != "" && port1 != "0" {
+		return true
+	}
+	return false
+}
+
 func (s *Server) readyzChecker() healthz.Checker {
 	return func(req *http.Request) error {
 		if !s.proxySynced.Load() {
@@ -431,21 +450,6 @@ func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Han
 
 // SetupWithManager registers all GARI reconcilers with the given Manager.
 func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
-	if s.opts.Manager != nil && (s.opts.HealthProbeBindAddress == "" || s.opts.HealthProbeBindAddress == "0") && s.opts.MetricsAddr != "0" {
-		readyzHandler, healthzHandler := s.healthzHandlers()
-		if err := mgr.AddMetricsServerExtraHandler("/healthz", http.StripPrefix("/healthz", healthzHandler)); err != nil {
-			return fmt.Errorf("failed to register /healthz metrics extra handler: %w", err)
-		}
-		if err := mgr.AddMetricsServerExtraHandler("/healthz/", http.StripPrefix("/healthz", healthzHandler)); err != nil {
-			return fmt.Errorf("failed to register /healthz/ metrics extra handler: %w", err)
-		}
-		if err := mgr.AddMetricsServerExtraHandler("/readyz", http.StripPrefix("/readyz", readyzHandler)); err != nil {
-			return fmt.Errorf("failed to register /readyz metrics extra handler: %w", err)
-		}
-		if err := mgr.AddMetricsServerExtraHandler("/readyz/", http.StripPrefix("/readyz", readyzHandler)); err != nil {
-			return fmt.Errorf("failed to register /readyz/ metrics extra handler: %w", err)
-		}
-	}
 	if err := mgr.AddReadyzCheck("readyz", s.readyzChecker()); err != nil {
 		return fmt.Errorf("failed to register readyz check: %w", err)
 	}

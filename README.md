@@ -106,7 +106,7 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--metrics-bind-address` | `:8999` | Address the metric and health probe endpoint binds to. |
-| `--health-probe-bind-address` | `""` (disabled) | Address the health probe endpoint binds to (disabled by default; probes are served on the metrics listener). |
+| `--health-probe-bind-address` | `:8999` | Address the health probe endpoint binds to (if configured to the same port as `--metrics-bind-address`, probes and metrics share a single listener). |
 | `--read-header-timeout` | `10s` | Maximum duration allowed to read request headers and complete TLS handshakes on HTTP and HTTPS servers. |
 | `--idle-timeout` | `60s` | Maximum duration to wait for the next request on keep-alive connections (and QUIC `MaxIdleTimeout` for HTTP/3). |
 | `--read-timeout` | `0s` (disabled) | Maximum duration for reading the entire request, including body. |
