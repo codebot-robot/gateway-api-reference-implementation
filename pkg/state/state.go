@@ -782,7 +782,19 @@ func (s *State) diffAndEmitLocked(outputs *Outputs) {
 	for k := range allGWKeys {
 		cur, curOk := outputs.GatewayStatuses[k]
 		old, oldOk := prevGWStatuses[k]
-		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) {
+		curP := outputs.GatewayParameters[k]
+		var oldP *Parameters
+		if prev != nil && prev.GatewayParameters != nil {
+			oldP = prev.GatewayParameters[k]
+		}
+		curErr := outputs.GatewayParametersErrors[k]
+		var oldErr error
+		if prev != nil && prev.GatewayParametersErrors != nil {
+			oldErr = prev.GatewayParametersErrors[k]
+		}
+		errChanged := (curErr == nil) != (oldErr == nil) || (curErr != nil && oldErr != nil && curErr.Error() != oldErr.Error())
+		paramsChanged := !ParametersEqual(curP, oldP) || errChanged
+		if curOk != oldOk || (curOk && !GatewayStatusesEqual(cur, old)) || paramsChanged {
 			s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: k})
 		}
 	}
@@ -984,6 +996,26 @@ func (s *State) GetDesiredGatewayStatus(key types.NamespacedName) (gatewayv1.Gat
 	}
 	st, ok := s.previousOutputs.GatewayStatuses[key]
 	return st, ok
+}
+
+// GetGatewayParameters returns the resolved Parameters for a Gateway.
+// - params: the resolved parameters.
+// - found: true if State has compiled outputs for this Gateway; false if not yet computed.
+// - err: non-nil if parameter resolution failed for this Gateway or its GatewayClass.
+func (s *State) GetGatewayParameters(key types.NamespacedName) (*Parameters, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.previousOutputs == nil {
+		return nil, false, nil
+	}
+	if pErr, ok := s.previousOutputs.GatewayParametersErrors[key]; ok && pErr != nil {
+		return nil, true, pErr
+	}
+	p, ok := s.previousOutputs.GatewayParameters[key]
+	if !ok {
+		return nil, false, nil
+	}
+	return p, true, nil
 }
 
 func (s *State) GetDesiredHTTPRouteStatus(key types.NamespacedName) (gatewayv1.HTTPRouteStatus, bool) {

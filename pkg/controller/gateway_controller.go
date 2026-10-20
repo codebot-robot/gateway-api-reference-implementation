@@ -174,7 +174,28 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				supportedTypes = r.State.GetSupportedAddressTypes()
 			}
 
-			if unsupp, _ := state.HasUnsupportedAddress(gw.Spec.Addresses, supportedTypes); unsupp {
+			var paramsErr error
+			if r.State != nil {
+				var found bool
+				_, found, paramsErr = r.State.GetGatewayParameters(req.NamespacedName)
+				if !found {
+					// State has not computed outputs for this Gateway yet.
+					// Leave Gateway pending without provisioning default resources;
+					// State diff will enqueue the Gateway once outputs are computed.
+					return ctrl.Result{}, nil
+				}
+			}
+
+			if paramsErr != nil {
+				// Parameters resolution error (Gateway or GatewayClass): fail closed, leave existing resources as they are.
+				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
+				r.State.SetGatewayAddresses(req.NamespacedName, nil)
+				r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{
+					Ready:   false,
+					Reason:  string(gatewayv1.GatewayReasonInvalidParameters),
+					Message: paramsErr.Error(),
+				})
+			} else if unsupp, _ := state.HasUnsupportedAddress(gw.Spec.Addresses, supportedTypes); unsupp {
 				r.State.SetGatewayProvisioningError(req.NamespacedName, "")
 				r.State.SetGatewayAddresses(req.NamespacedName, nil)
 				r.State.SetGatewayReadiness(req.NamespacedName, state.GatewayReadiness{Ready: false})
@@ -240,6 +261,9 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&gatewayv1.Gateway{})
 
 	if r.State != nil {
+		if sp, ok := r.AddressProvider.(interface{ SetState(*state.State) }); ok {
+			sp.SetState(r.State)
+		}
 		bldr.WatchesRawSource(r.State.GatewaySource())
 	}
 

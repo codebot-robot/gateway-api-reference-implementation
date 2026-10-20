@@ -363,6 +363,8 @@ type CompiledGateway struct {
 	Conditions            []metav1.Condition
 	BackendClientCert     *tls.Certificate
 	ResolvedRefsCondition metav1.Condition
+	Parameters            *Parameters
+	ParametersRefError    error
 }
 
 // CompiledRoute contains the compiled state for an HTTPRoute.
@@ -481,6 +483,8 @@ type ModelInputs struct {
 type Outputs struct {
 	Revision                 uint64
 	GatewayStatuses          map[types.NamespacedName]gatewayv1.GatewayStatus
+	GatewayParameters        map[types.NamespacedName]*Parameters
+	GatewayParametersErrors  map[types.NamespacedName]error
 	HTTPRouteStatuses        map[types.NamespacedName]gatewayv1.HTTPRouteStatus
 	TLSRouteStatuses         map[types.NamespacedName]gatewayv1.TLSRouteStatus
 	GRPCRouteStatuses        map[types.NamespacedName]gatewayv1.GRPCRouteStatus
@@ -1113,6 +1117,7 @@ func ComputeGatewayConditions(
 	provErr string,
 	supportedAddressTypes []gatewayv1.AddressType,
 	resolvedRefsCond metav1.Condition,
+	paramsErr error,
 ) []metav1.Condition {
 	totalListeners := len(gw.Spec.Listeners)
 	acceptedListenersCount := 0
@@ -1129,26 +1134,29 @@ func ComputeGatewayConditions(
 	gwAcceptedReason := gatewayv1.GatewayReasonAccepted
 	gwAcceptedMessage := "Gateway accepted by reference implementation"
 
-	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+	if paramsErr != nil {
 		gwAcceptedStatus = metav1.ConditionFalse
 		gwAcceptedReason = gatewayv1.GatewayReasonInvalidParameters
-		gwAcceptedMessage = "Invalid infrastructure parametersRef: parametersRef is not supported"
-	} else if unsupp, unsuppType := HasUnsupportedAddress(gw.Spec.Addresses, supportedAddressTypes); unsupp {
-		gwAcceptedStatus = metav1.ConditionFalse
-		gwAcceptedReason = gatewayv1.GatewayReasonUnsupportedAddress
-		gwAcceptedMessage = fmt.Sprintf("Address type %q is not supported", unsuppType)
-	} else if totalListeners == 0 {
-		gwAcceptedStatus = metav1.ConditionFalse
-		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
-		gwAcceptedMessage = "No listeners configured on Gateway"
-	} else if acceptedListenersCount == 0 {
-		gwAcceptedStatus = metav1.ConditionFalse
-		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
-		gwAcceptedMessage = "No listeners are accepted"
-	} else if acceptedListenersCount < totalListeners {
-		gwAcceptedStatus = metav1.ConditionTrue
-		gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
-		gwAcceptedMessage = "One or more listeners have invalid configuration"
+		gwAcceptedMessage = paramsErr.Error()
+	}
+	if gwAcceptedStatus == metav1.ConditionTrue {
+		if unsupp, unsuppType := HasUnsupportedAddress(gw.Spec.Addresses, supportedAddressTypes); unsupp {
+			gwAcceptedStatus = metav1.ConditionFalse
+			gwAcceptedReason = gatewayv1.GatewayReasonUnsupportedAddress
+			gwAcceptedMessage = fmt.Sprintf("Address type %q is not supported", unsuppType)
+		} else if totalListeners == 0 {
+			gwAcceptedStatus = metav1.ConditionFalse
+			gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
+			gwAcceptedMessage = "No listeners configured on Gateway"
+		} else if acceptedListenersCount == 0 {
+			gwAcceptedStatus = metav1.ConditionFalse
+			gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
+			gwAcceptedMessage = "No listeners are accepted"
+		} else if acceptedListenersCount < totalListeners {
+			gwAcceptedStatus = metav1.ConditionTrue
+			gwAcceptedReason = gatewayv1.GatewayReasonListenersNotValid
+			gwAcceptedMessage = "One or more listeners have invalid configuration"
+		}
 	}
 
 	gwProgrammedStatus := metav1.ConditionTrue
@@ -1542,10 +1550,41 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 		if inputs.ProvisioningErrors != nil {
 			provErr = inputs.ProvisioningErrors[gwKey]
 		}
+		var gcParams *Parameters
+		var paramsErr error
+		for _, gc := range inputs.GatewayClasses {
+			if gc != nil && gc.Name == string(gw.Spec.GatewayClassName) {
+				if gc.Spec.ParametersRef != nil {
+					p, err := ValidateGatewayClassParametersRef(gc.Spec.ParametersRef, inputs.ConfigMaps)
+					if err != nil {
+						paramsErr = fmt.Errorf("invalid GatewayClass parametersRef: %w", err)
+					} else {
+						gcParams = p
+					}
+				}
+				break
+			}
+		}
+		var gwParams *Parameters
+		if paramsErr == nil && gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+			p, err := ValidateGatewayParametersRef(gw.Spec.Infrastructure.ParametersRef, gw.Namespace, inputs.ConfigMaps)
+			if err != nil {
+				paramsErr = fmt.Errorf("invalid infrastructure parametersRef: %w", err)
+			} else {
+				gwParams = p
+			}
+		}
+		cg.ParametersRefError = paramsErr
+		if paramsErr == nil {
+			cg.Parameters = MergeParameters(gcParams, gwParams)
+		} else {
+			cg.Parameters = nil
+		}
+
 		clientCert, resolvedRefsCond := resolveGatewayBackendClientCert(gw, inputs.Secrets, refValidator)
 		cg.BackendClientCert = clientCert
 		cg.ResolvedRefsCondition = resolvedRefsCond
-		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr, inputs.SupportedAddressTypes, resolvedRefsCond)
+		cg.Conditions = ComputeGatewayConditions(gw, cg.EffectiveListeners, hasAddress, GatewayReadiness{Ready: true}, provErr, inputs.SupportedAddressTypes, resolvedRefsCond, cg.ParametersRefError)
 		cm.Gateways[gwKey] = cg
 	}
 
@@ -2290,6 +2329,8 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		ListenerSetStatuses:      make(map[types.NamespacedName]gatewayv1.ListenerSetStatus),
 		BackendTLSPolicyStatuses: make(map[types.NamespacedName]gatewayv1.PolicyStatus),
 		GatewayClassStatuses:     make(map[types.NamespacedName]gatewayv1.GatewayClassStatus),
+		GatewayParameters:        make(map[types.NamespacedName]*Parameters),
+		GatewayParametersErrors:  make(map[types.NamespacedName]error),
 	}
 
 	// 1. Gateway Statuses
@@ -2300,6 +2341,8 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 		cg := compiled.Gateways[gwKey]
 		if cg != nil {
+			outputs.GatewayParameters[gwKey] = cg.Parameters
+			outputs.GatewayParametersErrors[gwKey] = cg.ParametersRefError
 			var addrs []gatewayv1.GatewayStatusAddress
 			if inputs.GatewayAddresses != nil {
 				addrs = inputs.GatewayAddresses[gwKey]
@@ -2413,7 +2456,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 		}
 		if inputs.ControllerName == "" || string(gc.Spec.ControllerName) == inputs.ControllerName {
 			gcKey := types.NamespacedName{Name: gc.Name}
-			outputs.GatewayClassStatuses[gcKey] = ComputeDesiredGatewayClassStatus(gc, inputs.ControllerName, inputs.GatewayCRDBundleVersion)
+			outputs.GatewayClassStatuses[gcKey] = ComputeDesiredGatewayClassStatus(gc, inputs.ControllerName, inputs.GatewayCRDBundleVersion, inputs.ConfigMaps)
 		}
 	}
 
@@ -2453,13 +2496,17 @@ func ComputeDesiredGatewayStatus(
 	var effectiveListeners []*EffectiveListener
 	attachedLSCount := int32(0)
 	var resolvedRefsCond metav1.Condition
+	var paramsErr error
 	if compiledGw != nil {
 		effectiveListeners = compiledGw.EffectiveListeners
 		attachedLSCount = compiledGw.AttachedListenerSets
 		resolvedRefsCond = compiledGw.ResolvedRefsCondition
+		paramsErr = compiledGw.ParametersRefError
+	} else if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+		_, paramsErr = ValidateGatewayParametersRef(gw.Spec.Infrastructure.ParametersRef, gw.Namespace, nil)
 	}
 
-	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr, supportedAddressTypes, resolvedRefsCond)
+	desiredConditions := ComputeGatewayConditions(gw, effectiveListeners, hasAddress, readiness, provErr, supportedAddressTypes, resolvedRefsCond, paramsErr)
 
 	var desiredListenerStatuses []gatewayv1.ListenerStatus
 	for _, l := range gw.Spec.Listeners {
@@ -3021,15 +3068,22 @@ func ComputeSupportedVersionCondition(bundleVersion string, generation int64) me
 }
 
 // ComputeDesiredGatewayClassStatus computes the desired GatewayClass status.
-func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string, crdBundleVersion *string) gatewayv1.GatewayClassStatus {
+func ComputeDesiredGatewayClassStatus(gc *gatewayv1.GatewayClass, controllerName string, crdBundleVersion *string, configMaps ...map[types.NamespacedName]*corev1.ConfigMap) gatewayv1.GatewayClassStatus {
 	acceptedStatus := metav1.ConditionTrue
 	acceptedReason := string(gatewayv1.GatewayClassReasonAccepted)
 	acceptedMessage := "GatewayClass accepted by reference implementation"
 
 	if gc.Spec.ParametersRef != nil {
-		acceptedStatus = metav1.ConditionFalse
-		acceptedReason = string(gatewayv1.GatewayClassReasonInvalidParameters)
-		acceptedMessage = "Invalid parametersRef: parametersRef is not supported"
+		var cms map[types.NamespacedName]*corev1.ConfigMap
+		if len(configMaps) > 0 {
+			cms = configMaps[0]
+		}
+		_, err := ValidateGatewayClassParametersRef(gc.Spec.ParametersRef, cms)
+		if err != nil {
+			acceptedStatus = metav1.ConditionFalse
+			acceptedReason = string(gatewayv1.GatewayClassReasonInvalidParameters)
+			acceptedMessage = fmt.Sprintf("Invalid parametersRef: %v", err)
+		}
 	}
 
 	conds := []metav1.Condition{

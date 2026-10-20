@@ -196,6 +196,123 @@ spec:
 	h.WaitForResourceDeletion("role", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("rolebinding", secondResName, "default", 30*time.Second)
 	h.WaitForResourceDeletion("secret", secondResName, "default", 30*time.Second)
+
+	// 10. Verify Live Switch between LoadBalancer and ClusterIP via parametersRef ConfigMap
+	liveSwitchCM := `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-switch-params
+  namespace: default
+data:
+  serviceType: LoadBalancer
+  externalTrafficPolicy: Local
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: live-switch-gw
+  namespace: default
+spec:
+  gatewayClassName: reference-class
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: live-switch-params
+`
+	h.KubectlApplyContent(liveSwitchCM)
+	liveGwAddr := h.WaitForGatewayAddress("live-switch-gw", "default", 1*time.Minute)
+	if liveGwAddr == "" {
+		t.Fatalf("Expected live-switch-gw to get an address")
+	}
+
+	liveResName := singlepod.ResourceNameForGateway("live-switch-gw")
+	svcType := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
+	if svcType != "LoadBalancer" {
+		t.Errorf("Expected Service type LoadBalancer, got: %s", svcType)
+	}
+	etp := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.externalTrafficPolicy}"))
+	if etp != "Local" {
+		t.Errorf("Expected externalTrafficPolicy Local, got: %s", etp)
+	}
+
+	// Switch to ClusterIP through ConfigMap, providing a static address in spec.addresses
+	liveSwitchToClusterIP := `
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-switch-params
+  namespace: default
+data:
+  serviceType: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: live-switch-gw
+  namespace: default
+spec:
+  gatewayClassName: reference-class
+  addresses:
+  - type: IPAddress
+    value: "10.96.0.123"
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: live-switch-params
+`
+	h.KubectlApplyContent(liveSwitchToClusterIP)
+
+	waitForServiceType := func(expectedType string, timeout time.Duration) {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			st := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
+			if st == expectedType {
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+		t.Fatalf("Timed out waiting for Service %s to become %s", liveResName, expectedType)
+	}
+
+	waitForServiceType("ClusterIP", 30*time.Second)
+
+	svcType = strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.type}"))
+	if svcType != "ClusterIP" {
+		t.Errorf("Expected Service type ClusterIP after switch, got: %s", svcType)
+	}
+	etp = strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.spec.externalTrafficPolicy}"))
+	if etp != "" {
+		t.Errorf("Expected externalTrafficPolicy empty for ClusterIP, got: %s", etp)
+	}
+	lbIngress := strings.TrimSpace(h.runCmd("kubectl", "get", "svc", liveResName, "--namespace=default", "-o", "jsonpath={.status.loadBalancer.ingress}"))
+	if lbIngress != "" && lbIngress != "[]" {
+		t.Errorf("Expected no loadBalancer ingress for ClusterIP Service, got: %s", lbIngress)
+	}
+
+	gwStaticAddr := strings.TrimSpace(h.runCmd("kubectl", "get", "gateway", "live-switch-gw", "--namespace=default", "-o", "jsonpath={.status.addresses[0].value}"))
+	if gwStaticAddr != "10.96.0.123" {
+		t.Errorf("Expected Gateway status address 10.96.0.123, got: %s", gwStaticAddr)
+	}
+
+	// Switch back to LoadBalancer
+	h.KubectlApplyContent(liveSwitchCM)
+	waitForServiceType("LoadBalancer", 30*time.Second)
+
+	h.runCmd("kubectl", "delete", "gateway", "live-switch-gw", "--namespace=default")
+	h.runCmd("kubectl", "delete", "configmap", "live-switch-params", "--namespace=default")
+	h.WaitForResourceDeletion("svc", liveResName, "default", 30*time.Second)
+	h.WaitForResourceDeletion("deployment", liveResName, "default", 30*time.Second)
 }
 
 func runCmdAllowError(h *Harness, name string, args ...string) string {

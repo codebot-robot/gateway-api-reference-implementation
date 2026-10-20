@@ -74,6 +74,16 @@ GARI supports `UDPRoute` routing UDP datagram traffic on dedicated listener port
 - **Reserved Port**: UDP port 8443 is reserved for HTTP/3; listeners specifying UDP 8443 report `Conflicted=True` with `ProtocolConflict`.
 - **All-in-One Mode Limitation**: In all-in-one mode, the first Gateway wins a UDP port; subsequent Gateways requesting the same port report `Programmed=False` with reason `PortUnavailable`.
 
+### Infrastructure Parameters (parametersRef ConfigMap)
+
+In standard per-Gateway data plane mode (`singlepod`), the provisioned Service type, traffic policy, and Service annotations can be configured using a `parametersRef` pointing to a `ConfigMap` on `GatewayClass` (`spec.parametersRef`) or `Gateway` (`spec.infrastructure.parametersRef`):
+- `serviceType`: `LoadBalancer` (default) or `ClusterIP`.
+- `externalTrafficPolicy`: `Cluster` (default) or `Local` (meaningful for `LoadBalancer`).
+- `serviceAnnotations`: YAML/JSON map applied to the Service only (in addition to `spec.infrastructure.annotations`).
+- With `ClusterIP`, the address comes from `spec.addresses` (reported once the data plane is ready).
+
+See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and a complete GKE Standalone NEG example.
+
 ### Configuration Flags
 
 | Flag | Default | Description |

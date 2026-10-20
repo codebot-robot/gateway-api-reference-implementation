@@ -486,9 +486,15 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 		WithStatusSubresource(gcInvalidParams).
 		Build()
 
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gcInvalidParams)
+	st.Recompute()
+
 	r := &GatewayClassReconciler{
 		Client:         client,
 		Scheme:         scheme,
+		State:          st,
 		ControllerName: "test-controller",
 	}
 
@@ -521,6 +527,8 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 	if err := client.Update(ctx, &res); err != nil {
 		t.Fatalf("failed to update GatewayClass: %v", err)
 	}
+	st.UpsertGatewayClass(&res)
+	st.Recompute()
 
 	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "invalid-params-gc"}})
 	if err != nil {
@@ -539,6 +547,50 @@ func TestGatewayClassReconciler_ParametersRefAndGeneration(t *testing.T) {
 	}
 	if cond.ObservedGeneration != 2 {
 		t.Errorf("expected ObservedGeneration=2, got %d", cond.ObservedGeneration)
+	}
+
+	// 3. Update GatewayClass with valid ConfigMap parametersRef -> Accepted=True/Accepted
+	validCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-gc-cm"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType: "LoadBalancer",
+		},
+	}
+	if err := client.Create(ctx, validCM); err != nil {
+		t.Fatalf("failed to create valid ConfigMap: %v", err)
+	}
+	nsDefault := gatewayv1.Namespace("default")
+	res.Spec.ParametersRef = &gatewayv1.ParametersReference{
+		Group:     "",
+		Kind:      "ConfigMap",
+		Namespace: &nsDefault,
+		Name:      "valid-gc-cm",
+	}
+	res.Generation = 3
+	if err := client.Update(ctx, &res); err != nil {
+		t.Fatalf("failed to update GatewayClass: %v", err)
+	}
+	st.UpsertConfigMap(validCM)
+	st.UpsertGatewayClass(&res)
+	st.Recompute()
+
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "invalid-params-gc"}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := client.Get(ctx, types.NamespacedName{Name: "invalid-params-gc"}, &res); err != nil {
+		t.Fatalf("failed to get GatewayClass: %v", err)
+	}
+	cond = findCondition(res.Status.Conditions, string(gatewayv1.GatewayClassConditionStatusAccepted))
+	if cond == nil {
+		t.Fatalf("expected Accepted condition on GatewayClass, got none")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != string(gatewayv1.GatewayClassReasonAccepted) {
+		t.Errorf("expected Accepted=True/Accepted, got Status=%s, Reason=%s", cond.Status, cond.Reason)
+	}
+	if cond.ObservedGeneration != 3 {
+		t.Errorf("expected ObservedGeneration=3, got %d", cond.ObservedGeneration)
 	}
 }
 
@@ -927,6 +979,213 @@ func TestGatewayReconciler_InvalidParametersRef(t *testing.T) {
 	}
 	if progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.GatewayReasonInvalid) {
 		t.Errorf("expected Programmed=False/Invalid, got Status=%s, Reason=%s", progCond.Status, progCond.Reason)
+	}
+}
+
+func TestGatewayReconciler_ValidAndMissingConfigMapParametersRef(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	validCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-params"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType: "LoadBalancer",
+		},
+	}
+	gwValid := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "valid-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "valid-params",
+				},
+			},
+		},
+	}
+	gwMissingCM := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "missing-cm-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "nonexistent-params",
+				},
+			},
+		},
+	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertConfigMap(validCM)
+	st.UpsertGateway(gwValid)
+	st.UpsertGateway(gwMissingCM)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, validCM, gwValid, gwMissingCM).
+		WithStatusSubresource(gwValid, gwMissingCM).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+
+	// 1. Valid parametersRef should be Accepted=True
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "valid-gw"}})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling valid-gw: %v", err)
+	}
+	var resValid gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "valid-gw"}, &resValid); err != nil {
+		t.Fatalf("failed to get valid gateway: %v", err)
+	}
+	acceptedCond := findCondition(resValid.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionTrue || acceptedCond.Reason != string(gatewayv1.GatewayReasonAccepted) {
+		t.Errorf("expected Accepted=True/Accepted for valid-gw, got %+v", acceptedCond)
+	}
+
+	// 2. Missing ConfigMap should be Accepted=False/InvalidParameters
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "missing-cm-gw"}})
+	if err != nil {
+		t.Fatalf("unexpected error reconciling missing-cm-gw: %v", err)
+	}
+	var resMissing gatewayv1.Gateway
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "missing-cm-gw"}, &resMissing); err != nil {
+		t.Fatalf("failed to get missing gateway: %v", err)
+	}
+	missingAcceptedCond := findCondition(resMissing.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if missingAcceptedCond == nil || missingAcceptedCond.Status != metav1.ConditionFalse || missingAcceptedCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+		t.Errorf("expected Accepted=False/InvalidParameters for missing-cm-gw, got %+v", missingAcceptedCond)
+	}
+}
+
+func TestGatewayReconciler_ReconcileBeforeStateRecompute(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "clusterip-params"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType: "ClusterIP",
+		},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "race-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "clusterip-params",
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, cm, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	// State only knows about GatewayClass so far; Gateway has not been recomputed yet (!found)
+	st.UpsertGatewayClass(gwClass)
+	st.Recompute()
+
+	provider := &trackingAddressProvider{}
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: provider,
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "race-gw"}}
+
+	// 1. Reconcile runs before state has recomputed for gw -> must NOT call address provider
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling before recompute: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("expected no requeue, got %+v", res)
+	}
+	if provider.called {
+		t.Errorf("expected AddressProvider NOT to be called before State computes Gateway parameters")
+	}
+
+	// 2. Now state recomputes including the Gateway and ConfigMap
+	st.UpsertConfigMap(cm)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	// 3. Reconcile runs after state recompute -> must call address provider
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling after recompute: %v", err)
+	}
+	if !provider.called {
+		t.Errorf("expected AddressProvider to be called after State computes Gateway parameters")
 	}
 }
 

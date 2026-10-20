@@ -2509,3 +2509,922 @@ func TestSinglePodAddressProvider_WithholdAddressesUntilDataPlaneReady(t *testin
 		t.Fatalf("expected Programmed=False/AddressNotUsable, got %+v", progCond)
 	}
 }
+
+func TestSinglePodAddressProvider_ParametersRef_MergeOrder(t *testing.T) {
+	ctx := t.Context()
+	gcNS := gatewayv1.Namespace("default")
+	gcCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gc-params"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType:           "LoadBalancer",
+			state.ParameterKeyExternalTrafficPolicy: "Local",
+			state.ParameterKeyServiceAnnotations:    "class-anno: val1\ncommon: class-val\n",
+		},
+	}
+	gwCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "gw-params"},
+		Data: map[string]string{
+			state.ParameterKeyServiceAnnotations: "gw-anno: val2\ncommon: gw-val\n",
+		},
+	}
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+			ParametersRef: &gatewayv1.ParametersReference{
+				Group:     "",
+				Kind:      "ConfigMap",
+				Namespace: &gcNS,
+				Name:      "gc-params",
+			},
+		},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-gw",
+			Namespace:  "test-ns",
+			UID:        types.UID("gw-uid-1"),
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					"infra-anno": "infra-val",
+				},
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "gw-params",
+				},
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gcCM, gwCM, gc, gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.UpsertConfigMap(gcCM)
+	st.UpsertConfigMap(gwCM)
+	st.Recompute()
+
+	p := NewAddressProvider(c, WithState(st))
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var svc corev1.Service
+	resName := ResourceNameForGateway("test-gw")
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		t.Errorf("expected ServiceType LoadBalancer, got %s", svc.Spec.Type)
+	}
+	if svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+		t.Errorf("expected ExternalTrafficPolicy Local, got %s", svc.Spec.ExternalTrafficPolicy)
+	}
+	if svc.Annotations["class-anno"] != "val1" {
+		t.Errorf("expected class-anno=val1, got %q", svc.Annotations["class-anno"])
+	}
+	if svc.Annotations["gw-anno"] != "val2" {
+		t.Errorf("expected gw-anno=val2, got %q", svc.Annotations["gw-anno"])
+	}
+	if svc.Annotations["common"] != "gw-val" {
+		t.Errorf("expected common=gw-val (Gateway overrides GatewayClass), got %q", svc.Annotations["common"])
+	}
+	if svc.Annotations["infra-anno"] != "infra-val" {
+		t.Errorf("expected infra-anno=infra-val, got %q", svc.Annotations["infra-anno"])
+	}
+
+	// Verify serviceAnnotations are applied to Service only, not Deployment
+	var deploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+	if deploy.Annotations["class-anno"] != "" || deploy.Annotations["gw-anno"] != "" || deploy.Annotations["common"] != "" {
+		t.Errorf("serviceAnnotations leaked to Deployment: %+v", deploy.Annotations)
+	}
+	if deploy.Annotations["infra-anno"] != "infra-val" {
+		t.Errorf("expected infra-anno on Deployment, got %q", deploy.Annotations["infra-anno"])
+	}
+}
+
+func TestSinglePodAddressProvider_ParametersRef_EachKey(t *testing.T) {
+	ctx := t.Context()
+
+	t.Run("serviceType ClusterIP", func(t *testing.T) {
+		gwCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "clusterip-params"},
+			Data: map[string]string{
+				state.ParameterKeyServiceType: "ClusterIP",
+			},
+		}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-clusterip",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-2"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "test-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{
+						Group: "",
+						Kind:  "ConfigMap",
+						Name:  "clusterip-params",
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = clientgoscheme.AddToScheme(scheme)
+		_ = gatewayv1.AddToScheme(scheme)
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gwCM, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(gwCM)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var svc corev1.Service
+		resName := ResourceNameForGateway("gw-clusterip")
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+			t.Fatalf("failed to get Service: %v", err)
+		}
+		if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+			t.Errorf("expected ServiceType ClusterIP, got %s", svc.Spec.Type)
+		}
+		if svc.Spec.ExternalTrafficPolicy != "" {
+			t.Errorf("expected ExternalTrafficPolicy empty for ClusterIP, got %s", svc.Spec.ExternalTrafficPolicy)
+		}
+	})
+
+	t.Run("externalTrafficPolicy Local", func(t *testing.T) {
+		gwCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "local-params"},
+			Data: map[string]string{
+				state.ParameterKeyServiceType:           "LoadBalancer",
+				state.ParameterKeyExternalTrafficPolicy: "Local",
+			},
+		}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-local",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-3"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "test-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{
+						Group: "",
+						Kind:  "ConfigMap",
+						Name:  "local-params",
+					},
+				},
+			},
+		}
+
+		scheme := runtime.NewScheme()
+		_ = clientgoscheme.AddToScheme(scheme)
+		_ = gatewayv1.AddToScheme(scheme)
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gwCM, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(gwCM)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var svc corev1.Service
+		resName := ResourceNameForGateway("gw-local")
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+			t.Fatalf("failed to get Service: %v", err)
+		}
+		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+			t.Errorf("expected ServiceType LoadBalancer, got %s", svc.Spec.Type)
+		}
+		if svc.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+			t.Errorf("expected ExternalTrafficPolicy Local, got %s", svc.Spec.ExternalTrafficPolicy)
+		}
+	})
+}
+
+func TestSinglePodAddressProvider_ParametersRef_InvalidValues(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	testCases := []struct {
+		name string
+		data map[string]string
+	}{
+		{
+			name: "unknown key",
+			data: map[string]string{"foo": "bar"},
+		},
+		{
+			name: "invalid serviceType",
+			data: map[string]string{state.ParameterKeyServiceType: "NodePort"},
+		},
+		{
+			name: "invalid externalTrafficPolicy",
+			data: map[string]string{state.ParameterKeyExternalTrafficPolicy: "Invalid"},
+		},
+		{
+			name: "invalid serviceAnnotations YAML",
+			data: map[string]string{state.ParameterKeyServiceAnnotations: "invalid: [unclosed"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "bad-params"},
+				Data:       tc.data,
+			}
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "bad-gw",
+					Namespace:  "test-ns",
+					UID:        types.UID("gw-uid-bad"),
+					Generation: 1,
+				},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: "test-class",
+					Listeners: []gatewayv1.Listener{
+						{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+					},
+					Infrastructure: &gatewayv1.GatewayInfrastructure{
+						ParametersRef: &gatewayv1.LocalParametersReference{
+							Group: "",
+							Kind:  "ConfigMap",
+							Name:  "bad-params",
+						},
+					},
+				},
+			}
+
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(cm, gw).
+				WithReturnManagedFields().
+				WithInterceptorFuncs(ssaNoOpInterceptor()).
+				Build()
+
+			st := state.NewState()
+			st.SetControllerName("test-controller")
+			st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+				Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+			})
+			st.UpsertGateway(gw)
+			st.UpsertConfigMap(cm)
+			st.Recompute()
+
+			p := NewAddressProvider(c, WithState(st))
+			addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+			if err != nil {
+				t.Fatalf("expected nil error (reported via readiness), got: %v", err)
+			}
+			if len(addrs) != 0 {
+				t.Fatalf("expected 0 addresses, got %d", len(addrs))
+			}
+			if readiness.Ready {
+				t.Errorf("expected readiness.Ready=false")
+			}
+			if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+				t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+			}
+
+			// Verify no Service was created
+			var svc corev1.Service
+			resName := ResourceNameForGateway("bad-gw")
+			if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+				t.Errorf("expected NotFound for Service, got err: %v", err)
+			}
+		})
+	}
+}
+
+func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	t.Run("Gateway missing ConfigMap", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-missing-cm",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-missing"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "test-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{
+						Group: "",
+						Kind:  "ConfigMap",
+						Name:  "nonexistent-cm",
+					},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		if readiness.Ready {
+			t.Errorf("expected readiness.Ready=false")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		}
+	})
+
+	t.Run("GatewayClass missing ConfigMap", func(t *testing.T) {
+		gcNS := gatewayv1.Namespace("default")
+		gc := &gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec: gatewayv1.GatewayClassSpec{
+				ControllerName: "test-controller",
+				ParametersRef: &gatewayv1.ParametersReference{
+					Group:     "",
+					Kind:      "ConfigMap",
+					Namespace: &gcNS,
+					Name:      "nonexistent-gc-cm",
+				},
+			},
+		}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-class-missing-cm",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-class-missing"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "test-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(gc)
+		st.UpsertGateway(gw)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		if readiness.Ready {
+			t.Errorf("expected readiness.Ready=false")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		}
+
+		// Verify Gateway status has Accepted=False/InvalidParameters
+		status, ok := st.GetDesiredGatewayStatus(types.NamespacedName{Namespace: "test-ns", Name: "gw-class-missing-cm"})
+		if !ok {
+			t.Fatalf("expected Gateway status in State")
+		}
+		acceptedCond := state.FindCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected Gateway Accepted=False/InvalidParameters for missing class ConfigMap, got %+v", acceptedCond)
+		}
+	})
+
+	t.Run("GatewayClass invalid ConfigMap keys or values", func(t *testing.T) {
+		gcNS := gatewayv1.Namespace("default")
+		badCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "bad-gc-cm"},
+			Data: map[string]string{
+				state.ParameterKeyServiceType: "NodePort",
+			},
+		}
+		gc := &gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "bad-class"},
+			Spec: gatewayv1.GatewayClassSpec{
+				ControllerName: "test-controller",
+				ParametersRef: &gatewayv1.ParametersReference{
+					Group:     "",
+					Kind:      "ConfigMap",
+					Namespace: &gcNS,
+					Name:      "bad-gc-cm",
+				},
+			},
+		}
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-class-bad-cm",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-class-bad"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "bad-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(gc, badCM, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(gc)
+		st.UpsertConfigMap(badCM)
+		st.UpsertGateway(gw)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		_, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("expected nil error, got: %v", err)
+		}
+		if readiness.Ready {
+			t.Errorf("expected readiness.Ready=false")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected readiness.Reason=InvalidParameters, got %s", readiness.Reason)
+		}
+
+		// Verify Gateway status has Accepted=False/InvalidParameters
+		status, ok := st.GetDesiredGatewayStatus(types.NamespacedName{Namespace: "test-ns", Name: "gw-class-bad-cm"})
+		if !ok {
+			t.Fatalf("expected Gateway status in State")
+		}
+		acceptedCond := state.FindCondition(status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+			t.Errorf("expected Gateway Accepted=False/InvalidParameters for invalid class ConfigMap, got %+v", acceptedCond)
+		}
+
+		// Verify no Service was created
+		var svc corev1.Service
+		resName := ResourceNameForGateway("gw-class-bad-cm")
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+			t.Errorf("expected NotFound for Service, got err: %v", err)
+		}
+	})
+}
+
+func TestSinglePodAddressProvider_ParametersRef_NotComputedYet(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-not-computed",
+			Namespace:  "test-ns",
+			UID:        types.UID("gw-uid-not-computed"),
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	// State has not computed outputs for gw yet
+
+	p := NewAddressProvider(c, WithState(st))
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Errorf("expected 0 addresses before state computes parameters, got %d", len(addrs))
+	}
+	if readiness.Ready {
+		t.Errorf("expected readiness.Ready=false")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected readiness.Reason=Pending, got %s", readiness.Reason)
+	}
+
+	// Verify no Service was created
+	var svc corev1.Service
+	resName := ResourceNameForGateway("gw-not-computed")
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("expected NotFound for Service, got err: %v", err)
+	}
+}
+
+func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "clusterip-cfg"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType: "ClusterIP",
+		},
+	}
+
+	t.Run("no spec.addresses -> Programmed=False/AddressNotAssigned with static address message", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-no-addr",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-no-addr"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "test-class",
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{
+						Group: "",
+						Kind:  "ConfigMap",
+						Name:  "clusterip-cfg",
+					},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(cm, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(cm)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+		addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(addrs) != 0 {
+			t.Fatalf("expected 0 addresses, got %d", len(addrs))
+		}
+		if readiness.Ready {
+			t.Errorf("expected readiness.Ready=false")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+			t.Errorf("expected AddressNotAssigned, got %s", readiness.Reason)
+		}
+		if !strings.Contains(readiness.Message, "static address") {
+			t.Errorf("expected message explaining static address needed, got %q", readiness.Message)
+		}
+	})
+
+	t.Run("with spec.addresses: IP and Hostname", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "gw-with-addr",
+				Namespace:  "test-ns",
+				UID:        types.UID("gw-uid-with-addr"),
+				Generation: 1,
+			},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "test-class",
+				Addresses: []gatewayv1.GatewaySpecAddress{
+					{
+						Type:  state.Ptr(gatewayv1.IPAddressType),
+						Value: "203.0.113.50",
+					},
+					{
+						Type:  state.Ptr(gatewayv1.HostnameAddressType),
+						Value: "lb.example.com",
+					},
+				},
+				Listeners: []gatewayv1.Listener{
+					{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+				},
+				Infrastructure: &gatewayv1.GatewayInfrastructure{
+					ParametersRef: &gatewayv1.LocalParametersReference{
+						Group: "",
+						Kind:  "ConfigMap",
+						Name:  "clusterip-cfg",
+					},
+				},
+			},
+		}
+
+		c := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(cm, gw).
+			WithReturnManagedFields().
+			WithInterceptorFuncs(ssaNoOpInterceptor()).
+			Build()
+
+		st := state.NewState()
+		st.SetControllerName("test-controller")
+		st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+			Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+		})
+		st.UpsertGateway(gw)
+		st.UpsertConfigMap(cm)
+		st.Recompute()
+
+		p := NewAddressProvider(c, WithState(st))
+
+		// 1. Initial reconcile: Deployment has 0 available replicas -> addresses withheld
+		addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(addrs) != 0 {
+			t.Fatalf("expected 0 addresses while deployment not ready, got %d", len(addrs))
+		}
+		if readiness.Ready {
+			t.Errorf("expected readiness.Ready=false")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonAddressNotAssigned) {
+			t.Errorf("expected AddressNotAssigned, got %s", readiness.Reason)
+		}
+
+		// 2. Simulate Deployment becoming available
+		resName := ResourceNameForGateway("gw-with-addr")
+		var deploy appsv1.Deployment
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+			t.Fatalf("failed to get Deployment: %v", err)
+		}
+		deploy.Status.AvailableReplicas = 1
+		deploy.Status.ReadyReplicas = 1
+		if err := c.Status().Update(ctx, &deploy); err != nil {
+			t.Fatalf("failed to update Deployment status: %v", err)
+		}
+
+		// 3. Reconcile again: data plane is ready -> addresses are reported
+		addrs, readiness, err = p.GatewayAddressesWithReadiness(ctx, gw, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !readiness.Ready {
+			t.Errorf("expected readiness.Ready=true")
+		}
+		if readiness.Reason != string(gatewayv1.GatewayReasonProgrammed) {
+			t.Errorf("expected Programmed, got %s", readiness.Reason)
+		}
+		if len(addrs) != 2 {
+			t.Fatalf("expected 2 addresses (IP and Hostname), got %d: %+v", len(addrs), addrs)
+		}
+		if *addrs[0].Type != gatewayv1.IPAddressType || addrs[0].Value != "203.0.113.50" {
+			t.Errorf("unexpected address 0: %+v", addrs[0])
+		}
+		if *addrs[1].Type != gatewayv1.HostnameAddressType || addrs[1].Value != "lb.example.com" {
+			t.Errorf("unexpected address 1: %+v", addrs[1])
+		}
+	})
+}
+
+func TestSinglePodAddressProvider_LiveSwitch_LoadBalancer_To_ClusterIP(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: "gw-params"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType: "LoadBalancer",
+		},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "live-gw",
+			Namespace:  "test-ns",
+			UID:        types.UID("live-gw-uid"),
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "gw-params",
+				},
+			},
+		},
+	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gc)
+	st.UpsertGateway(gw)
+	st.UpsertConfigMap(cm)
+	st.Recompute()
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gc, cm, gw).
+		WithStatusSubresource(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	p := NewAddressProvider(c, WithState(st))
+	st.SetSupportedAddressTypes(p.SupportedAddressTypes())
+
+	r := &controller.GatewayReconciler{
+		Client:          c,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: p,
+	}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: "live-gw"}}
+
+	// 1. Initial reconcile creates Service as type LoadBalancer
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resName := ResourceNameForGateway("live-gw")
+	var svc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		t.Fatalf("expected Service type LoadBalancer, got %s", svc.Spec.Type)
+	}
+
+	// 2. Change parameters to ClusterIP on the live Gateway
+	cm.Data[state.ParameterKeyServiceType] = "ClusterIP"
+	if err := c.Update(ctx, cm); err != nil {
+		t.Fatalf("failed to update ConfigMap: %v", err)
+	}
+	if err := c.Get(ctx, req.NamespacedName, gw); err != nil {
+		t.Fatalf("failed to get latest Gateway: %v", err)
+	}
+	gw.Spec.Addresses = []gatewayv1.GatewaySpecAddress{
+		{
+			Type:  state.Ptr(gatewayv1.IPAddressType),
+			Value: "10.0.0.99",
+		},
+	}
+	gw.Generation = 2
+	if err := c.Update(ctx, gw); err != nil {
+		t.Fatalf("failed to update Gateway: %v", err)
+	}
+
+	st.UpsertConfigMap(cm)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	// 3. Reconcile again: Service is updated in-place to ClusterIP
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling updated gateway: %v", err)
+	}
+
+	var updatedSvc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &updatedSvc); err != nil {
+		t.Fatalf("failed to get Service: %v", err)
+	}
+	if updatedSvc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("expected Service type ClusterIP after update, got %s", updatedSvc.Spec.Type)
+	}
+	if updatedSvc.Spec.ExternalTrafficPolicy != "" {
+		t.Errorf("expected ExternalTrafficPolicy empty for ClusterIP, got %s", updatedSvc.Spec.ExternalTrafficPolicy)
+	}
+
+	// Verify no second or leftover LoadBalancer service exists in namespace
+	var svcList corev1.ServiceList
+	if err := c.List(ctx, &svcList, client.InNamespace("test-ns")); err != nil {
+		t.Fatalf("failed to list services: %v", err)
+	}
+	if len(svcList.Items) != 1 {
+		t.Errorf("expected exactly 1 Service in namespace, got %d", len(svcList.Items))
+	}
+}

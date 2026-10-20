@@ -121,6 +121,19 @@ type AddressProvider struct {
 	dataplaneImage   string
 	enableH2C        bool
 	forwardedForMode string
+	state            *state.State
+}
+
+// WithState sets the State reference for the AddressProvider.
+func WithState(s *state.State) Option {
+	return func(p *AddressProvider) {
+		p.state = s
+	}
+}
+
+// SetState sets the State reference for the AddressProvider.
+func (p *AddressProvider) SetState(s *state.State) {
+	p.state = s
 }
 
 // NewAddressProvider creates a new singlepod AddressProvider.
@@ -194,11 +207,46 @@ func requestedIPAddresses(gw *gatewayv1.Gateway) []string {
 	return ips
 }
 
-// GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and LoadBalancer Service,
-// and returns the Service's LoadBalancer ingress addresses and detailed readiness state.
+func requestedHostnameAddresses(gw *gatewayv1.Gateway) []string {
+	var hosts []string
+	if gw == nil {
+		return nil
+	}
+	for _, addr := range gw.Spec.Addresses {
+		if addr.Type != nil && *addr.Type == gatewayv1.HostnameAddressType && addr.Value != "" {
+			hosts = append(hosts, addr.Value)
+		}
+	}
+	return hosts
+}
+
+// GatewayAddressesWithReadiness reconciles the per-Gateway ServiceAccount, Deployment, and Service,
+// and returns the Service's ingress addresses and detailed readiness state.
 func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw *gatewayv1.Gateway, effectiveListeners []*state.EffectiveListener) ([]gatewayv1.GatewayStatusAddress, state.GatewayReadiness, error) {
 	if p.client == nil {
 		return nil, state.GatewayReadiness{}, nil
+	}
+
+	var params *state.Parameters
+	if p.state != nil && gw != nil {
+		prms, found, err := p.state.GetGatewayParameters(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		if !found {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonPending),
+				Message: "Waiting for state to compute gateway parameters",
+			}, nil
+		}
+		if err != nil {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonInvalidParameters),
+				Message: err.Error(),
+			}, nil
+		}
+		params = prms
+	} else if p.state == nil {
+		params = state.DefaultParameters()
 	}
 
 	name := ResourceNameForGateway(gw.Name)
@@ -565,24 +613,38 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 
 	requestedIPs := requestedIPAddresses(gw)
+	requestedHostnames := requestedHostnameAddresses(gw)
 
 	if len(svcPorts) > 0 {
 		svcSpec := corev1ac.ServiceSpec().
-			WithType(corev1.ServiceTypeLoadBalancer).
+			WithType(params.ServiceType).
 			WithSelector(map[string]string{
 				LabelGatewayName: gw.Name,
 				LabelAppName:     AppNameValue,
 			}).
 			WithPorts(svcPorts...)
-		if len(requestedIPs) > 0 {
-			svcSpec.WithLoadBalancerIP(requestedIPs[0])
+		if params.ServiceType == corev1.ServiceTypeLoadBalancer {
+			if params.ExternalTrafficPolicy != "" {
+				svcSpec.WithExternalTrafficPolicy(params.ExternalTrafficPolicy)
+			}
+			if len(requestedIPs) > 0 {
+				svcSpec.WithLoadBalancerIP(requestedIPs[0])
+			}
 		}
 		svcApply := corev1ac.Service(name, gwNamespace).
 			WithOwnerReferences(ownerRef).
 			WithLabels(labels).
 			WithSpec(svcSpec)
-		if len(annotations) > 0 {
-			svcApply.WithAnnotations(annotations)
+
+		svcAnnos := make(map[string]string)
+		for k, v := range annotations {
+			svcAnnos[k] = v
+		}
+		for k, v := range params.ServiceAnnotations {
+			svcAnnos[k] = v
+		}
+		if len(svcAnnos) > 0 {
+			svcApply.WithAnnotations(svcAnnos)
 		}
 		if err := p.client.Apply(ctx, svcApply, client.FieldOwner(FieldManager), client.ForceOwnership); err != nil {
 			return nil, state.GatewayReadiness{}, fmt.Errorf("failed to apply Service for Gateway %s/%s: %w", gw.Namespace, gw.Name, err)
@@ -601,8 +663,47 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		}
 	}
 
+	if params.ServiceType == corev1.ServiceTypeClusterIP {
+		var addresses []gatewayv1.GatewayStatusAddress
+		for _, addr := range gw.Spec.Addresses {
+			if addr.Value != "" {
+				addrType := gatewayv1.IPAddressType
+				if addr.Type != nil && *addr.Type != "" {
+					addrType = *addr.Type
+				}
+				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
+					Type:  state.Ptr(addrType),
+					Value: addr.Value,
+				})
+			}
+		}
+
+		if len(addresses) == 0 {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: "ClusterIP Gateway requires a static address in spec.addresses",
+			}, nil
+		}
+
+		if !deployReady {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotAssigned),
+				Message: "Waiting for data-plane deployment to become available",
+			}, nil
+		}
+
+		return addresses, state.GatewayReadiness{
+			Ready:   true,
+			Reason:  string(gatewayv1.GatewayReasonProgrammed),
+			Message: "Gateway programmed by reference implementation",
+		}, nil
+	}
+
 	var addresses []gatewayv1.GatewayStatusAddress
 	var ingressIPs []string
+	var ingressHostnames []string
 	if err := p.client.Get(ctx, types.NamespacedName{Namespace: gwNamespace, Name: name}, &existingSvc); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return nil, state.GatewayReadiness{}, fmt.Errorf("getting Service %s/%s for address check: %w", gwNamespace, name, err)
@@ -617,6 +718,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				})
 			}
 			if ingress.Hostname != "" {
+				ingressHostnames = append(ingressHostnames, ingress.Hostname)
 				addresses = append(addresses, gatewayv1.GatewayStatusAddress{
 					Type:  state.Ptr(gatewayv1.HostnameAddressType),
 					Value: ingress.Hostname,
@@ -642,6 +744,23 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				Ready:   false,
 				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
 				Message: msg,
+			}, nil
+		}
+	}
+
+	for _, reqHost := range requestedHostnames {
+		bound := false
+		for _, ingressHost := range ingressHostnames {
+			if ingressHost == reqHost {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return addresses, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonAddressNotUsable),
+				Message: fmt.Sprintf("Requested address %s could not be bound to Service", reqHost),
 			}, nil
 		}
 	}
@@ -682,7 +801,7 @@ func (p *AddressProvider) GatewayAddresses(ctx context.Context, gw *gatewayv1.Ga
 
 // SupportedAddressTypes returns the address types supported by singlepod.
 func (p *AddressProvider) SupportedAddressTypes() []gatewayv1.AddressType {
-	return []gatewayv1.AddressType{gatewayv1.IPAddressType}
+	return []gatewayv1.AddressType{gatewayv1.IPAddressType, gatewayv1.HostnameAddressType}
 }
 
 func managedByPredicate() predicate.Predicate {
