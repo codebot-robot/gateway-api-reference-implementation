@@ -999,17 +999,23 @@ func (s *State) GetDesiredGatewayStatus(key types.NamespacedName) (gatewayv1.Gat
 }
 
 // GetGatewayParameters returns the resolved Parameters for a Gateway.
-// If parameter resolution failed (on Gateway or GatewayClass), it returns nil and the error.
-func (s *State) GetGatewayParameters(key types.NamespacedName) (*Parameters, error) {
+// - params: the resolved parameters.
+// - found: true if State has compiled outputs for this Gateway; false if not yet computed.
+// - err: non-nil if parameter resolution failed for this Gateway or its GatewayClass.
+func (s *State) GetGatewayParameters(key types.NamespacedName) (*Parameters, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.previousOutputs == nil {
-		return nil, nil
+		return nil, false, nil
 	}
-	if err, ok := s.previousOutputs.GatewayParametersErrors[key]; ok && err != nil {
-		return nil, err
+	if pErr, ok := s.previousOutputs.GatewayParametersErrors[key]; ok && pErr != nil {
+		return nil, true, pErr
 	}
-	return s.previousOutputs.GatewayParameters[key], nil
+	p, ok := s.previousOutputs.GatewayParameters[key]
+	if !ok {
+		return nil, false, nil
+	}
+	return p, true, nil
 }
 
 func (s *State) GetDesiredHTTPRouteStatus(key types.NamespacedName) (gatewayv1.HTTPRouteStatus, bool) {

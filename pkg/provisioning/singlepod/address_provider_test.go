@@ -3069,6 +3069,61 @@ func TestSinglePodAddressProvider_ParametersRef_MissingConfigMap(t *testing.T) {
 	})
 }
 
+func TestSinglePodAddressProvider_ParametersRef_NotComputedYet(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "gw-not-computed",
+			Namespace:  "test-ns",
+			UID:        types.UID("gw-uid-not-computed"),
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	// State has not computed outputs for gw yet
+
+	p := NewAddressProvider(c, WithState(st))
+	addrs, readiness, err := p.GatewayAddressesWithReadiness(ctx, gw, nil)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if len(addrs) != 0 {
+		t.Errorf("expected 0 addresses before state computes parameters, got %d", len(addrs))
+	}
+	if readiness.Ready {
+		t.Errorf("expected readiness.Ready=false")
+	}
+	if readiness.Reason != string(gatewayv1.GatewayReasonPending) {
+		t.Errorf("expected readiness.Reason=Pending, got %s", readiness.Reason)
+	}
+
+	// Verify no Service was created
+	var svc corev1.Service
+	resName := ResourceNameForGateway("gw-not-computed")
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &svc); !apierrors.IsNotFound(err) {
+		t.Errorf("expected NotFound for Service, got err: %v", err)
+	}
+}
+
 func TestSinglePodAddressProvider_ClusterIP_AddressRule(t *testing.T) {
 	ctx := t.Context()
 	scheme := runtime.NewScheme()

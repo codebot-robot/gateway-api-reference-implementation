@@ -176,7 +176,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 			var paramsErr error
 			if r.State != nil {
-				_, paramsErr = r.State.GetGatewayParameters(req.NamespacedName)
+				var found bool
+				_, found, paramsErr = r.State.GetGatewayParameters(req.NamespacedName)
+				if !found {
+					// State has not computed outputs for this Gateway yet.
+					// Leave Gateway pending without provisioning default resources;
+					// State diff will enqueue the Gateway once outputs are computed.
+					return ctrl.Result{}, nil
+				}
 			}
 
 			if paramsErr != nil {

@@ -1098,6 +1098,97 @@ func TestGatewayReconciler_ValidAndMissingConfigMapParametersRef(t *testing.T) {
 	}
 }
 
+func TestGatewayReconciler_ReconcileBeforeStateRecompute(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "clusterip-params"},
+		Data: map[string]string{
+			state.ParameterKeyServiceType: "ClusterIP",
+		},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "race-gw",
+			Namespace:  "default",
+			Generation: 1,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "clusterip-params",
+				},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, cm, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	// State only knows about GatewayClass so far; Gateway has not been recomputed yet (!found)
+	st.UpsertGatewayClass(gwClass)
+	st.Recompute()
+
+	provider := &trackingAddressProvider{}
+	r := &GatewayReconciler{
+		Client:          client,
+		Scheme:          scheme,
+		State:           st,
+		ControllerName:  "test-controller",
+		AddressProvider: provider,
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "race-gw"}}
+
+	// 1. Reconcile runs before state has recomputed for gw -> must NOT call address provider
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling before recompute: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("expected no requeue, got %+v", res)
+	}
+	if provider.called {
+		t.Errorf("expected AddressProvider NOT to be called before State computes Gateway parameters")
+	}
+
+	// 2. Now state recomputes including the Gateway and ConfigMap
+	st.UpsertConfigMap(cm)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	// 3. Reconcile runs after state recompute -> must call address provider
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling after recompute: %v", err)
+	}
+	if !provider.called {
+		t.Errorf("expected AddressProvider to be called after State computes Gateway parameters")
+	}
+}
+
 func TestGatewayReconciler_UnsupportedProtocol(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)

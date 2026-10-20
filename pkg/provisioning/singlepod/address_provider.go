@@ -229,7 +229,14 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 
 	var params *state.Parameters
 	if p.state != nil && gw != nil {
-		prms, err := p.state.GetGatewayParameters(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		prms, found, err := p.state.GetGatewayParameters(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		if !found {
+			return nil, state.GatewayReadiness{
+				Ready:   false,
+				Reason:  string(gatewayv1.GatewayReasonPending),
+				Message: "Waiting for state to compute gateway parameters",
+			}, nil
+		}
 		if err != nil {
 			return nil, state.GatewayReadiness{
 				Ready:   false,
@@ -238,8 +245,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			}, nil
 		}
 		params = prms
-	}
-	if params == nil {
+	} else if p.state == nil {
 		params = state.DefaultParameters()
 	}
 
