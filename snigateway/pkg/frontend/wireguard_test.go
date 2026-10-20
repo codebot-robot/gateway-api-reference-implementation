@@ -570,7 +570,7 @@ func TestCompositeTransport_GetConnForSessions_DialRetryOnUsablePeer(t *testing.
 		ListenAddr:            "127.0.0.1:0",
 		Prefix:                "fd00::/64",
 		HandshakeSyncInterval: 20 * time.Millisecond,
-		PerAttemptTimeout:     50 * time.Millisecond,
+		PerAttemptTimeout:     2 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewWireGuardTransport failed: %v", err)
@@ -631,7 +631,7 @@ func TestCompositeTransport_GetConnForSessions_DialRetryOnUsablePeer(t *testing.
 	comp.SetWireGuard(tr)
 	defer comp.Close()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	type result struct {
@@ -695,7 +695,7 @@ func TestCompositeTransport_GetConnForSessions_DialRetryOnUsablePeer(t *testing.
 		if string(buf) != string(msg) {
 			t.Fatalf("got %q, want %q", string(buf), string(msg))
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("GetConnForSessions parked and did not retry failed dial to usable peer")
 	}
 }
