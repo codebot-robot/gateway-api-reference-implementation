@@ -412,32 +412,21 @@ func (s *Server) runLeaseReaper() {
 }
 
 type frontendSession struct {
-	identity            ClientIdentity
 	cancel              context.CancelFunc // HTTP sessions only
 	closers             []func()
 	wireguardRegistered bool
 }
 
-func (s *Server) createSession(sessionID string, identity ClientIdentity, cancel context.CancelFunc) {
+func (s *Server) createSession(sessionID string, cancel context.CancelFunc, closer func()) {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
-	s.sessions[sessionID] = &frontendSession{
-		identity: identity,
-		cancel:   cancel,
-	}
-}
-
-func (s *Server) registerSessionCloser(sessionID string, closer func()) bool {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-	sess, ok := s.sessions[sessionID]
-	if !ok {
-		return false
+	sess := &frontendSession{
+		cancel: cancel,
 	}
 	if closer != nil {
 		sess.closers = append(sess.closers, closer)
 	}
-	return true
+	s.sessions[sessionID] = sess
 }
 
 func (s *Server) registerWireGuardSessionCloser(sessionID string) bool {
@@ -471,6 +460,14 @@ func (s *Server) CloseSession(sessionID string) {
 	delete(s.sessions, sessionID)
 	s.sessionsMu.Unlock()
 
+	s.table.Unregister(sessionID)
+	s.pool.UnregisterSession(sessionID)
+	s.h2.UnregisterSession(sessionID)
+	s.quic.UnregisterSession(sessionID)
+	if s.wireguard != nil {
+		s.wireguard.UnregisterSession(sessionID)
+	}
+
 	if sess.cancel != nil {
 		sess.cancel()
 	}
@@ -478,14 +475,6 @@ func (s *Server) CloseSession(sessionID string) {
 		if c != nil {
 			c()
 		}
-	}
-
-	s.table.Unregister(sessionID)
-	s.pool.UnregisterSession(sessionID)
-	s.h2.UnregisterSession(sessionID)
-	s.quic.UnregisterSession(sessionID)
-	if s.wireguard != nil {
-		s.wireguard.UnregisterSession(sessionID)
 	}
 }
 
@@ -860,15 +849,11 @@ func (s *Server) handleQUICConnection(qConn *quic.Conn) {
 	}
 
 	sessionID := generateConnID()
-	s.createSession(sessionID, clientIdentity, nil)
+	s.createSession(sessionID, nil, func() {
+		closeQUICConn(qConn, 0, "session closed")
+	})
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.quic.RegisterSession(sessionID, qConn)
-	if !s.registerSessionCloser(sessionID, func() {
-		closeQUICConn(qConn, 0, "session closed")
-	}) {
-		closeQUICConn(qConn, 0, "session closed")
-		return
-	}
 	log.Printf("Frontend: created QUIC session %s for client %q", sessionID, clientIdentity.ID)
 
 	defer func() {
@@ -1138,7 +1123,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := generateConnID()
 	sessCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	s.createSession(sessionID, clientIdentity, cancel)
+	s.createSession(sessionID, cancel, nil)
 
 	s.table.RegisterSession(sessionID, clientIdentity)
 	s.pool.RegisterSession(sessionID)
