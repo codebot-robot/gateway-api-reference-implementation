@@ -1,8 +1,8 @@
 module github.com/gke-labs/gateway-api-reference-implementation
 
-go 1.27.1
+go 1.27.2
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/google/go-cmp v0.7.0

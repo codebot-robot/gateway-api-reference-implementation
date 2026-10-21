@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=$BUILDPLATFORM golang:1.27.2 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 COPY snigateway/go.mod snigateway/go.sum snigateway/go.work ./snigateway/
