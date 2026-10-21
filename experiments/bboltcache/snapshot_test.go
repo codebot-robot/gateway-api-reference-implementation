@@ -175,3 +175,83 @@ func TestLazyResolver_MemoizationAndEviction(t *testing.T) {
 		t.Fatalf("expected 1 item after stale eviction, got %d", resolver.Len())
 	}
 }
+
+func TestLazyResolver_RecomputeLifecycle_EvictsOldVersionsAndUnreferenced(t *testing.T) {
+	cipher, err := NewEphemeralAESGCMCipher()
+	if err != nil {
+		t.Fatalf("cipher err: %v", err)
+	}
+
+	store, err := NewStore(WithCipher(cipher))
+	if err != nil {
+		t.Fatalf("store err: %v", err)
+	}
+	defer store.Close()
+
+	cmIndexer, err := NewBBoltIndexer(store, &corev1.ConfigMap{}, WithBucketName("ConfigMap"))
+	if err != nil {
+		t.Fatalf("indexer err: %v", err)
+	}
+
+	cmA := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ca-a", Namespace: "default", ResourceVersion: "1"},
+		Data:       map[string]string{"ca.crt": "cert-a-v1"},
+	}
+	cmB := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ca-b", Namespace: "default", ResourceVersion: "1"},
+		Data:       map[string]string{"ca.crt": "cert-b-v1"},
+	}
+	_ = cmIndexer.Add(cmA)
+	_ = cmIndexer.Add(cmB)
+
+	resolver := NewLazyResolver("ConfigMap", "Secret", cipher)
+	keyA := types.NamespacedName{Namespace: "default", Name: "ca-a"}
+	keyB := types.NamespacedName{Namespace: "default", Name: "ca-b"}
+
+	// Cycle 1: resolve both A and B
+	resolver.StartRecompute()
+	snap1, _ := store.NewSnapshot()
+	_, _, _ = resolver.ResolveConfigMap(snap1, keyA, "1")
+	_, _, _ = resolver.ResolveConfigMap(snap1, keyB, "1")
+	_ = snap1.Close()
+	resolver.FinishRecompute()
+
+	if resolver.Len() != 2 {
+		t.Fatalf("expected 2 memoized items after cycle 1, got %d", resolver.Len())
+	}
+
+	// Update A to rv 2 in store
+	cmA2 := cmA.DeepCopy()
+	cmA2.ResourceVersion = "2"
+	cmA2.Data["ca.crt"] = "cert-a-v2"
+	_ = cmIndexer.Update(cmA2)
+
+	// Cycle 2: only resolve A (updated to rv 2); B is no longer referenced
+	resolver.StartRecompute()
+	snap2, _ := store.NewSnapshot()
+	resA2, exists, err := resolver.ResolveConfigMap(snap2, keyA, "2")
+	if err != nil || !exists || resA2.Data["ca.crt"] != "cert-a-v2" {
+		t.Fatalf("failed to resolve A@2: exists=%v, err=%v", exists, err)
+	}
+	_ = snap2.Close()
+	resolver.FinishRecompute()
+
+	// Both A@1 (old version) and B@1 (unreferenced) must be evicted!
+	if resolver.Len() != 1 {
+		t.Fatalf("expected exactly 1 memoized item after cycle 2, got %d", resolver.Len())
+	}
+
+	// Cycle 3: cache hit on A@2
+	resolver.StartRecompute()
+	snap3, _ := store.NewSnapshot()
+	resA2Hit, exists, err := resolver.ResolveConfigMap(snap3, keyA, "2")
+	if err != nil || !exists || resA2Hit != resA2 {
+		t.Fatalf("expected cache hit for A@2")
+	}
+	_ = snap3.Close()
+	resolver.FinishRecompute()
+
+	if resolver.Len() != 1 {
+		t.Fatalf("expected 1 item preserved after cycle 3, got %d", resolver.Len())
+	}
+}

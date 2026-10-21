@@ -90,7 +90,8 @@ func (s *Snapshot) GetObject(bucketName, key string, into runtime.Object, cipher
 	if cipher == nil {
 		cipher = s.store.Cipher()
 	}
-	decrypted, err := cipher.Decrypt(raw)
+	ad := AdditionalData(bucketName, key)
+	decrypted, err := cipher.Decrypt(raw, ad)
 	if err != nil {
 		return false, fmt.Errorf("failed to decrypt %s: %w", key, err)
 	}
@@ -127,6 +128,7 @@ func (s *Snapshot) GetSecret(bucketName, key string, cipher Cipher) (*corev1.Sec
 type LazyResolver struct {
 	mu            sync.RWMutex
 	memo          map[string]any
+	touched       map[string]struct{}
 	cmBucketName  string
 	secBucketName string
 	cipher        Cipher
@@ -155,17 +157,47 @@ func memoKey(kind string, key types.NamespacedName, rv string) string {
 	return fmt.Sprintf("%s:%s/%s@%s", kind, key.Namespace, key.Name, rv)
 }
 
+// StartRecompute begins a new recompute cycle, tracking touched entries.
+func (r *LazyResolver) StartRecompute() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.touched = make(map[string]struct{})
+}
+
+// FinishRecompute ends the recompute cycle and evicts all memoized entries that were not
+// touched in this cycle. This ensures old versions and unreferenced objects are reclaimed.
+func (r *LazyResolver) FinishRecompute() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.touched == nil {
+		return
+	}
+	for k := range r.memo {
+		if _, ok := r.touched[k]; !ok {
+			delete(r.memo, k)
+		}
+	}
+	r.touched = nil
+}
+
 // ResolveConfigMap resolves a ConfigMap from the snapshot, returning the memoized instance
 // if the resourceVersion matches.
 func (r *LazyResolver) ResolveConfigMap(snap *Snapshot, key types.NamespacedName, rv string) (*corev1.ConfigMap, bool, error) {
 	strKey := key.String()
+	mKey := ""
 	if rv != "" {
+		mKey = memoKey("ConfigMap", key, rv)
 		r.mu.RLock()
-		if val, ok := r.memo[memoKey("ConfigMap", key, rv)]; ok {
-			r.mu.RUnlock()
+		val, ok := r.memo[mKey]
+		r.mu.RUnlock()
+		if ok {
+			r.mu.Lock()
+			if r.touched != nil {
+				r.touched[mKey] = struct{}{}
+			}
+			r.mu.Unlock()
 			return val.(*corev1.ConfigMap), true, nil
 		}
-		r.mu.RUnlock()
 	}
 
 	cm, exists, err := snap.GetConfigMap(r.cmBucketName, strKey, r.cipher)
@@ -175,8 +207,12 @@ func (r *LazyResolver) ResolveConfigMap(snap *Snapshot, key types.NamespacedName
 
 	actualRV := cm.ResourceVersion
 	if actualRV != "" {
+		newMKey := memoKey("ConfigMap", key, actualRV)
 		r.mu.Lock()
-		r.memo[memoKey("ConfigMap", key, actualRV)] = cm
+		r.memo[newMKey] = cm
+		if r.touched != nil {
+			r.touched[newMKey] = struct{}{}
+		}
 		r.mu.Unlock()
 	}
 	return cm, true, nil
@@ -186,13 +222,20 @@ func (r *LazyResolver) ResolveConfigMap(snap *Snapshot, key types.NamespacedName
 // if the resourceVersion matches.
 func (r *LazyResolver) ResolveSecret(snap *Snapshot, key types.NamespacedName, rv string) (*corev1.Secret, bool, error) {
 	strKey := key.String()
+	mKey := ""
 	if rv != "" {
+		mKey = memoKey("Secret", key, rv)
 		r.mu.RLock()
-		if val, ok := r.memo[memoKey("Secret", key, rv)]; ok {
-			r.mu.RUnlock()
+		val, ok := r.memo[mKey]
+		r.mu.RUnlock()
+		if ok {
+			r.mu.Lock()
+			if r.touched != nil {
+				r.touched[mKey] = struct{}{}
+			}
+			r.mu.Unlock()
 			return val.(*corev1.Secret), true, nil
 		}
-		r.mu.RUnlock()
 	}
 
 	sec, exists, err := snap.GetSecret(r.secBucketName, strKey, r.cipher)
@@ -202,8 +245,12 @@ func (r *LazyResolver) ResolveSecret(snap *Snapshot, key types.NamespacedName, r
 
 	actualRV := sec.ResourceVersion
 	if actualRV != "" {
+		newMKey := memoKey("Secret", key, actualRV)
 		r.mu.Lock()
-		r.memo[memoKey("Secret", key, actualRV)] = sec
+		r.memo[newMKey] = sec
+		if r.touched != nil {
+			r.touched[newMKey] = struct{}{}
+		}
 		r.mu.Unlock()
 	}
 	return sec, true, nil

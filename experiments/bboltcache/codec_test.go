@@ -21,8 +21,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestJSONCodec_StripsManagedFields(t *testing.T) {
-	codec := NewJSONCodec()
+func TestHybridCodec_ProtobufAndNoSideEffects(t *testing.T) {
+	codec := NewHybridCodec()
 
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -45,6 +45,16 @@ func TestJSONCodec_StripsManagedFields(t *testing.T) {
 		t.Fatalf("failed to encode: %v", err)
 	}
 
+	// Verify it encoded using Protobuf (formatProtobuf = 0x01)
+	if len(encoded) == 0 || encoded[0] != formatProtobuf {
+		t.Fatalf("expected formatProtobuf (0x01), got %x", encoded[0])
+	}
+
+	// CRITICAL CHECK: Verify the original object passed to Encode was NOT mutated!
+	if len(cm.ManagedFields) != 1 {
+		t.Fatalf("side-effect detected: original object managedFields was mutated! len=%d", len(cm.ManagedFields))
+	}
+
 	decoded := &corev1.ConfigMap{}
 	if err := codec.Decode(encoded, decoded); err != nil {
 		t.Fatalf("failed to decode: %v", err)
@@ -56,13 +66,14 @@ func TestJSONCodec_StripsManagedFields(t *testing.T) {
 	if decoded.Data["key"] != "value" {
 		t.Fatalf("data mismatch: got %v", decoded.Data)
 	}
+	// The decoded object should have managedFields stripped
 	if len(decoded.ManagedFields) != 0 {
-		t.Fatalf("expected managedFields to be stripped, got %v", decoded.ManagedFields)
+		t.Fatalf("expected managedFields to be stripped in stored object, got %v", decoded.ManagedFields)
 	}
 }
 
-func TestJSONCodec_SecretFidelity(t *testing.T) {
-	codec := NewJSONCodec()
+func TestHybridCodec_SecretFidelity(t *testing.T) {
+	codec := NewHybridCodec()
 
 	sec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -81,6 +92,10 @@ func TestJSONCodec_SecretFidelity(t *testing.T) {
 		t.Fatalf("failed to encode: %v", err)
 	}
 
+	if len(encoded) == 0 || encoded[0] != formatProtobuf {
+		t.Fatalf("expected formatProtobuf for Secret, got %x", encoded[0])
+	}
+
 	decoded := &corev1.Secret{}
 	if err := codec.Decode(encoded, decoded); err != nil {
 		t.Fatalf("failed to decode: %v", err)
@@ -94,5 +109,25 @@ func TestJSONCodec_SecretFidelity(t *testing.T) {
 	}
 	if string(decoded.Data[corev1.TLSPrivateKeyKey]) != "dummy-key-data" {
 		t.Fatalf("key mismatch")
+	}
+}
+
+func TestTransformFunc(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test",
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{Manager: "test"},
+			},
+		},
+	}
+
+	transformed, err := TransformFunc(cm)
+	if err != nil {
+		t.Fatalf("TransformFunc failed: %v", err)
+	}
+	resCM := transformed.(*corev1.ConfigMap)
+	if len(resCM.ManagedFields) != 0 {
+		t.Fatalf("expected managedFields to be stripped by TransformFunc")
 	}
 }

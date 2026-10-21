@@ -19,12 +19,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
 	"go.etcd.io/bbolt"
-	"k8s.io/apimachinery/pkg/runtime"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 // IndexerOptions configures a BBoltIndexer.
@@ -74,12 +77,32 @@ func WithIndexerCodec(codec ObjectCodec) IndexerOption {
 	}
 }
 
+// callerInfo returns the name, file, and line of the first caller outside bboltcache.
+func callerInfo() string {
+	for skip := 2; skip <= 6; skip++ {
+		pc, file, line, ok := runtime.Caller(skip)
+		if !ok {
+			break
+		}
+		fn := runtime.FuncForPC(pc)
+		if fn == nil {
+			continue
+		}
+		fnName := fn.Name()
+		if strings.Contains(fnName, "bboltcache") {
+			continue
+		}
+		return fmt.Sprintf("%s (%s:%d)", fnName, filepath.Base(file), line)
+	}
+	return "unknown caller"
+}
+
 // BBoltIndexer implements k8s.io/client-go/tools/cache.Indexer backed by a bbolt database.
 // Stored objects are serialized and encrypted on disk, living in the page cache rather than Go heap.
 type BBoltIndexer struct {
 	store      *Store
 	bucketName string
-	example    runtime.Object
+	example    k8sruntime.Object
 	keyFunc    toolscache.KeyFunc
 	cipher     Cipher
 	codec      ObjectCodec
@@ -91,7 +114,7 @@ type BBoltIndexer struct {
 var _ toolscache.Indexer = (*BBoltIndexer)(nil)
 
 // NewBBoltIndexer creates a new Indexer for the given example object type.
-func NewBBoltIndexer(store *Store, example runtime.Object, opts ...IndexerOption) (*BBoltIndexer, error) {
+func NewBBoltIndexer(store *Store, example k8sruntime.Object, opts ...IndexerOption) (*BBoltIndexer, error) {
 	if store == nil {
 		return nil, errors.New("store cannot be nil")
 	}
@@ -150,7 +173,7 @@ func (b *BBoltIndexer) Update(obj any) error {
 		return toolscache.KeyError{Obj: obj, Err: err}
 	}
 
-	runtimeObj, ok := obj.(runtime.Object)
+	runtimeObj, ok := obj.(k8sruntime.Object)
 	if !ok {
 		return fmt.Errorf("object %T does not implement runtime.Object", obj)
 	}
@@ -160,7 +183,8 @@ func (b *BBoltIndexer) Update(obj any) error {
 		return fmt.Errorf("failed to encode object: %w", err)
 	}
 
-	encrypted, err := b.cipher.Encrypt(encoded)
+	ad := AdditionalData(b.bucketName, key)
+	encrypted, err := b.cipher.Encrypt(encoded, ad)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt object: %w", err)
 	}
@@ -314,7 +338,8 @@ func (b *BBoltIndexer) GetByKey(key string) (item any, exists bool, err error) {
 		return nil, false, nil
 	}
 
-	decrypted, err := b.cipher.Decrypt(encrypted)
+	ad := AdditionalData(b.bucketName, key)
+	decrypted, err := b.cipher.Decrypt(encrypted, ad)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to decrypt %s: %w", key, err)
 	}
@@ -328,6 +353,8 @@ func (b *BBoltIndexer) GetByKey(key string) (item any, exists bool, err error) {
 }
 
 // List returns all objects stored in the bucket.
+// Note: Calling List() decodes every object in the bucket into Go heap memory,
+// recreating the memory cost this store is meant to avoid. Broad reads are logged at Info level.
 func (b *BBoltIndexer) List() []any {
 	var items []any
 	err := b.store.DB().View(func(tx *bbolt.Tx) error {
@@ -335,8 +362,9 @@ func (b *BBoltIndexer) List() []any {
 		if bucket == nil {
 			return nil
 		}
-		return bucket.ForEach(func(_, val []byte) error {
-			decrypted, err := b.cipher.Decrypt(val)
+		return bucket.ForEach(func(k, val []byte) error {
+			ad := AdditionalData(b.bucketName, string(k))
+			decrypted, err := b.cipher.Decrypt(val, ad)
 			if err != nil {
 				return nil
 			}
@@ -351,6 +379,7 @@ func (b *BBoltIndexer) List() []any {
 	if err != nil {
 		return nil
 	}
+	klog.Infof("bboltcache: broad read invoked on bucket %q: List() decoded %d objects (caller: %s)", b.bucketName, len(items), callerInfo())
 	return items
 }
 
@@ -405,7 +434,7 @@ func (b *BBoltIndexer) Replace(list []any, rv string) error {
 				return toolscache.KeyError{Obj: item, Err: err}
 			}
 
-			runtimeObj, ok := item.(runtime.Object)
+			runtimeObj, ok := item.(k8sruntime.Object)
 			if !ok {
 				return fmt.Errorf("object %T does not implement runtime.Object", item)
 			}
@@ -415,7 +444,8 @@ func (b *BBoltIndexer) Replace(list []any, rv string) error {
 				return err
 			}
 
-			encrypted, err := b.cipher.Encrypt(encoded)
+			ad := AdditionalData(b.bucketName, key)
+			encrypted, err := b.cipher.Encrypt(encoded, ad)
 			if err != nil {
 				return err
 			}
@@ -533,6 +563,9 @@ func (b *BBoltIndexer) Index(indexName string, obj any) ([]any, error) {
 			items = append(items, item)
 		}
 	}
+	if len(items) > 10 {
+		klog.Infof("bboltcache: broad index read invoked on bucket %q (index %q): decoded %d objects (caller: %s)", b.bucketName, indexName, len(items), callerInfo())
+	}
 	return items, nil
 }
 
@@ -580,6 +613,9 @@ func (b *BBoltIndexer) ByIndex(indexName, indexedValue string) ([]any, error) {
 		if exists {
 			items = append(items, item)
 		}
+	}
+	if len(items) > 10 {
+		klog.Infof("bboltcache: broad index read invoked on bucket %q (index %q, value %q): decoded %d objects (caller: %s)", b.bucketName, indexName, indexedValue, len(items), callerInfo())
 	}
 	return items, nil
 }

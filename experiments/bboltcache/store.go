@@ -91,19 +91,21 @@ type Store struct {
 func NewStore(opts ...StoreOption) (*Store, error) {
 	options := StoreOptions{
 		Cipher:     NoopCipher{},
-		Codec:      NewJSONCodec(),
+		Codec:      NewHybridCodec(),
 		AutoDelete: true,
 		BoltOpts: &bbolt.Options{
 			Timeout:         1 * time.Second,
 			FreelistType:    bbolt.FreelistMapType,
-			InitialMmapSize: 64 * 1024 * 1024,
+			InitialMmapSize: 256 * 1024 * 1024,
+			NoSync:          true,
+			NoFreelistSync:  true,
 		},
 	}
 	for _, opt := range opts {
 		opt(&options)
 	}
 	if options.BoltOpts != nil && options.BoltOpts.InitialMmapSize == 0 {
-		options.BoltOpts.InitialMmapSize = 64 * 1024 * 1024
+		options.BoltOpts.InitialMmapSize = 256 * 1024 * 1024
 	}
 
 	path := options.FilePath

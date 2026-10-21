@@ -23,20 +23,27 @@ import (
 	"io"
 )
 
-// Cipher defines an interface for symmetric payload encryption and decryption.
+// Cipher defines an interface for authenticated symmetric payload encryption and decryption.
+// Additional authenticated data (additionalData) binds the ciphertext to its bucket and key
+// so a ciphertext cannot be transplanted or read under a different key.
 type Cipher interface {
-	Encrypt(plaintext []byte) ([]byte, error)
-	Decrypt(ciphertext []byte) ([]byte, error)
+	Encrypt(plaintext []byte, additionalData []byte) ([]byte, error)
+	Decrypt(ciphertext []byte, additionalData []byte) ([]byte, error)
+}
+
+// AdditionalData formats the AEAD additional authenticated data from bucket name and object key.
+func AdditionalData(bucketName, key string) []byte {
+	return []byte(bucketName + "/" + key)
 }
 
 // NoopCipher passes data through without encryption.
 type NoopCipher struct{}
 
-func (NoopCipher) Encrypt(plaintext []byte) ([]byte, error) {
+func (NoopCipher) Encrypt(plaintext []byte, _ []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-func (NoopCipher) Decrypt(ciphertext []byte) ([]byte, error) {
+func (NoopCipher) Decrypt(ciphertext []byte, _ []byte) ([]byte, error) {
 	return ciphertext, nil
 }
 
@@ -68,26 +75,26 @@ func NewAESGCMCipher(key []byte) (*AESGCMCipher, error) {
 	return &AESGCMCipher{aead: gcm}, nil
 }
 
-// Encrypt encrypts plaintext using AES-GCM with a fresh random nonce.
+// Encrypt encrypts plaintext using AES-GCM with a fresh random nonce and binds additionalData.
 // The nonce is prepended to the ciphertext.
-func (c *AESGCMCipher) Encrypt(plaintext []byte) ([]byte, error) {
+func (c *AESGCMCipher) Encrypt(plaintext []byte, additionalData []byte) ([]byte, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 	// gcm.Seal appends ciphertext and authentication tag to dst (nonce).
-	return c.aead.Seal(nonce, nonce, plaintext, nil), nil
+	return c.aead.Seal(nonce, nonce, plaintext, additionalData), nil
 }
 
-// Decrypt verifies and decrypts ciphertext using AES-GCM.
-func (c *AESGCMCipher) Decrypt(ciphertext []byte) ([]byte, error) {
+// Decrypt verifies and decrypts ciphertext using AES-GCM with additionalData.
+func (c *AESGCMCipher) Decrypt(ciphertext []byte, additionalData []byte) ([]byte, error) {
 	nonceSize := c.aead.NonceSize()
 	if len(ciphertext) < nonceSize {
 		return nil, errors.New("ciphertext too short: missing nonce")
 	}
 	nonce := ciphertext[:nonceSize]
 	data := ciphertext[nonceSize:]
-	plaintext, err := c.aead.Open(nil, nonce, data, nil)
+	plaintext, err := c.aead.Open(nil, nonce, data, additionalData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt ciphertext: %w", err)
 	}

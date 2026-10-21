@@ -219,6 +219,15 @@ func TestBBoltIndexer_WithEncryption(t *testing.T) {
 	if string(raw) == "SUPER_CONFIDENTIAL_KEY" {
 		t.Fatal("security violation: raw database contains unencrypted secret key!")
 	}
+
+	// Verify key-binding: copying ciphertext to a different key must fail decryption!
+	if err := store.Put(fmt.Sprintf("%T", sec), "default/swapped-secret", raw); err != nil {
+		t.Fatalf("store.Put failed: %v", err)
+	}
+	_, _, err = indexer.GetByKey("default/swapped-secret")
+	if err == nil {
+		t.Fatal("security violation: swapped ciphertext under different key decrypted successfully!")
+	}
 }
 
 func TestBBoltIndexer_ReplaceAndResourceVersion(t *testing.T) {
