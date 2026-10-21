@@ -71,8 +71,25 @@ GARI supports `UDPRoute` routing UDP datagram traffic on dedicated listener port
 - **Weighted Routing**: Traffic is distributed across configured backendRefs according to weight; backends with weight `0` receive no traffic.
 - **Session Lifecycle & Limits**: Sessions expire after an idle timeout (default 60s, configurable via `--udp-idle-timeout`) and are capped per listener (default 10000, configurable via `--udp-max-sessions`). New clients exceeding the cap are dropped without evicting active sessions.
 - **Per-Gateway Data Plane (Default / Conformance)**: In standard deployment (`singlepod`), each Gateway runs its own data plane Deployment and LoadBalancer Service mapping UDP listener ports directly to matching container ports.
-- **Reserved Port**: UDP port 8443 is reserved for HTTP/3; listeners specifying UDP 8443 report `Conflicted=True` with `ProtocolConflict`.
+- **Reserved Ports**: Container ports 8080, 8443, and 8999 are reserved inside the data-plane pod; raw TCP or UDP listeners specifying these ports report `Accepted=False` with reason `PortUnavailable`.
 - **All-in-One Mode Limitation**: In all-in-one mode, the first Gateway wins a UDP port; subsequent Gateways requesting the same port report `Programmed=False` with reason `PortUnavailable`.
+
+### Data-Plane Ports
+
+In `singlepod` per-Gateway data plane mode, pods listen on the following container ports:
+
+| Purpose | Port | Protocol | Description |
+| --- | --- | --- | --- |
+| HTTP proxy | 8080 | TCP | Plain HTTP listeners (all HTTP listener ports collapse here behind the Service) |
+| HTTPS / TLS proxy | 8443 | TCP | TLS and HTTPS listeners |
+| HTTP/3 proxy | 8443 | UDP | HTTP/3 over QUIC |
+| Metrics and Health | 8999 | TCP | `/metrics`, `/healthz`, and `/readyz` |
+
+Ports 8080, 8443, and 8999 are reserved container ports inside the data-plane pod. A raw TCP or UDP listener requesting any of these ports reports `Accepted=False` with reason `PortUnavailable`.
+
+Provisioned Services use named target ports (`http`, `https`, `http3`) to decouple Gateway listener ports from internal container ports and ensure rollout-safe upgrades.
+
+> **Note for operators fronting data planes with standalone NEGs:** update firewall rules and health check ports from 8000/8081 to 8080/8999.
 
 ### Infrastructure Parameters (parametersRef ConfigMap)
 
@@ -88,6 +105,8 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--metrics-bind-address` | `:8999` | Address the metric and health probe endpoint binds to. |
+| `--health-probe-bind-address` | `:8999` | Address the health probe endpoint binds to (if configured to the same port as `--metrics-bind-address`, probes and metrics share a single listener). |
 | `--read-header-timeout` | `10s` | Maximum duration allowed to read request headers and complete TLS handshakes on HTTP and HTTPS servers. |
 | `--idle-timeout` | `60s` | Maximum duration to wait for the next request on keep-alive connections (and QUIC `MaxIdleTimeout` for HTTP/3). |
 | `--read-timeout` | `0s` (disabled) | Maximum duration for reading the entire request, including body. |
@@ -97,7 +116,7 @@ See [docs/singlepod-parameters.md](docs/singlepod-parameters.md) for details and
 | `--udp-max-sessions` | `10000` | Maximum number of concurrent UDP sessions per listener. |
 | `--udp-idle-timeout` | `60s` | Idle timeout for UDP sessions. |
 | `--forwarded-for-mode` | `append` | How to handle `X-Forwarded-For`: `append` (default) or `replace`. |
-| `--proxy-bind-address` | `:8000` | Address the proxy binds to for HTTP. |
+| `--proxy-bind-address` | `:8080` | Address the proxy binds to for HTTP. |
 | `--proxy-https-bind-address` | `:8443` | Address the proxy binds to for HTTPS. |
 | `--proxy-http3-bind-address` | `""` (disabled) | UDP address the proxy binds to for HTTP/3. |
 | `--proxy-http3-advertised-port` | `0` (inferred) | Port advertised in the `Alt-Svc` header for HTTP/3. |

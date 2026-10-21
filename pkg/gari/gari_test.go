@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +42,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -49,8 +51,8 @@ func TestDefaultOptions(t *testing.T) {
 	if opts.ControllerName != controller.DefaultControllerName {
 		t.Errorf("expected controller name %q, got %q", controller.DefaultControllerName, opts.ControllerName)
 	}
-	if opts.ProxyAddr != ":8000" {
-		t.Errorf("expected proxy addr :8000, got %q", opts.ProxyAddr)
+	if opts.ProxyAddr != ":8080" {
+		t.Errorf("expected proxy addr :8080, got %q", opts.ProxyAddr)
 	}
 	if opts.ProxyHTTPSAddr != ":8443" {
 		t.Errorf("expected proxy https addr :8443, got %q", opts.ProxyHTTPSAddr)
@@ -61,11 +63,11 @@ func TestDefaultOptions(t *testing.T) {
 	if opts.ProxyHTTP3AdvertisedPort != 0 {
 		t.Errorf("expected proxy http3 advertised port to be 0 by default, got %d", opts.ProxyHTTP3AdvertisedPort)
 	}
-	if opts.MetricsAddr != ":8080" {
-		t.Errorf("expected metrics addr :8080, got %q", opts.MetricsAddr)
+	if opts.MetricsAddr != ":8999" {
+		t.Errorf("expected metrics addr :8999, got %q", opts.MetricsAddr)
 	}
-	if opts.HealthProbeBindAddress != ":8081" {
-		t.Errorf("expected probe addr :8081, got %q", opts.HealthProbeBindAddress)
+	if opts.HealthProbeBindAddress != ":8999" {
+		t.Errorf("expected probe addr :8999, got %q", opts.HealthProbeBindAddress)
 	}
 	if opts.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("expected read header timeout 10s, got %v", opts.ReadHeaderTimeout)
@@ -81,6 +83,157 @@ func TestDefaultOptions(t *testing.T) {
 	}
 	if opts.ForwardedForMode != proxy.ForwardedForModeAppend {
 		t.Errorf("expected forwarded for mode %q, got %q", proxy.ForwardedForModeAppend, opts.ForwardedForMode)
+	}
+}
+
+func TestHealthzAndReadyzHandlers(t *testing.T) {
+	s := &Server{}
+	readyzHandler, healthzHandler := s.healthzHandlers()
+	wrappedHealthz := http.StripPrefix("/healthz", healthzHandler)
+	wrappedReadyz := http.StripPrefix("/readyz", readyzHandler)
+
+	// 1. healthz should return 200 "ok"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	wrappedHealthz.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Errorf("expected healthz 200 ok, got %d %q", rec.Code, rec.Body.String())
+	}
+
+	// 2. readyz before sync should return 500
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	wrappedReadyz.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected readyz 500 before sync, got %d", rec.Code)
+	}
+
+	// 3. readyz after sync should return 200 "ok"
+	s.proxySynced.Store(true)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	wrappedReadyz.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Errorf("expected readyz 200 ok after sync, got %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetricsAndHealthServer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	s := &Server{}
+	readyzHandler, healthzHandler := s.healthzHandlers()
+
+	ms, err := metricsserver.NewServer(metricsserver.Options{
+		BindAddress: fmt.Sprintf("127.0.0.1:%d", port),
+		ExtraHandlers: map[string]http.Handler{
+			"/healthz":  http.StripPrefix("/healthz", healthzHandler),
+			"/healthz/": http.StripPrefix("/healthz", healthzHandler),
+			"/readyz":   http.StripPrefix("/readyz", readyzHandler),
+			"/readyz/":  http.StripPrefix("/readyz", readyzHandler),
+		},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("failed to create metrics server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ms.Start(ctx)
+	}()
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	httpClient := &http.Client{Timeout: 2 * time.Second}
+
+	var resp *http.Response
+	for i := 0; i < 20; i++ {
+		resp, err = httpClient.Get(baseURL + "/healthz")
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("failed to connect to server: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected /healthz 200 OK, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Errorf("expected /healthz 'ok', got %q", string(body))
+	}
+
+	// Verify /readyz returns 500 before sync
+	respReady, err := httpClient.Get(baseURL + "/readyz")
+	if err != nil {
+		t.Fatalf("failed to get /readyz: %v", err)
+	}
+	defer respReady.Body.Close()
+	if respReady.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected /readyz 500 before sync, got %d", respReady.StatusCode)
+	}
+
+	// Mark synced and verify /readyz returns 200 OK
+	s.proxySynced.Store(true)
+	respReadySynced, err := httpClient.Get(baseURL + "/readyz")
+	if err != nil {
+		t.Fatalf("failed to get /readyz after sync: %v", err)
+	}
+	defer respReadySynced.Body.Close()
+	if respReadySynced.StatusCode != http.StatusOK {
+		t.Errorf("expected /readyz 200 OK after sync, got %d", respReadySynced.StatusCode)
+	}
+	bodyReady, _ := io.ReadAll(respReadySynced.Body)
+	if string(bodyReady) != "ok" {
+		t.Errorf("expected /readyz 'ok', got %q", string(bodyReady))
+	}
+
+	// Verify /metrics returns 200 OK and Prometheus metrics
+	respMetrics, err := httpClient.Get(baseURL + "/metrics")
+	if err != nil {
+		t.Fatalf("failed to get /metrics: %v", err)
+	}
+	defer respMetrics.Body.Close()
+	if respMetrics.StatusCode != http.StatusOK {
+		t.Errorf("expected /metrics 200 OK, got %d", respMetrics.StatusCode)
+	}
+	metricsBody, _ := io.ReadAll(respMetrics.Body)
+	if !strings.Contains(string(metricsBody), "promhttp_metric_handler_requests_total") && !strings.Contains(string(metricsBody), "go_goroutines") {
+		t.Errorf("expected prometheus metrics in response, got %s", string(metricsBody[:min(len(metricsBody), 200)]))
+	}
+}
+
+func TestSamePortOrAddr(t *testing.T) {
+	tests := []struct {
+		addr1    string
+		addr2    string
+		expected bool
+	}{
+		{":8999", ":8999", true},
+		{"0.0.0.0:8999", ":8999", true},
+		{":8999", "127.0.0.1:8999", true},
+		{"127.0.0.1:8999", "127.0.0.1:8999", true},
+		{":8999", ":8081", false},
+		{":8999", "127.0.0.1:8081", false},
+		{"", "", false},
+		{"0", "0", false},
+		{":0", ":0", false},
+		{"127.0.0.1:0", "127.0.0.1:0", false},
+	}
+	for _, tc := range tests {
+		if actual := samePortOrAddr(tc.addr1, tc.addr2); actual != tc.expected {
+			t.Errorf("samePortOrAddr(%q, %q) = %v, want %v", tc.addr1, tc.addr2, actual, tc.expected)
+		}
 	}
 }
 

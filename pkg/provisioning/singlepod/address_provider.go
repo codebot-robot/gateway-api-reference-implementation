@@ -409,18 +409,21 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				continue
 			}
 			if el.Protocol == gatewayv1.TCPProtocolType {
-				if !seenTCPPort[el.Port] {
+				if !state.IsReservedDataPlanePort(el.Port) && !seenTCPPort[el.Port] {
 					seenTCPPort[el.Port] = true
 					tcpPorts = append(tcpPorts, int(el.Port))
 				}
 			}
-			if el.Protocol == gatewayv1.UDPProtocolType && el.Port != 8443 {
-				if !seenUDPPort[el.Port] {
+			if el.Protocol == gatewayv1.UDPProtocolType {
+				if !state.IsReservedDataPlanePort(el.Port) && !seenUDPPort[el.Port] {
 					seenUDPPort[el.Port] = true
 					udpPorts = append(udpPorts, int(el.Port))
 				}
 			}
 			if el.Protocol != gatewayv1.UDPProtocolType {
+				if el.Protocol == gatewayv1.TCPProtocolType && state.IsReservedDataPlanePort(el.Port) {
+					continue
+				}
 				if prev, ok := uniquePorts[el.Port]; !ok {
 					uniquePorts[el.Port] = el.Protocol
 				} else if el.Protocol == gatewayv1.HTTPSProtocolType {
@@ -433,18 +436,21 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	} else {
 		for _, l := range gw.Spec.Listeners {
 			if l.Protocol == gatewayv1.TCPProtocolType {
-				if !seenTCPPort[l.Port] {
+				if !state.IsReservedDataPlanePort(l.Port) && !seenTCPPort[l.Port] {
 					seenTCPPort[l.Port] = true
 					tcpPorts = append(tcpPorts, int(l.Port))
 				}
 			}
-			if l.Protocol == gatewayv1.UDPProtocolType && l.Port != 8443 {
-				if !seenUDPPort[l.Port] {
+			if l.Protocol == gatewayv1.UDPProtocolType {
+				if !state.IsReservedDataPlanePort(l.Port) && !seenUDPPort[l.Port] {
 					seenUDPPort[l.Port] = true
 					udpPorts = append(udpPorts, int(l.Port))
 				}
 			}
 			if l.Protocol != gatewayv1.UDPProtocolType {
+				if l.Protocol == gatewayv1.TCPProtocolType && state.IsReservedDataPlanePort(l.Port) {
+					continue
+				}
 				if prev, ok := uniquePorts[l.Port]; !ok {
 					uniquePorts[l.Port] = l.Protocol
 				} else if el := l; prev != gatewayv1.HTTPSProtocolType && el.Protocol == gatewayv1.HTTPSProtocolType {
@@ -461,7 +467,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	containerPorts := []*corev1ac.ContainerPortApplyConfiguration{
 		corev1ac.ContainerPort().
 			WithName("http").
-			WithContainerPort(8000).
+			WithContainerPort(8080).
 			WithProtocol(corev1.ProtocolTCP),
 		corev1ac.ContainerPort().
 			WithName("https").
@@ -473,7 +479,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 			WithProtocol(corev1.ProtocolUDP),
 	}
 	for _, portInt := range tcpPorts {
-		if portInt == 8000 || portInt == 8443 {
+		if state.IsReservedDataPlanePort(gatewayv1.PortNumber(portInt)) {
 			continue
 		}
 		containerPorts = append(containerPorts,
@@ -484,7 +490,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		)
 	}
 	for _, portInt := range udpPorts {
-		if portInt == 8443 {
+		if state.IsReservedDataPlanePort(gatewayv1.PortNumber(portInt)) {
 			continue
 		}
 		containerPorts = append(containerPorts,
@@ -508,7 +514,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				WithReadinessProbe(corev1ac.Probe().
 					WithHTTPGet(corev1ac.HTTPGetAction().
 						WithPath("/readyz").
-						WithPort(intstr.FromInt32(8081)),
+						WithPort(intstr.FromInt32(8999)),
 					).
 					WithInitialDelaySeconds(1).
 					WithPeriodSeconds(2),
@@ -567,12 +573,12 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				corev1ac.ServicePort().
 					WithName(fmt.Sprintf("https-%d", port)).
 					WithPort(int32(port)).
-					WithTargetPort(intstr.FromInt32(8443)).
+					WithTargetPort(intstr.FromString("https")).
 					WithProtocol(corev1.ProtocolTCP),
 				corev1ac.ServicePort().
 					WithName(fmt.Sprintf("http3-%d", port)).
 					WithPort(int32(port)).
-					WithTargetPort(intstr.FromInt32(8443)).
+					WithTargetPort(intstr.FromString("http3")).
 					WithProtocol(corev1.ProtocolUDP),
 			)
 		} else if proto == gatewayv1.TLSProtocolType {
@@ -580,7 +586,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				corev1ac.ServicePort().
 					WithName(fmt.Sprintf("tls-%d", port)).
 					WithPort(int32(port)).
-					WithTargetPort(intstr.FromInt32(8443)).
+					WithTargetPort(intstr.FromString("https")).
 					WithProtocol(corev1.ProtocolTCP),
 			)
 		} else if proto == gatewayv1.TCPProtocolType {
@@ -596,7 +602,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				corev1ac.ServicePort().
 					WithName(fmt.Sprintf("http-%d", port)).
 					WithPort(int32(port)).
-					WithTargetPort(intstr.FromInt32(8000)).
+					WithTargetPort(intstr.FromString("http")).
 					WithProtocol(corev1.ProtocolTCP),
 			)
 		}

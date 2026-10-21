@@ -48,7 +48,7 @@ func main() {
 	flag.StringVar(&dataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
 	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
-	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to.")
+	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to for HTTP.")
 	flag.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "The address the proxy binds to for HTTPS.")
 	flag.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (disabled by default).")
 	flag.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address).")

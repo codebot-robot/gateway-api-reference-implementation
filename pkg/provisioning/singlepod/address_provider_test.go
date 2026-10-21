@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1924,6 +1925,11 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 				},
 				{
 					Name:     "tcp-conflicted",
+					Port:     8080,
+					Protocol: gatewayv1.TCPProtocolType,
+				},
+				{
+					Name:     "tcp-8000",
 					Port:     8000,
 					Protocol: gatewayv1.TCPProtocolType,
 				},
@@ -1949,15 +1955,20 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		},
 		{
 			Name:     "tcp-conflicted",
-			Port:     8000,
+			Port:     8080,
 			Protocol: gatewayv1.TCPProtocolType,
 			Conditions: []metav1.Condition{
 				{
 					Type:   string(gatewayv1.ListenerConditionConflicted),
 					Status: metav1.ConditionTrue,
-					Reason: string(gatewayv1.ListenerReasonProtocolConflict),
+					Reason: string(gatewayv1.ListenerReasonPortUnavailable),
 				},
 			},
+		},
+		{
+			Name:     "tcp-8000",
+			Port:     8000,
+			Protocol: gatewayv1.TCPProtocolType,
 		},
 	}
 
@@ -1979,11 +1990,11 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		svcPortMap[sp.Name] = sp
 	}
 
-	// Verify HTTP port remapped to 8000
+	// Verify HTTP port mapped to named targetPort "http"
 	if sp, ok := svcPortMap["http-80"]; !ok {
 		t.Errorf("expected Service port http-80")
 	} else {
-		if sp.Port != 80 || sp.TargetPort.IntValue() != 8000 || sp.Protocol != corev1.ProtocolTCP {
+		if sp.Port != 80 || sp.TargetPort.Type != intstr.String || sp.TargetPort.StrVal != "http" || sp.Protocol != corev1.ProtocolTCP {
 			t.Errorf("http-80: got port=%d targetPort=%v proto=%s", sp.Port, sp.TargetPort, sp.Protocol)
 		}
 	}
@@ -2005,9 +2016,16 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		}
 	}
 
-	// Verify conflicted TCP listener port 8000 is NOT in Service
-	if _, ok := svcPortMap["tcp-8000"]; ok {
-		t.Errorf("conflicted port 8000 should NOT be exposed on Service")
+	// Verify unreserved TCP listener port 8000 IS in Service
+	if sp, ok := svcPortMap["tcp-8000"]; !ok {
+		t.Errorf("unreserved port 8000 should be exposed on Service")
+	} else if sp.Port != 8000 || sp.TargetPort.IntValue() != 8000 || sp.Protocol != corev1.ProtocolTCP {
+		t.Errorf("tcp-8000: got port=%d targetPort=%v proto=%s", sp.Port, sp.TargetPort, sp.Protocol)
+	}
+
+	// Verify conflicted TCP listener port 8080 is NOT in Service
+	if _, ok := svcPortMap["tcp-8080"]; ok {
+		t.Errorf("conflicted port 8080 should NOT be exposed on Service")
 	}
 
 	// 2. Verify Deployment container ports
@@ -2023,11 +2041,17 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 	}
 
 	// Verify default container ports
-	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8000 {
-		t.Errorf("expected container port http:8000")
+	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8080 {
+		t.Errorf("expected container port http:8080, got %+v", cpMap["http"])
 	}
 	if cp, ok := cpMap["https"]; !ok || cp.ContainerPort != 8443 {
 		t.Errorf("expected container port https:8443")
+	}
+
+	// Verify readiness probe port 8999
+	probe := deploy.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Port.IntValue() != 8999 {
+		t.Errorf("expected readiness probe on port 8999, got %+v", probe)
 	}
 
 	// Verify TCP listener container ports
@@ -2043,9 +2067,14 @@ func TestSinglePodAddressProvider_TCPListenerServiceAndDeploymentPorts(t *testin
 		t.Errorf("tcp-9001: got containerPort=%d proto=%s, want 9001/TCP", cp.ContainerPort, cp.Protocol)
 	}
 
-	// Verify conflicted TCP listener port 8000 is NOT in Deployment
-	if _, ok := cpMap["tcp-8000"]; ok {
-		t.Errorf("conflicted port 8000 should NOT be declared on Deployment container ports")
+	// Verify unreserved TCP listener port 8000 IS in Deployment
+	if cp, ok := cpMap["tcp-8000"]; !ok || cp.ContainerPort != 8000 {
+		t.Errorf("unreserved port 8000 should be in Deployment container ports, got %+v", cpMap["tcp-8000"])
+	}
+
+	// Verify conflicted TCP listener port 8080 is NOT in Deployment
+	if _, ok := cpMap["tcp-8080"]; ok {
+		t.Errorf("conflicted port 8080 should NOT be declared on Deployment container ports")
 	}
 }
 
@@ -2110,7 +2139,7 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 				{
 					Type:   string(gatewayv1.ListenerConditionConflicted),
 					Status: metav1.ConditionTrue,
-					Reason: string(gatewayv1.ListenerReasonProtocolConflict),
+					Reason: string(gatewayv1.ListenerReasonPortUnavailable),
 				},
 			},
 		},
@@ -2134,11 +2163,11 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 		svcPortMap[sp.Name] = sp
 	}
 
-	// Verify HTTP port remapped to 8000
+	// Verify HTTP port mapped to named targetPort "http"
 	if sp, ok := svcPortMap["http-80"]; !ok {
 		t.Errorf("expected Service port http-80")
 	} else {
-		if sp.Port != 80 || sp.TargetPort.IntValue() != 8000 || sp.Protocol != corev1.ProtocolTCP {
+		if sp.Port != 80 || sp.TargetPort.Type != intstr.String || sp.TargetPort.StrVal != "http" || sp.Protocol != corev1.ProtocolTCP {
 			t.Errorf("http-80: got port=%d targetPort=%v proto=%s", sp.Port, sp.TargetPort, sp.Protocol)
 		}
 	}
@@ -2178,14 +2207,20 @@ func TestSinglePodAddressProvider_UDPListenerServiceAndDeploymentPorts(t *testin
 	}
 
 	// Verify default container ports
-	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8000 {
-		t.Errorf("expected container port http:8000")
+	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8080 {
+		t.Errorf("expected container port http:8080, got %+v", cpMap["http"])
 	}
 	if cp, ok := cpMap["https"]; !ok || cp.ContainerPort != 8443 {
 		t.Errorf("expected container port https:8443")
 	}
 	if cp, ok := cpMap["http3"]; !ok || cp.ContainerPort != 8443 || cp.Protocol != corev1.ProtocolUDP {
 		t.Errorf("expected container port http3:8443/UDP")
+	}
+
+	// Verify readiness probe port 8999
+	probe := deploy.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Port.IntValue() != 8999 {
+		t.Errorf("expected readiness probe on port 8999, got %+v", probe)
 	}
 
 	// Verify UDP listener container ports
@@ -3426,5 +3461,173 @@ func TestSinglePodAddressProvider_LiveSwitch_LoadBalancer_To_ClusterIP(t *testin
 	}
 	if len(svcList.Items) != 1 {
 		t.Errorf("expected exactly 1 Service in namespace, got %d", len(svcList.Items))
+	}
+}
+
+func TestSinglePodAddressProvider_UpgradeUpdatesServiceAndDeploymentInPlace(t *testing.T) {
+	c := setupTestClient(t)
+	ctx := t.Context()
+	p := NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "upgrading-gw",
+			Namespace:  "test-ns",
+			Generation: 1,
+			UID:        types.UID("gw-uid-1234"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     "http",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+		},
+		{
+			Name:     "https",
+			Port:     443,
+			Protocol: gatewayv1.HTTPSProtocolType,
+		},
+	}
+
+	resName := ResourceNameForGateway(gw.Name)
+	controllerTrue := true
+	ownerRef := metav1.OwnerReference{
+		APIVersion: gatewayv1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: &controllerTrue,
+	}
+
+	// 1. Simulate pre-upgrade state: Service uses numeric target ports 8000 and 8443
+	oldSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            resName,
+			Namespace:       "test-ns",
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http-80",
+					Port:       80,
+					TargetPort: intstr.FromInt32(8000),
+					Protocol:   corev1.ProtocolTCP,
+				},
+				{
+					Name:       "https-443",
+					Port:       443,
+					TargetPort: intstr.FromInt32(8443),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+	if err := c.Create(ctx, oldSvc); err != nil {
+		t.Fatalf("failed to create old Service: %v", err)
+	}
+
+	// 2. Simulate pre-upgrade state: Deployment uses containerPort 8000 for http and probe on 8081
+	oldDeploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            resName,
+			Namespace:       "test-ns",
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "dataplane",
+							Image: "gari-dataplane:v1",
+							Ports: []corev1.ContainerPort{
+								{Name: "http", ContainerPort: 8000, Protocol: corev1.ProtocolTCP},
+								{Name: "https", ContainerPort: 8443, Protocol: corev1.ProtocolTCP},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/readyz",
+										Port: intstr.FromInt32(8081),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := c.Create(ctx, oldDeploy); err != nil {
+		t.Fatalf("failed to create old Deployment: %v", err)
+	}
+
+	// 3. Reconcile with updated provider
+	_, _, err := p.GatewayAddressesWithReadiness(ctx, gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("unexpected error during reconcile: %v", err)
+	}
+
+	// 4. Verify Service updated in place to named target ports
+	var updatedSvc corev1.Service
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &updatedSvc); err != nil {
+		t.Fatalf("failed to get updated Service: %v", err)
+	}
+	svcPortMap := make(map[string]corev1.ServicePort)
+	for _, sp := range updatedSvc.Spec.Ports {
+		svcPortMap[sp.Name] = sp
+	}
+
+	if sp, ok := svcPortMap["http-80"]; !ok {
+		t.Errorf("expected Service port http-80")
+	} else if sp.TargetPort.Type != intstr.String || sp.TargetPort.StrVal != "http" {
+		t.Errorf("expected http-80 targetPort 'http', got %+v", sp.TargetPort)
+	}
+
+	if sp, ok := svcPortMap["https-443"]; !ok {
+		t.Errorf("expected Service port https-443")
+	} else if sp.TargetPort.Type != intstr.String || sp.TargetPort.StrVal != "https" {
+		t.Errorf("expected https-443 targetPort 'https', got %+v", sp.TargetPort)
+	}
+
+	// 5. Verify Deployment updated in place to container port 8080 and readiness probe on 8999
+	var updatedDeploy appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: resName}, &updatedDeploy); err != nil {
+		t.Fatalf("failed to get updated Deployment: %v", err)
+	}
+	cpMap := make(map[string]corev1.ContainerPort)
+	for _, cp := range updatedDeploy.Spec.Template.Spec.Containers[0].Ports {
+		cpMap[cp.Name] = cp
+	}
+
+	if cp, ok := cpMap["http"]; !ok || cp.ContainerPort != 8080 {
+		t.Errorf("expected container port http:8080, got %+v", cpMap["http"])
+	}
+	if cp, ok := cpMap["https"]; !ok || cp.ContainerPort != 8443 {
+		t.Errorf("expected container port https:8443, got %+v", cpMap["https"])
+	}
+
+	probe := updatedDeploy.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Port.IntValue() != 8999 {
+		t.Errorf("expected readiness probe on port 8999, got %+v", probe)
 	}
 }

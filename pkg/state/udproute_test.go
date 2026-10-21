@@ -981,7 +981,7 @@ func TestSelectUDPBackend(t *testing.T) {
 func TestUDPPort8443Conflict(t *testing.T) {
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:       "gw-udp-8443",
+			Name:       "gw-udp-reserved",
 			Namespace:  "default",
 			Generation: 1,
 		},
@@ -989,8 +989,33 @@ func TestUDPPort8443Conflict(t *testing.T) {
 			GatewayClassName: "reference-class",
 			Listeners: []gatewayv1.Listener{
 				{
+					Name:     "udp-8080",
+					Port:     8080,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
 					Name:     "udp-8443",
 					Port:     8443,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
+					Name:     "udp-8999",
+					Port:     8999,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
+					Name:     "udp-8000",
+					Port:     8000,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
+					Name:     "udp-8081",
+					Port:     8081,
+					Protocol: gatewayv1.UDPProtocolType,
+				},
+				{
+					Name:     "udp-valid",
+					Port:     9000,
 					Protocol: gatewayv1.UDPProtocolType,
 				},
 			},
@@ -1013,15 +1038,59 @@ func TestUDPPort8443Conflict(t *testing.T) {
 	outputs := ComputeOutputs(inputs)
 	gwStatus := outputs.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: gw.Name}]
 
-	var confCond *metav1.Condition
-	for _, c := range gwStatus.Listeners[0].Conditions {
-		if c.Type == string(gatewayv1.ListenerConditionConflicted) {
-			confCond = &c
-			break
+	listenerStatusMap := make(map[gatewayv1.SectionName]gatewayv1.ListenerStatus)
+	for _, ls := range gwStatus.Listeners {
+		listenerStatusMap[ls.Name] = ls
+	}
+
+	for _, name := range []gatewayv1.SectionName{"udp-8080", "udp-8443", "udp-8999"} {
+		ls, ok := listenerStatusMap[name]
+		if !ok {
+			t.Fatalf("listener %s status not found", name)
+		}
+		var confCond, acceptedCond, progCond *metav1.Condition
+		for _, c := range ls.Conditions {
+			switch c.Type {
+			case string(gatewayv1.ListenerConditionConflicted):
+				confCond = &c
+			case string(gatewayv1.ListenerConditionAccepted):
+				acceptedCond = &c
+			case string(gatewayv1.ListenerConditionProgrammed):
+				progCond = &c
+			}
+		}
+		if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+			t.Errorf("listener %s expected Conflicted=True PortUnavailable, got %+v", name, confCond)
+		}
+		if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+			t.Errorf("listener %s expected Accepted=False PortUnavailable, got %+v", name, acceptedCond)
+		}
+		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPortUnavailable) {
+			t.Errorf("listener %s expected Programmed=False PortUnavailable, got %+v", name, progCond)
 		}
 	}
-	if confCond == nil || confCond.Status != metav1.ConditionTrue || confCond.Reason != string(gatewayv1.ListenerReasonProtocolConflict) {
-		t.Errorf("expected Conflicted=True with ProtocolConflict on UDP 8443, got %+v", confCond)
+
+	// Unreserved ports (8000, 8081, 9000) must be accepted and programmed
+	for _, name := range []gatewayv1.SectionName{"udp-8000", "udp-8081", "udp-valid"} {
+		ls, ok := listenerStatusMap[name]
+		if !ok {
+			t.Fatalf("listener %s status not found", name)
+		}
+		var validAccepted, validProg *metav1.Condition
+		for _, c := range ls.Conditions {
+			switch c.Type {
+			case string(gatewayv1.ListenerConditionAccepted):
+				validAccepted = &c
+			case string(gatewayv1.ListenerConditionProgrammed):
+				validProg = &c
+			}
+		}
+		if validAccepted == nil || validAccepted.Status != metav1.ConditionTrue {
+			t.Errorf("listener %s expected Accepted=True, got %+v", name, validAccepted)
+		}
+		if validProg == nil || validProg.Status != metav1.ConditionTrue {
+			t.Errorf("listener %s expected Programmed=True, got %+v", name, validProg)
+		}
 	}
 }
 

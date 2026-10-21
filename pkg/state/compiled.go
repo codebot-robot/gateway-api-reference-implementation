@@ -1309,6 +1309,12 @@ func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 	return false
 }
 
+// IsReservedDataPlanePort returns true if the port is reserved inside the data-plane pod:
+// 8080 (HTTP proxy), 8443 (HTTPS/TLS/HTTP3 proxy), 8999 (metrics and health probes).
+func IsReservedDataPlanePort(port gatewayv1.PortNumber) bool {
+	return port == 8080 || port == 8443 || port == 8999
+}
+
 func markListenerConflicted(el *EffectiveListener, reason gatewayv1.ListenerConditionReason, message string) {
 	SetCondition(&el.Conditions, NewCondition(
 		string(gatewayv1.ListenerConditionAccepted),
@@ -1464,15 +1470,10 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				continue
 			}
 
-			// Port conflicts with reserved proxy ports 8000/8443
-			if elCur.Protocol == gatewayv1.TCPProtocolType && (elCur.Port == 8000 || elCur.Port == 8443) {
-				msg := fmt.Sprintf("TCP listener port %d conflicts with reserved proxy port %d", elCur.Port, elCur.Port)
-				markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
-				continue
-			}
-			if elCur.Protocol == gatewayv1.UDPProtocolType && elCur.Port == 8443 {
-				msg := fmt.Sprintf("UDP listener port %d conflicts with reserved proxy port %d", elCur.Port, elCur.Port)
-				markListenerConflicted(elCur, gatewayv1.ListenerReasonProtocolConflict, msg)
+			// Raw TCP or UDP listener requesting a reserved data-plane port (8080, 8443, 8999)
+			if (elCur.Protocol == gatewayv1.TCPProtocolType || elCur.Protocol == gatewayv1.UDPProtocolType) && IsReservedDataPlanePort(elCur.Port) {
+				msg := fmt.Sprintf("%s listener port %d conflicts with reserved port %d", elCur.Protocol, elCur.Port, elCur.Port)
+				markListenerConflicted(elCur, gatewayv1.ListenerReasonPortUnavailable, msg)
 				continue
 			}
 
