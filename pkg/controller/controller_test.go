@@ -650,15 +650,20 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			ControllerName: "test-controller",
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -690,15 +695,20 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			ControllerName: "test-controller",
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -730,15 +740,20 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			ControllerName: "test-controller",
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -774,15 +789,20 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			ControllerName: "test-controller",
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -814,15 +834,20 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			ControllerName: "test-controller",
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -846,15 +871,20 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			ControllerName: "test-controller",
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		r := &GatewayClassReconciler{
+			Client:         client,
+			Scheme:         scheme,
+			ControllerName: "test-controller",
+			CRDView:        crdView,
+		}
+
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -880,16 +910,21 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView, err := NewCRDView(ctx, client)
+		if err != nil {
+			t.Fatalf("unexpected NewCRDView error: %v", err)
+		}
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			State:          st,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
