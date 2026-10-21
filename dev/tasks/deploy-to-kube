@@ -38,6 +38,7 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/downloa
 echo "Deploying controller..."
 kubectl apply -f k8s/controller.yaml
 kubectl set image deployment/gari-controller controller="${IMAGE_NAME}:${IMAGE_TAG}"
-kubectl patch deployment gari-controller -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"controller\",\"imagePullPolicy\":\"IfNotPresent\",\"args\":[\"--dataplane-image=${IMAGE_NAME}:${IMAGE_TAG}\"]}]}}}}"
+kubectl set env deployment/gari-controller DATAPLANE_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+kubectl patch deployment gari-controller -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"controller\",\"imagePullPolicy\":\"IfNotPresent\"}]}}}}"
 
 echo "Deployment complete."
