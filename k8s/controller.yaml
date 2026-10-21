@@ -78,8 +78,11 @@ spec:
       containers:
       - name: controller
         image: gari-controller:latest
+        env:
+        - name: DATAPLANE_IMAGE
+          value: ${IMAGE_PREFIX}/gari-controller
         args:
-        - --dataplane-image=${IMAGE_PREFIX}/gari-controller
+        - --dataplane-image=$(DATAPLANE_IMAGE)
         ports:
         - name: metrics
           containerPort: 8999
