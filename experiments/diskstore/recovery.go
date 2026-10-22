@@ -47,6 +47,59 @@ type candidatePageCopy struct {
 	numBlocks   int
 }
 
+type chunkBlockReader struct {
+	file       File
+	totalSize  int64
+	chunkSize  int64
+	chunkBuf   []byte
+	chunkStart int64
+	chunkLen   int64
+}
+
+func newChunkBlockReader(file File, totalSize int64) *chunkBlockReader {
+	chunkSize := int64(256 * 1024) // 256 KiB chunk = 64 blocks
+	if chunkSize > totalSize {
+		chunkSize = totalSize
+	}
+	return &chunkBlockReader{
+		file:       file,
+		totalSize:  totalSize,
+		chunkSize:  chunkSize,
+		chunkBuf:   make([]byte, chunkSize),
+		chunkStart: -1,
+	}
+}
+
+func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
+	off := int64(b * BlockSize)
+	if off+BlockSize > r.totalSize {
+		return nil, io.EOF
+	}
+
+	if r.chunkStart >= 0 && off >= r.chunkStart && off+BlockSize <= r.chunkStart+r.chunkLen {
+		localOff := off - r.chunkStart
+		return r.chunkBuf[localOff : localOff+BlockSize], nil
+	}
+
+	// Fetch new chunk
+	r.chunkStart = off
+	toRead := r.chunkSize
+	if r.chunkStart+toRead > r.totalSize {
+		toRead = r.totalSize - r.chunkStart
+	}
+
+	n, err := r.file.ReadAt(r.chunkBuf[:toRead], r.chunkStart)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	r.chunkLen = int64(n)
+	if r.chunkLen < BlockSize {
+		return nil, io.EOF
+	}
+
+	return r.chunkBuf[0:BlockSize], nil
+}
+
 // Recover scans the heap file, filters out foreign and torn copies, replays the WAL from
 // the last checkpoint's redo start, and rebuilds the in-memory indexes and allocator state.
 func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResult, error) {
@@ -57,14 +110,14 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 
 	totalBlocks := uint64(size / BlockSize)
 	buddy := NewBuddyAllocator(totalBlocks)
+	reader := newChunkBlockReader(heapFile, size)
 
 	// Step 1 & 2: Scan physical blocks in heap file to find valid candidate page copies
 	bestCandidates := make(map[uint64]candidatePageCopy) // logicalPage -> candidatePageCopy
 
 	b := uint64(0)
 	for b < totalBlocks {
-		blockBuf := make([]byte, BlockSize)
-		_, err := heapFile.ReadAt(blockBuf, int64(b*BlockSize))
+		blockBuf, err := reader.ReadBlock(b)
 		if err != nil {
 			break
 		}
@@ -84,8 +137,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 		// Verify candidate page run
 		valid := true
 		for k := 0; k < numBlocks; k++ {
-			kbBuf := make([]byte, BlockSize)
-			_, err := heapFile.ReadAt(kbBuf, int64((b+uint64(k))*BlockSize))
+			kbBuf, err := reader.ReadBlock(b + uint64(k))
 			if err != nil {
 				valid = false
 				break
@@ -150,8 +202,12 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	for logicalPage, cand := range bestCandidates {
 		blocks := make([][]byte, cand.numBlocks)
 		for i := 0; i < cand.numBlocks; i++ {
+			bBytes, err := reader.ReadBlock(cand.startBlock + uint64(i))
+			if err != nil {
+				break
+			}
 			blocks[i] = make([]byte, BlockSize)
-			_, _ = heapFile.ReadAt(blocks[i], int64((cand.startBlock+uint64(i))*BlockSize))
+			copy(blocks[i], bBytes)
 		}
 
 		if cand.numBlocks == 1 {
