@@ -18,6 +18,10 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	toolscache "k8s.io/client-go/tools/cache"
 )
 
 func TestDiskStore_BasicCRUD(t *testing.T) {
@@ -140,22 +144,305 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	}
 	defer store.Close()
 
-	// Put version 1
+	// Put version 1 and checkpoint to disk
 	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v1"), "1")
+	_, _ = store.Checkpoint()
 
-	// Put version 2 (LSN increments)
+	qKey := qualifyKey("ConfigMap", "default/cm-stale")
+	store.keyMu.RLock()
+	entryV1 := store.keyIndex[qKey]
+	store.keyMu.RUnlock()
+
+	// Capture version 1's disk block
+	v1Block := make([]byte, BlockSize)
+	store.bp.mu.Lock()
+	locV1 := store.bp.pageTable[entryV1.LogicalPage].DurableLoc
+	store.bp.mu.Unlock()
+	_, _ = store.heapFile.ReadAt(v1Block, int64(locV1*BlockSize))
+
+	// Put version 2 (LSN increments to 3)
 	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v2"), "2")
 
-	// Artificially modify the key index LSN to expect higher LSN (simulating page roll-back / substitution)
-	store.keyMu.Lock()
-	entry := store.keyIndex["default/cm-stale"]
-	entry.LSN = 999 // Mismatch!
-	store.keyIndex["default/cm-stale"] = entry
-	store.keyMu.Unlock()
+	// Evict page from memory frames by unloading frames
+	store.bp.mu.Lock()
+	desc := store.bp.pageTable[entryV1.LogicalPage]
+	desc.FrameIDs = nil // force reload from disk
+	desc.PhysicalBlock = locV1
+	store.bp.mu.Unlock()
+
+	// Substitute older valid page copy underneath the buffer pool on disk
+	faultFS.SetAssertReuseRule(false)
+	_, _ = store.heapFile.WriteAt(v1Block, int64(locV1*BlockSize))
 
 	// Read must detect mismatch, report corruption, and put store in failed state
 	_, _, err = store.Get("ConfigMap", "default/cm-stale")
 	if !errors.Is(err, ErrStoreFailed) {
 		t.Fatalf("expected ErrStoreFailed on stale read detection, got %v", err)
+	}
+}
+
+// TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync asserts locations flushed after sync starts aren't promoted.
+func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	store, err := OpenStore(WithFS(faultFS), WithDir("test_reuse_rule_promote"))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	// Put page 1, flush it
+	_ = store.Put("ConfigMap", "k1", []byte("v1"), "1")
+	store.bp.mu.Lock()
+	desc := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k1")].LogicalPage]
+	_ = store.bp.flushPageLocked(desc)
+	loc1 := desc.FlushedLoc
+	store.bp.mu.Unlock()
+
+	// Snapshot for sync
+	store.bp.SnapshotFlushedForSync()
+
+	// Put page 2 and flush it AFTER snapshot was taken
+	_ = store.Put("ConfigMap", "k2", []byte("v2"), "2")
+	store.bp.mu.Lock()
+	desc2 := store.bp.pageTable[store.keyIndex[qualifyKey("ConfigMap", "k2")].LogicalPage]
+	_ = store.bp.flushPageLocked(desc2)
+	loc2 := desc2.FlushedLoc
+	store.bp.mu.Unlock()
+
+	// Now promote flushed locations
+	_ = store.bp.PromoteFlushedToDurable()
+
+	store.bp.mu.Lock()
+	defer store.bp.mu.Unlock()
+
+	// loc1 was before snapshot -> promoted to durable!
+	if desc.DurableLoc != loc1 {
+		t.Fatalf("desc 1 DurableLoc=%d, expected %d", desc.DurableLoc, loc1)
+	}
+	// loc2 was flushed AFTER snapshot -> must NOT be promoted to durable yet!
+	if desc2.DurableLoc == loc2 {
+		t.Fatalf("desc 2 DurableLoc was prematurely promoted to durable before its fsync!")
+	}
+}
+
+// TestRegression_Item15_16_NoOldRecordResurrection asserts deleted multi-block objects don't resurrect after truncation.
+func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_no_old_record_resurrection"
+
+	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	largeVal := bytes.Repeat([]byte("multi-block-payload-"), 500) // ~10 KB
+	_ = store.Put("ConfigMap", "large-cm", largeVal, "1")
+
+	// Delete large-cm
+	if err := store.Delete("ConfigMap", "large-cm"); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	// Checkpoint to truncate WAL
+	_, err = store.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+	_ = store.Close()
+
+	// Reopen store: large-cm must NOT resurrect!
+	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	if _, exists, _ := store2.Get("ConfigMap", "large-cm"); exists {
+		t.Fatalf("deleted multi-block record resurrected after checkpoint truncation!")
+	}
+}
+
+// TestRegression_Item17_OversizeObjectPersistence asserts oversize objects (> 2 MiB) persist across reopen.
+func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_oversize_persistence"
+
+	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	oversizeVal := bytes.Repeat([]byte("0123456789abcdef"), 150000) // ~2.4 MiB
+	if err := store.Put("ConfigMap", "oversize-cm", oversizeVal, "1"); err != nil {
+		t.Fatalf("Put oversize failed: %v", err)
+	}
+
+	// Checkpoint and close
+	_, _ = store.Checkpoint()
+	_ = store.Close()
+
+	// Reopen store: oversize object must still be readable!
+	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	val, exists, err := store2.Get("ConfigMap", "oversize-cm")
+	if err != nil || !exists {
+		t.Fatalf("oversize object missing after reopen: exists=%v, err=%v", exists, err)
+	}
+	if len(val) != len(oversizeVal) || !bytes.Equal(val, oversizeVal) {
+		t.Fatalf("oversize payload mismatch")
+	}
+}
+
+// TestRegression_Item19_BucketIsolation asserts keys in different buckets with same name do not collide.
+func TestRegression_Item19_BucketIsolation(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_bucket_isolation"
+
+	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	// Put "default/my-name" into ConfigMap and Secret buckets with different values
+	_ = store.Put("ConfigMap", "default/my-name", []byte("cm-data"), "1")
+	_ = store.Put("Secret", "default/my-name", []byte("secret-data"), "2")
+
+	cmVal, exists, err := store.Get("ConfigMap", "default/my-name")
+	if err != nil || !exists || string(cmVal) != "cm-data" {
+		t.Fatalf("ConfigMap get failed: %q, err=%v", string(cmVal), err)
+	}
+
+	secretVal, exists, err := store.Get("Secret", "default/my-name")
+	if err != nil || !exists || string(secretVal) != "secret-data" {
+		t.Fatalf("Secret get failed: %q, err=%v", string(secretVal), err)
+	}
+
+	// Delete from ConfigMap; Secret must NOT be affected
+	_ = store.Delete("ConfigMap", "default/my-name")
+	if _, exists, _ := store.Get("ConfigMap", "default/my-name"); exists {
+		t.Fatalf("ConfigMap key should be deleted")
+	}
+
+	secretValAfter, exists, err := store.Get("Secret", "default/my-name")
+	if err != nil || !exists || string(secretValAfter) != "secret-data" {
+		t.Fatalf("Secret was affected by ConfigMap delete!")
+	}
+}
+
+// TestRegression_Item20_SecondaryIndexesRebuiltOnReopen asserts secondary indexes work immediately on reopen.
+func TestRegression_Item20_SecondaryIndexesRebuiltOnReopen(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_secondary_rebuild"
+
+	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	cmExample := &corev1.ConfigMap{}
+	indexer, err := NewDiskIndexer(store, cmExample,
+		WithBucketName("ConfigMap"),
+		WithIndexers(toolscache.Indexers{
+			"namespace": toolscache.MetaNamespaceIndexFunc,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewDiskIndexer failed: %v", err)
+	}
+
+	cm1 := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns-a", Name: "cm-1"},
+		Data:       map[string]string{"foo": "bar"},
+	}
+	cm2 := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns-a", Name: "cm-2"},
+		Data:       map[string]string{"foo": "baz"},
+	}
+	_ = indexer.Add(cm1)
+	_ = indexer.Add(cm2)
+	_ = store.Close()
+
+	// Reopen store with a new indexer instance
+	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Reopen OpenStore failed: %v", err)
+	}
+	defer store2.Close()
+
+	indexer2, err := NewDiskIndexer(store2, cmExample,
+		WithBucketName("ConfigMap"),
+		WithIndexers(toolscache.Indexers{
+			"namespace": toolscache.MetaNamespaceIndexFunc,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewDiskIndexer 2 failed: %v", err)
+	}
+
+	// ByIndex must find both objects immediately without requiring any rewrite
+	objs, err := indexer2.ByIndex("namespace", "ns-a")
+	if err != nil {
+		t.Fatalf("ByIndex failed: %v", err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("expected 2 objects for namespace ns-a, got %d", len(objs))
+	}
+}
+
+// TestRegression_Item21_ReplaceAsDiff asserts Replace operates as a diff and sets RV only once complete.
+func TestRegression_Item21_ReplaceAsDiff(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_replace_as_diff"
+
+	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	indexer, _ := NewDiskIndexer(store, &corev1.ConfigMap{}, WithBucketName("ConfigMap"))
+
+	cmA := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a", ResourceVersion: "1"}}
+	cmB := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b", ResourceVersion: "1"}}
+	_ = indexer.Add(cmA)
+	_ = indexer.Add(cmB)
+
+	// Replace with B and C (A should be deleted, B updated, C added)
+	cmBUpdated := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "b", ResourceVersion: "2"}, Data: map[string]string{"k": "v"}}
+	cmC := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "c", ResourceVersion: "2"}}
+
+	if err := indexer.Replace([]any{cmBUpdated, cmC}, "rv-list-100"); err != nil {
+		t.Fatalf("Replace failed: %v", err)
+	}
+
+	// A must be gone
+	if _, exists, _ := indexer.Get(cmA); exists {
+		t.Fatalf("cmA should have been removed by Replace diff")
+	}
+
+	// B must have updated data
+	bItem, exists, err := indexer.Get(cmB)
+	if err != nil || !exists {
+		t.Fatalf("cmB missing after replace: %v", err)
+	}
+	if bItem.(*corev1.ConfigMap).Data["k"] != "v" {
+		t.Fatalf("cmB data not updated")
+	}
+
+	// C must be present
+	if _, exists, _ := indexer.Get(cmC); !exists {
+		t.Fatalf("cmC missing after replace")
+	}
+
+	// LastStoreSyncResourceVersion must be rv-list-100
+	if indexer.LastStoreSyncResourceVersion() != "rv-list-100" {
+		t.Fatalf("last sync RV mismatch: got %q, want %q", indexer.LastStoreSyncResourceVersion(), "rv-list-100")
 	}
 }

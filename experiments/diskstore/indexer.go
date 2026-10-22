@@ -23,12 +23,13 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
 
-// IndexerOptions configures a DiskIndexer.
+// IndexerOptions configures a DiskIndexer instance.
 type IndexerOptions struct {
 	BucketName string
 	KeyFunc    toolscache.KeyFunc
@@ -40,35 +41,35 @@ type IndexerOptions struct {
 // IndexerOption is a functional option for configuring a DiskIndexer.
 type IndexerOption func(*IndexerOptions)
 
-// WithBucketName sets the bucket name.
+// WithBucketName sets the storage bucket name.
 func WithBucketName(name string) IndexerOption {
 	return func(o *IndexerOptions) {
 		o.BucketName = name
 	}
 }
 
-// WithKeyFunc sets the key function.
-func WithKeyFunc(kf toolscache.KeyFunc) IndexerOption {
+// WithKeyFunc sets the key function for the indexer.
+func WithKeyFunc(fn toolscache.KeyFunc) IndexerOption {
 	return func(o *IndexerOptions) {
-		o.KeyFunc = kf
+		o.KeyFunc = fn
 	}
 }
 
-// WithIndexers sets secondary indexers.
+// WithIndexers registers secondary indexers on creation.
 func WithIndexers(indexers toolscache.Indexers) IndexerOption {
 	return func(o *IndexerOptions) {
 		o.Indexers = indexers
 	}
 }
 
-// WithIndexerCipher overrides the cipher.
+// WithIndexerCipher sets the cipher for the indexer.
 func WithIndexerCipher(cipher Cipher) IndexerOption {
 	return func(o *IndexerOptions) {
 		o.Cipher = cipher
 	}
 }
 
-// WithIndexerCodec overrides the codec.
+// WithIndexerCodec sets the object codec for the indexer.
 func WithIndexerCodec(codec ObjectCodec) IndexerOption {
 	return func(o *IndexerOptions) {
 		o.Codec = codec
@@ -76,7 +77,7 @@ func WithIndexerCodec(codec ObjectCodec) IndexerOption {
 }
 
 func callerInfo() string {
-	for skip := 2; skip <= 6; skip++ {
+	for skip := 2; skip < 8; skip++ {
 		pc, file, line, ok := runtime.Caller(skip)
 		if !ok {
 			break
@@ -149,44 +150,35 @@ func NewDiskIndexer(store *DiskStore, example k8sruntime.Object, opts ...Indexer
 		indexer.indices[k] = make(map[string]map[string]struct{})
 	}
 
+	// Item 20: Rebuild secondary indexes for existing objects in the bucket upon reopen
+	existingItems, err := indexer.store.List(indexer.bucketName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list items in bucket %s on reopen: %w", indexer.bucketName, err)
+	}
+	for _, raw := range existingItems {
+		ad := AdditionalData(indexer.bucketName, raw.Key)
+		decrypted, err := indexer.cipher.Decrypt(raw.Payload, ad)
+		if err != nil {
+			continue
+		}
+		target := indexer.example.DeepCopyObject()
+		if err := indexer.codec.Decode(decrypted, target); err != nil {
+			continue
+		}
+		indexer.updateIndicesLocked(raw.Key, target)
+	}
+
 	return indexer, nil
 }
 
-// Add inserts or updates an object.
-func (d *DiskIndexer) Add(obj any) error {
-	return d.Update(obj)
-}
-
-// Update updates an existing object or adds it if not present.
-func (d *DiskIndexer) Update(obj any) error {
-	key, err := d.keyFunc(obj)
-	if err != nil {
-		return toolscache.KeyError{Obj: obj, Err: err}
-	}
-
-	runtimeObj, ok := obj.(k8sruntime.Object)
-	if !ok {
-		return fmt.Errorf("object %T does not implement runtime.Object", obj)
-	}
-
-	encoded, err := d.codec.Encode(runtimeObj)
-	if err != nil {
-		return fmt.Errorf("failed to encode object: %w", err)
-	}
-
-	ad := AdditionalData(d.bucketName, key)
-	encrypted, err := d.cipher.Encrypt(encoded, ad)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt object: %w", err)
-	}
-
-	// Update secondary indices
+func (d *DiskIndexer) updateIndicesLocked(key string, obj any) {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	for indexName, indexFunc := range d.indexers {
 		newVals, err := indexFunc(obj)
 		if err != nil {
-			d.mu.Unlock()
-			return fmt.Errorf("indexing error for %s: %w", indexName, err)
+			continue
 		}
 
 		// Remove old entries
@@ -216,9 +208,57 @@ func (d *DiskIndexer) Update(obj any) error {
 		}
 		d.revIndices[key][indexName] = newVals
 	}
-	d.mu.Unlock()
+}
 
-	return d.store.Put(d.bucketName, key, encrypted, d.lastSyncRV)
+// Add inserts or updates an object.
+func (d *DiskIndexer) Add(obj any) error {
+	return d.Update(obj)
+}
+
+// Update updates an existing object or adds it if not present.
+// Item 21: Extracts the object's own resourceVersion rather than the list's.
+func (d *DiskIndexer) Update(obj any) error {
+	key, err := d.keyFunc(obj)
+	if err != nil {
+		return toolscache.KeyError{Obj: obj, Err: err}
+	}
+
+	runtimeObj, ok := obj.(k8sruntime.Object)
+	if !ok {
+		return fmt.Errorf("object %T does not implement runtime.Object", obj)
+	}
+
+	encoded, err := d.codec.Encode(runtimeObj)
+	if err != nil {
+		return fmt.Errorf("failed to encode object: %w", err)
+	}
+
+	ad := AdditionalData(d.bucketName, key)
+	encrypted, err := d.cipher.Encrypt(encoded, ad)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt object: %w", err)
+	}
+
+	// Update secondary indices
+	d.updateIndicesLocked(key, obj)
+
+	// Item 21: extract object's own resourceVersion
+	objRV := ""
+	acc, err := meta.Accessor(obj)
+	if err != nil {
+		d.mu.RLock()
+		objRV = d.lastSyncRV
+		d.mu.RUnlock()
+	} else {
+		objRV = acc.GetResourceVersion()
+		if objRV == "" {
+			d.mu.RLock()
+			objRV = d.lastSyncRV
+			d.mu.RUnlock()
+		}
+	}
+
+	return d.store.Put(d.bucketName, key, encrypted, objRV)
 }
 
 // Delete removes an object from the store and secondary indices.
@@ -300,35 +340,64 @@ func (d *DiskIndexer) List() []any {
 	return items
 }
 
-// ListKeys returns all keys currently stored without decoding payloads.
+// ListKeys returns all keys currently stored for this bucket without decoding payloads.
 func (d *DiskIndexer) ListKeys() []string {
-	return d.store.ListKeys()
+	rawItems, err := d.store.List(d.bucketName)
+	if err != nil {
+		return nil
+	}
+	keys := make([]string, len(rawItems))
+	for i, raw := range rawItems {
+		keys[i] = raw.Key
+	}
+	return keys
 }
 
-// Replace replaces all store contents with list.
+// Replace replaces all store contents with list applying diffs and recording RV only once complete (Item 21).
 func (d *DiskIndexer) Replace(list []any, rv string) error {
-	d.mu.Lock()
-	d.lastSyncRV = rv
-	// Reset indices
-	d.indices = make(map[string]map[string]map[string]struct{})
-	for k := range d.indexers {
-		d.indices[k] = make(map[string]map[string]struct{})
+	newKeyMap := make(map[string]any, len(list))
+	for _, item := range list {
+		k, err := d.keyFunc(item)
+		if err != nil {
+			return toolscache.KeyError{Obj: item, Err: err}
+		}
+		newKeyMap[k] = item
 	}
-	d.revIndices = make(map[string]map[string][]string)
-	d.mu.Unlock()
 
-	// Clear existing items in store
-	for _, k := range d.store.ListKeys() {
-		if err := d.store.Delete(d.bucketName, k); err != nil {
-			return err
+	// Diff against current keys in bucket
+	currentKeys := d.ListKeys()
+	for _, curKey := range currentKeys {
+		if _, stillPresent := newKeyMap[curKey]; !stillPresent {
+			if err := d.store.Delete(d.bucketName, curKey); err != nil {
+				return err
+			}
+			d.mu.Lock()
+			if oldMap, ok := d.revIndices[curKey]; ok {
+				for indexName, oldVals := range oldMap {
+					for _, oldVal := range oldVals {
+						if d.indices[indexName] != nil && d.indices[indexName][oldVal] != nil {
+							delete(d.indices[indexName][oldVal], curKey)
+						}
+					}
+				}
+				delete(d.revIndices, curKey)
+			}
+			d.mu.Unlock()
 		}
 	}
 
+	// Update items
 	for _, item := range list {
 		if err := d.Update(item); err != nil {
 			return err
 		}
 	}
+
+	// Item 21: Record new resourceVersion only once Replace is completely applied
+	d.mu.Lock()
+	d.lastSyncRV = rv
+	d.mu.Unlock()
+
 	return nil
 }
 
@@ -347,11 +416,16 @@ func (d *DiskIndexer) LastStoreSyncResourceVersion() string {
 	return d.store.LastRecoveredResourceVersion()
 }
 
-// Bookmark records the resourceVersion from a watch bookmark.
+// Bookmark records the resourceVersion from a watch bookmark (Item 21).
 func (d *DiskIndexer) Bookmark(rv string) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.lastSyncRV = rv
+	d.mu.Unlock()
+
+	// Persist bookmark to WAL
+	if err := d.store.Put(d.bucketName, ".bookmark", nil, rv); err != nil {
+		klog.V(4).ErrorS(err, "failed to record bookmark in store", "bucket", d.bucketName, "rv", rv)
+	}
 }
 
 // AddIndexers registers new secondary indexers.
