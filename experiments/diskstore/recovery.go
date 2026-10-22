@@ -122,7 +122,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			break
 		}
 
-		hdr, err := DecodeBlockHeader(blockBuf, dbID)
+		hdr, err := DecodeBlockHeader(blockBuf)
 		if err != nil || hdr.BlockIndex != 0 || hdr.NumBlocks == 0 {
 			b++
 			continue
@@ -143,7 +143,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				break
 			}
 
-			kHdr, err := DecodeBlockHeader(kbBuf, dbID)
+			kHdr, err := DecodeBlockHeader(kbBuf)
 			if err != nil || kHdr.LogicalPage != hdr.LogicalPage || kHdr.LSN != hdr.LSN ||
 				kHdr.BlockIndex != uint32(k) || kHdr.NumBlocks != hdr.NumBlocks {
 				valid = false
@@ -212,30 +212,36 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 
 		if cand.numBlocks == 1 {
 			slotted, err := WrapSlottedPage(blocks[0])
-			if err == nil {
-				if slotted.ActiveSlotsCount() == 0 {
-					emptyPages = append(emptyPages, logicalPage)
-				} else {
-					for s := uint32(0); s < uint32(slotted.NumSlots()); s++ {
-						k, _, recLSN, err := slotted.Get(s)
-						if err == nil {
-							keyIndex[k] = KeyIndexEntry{
-								LogicalPage: logicalPage,
-								Slot:        s,
-								LSN:         recLSN,
-							}
+			if err != nil {
+				return nil, fmt.Errorf("failed to wrap recovered slotted page %d: %w", logicalPage, err)
+			}
+			if slotted.ActiveSlotsCount() == 0 {
+				emptyPages = append(emptyPages, logicalPage)
+			} else {
+				for s := uint32(0); s < uint32(slotted.NumSlots()); s++ {
+					k, _, recLSN, err := slotted.Get(s)
+					if err != nil {
+						if errors.Is(err, ErrSlotNotFound) {
+							continue
 						}
+						return nil, fmt.Errorf("failed to get slot %d from page %d: %w", s, logicalPage, err)
+					}
+					keyIndex[k] = KeyIndexEntry{
+						LogicalPage: logicalPage,
+						Slot:        s,
+						LSN:         recLSN,
 					}
 				}
 			}
 		} else {
 			k, _, recLSN, err := DecodeMultiBlockPage(blocks)
-			if err == nil {
-				keyIndex[k] = KeyIndexEntry{
-					LogicalPage: logicalPage,
-					Slot:        0,
-					LSN:         recLSN,
-				}
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode recovered multi-block page %d: %w", logicalPage, err)
+			}
+			keyIndex[k] = KeyIndexEntry{
+				LogicalPage: logicalPage,
+				Slot:        0,
+				LSN:         recLSN,
 			}
 		}
 	}
@@ -265,7 +271,9 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				redoStartLSN = rec.RedoStartLSN
 			}
 		}
-		_ = walScanIt.Close()
+		if closeErr := walScanIt.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to close WAL scan iterator: %w", closeErr)
+		}
 	}
 
 	// Step 6: Replay WAL from redoStartLSN
@@ -333,7 +341,9 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				}
 			}
 		}
-		_ = walRedoIt.Close()
+		if closeErr := walRedoIt.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to close WAL redo iterator: %w", closeErr)
+		}
 	}
 
 	return &RecoveryResult{

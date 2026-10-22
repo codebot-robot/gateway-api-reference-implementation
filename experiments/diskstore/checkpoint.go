@@ -69,7 +69,9 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 	}
 
 	// 4. Promote flushed locations to durable (frees superseded locations)
-	c.bp.PromoteFlushedToDurable()
+	if err := c.bp.PromoteFlushedToDurable(); err != nil {
+		return 0, fmt.Errorf("checkpoint failed to promote flushed pages: %w", err)
+	}
 
 	chkLSN := c.wal.NextLSN()
 	if redoStartLSN == 0 {

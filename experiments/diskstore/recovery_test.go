@@ -36,7 +36,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "large-obj", Payload: payloadV1, ResourceVersion: "10"})
 	_ = wal.Sync()
 
-	mbV1, err := NewMultiBlockPage(1, 10, dbID, "large-obj", payloadV1)
+	mbV1, err := NewMultiBlockPage(1, 10, "large-obj", payloadV1)
 	if err != nil {
 		t.Fatalf("NewMultiBlockPage v1 failed: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "large-obj", Payload: payloadV2, ResourceVersion: "20"})
 	_ = wal.Sync()
 
-	mbV2, err := NewMultiBlockPage(1, 20, dbID, "large-obj", payloadV2)
+	mbV2, err := NewMultiBlockPage(1, 20, "large-obj", payloadV2)
 	if err != nil {
 		t.Fatalf("NewMultiBlockPage v2 failed: %v", err)
 	}
@@ -83,27 +83,26 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	}
 }
 
-func TestRecovery_ForeignBlocks(t *testing.T) {
+func TestRecovery_InvalidMagicBlocks(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 	faultFS.SetMaxFsyncedLSN(100)
 
 	var dbID [16]byte
 	copy(dbID[:], []byte("rec-foreign-db01"))
-	var foreignID [16]byte
-	copy(foreignID[:], []byte("rec-foreign-db02"))
 
 	heapFile, _ := faultFS.Create("heap.db")
 
-	// Write a valid block with dbID
+	// Write a valid block
 	b1 := make([]byte, BlockSize)
-	EncodeBlockHeader(BlockHeader{DBID: dbID, LogicalPage: 1, LSN: 5, NumBlocks: 1}, b1)
+	EncodeBlockHeader(BlockHeader{LogicalPage: 1, LSN: 5, NumBlocks: 1}, b1)
 	FinalizeBlockCRC(b1)
 	_, _ = heapFile.WriteAt(b1, 0)
 
-	// Write a block with foreignID
+	// Write an invalid block (corrupt magic)
 	b2 := make([]byte, BlockSize)
-	EncodeBlockHeader(BlockHeader{DBID: foreignID, LogicalPage: 2, LSN: 10, NumBlocks: 1}, b2)
+	EncodeBlockHeader(BlockHeader{LogicalPage: 2, LSN: 10, NumBlocks: 1}, b2)
+	b2[0] = 0xff // invalid magic
 	FinalizeBlockCRC(b2)
 	_, _ = heapFile.WriteAt(b2, BlockSize)
 	_ = heapFile.Sync()
@@ -114,12 +113,12 @@ func TestRecovery_ForeignBlocks(t *testing.T) {
 		t.Fatalf("Recover failed: %v", err)
 	}
 
-	// Page 1 should be recovered; foreign page 2 must be ignored
+	// Page 1 should be recovered; invalid magic page 2 must be ignored
 	if _, ok := res.PageDescs[1]; !ok {
 		t.Fatalf("page 1 should be recovered")
 	}
 	if _, ok := res.PageDescs[2]; ok {
-		t.Fatalf("foreign page 2 should NOT be recovered")
+		t.Fatalf("invalid page 2 should NOT be recovered")
 	}
 }
 
@@ -189,10 +188,9 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
 
 	// Construct an untrusted payload that contains forged block headers with valid CRCs,
-	// the store's database ID, high LSN (9999), and target logical page placed at EVERY offset.
+	// high LSN (9999), and target logical page placed at EVERY offset.
 	forgedHeader := make([]byte, BlockSize)
 	EncodeBlockHeader(BlockHeader{
-		DBID:        dbID,
 		LogicalPage: 1,
 		LSN:         9999, // higher than any real LSN
 		BlockIndex:  0,
@@ -218,7 +216,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	// Now store the malicious object containing forged headers at LSN 10
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload, ResourceVersion: "10"})
 	_ = wal.Sync()
-	mbPage, err := NewMultiBlockPage(2, 10, dbID, "malicious-key", maliciousPayload)
+	mbPage, err := NewMultiBlockPage(2, 10, "malicious-key", maliciousPayload)
 	if err != nil {
 		t.Fatalf("NewMultiBlockPage failed: %v", err)
 	}
