@@ -106,7 +106,7 @@ type DiskIndexer struct {
 	mu         sync.RWMutex
 	indexers   toolscache.Indexers
 	indices    map[string]map[string]map[string]struct{} // indexName -> indexVal -> set of keys
-	revIndices map[string]map[string][]string           // key -> indexName -> []indexVal
+	revIndices map[string]map[string][]string            // key -> indexName -> []indexVal
 	lastSyncRV string
 }
 

@@ -45,20 +45,20 @@ const (
 
 // WAL manages appending, syncing, and segment lifecycle of the write-ahead log.
 type WAL struct {
-	fs     FS
-	dir    string
-	dbID   [16]byte
-	mu     sync.Mutex
+	fs   FS
+	dir  string
+	dbID [16]byte
+	mu   sync.Mutex
 
 	activeFile     File
 	activePath     string
 	activeStartLSN uint64
 	activeSize     int64
 
-	maxLSN        atomic.Uint64
-	fsyncedLSN    atomic.Uint64
-	maxSegSize    int64
-	createdLSNs   map[uint64]bool // Asserts never reuse/recycle segment file names
+	maxLSN      atomic.Uint64
+	fsyncedLSN  atomic.Uint64
+	maxSegSize  int64
+	createdLSNs map[uint64]bool // Asserts never reuse/recycle segment file names
 }
 
 // WALOptions configures a WAL instance.

@@ -62,10 +62,10 @@ func NewSlottedPage(logicalPage, lsn uint64, dbID [16]byte) *SlottedPage {
 	EncodeBlockHeader(hdr, buf)
 
 	// Slotted metadata at offset 64
-	binary.BigEndian.PutUint16(buf[64:66], 0)                     // NumSlots = 0
-	binary.BigEndian.PutUint16(buf[66:68], BlockHeaderSize+8)    // FreeStart = 72
-	binary.BigEndian.PutUint16(buf[68:70], uint16(BlockSize))    // FreeEnd = 4096
-	binary.BigEndian.PutUint16(buf[70:72], 0)                     // Flags
+	binary.BigEndian.PutUint16(buf[64:66], 0)                 // NumSlots = 0
+	binary.BigEndian.PutUint16(buf[66:68], BlockHeaderSize+8) // FreeStart = 72
+	binary.BigEndian.PutUint16(buf[68:70], uint16(BlockSize)) // FreeEnd = 4096
+	binary.BigEndian.PutUint16(buf[70:72], 0)                 // Flags
 
 	return &SlottedPage{buf: buf}
 }
