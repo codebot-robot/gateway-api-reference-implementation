@@ -273,9 +273,9 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 			if len(blockBytes) >= 64 {
 				magic := binary.BigEndian.Uint64(blockBytes[0:8])
 				if magic == BlockMagicValue {
-					logicalPage := binary.BigEndian.Uint64(blockBytes[28:36])
-					lsn := binary.BigEndian.Uint64(blockBytes[36:44])
-					numBlocks := binary.BigEndian.Uint32(blockBytes[48:52])
+					logicalPage := binary.BigEndian.Uint64(blockBytes[32:40])
+					lsn := binary.BigEndian.Uint64(blockBytes[40:48])
+					numBlocks := binary.BigEndian.Uint32(blockBytes[52:56])
 
 					_ = logicalPage
 					_ = numBlocks
@@ -372,10 +372,10 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 			continue
 		}
 
-		logicalPage := binary.BigEndian.Uint64(blockBytes[28:36])
-		lsn := binary.BigEndian.Uint64(blockBytes[36:44])
-		blockIndex := binary.BigEndian.Uint32(blockBytes[44:48])
-		numBlocks := binary.BigEndian.Uint32(blockBytes[48:52])
+		logicalPage := binary.BigEndian.Uint64(blockBytes[32:40])
+		lsn := binary.BigEndian.Uint64(blockBytes[40:48])
+		blockIndex := binary.BigEndian.Uint32(blockBytes[48:52])
+		numBlocks := binary.BigEndian.Uint32(blockBytes[52:56])
 
 		// Must be the first block of a page
 		if blockIndex != 0 || numBlocks == 0 || b+int(numBlocks) > totalBlocks {
@@ -390,11 +390,11 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 			kbBytes := f.durableData[kbStart : kbStart+DefaultBlockSize]
 
 			kMagic := binary.BigEndian.Uint64(kbBytes[0:8])
-			kLogical := binary.BigEndian.Uint64(kbBytes[28:36])
-			kLSN := binary.BigEndian.Uint64(kbBytes[36:44])
-			kIndex := binary.BigEndian.Uint32(kbBytes[44:48])
-			kNum := binary.BigEndian.Uint32(kbBytes[48:52])
-			kCRC := binary.BigEndian.Uint32(kbBytes[52:56])
+			kLogical := binary.BigEndian.Uint64(kbBytes[32:40])
+			kLSN := binary.BigEndian.Uint64(kbBytes[40:48])
+			kIndex := binary.BigEndian.Uint32(kbBytes[48:52])
+			kNum := binary.BigEndian.Uint32(kbBytes[52:56])
+			kCRC := binary.BigEndian.Uint32(kbBytes[56:60])
 
 			if kMagic != BlockMagicValue || kLogical != logicalPage || kLSN != lsn ||
 				kIndex != uint32(k) || kNum != numBlocks {
@@ -405,10 +405,10 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 			// Verify CRC
 			calcBuf := make([]byte, DefaultBlockSize)
 			copy(calcBuf, kbBytes)
-			calcBuf[52] = 0
-			calcBuf[53] = 0
-			calcBuf[54] = 0
-			calcBuf[55] = 0
+			calcBuf[56] = 0
+			calcBuf[57] = 0
+			calcBuf[58] = 0
+			calcBuf[59] = 0
 			expectedCRC := crc32.Checksum(calcBuf, crc32.MakeTable(crc32.Castagnoli))
 			if kCRC != expectedCRC {
 				valid = false

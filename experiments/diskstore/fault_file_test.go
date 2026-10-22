@@ -27,21 +27,22 @@ func makeTestBlock(logicalPage, lsn uint64, blockIndex, numBlocks uint32) []byte
 	buf := make([]byte, DefaultBlockSize)
 	binary.BigEndian.PutUint64(buf[0:8], BlockMagicValue)
 	binary.BigEndian.PutUint32(buf[8:12], 1) // version
-	// DBID bytes 12..28 (16 bytes)
-	copy(buf[12:28], []byte("1234567890123456"))
-	binary.BigEndian.PutUint64(buf[28:36], logicalPage)
-	binary.BigEndian.PutUint64(buf[36:44], lsn)
-	binary.BigEndian.PutUint32(buf[44:48], blockIndex)
-	binary.BigEndian.PutUint32(buf[48:52], numBlocks)
+	binary.BigEndian.PutUint32(buf[12:16], 0)
+	// DBID bytes 16..32 (16 bytes)
+	copy(buf[16:32], []byte("1234567890123456"))
+	binary.BigEndian.PutUint64(buf[32:40], logicalPage)
+	binary.BigEndian.PutUint64(buf[40:48], lsn)
+	binary.BigEndian.PutUint32(buf[48:52], blockIndex)
+	binary.BigEndian.PutUint32(buf[52:56], numBlocks)
 
-	// CRC at 52:56 (zeroed during calculation)
-	buf[52] = 0
-	buf[53] = 0
-	buf[54] = 0
-	buf[55] = 0
+	// CRC at 56:60 (zeroed during calculation)
+	buf[56] = 0
+	buf[57] = 0
+	buf[58] = 0
+	buf[59] = 0
 
 	crc := crc32.Checksum(buf, crc32.MakeTable(crc32.Castagnoli))
-	binary.BigEndian.PutUint32(buf[52:56], crc)
+	binary.BigEndian.PutUint32(buf[56:60], crc)
 	return buf
 }
 
@@ -133,13 +134,13 @@ func TestFaultFile_CrashTearBlocks(t *testing.T) {
 	_, _ = file.ReadAt(readBuf, 0)
 
 	// Block should now fail CRC
-	storedCRC := binary.BigEndian.Uint32(readBuf[52:56])
+	storedCRC := binary.BigEndian.Uint32(readBuf[56:60])
 	calcBuf := make([]byte, DefaultBlockSize)
 	copy(calcBuf, readBuf)
-	calcBuf[52] = 0
-	calcBuf[53] = 0
-	calcBuf[54] = 0
-	calcBuf[55] = 0
+	calcBuf[56] = 0
+	calcBuf[57] = 0
+	calcBuf[58] = 0
+	calcBuf[59] = 0
 	actualCRC := crc32.Checksum(calcBuf, crc32.MakeTable(crc32.Castagnoli))
 
 	if storedCRC == actualCRC {
