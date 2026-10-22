@@ -359,6 +359,9 @@ func (bp *BufferPool) flushPageLocked(desc *PageDesc) error {
 		return nil
 	}
 
+	desc.Mu.Lock()
+	defer desc.Mu.Unlock()
+
 	// Write-ahead rule: before writing any page whose LSN is L, log must be fsynced through L.
 	if bp.wal != nil {
 		if err := bp.wal.SyncThrough(desc.PageLSN); err != nil {
