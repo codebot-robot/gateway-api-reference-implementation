@@ -421,6 +421,16 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 	offset := SegmentHeaderSize
 	var maxLSN uint64
 	for offset+RecordHeaderSize <= len(f.durableData) {
+		if f.durableData[offset] == 0 {
+			// Zero padding in block: skip to next 4 KiB block boundary
+			nextBlock := ((offset / DefaultBlockSize) + 1) * DefaultBlockSize
+			if nextBlock <= offset || nextBlock >= len(f.durableData) {
+				break
+			}
+			offset = nextBlock
+			continue
+		}
+
 		r, err := DecodeRecord(bytes.NewReader(f.durableData[offset:]))
 		if err != nil {
 			break
