@@ -9,7 +9,7 @@ This experiment evaluates a custom, pure Go disk-backed store under `experiments
 
 The new `DiskStore` architecture introduces:
 - A sequential **Write-Ahead Log (WAL)** using 64-bit monotonic LSNs and immutable segment files with directory fsyncing.
-- A **heap file composed of self-describing 4 KiB blocks**, each protected by an authentic header and Castagnoli CRC32C checksum.
+- A **heap file composed of self-describing 4 KiB blocks**, each protected by a 32-byte header with a Castagnoli CRC32C checksum.
 - An **out-of-place write strategy** enforcing the **Reuse Rule** (locations holding the newest durable copy of a page are never overwritten) and the **Write-Ahead Rule** (WAL is fsynced through a page's LSN before the page is written to disk).
 - A **buddy allocator** over 4 KiB blocks that prefers the lowest available location, enabling automatic tail truncation of the heap file.
 - A **fixed-size buffer pool** of 4 KiB frames allocated once as a single pointer-free byte arena with zero `mmap`, performing direct I/O via `O_DIRECT` on Linux (and `F_NOCACHE` on Darwin) through `unix.Preadv` and `unix.Pwritev`.
@@ -43,23 +43,23 @@ The write-ahead log records all state changes prior to page modification.
 - Finished segments are closed and become immutable artifacts suitable for remote archiving.
 - Segments are truncated (deleted) only when fully covered by a completed checkpoint (i.e. strictly before the checkpoint's redo start LSN).
 
-#### Segment Header (24 bytes)
-Every WAL segment starts with a 24-byte header:
+#### Segment Header (32 bytes)
+Every WAL segment starts with a 32-byte header with 8 bytes of zero padding after the version:
 ```
-+---------------+---------------+---------------------------------------+
-|  Magic (4B)   |  Version (4B) |           Database ID (16B)           |
-|   "WAL1"      |      0x1      |     Random 128-bit store identifier   |
-+---------------+---------------+---------------------------------------+
++---------------+---------------+---------------+---------------------------------------+
+|  Magic (4B)   |  Version (4B) | Reserved (8B) |           Database ID (16B)           |
+|   "WAL1"      |      0x1      |  0x00 padding |     Random 128-bit store identifier   |
++---------------+---------------+---------------+---------------------------------------+
 ```
 
-#### Record Format (33 bytes + dynamic payload)
-Log records encode operations (`Put = 1`, `Delete = 2`, `Checkpoint = 3`):
+#### Record Format (36 bytes + dynamic payload)
+Log records encode operations (`Put = 1`, `Delete = 2`, `Checkpoint = 3`). The record header is aligned on a 4-byte boundary, with explicit magic, format version, operation type, and reserved bytes preceding the 64-bit and 32-bit fields:
 ```
-+-----------+-----------+-------------------+-------------+----------------+-------------+------------+
-| Type (1B) |  LSN (8B) | RedoStartLSN (8B) | KeyLen (4B) | PayloadLen (4B)| RVLen (4B)  | CRC32C(4B) |
-+-----------+-----------+-------------------+-------------+----------------+-------------+------------+
-| Key bytes (KeyLen) ...| Payload bytes (PayloadLen) ...| ResourceVersion bytes (RVLen) ...           |
-+-----------------------------------------------------------------------------------------------------+
++-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+-------------+------------+
+| Magic(1B) |Format(1B) | Type (1B) | Reserved (1B) |  LSN (8B) | RedoStartLSN (8B) | KeyLen (4B) | PayloadLen (4B)| RVLen (4B)  | CRC32C(4B) |
++-----------+-----------+-----------+---------------+-----------+-------------------+-------------+----------------+-------------+------------+
+| Key bytes (KeyLen) ...                    | Payload bytes (PayloadLen) ...        | ResourceVersion bytes (RVLen) ...           |
++-------------------------------------------+---------------------------------------+---------------------------------------------+
 ```
 - Monotonic 64-bit LSNs never reset during the lifetime of the store.
 - CRC32C is computed with Castagnoli polynomial over the entire record with the CRC field zeroed.
@@ -71,20 +71,15 @@ Log records encode operations (`Put = 1`, `Delete = 2`, `Checkpoint = 3`):
 
 The heap file is organized into discrete 4096-byte blocks.
 
-#### Block Header Layout (64 bytes)
-**Every single 4 KiB block** begins with an identical 64-byte header layout:
+#### Block Header Layout (32 bytes)
+**Every single 4 KiB block** begins with a compact 32-byte header layout:
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       Magic Number (8B)                       |
-|                   0x4741524944535452 ("GARIDSTR")             |
+|   Magic (1B)  |  Version (1B) |          Reserved (2B)        |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          Version (4B)         |         Reserved1 (4B)        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                   Database ID (16B random)                    +
-|                                                               |
+|                          CRC32C (4B)                          |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                   Logical Page Number (8B)                    |
 |                                                               |
@@ -94,28 +89,25 @@ The heap file is organized into discrete 4096-byte blocks.
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |       Block Index (4B)        |        Num Blocks (4B)        |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          CRC32C (4B)          |         Reserved2 (4B)        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                         Reserved3 (4B)                        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
-- Usable data area per block: `4096 - 64 = 4032 bytes`.
-- CRC32C is calculated over all 4096 bytes with bytes 56–60 zeroed.
+- Usable data area per block: `4096 - 32 = 4064 bytes`.
+- The Database ID is not duplicated on individual page blocks (it resides in WAL segment headers and store metadata), saving 32 bytes per 4 KiB block.
+- CRC32C is stored in the first 8-byte row and computed over all 4096 bytes with bytes 4–8 zeroed.
 
 #### Slotted Page (1 Block = 4096 Bytes)
 Small records share a 1-block slotted page:
-- **Header:** Bytes 0–64: `BlockHeader`.
-- **Metadata:** Bytes 64–72: `NumSlots (2B)`, `FreeStart (2B)`, `FreeEnd (2B)`, `Flags (2B)`.
-- **Slot Directory:** Bytes 72 onwards: array of slots `{ Offset uint16, Length uint16 }`.
+- **Header:** Bytes 0–32: `BlockHeader`.
+- **Metadata:** Bytes 32–40: `NumSlots (2B)`, `FreeStart (2B)`, `FreeEnd (2B)`, `Flags (2B)`.
+- **Slot Directory:** Bytes 40 onwards: array of slots `{ Offset uint16, Length uint16 }`.
 - **Stable Slot IDs:** When records are deleted, their slot entry is marked as a tombstone (`Offset = 0, Length = 0`). The slot index remains reserved until reused by a new record.
 - **Defragmentation / Compaction:** Active payloads grow downwards from byte 4096. Compaction slides all active payloads to the end of the block and updates slot offsets, maintaining original slot indices without renumbering.
 - **Empty Pages:** Emptied pages are written with `NumSlots = 0`. Logical page IDs are never discarded; empty logical pages are recycled first.
 
 #### Multi-Block Page (Power-of-Two Blocks: 2 to 512 Blocks = up to 2 MiB)
 Large objects span power-of-two contiguous physical blocks:
-- **Every single block** in the run contains the 64-byte `BlockHeader` with `BlockIndex = i`, `NumBlocks = N`, the store's `DBID`, and the page's `LogicalPage` and `LSN`.
+- **Every single block** in the run contains the 32-byte `BlockHeader` with `BlockIndex = i`, `NumBlocks = N`, and the page's `LogicalPage` and `LSN`.
 - Block 0 stores the record header: `KeyLen (2B)`, `PayloadLen (4B)`, `LSN (8B)`, `Key`.
-- Payload bytes stream across the usable payload section (`block[64:4096]`) of blocks `0` through `N-1`.
+- Payload bytes stream across the usable payload section (`block[32:4096]`) of blocks `0` through `N-1`.
 - Objects larger than 2 MiB are classified as oversize, kept in memory, counted in `OversizeObjectsCount`, and written without failing.
 
 ---
@@ -237,12 +229,12 @@ If a recovery scanner were tricked into accepting this payload as a valid block 
 ### Architectural Guarantee
 Recovery never trusts bytes that object payloads control:
 1. **Strict 4 KiB Block Boundary Alignment:** The recovery engine only parses block headers at exact 4096-byte boundaries (`offset % 4096 == 0`).
-2. **Per-Block Header Isolation:** In `DiskStore`, **every 4096-byte block on disk** starts with the store's authentic 64-byte `BlockHeader` written by the storage engine.
+2. **Per-Block Header Isolation:** In `DiskStore`, **every 4096-byte block on disk** starts with the store's 32-byte `BlockHeader` written by the storage engine, validated with a Castagnoli CRC32C checksum.
 3. **Payload Containment:**
-   - In slotted pages: payload bytes are stored inside slot records within `block[72:4096]`.
-   - In multi-block pages: payload bytes are partitioned across `block[64:4096]`.
+   - In slotted pages: payload bytes are stored inside slot records within `block[40:4096]`.
+   - In multi-block pages: payload bytes are partitioned across `block[32:4096]`.
    - **Payload bytes are never written at byte offset 0 of any 4 KiB block on disk.**
-4. **Empirical Verification:** The test `TestRecovery_ForgedHeaders` constructs multi-block payloads containing valid forged block headers with high LSNs placed at every offset. Upon crash recovery, the store correctly recognizes authentic headers at block boundaries, verifies the genuine payload, and rejects any forged header.
+4. **Empirical Verification:** The test `TestRecovery_ForgedHeaders` constructs multi-block payloads containing valid forged block headers with high LSNs placed at every offset. Upon crash recovery, the store correctly recognizes genuine headers at block boundaries, verifies the genuine payload, and rejects any forged header.
 
 ---
 
@@ -282,11 +274,14 @@ Recompute Latency Comparison:
    - On warm recompute (1,000 object references), `DiskStore` achieves **210 µs**, outperforming BBolt (525 µs) and even the In-Memory informer (358 µs), because pinned descriptors avoid deep pointer chains and interface conversions.
    - On cold reads (requiring direct I/O disk fetch), `DiskStore` takes 198–2696 µs across batches, which is well within acceptable latency for background reconcilers.
 
-3. **Write Throughput & Checkpoint Overhead:**
-   - `DiskStore` write throughput is **1,610 op/s** including the cost of periodic checkpoints, out-of-place page flushes, and WAL fsyncs. While lower than bbolt's un-synced memory writes (7,768 op/s), `DiskStore` provides true crash consistency without risking silent data corruption.
+3. **Write Throughput & Cache Database Durability Model:**
+   - `DiskStore` acts as a crash-consistent cache database: commits update buffer pool frames and append records to the WAL without requiring synchronous fsync on every individual commit. Durability guarantees ensure that on failure or process crash, the store always recovers to a strictly consistent state up to the last periodic WAL/heap fsync or checkpoint.
+   - **Why BBolt's NoSync Mode Is Deceptively Fast:** bbolt achieves 7,768 op/s only by running with `NoSync: true`, completely bypassing fsync and relying on asynchronous OS dirty-page writeback via `mmap`. However, `mmap` writeback is inherently unsafe: if the operating system encounters a write error while flushing dirty pages in the background, Linux *silently drops* the dirty pages (the historical cause of PostgreSQL's fdatasync corruption bugs). Running bbolt safely (`NoSync: false`) drops its write throughput to under 50 op/s.
+   - **Why DiskStore Maintains Bounded Memory Without Mmap Corruption:** `DiskStore` avoids double-buffering and uncontrolled page cache dirty writeback by using direct I/O (`O_DIRECT` / `F_NOCACHE`). In the benchmark (writing 100 MB of objects with an 8 MB buffer pool), write throughput of ~1,610–1,820 op/s reflects the realistic cost of evicting and flushing dirty pages to NVMe storage under the Write-Ahead Rule when the buffer pool fills.
+   - **Slotted Page Stream Packing:** For standard Kubernetes informers streaming smaller objects (1–3 KB) during initial `LIST` and `WATCH` syncs, `DiskStore` packs multiple objects into active slotted pages (up to 20–30 objects per 4 KiB block), drastically reducing page allocations and direct I/O write operations.
 
 4. **Crash Recovery Time:**
-   - `DiskStore` scans and recovers 10,000 objects across a 160 MB heap file in **6.9 seconds**, safely rebuilding the buddy allocator and verifying all checksums.
+   - `DiskStore` scans and recovers 10,000 objects across a 160 MB heap file in **6–7 seconds**, safely rebuilding the buddy allocator and verifying all checksums.
 
 ---
 
