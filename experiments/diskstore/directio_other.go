@@ -16,12 +16,17 @@
 
 package diskstore
 
+import (
+	"errors"
+	"fmt"
+)
+
 func platformPreadv(fd uintptr, off int64, iov [][]byte) error {
-	return nil
+	return fmt.Errorf("vectored direct I/O preadv is not supported on this platform: %w", errors.ErrUnsupported)
 }
 
 func platformPwritev(fd uintptr, off int64, iov [][]byte) error {
-	return nil
+	return fmt.Errorf("vectored direct I/O pwritev is not supported on this platform: %w", errors.ErrUnsupported)
 }
 
 func DirectIOOpenFlag() int {

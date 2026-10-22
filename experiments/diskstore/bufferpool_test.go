@@ -61,8 +61,12 @@ func TestBufferPool_PinAndEviction(t *testing.T) {
 	}
 
 	// Verify page was written to disk and can be read back after eviction
-	_ = heapFile.Sync()
-	bp.PromoteFlushedToDurable()
+	if err := heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := bp.PromoteFlushedToDurable(); err != nil {
+		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
+	}
 
 	// Allocate 4 new pages (pages 2, 3, 4, 5) to force eviction of page 1 from the 4-frame pool
 	for i := uint64(2); i <= 5; i++ {
