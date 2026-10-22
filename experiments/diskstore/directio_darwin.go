@@ -37,6 +37,6 @@ func DirectIOOpenFlag() int {
 
 func applyPlatformDirectIOFlags(fd uintptr) error {
 	// Enable F_NOCACHE to bypass page cache on macOS
-	_, err := unix.FcntlInt(int(fd), unix.F_NOCACHE, 1)
+	_, err := unix.FcntlInt(fd, unix.F_NOCACHE, 1)
 	return err
 }
