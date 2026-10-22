@@ -20,11 +20,7 @@ import (
 )
 
 func TestBlock_HeaderEncodeDecode(t *testing.T) {
-	var dbID [16]byte
-	copy(dbID[:], []byte("block-test-db-01"))
-
 	hdr := BlockHeader{
-		DBID:        dbID,
 		LogicalPage: 42,
 		LSN:         1001,
 		BlockIndex:  3,
@@ -35,7 +31,7 @@ func TestBlock_HeaderEncodeDecode(t *testing.T) {
 	EncodeBlockHeader(hdr, buf)
 	FinalizeBlockCRC(buf)
 
-	decoded, err := DecodeBlockHeader(buf, dbID)
+	decoded, err := DecodeBlockHeader(buf)
 	if err != nil {
 		t.Fatalf("DecodeBlockHeader failed: %v", err)
 	}
@@ -43,39 +39,43 @@ func TestBlock_HeaderEncodeDecode(t *testing.T) {
 	if decoded.LogicalPage != hdr.LogicalPage ||
 		decoded.LSN != hdr.LSN ||
 		decoded.BlockIndex != hdr.BlockIndex ||
-		decoded.NumBlocks != hdr.NumBlocks ||
-		decoded.DBID != hdr.DBID {
+		decoded.NumBlocks != hdr.NumBlocks {
 		t.Fatalf("decoded header mismatch: got %+v, want %+v", decoded, hdr)
 	}
 }
 
-func TestBlock_ForeignDBID(t *testing.T) {
-	var dbID1, dbID2 [16]byte
-	copy(dbID1[:], []byte("db-one-111111111"))
-	copy(dbID2[:], []byte("db-two-222222222"))
-
+func TestBlock_InvalidMagicOrVersion(t *testing.T) {
 	buf := make([]byte, BlockSize)
-	EncodeBlockHeader(BlockHeader{DBID: dbID1, LogicalPage: 1, LSN: 10, NumBlocks: 1}, buf)
+	EncodeBlockHeader(BlockHeader{LogicalPage: 1, LSN: 10, NumBlocks: 1}, buf)
 	FinalizeBlockCRC(buf)
 
-	_, err := DecodeBlockHeader(buf, dbID2)
-	if !errors.Is(err, ErrForeignBlock) {
-		t.Fatalf("expected ErrForeignBlock, got %v", err)
+	// Invalidate magic
+	buf[0] = 0xff
+	FinalizeBlockCRC(buf)
+	_, err := DecodeBlockHeader(buf)
+	if !errors.Is(err, ErrInvalidBlockMagic) {
+		t.Fatalf("expected ErrInvalidBlockMagic, got %v", err)
+	}
+
+	// Invalidate version
+	buf[0] = BlockMagic
+	buf[1] = 0x99
+	FinalizeBlockCRC(buf)
+	_, err = DecodeBlockHeader(buf)
+	if !errors.Is(err, ErrInvalidBlockVersion) {
+		t.Fatalf("expected ErrInvalidBlockVersion, got %v", err)
 	}
 }
 
 func TestBlock_CRCMismatch(t *testing.T) {
-	var dbID [16]byte
-	copy(dbID[:], []byte("db-crc-test-0001"))
-
 	buf := make([]byte, BlockSize)
-	EncodeBlockHeader(BlockHeader{DBID: dbID, LogicalPage: 1, LSN: 10, NumBlocks: 1}, buf)
+	EncodeBlockHeader(BlockHeader{LogicalPage: 1, LSN: 10, NumBlocks: 1}, buf)
 	FinalizeBlockCRC(buf)
 
 	// Corrupt a byte in payload area
 	buf[100] ^= 0xff
 
-	_, err := DecodeBlockHeader(buf, dbID)
+	_, err := DecodeBlockHeader(buf)
 	if !errors.Is(err, ErrBlockCRCMismatch) {
 		t.Fatalf("expected ErrBlockCRCMismatch, got %v", err)
 	}

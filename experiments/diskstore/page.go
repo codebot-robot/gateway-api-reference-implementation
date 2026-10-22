@@ -26,6 +26,9 @@ const (
 	// SlotEntrySize is 4 bytes: Offset(2) + Length(2).
 	SlotEntrySize = 4
 
+	// BlockLSNOffset is offset 16 in BlockHeader.
+	BlockLSNOffset = 16
+
 	// MaxMultiBlockCount is 512 blocks (2 MiB).
 	MaxMultiBlockCount = 512
 
@@ -50,10 +53,9 @@ type SlottedPage struct {
 }
 
 // NewSlottedPage initializes a blank slotted page buffer with headers.
-func NewSlottedPage(logicalPage, lsn uint64, dbID [16]byte) *SlottedPage {
+func NewSlottedPage(logicalPage, lsn uint64) *SlottedPage {
 	buf := make([]byte, BlockSize)
 	hdr := BlockHeader{
-		DBID:        dbID,
 		LogicalPage: logicalPage,
 		LSN:         lsn,
 		BlockIndex:  0,
@@ -61,11 +63,11 @@ func NewSlottedPage(logicalPage, lsn uint64, dbID [16]byte) *SlottedPage {
 	}
 	EncodeBlockHeader(hdr, buf)
 
-	// Slotted metadata at offset 64
-	binary.BigEndian.PutUint16(buf[64:66], 0)                 // NumSlots = 0
-	binary.BigEndian.PutUint16(buf[66:68], BlockHeaderSize+8) // FreeStart = 72
-	binary.BigEndian.PutUint16(buf[68:70], uint16(BlockSize)) // FreeEnd = 4096
-	binary.BigEndian.PutUint16(buf[70:72], 0)                 // Flags
+	// Slotted metadata at BlockHeaderSize (32)
+	binary.BigEndian.PutUint16(buf[BlockHeaderSize:BlockHeaderSize+2], 0)                                     // NumSlots = 0
+	binary.BigEndian.PutUint16(buf[BlockHeaderSize+2:BlockHeaderSize+4], BlockHeaderSize+SlottedPageMetaSize) // FreeStart = 40
+	binary.BigEndian.PutUint16(buf[BlockHeaderSize+4:BlockHeaderSize+6], uint16(BlockSize))                   // FreeEnd = 4096
+	binary.BigEndian.PutUint16(buf[BlockHeaderSize+6:BlockHeaderSize+8], 0)                                   // Flags
 
 	return &SlottedPage{buf: buf}
 }
@@ -74,6 +76,13 @@ func NewSlottedPage(logicalPage, lsn uint64, dbID [16]byte) *SlottedPage {
 func WrapSlottedPage(buf []byte) (*SlottedPage, error) {
 	if len(buf) != BlockSize {
 		return nil, errors.New("invalid slotted page buffer size")
+	}
+	// If uninitialized (freeEnd == 0), initialize metadata
+	if binary.BigEndian.Uint16(buf[BlockHeaderSize+4:BlockHeaderSize+6]) == 0 {
+		binary.BigEndian.PutUint16(buf[BlockHeaderSize:BlockHeaderSize+2], 0)                                     // NumSlots = 0
+		binary.BigEndian.PutUint16(buf[BlockHeaderSize+2:BlockHeaderSize+4], BlockHeaderSize+SlottedPageMetaSize) // FreeStart = 40
+		binary.BigEndian.PutUint16(buf[BlockHeaderSize+4:BlockHeaderSize+6], uint16(BlockSize))                   // FreeEnd = 4096
+		binary.BigEndian.PutUint16(buf[BlockHeaderSize+6:BlockHeaderSize+8], 0)                                   // Flags
 	}
 	return &SlottedPage{buf: buf}, nil
 }
@@ -84,27 +93,27 @@ func (p *SlottedPage) Buffer() []byte {
 }
 
 func (p *SlottedPage) numSlots() uint16 {
-	return binary.BigEndian.Uint16(p.buf[64:66])
+	return binary.BigEndian.Uint16(p.buf[BlockHeaderSize : BlockHeaderSize+2])
 }
 
 func (p *SlottedPage) setNumSlots(n uint16) {
-	binary.BigEndian.PutUint16(p.buf[64:66], n)
+	binary.BigEndian.PutUint16(p.buf[BlockHeaderSize:BlockHeaderSize+2], n)
 }
 
 func (p *SlottedPage) freeStart() uint16 {
-	return binary.BigEndian.Uint16(p.buf[66:68])
+	return binary.BigEndian.Uint16(p.buf[BlockHeaderSize+2 : BlockHeaderSize+4])
 }
 
 func (p *SlottedPage) setFreeStart(off uint16) {
-	binary.BigEndian.PutUint16(p.buf[66:68], off)
+	binary.BigEndian.PutUint16(p.buf[BlockHeaderSize+2:BlockHeaderSize+4], off)
 }
 
 func (p *SlottedPage) freeEnd() uint16 {
-	return binary.BigEndian.Uint16(p.buf[68:70])
+	return binary.BigEndian.Uint16(p.buf[BlockHeaderSize+4 : BlockHeaderSize+6])
 }
 
 func (p *SlottedPage) setFreeEnd(off uint16) {
-	binary.BigEndian.PutUint16(p.buf[68:70], off)
+	binary.BigEndian.PutUint16(p.buf[BlockHeaderSize+4:BlockHeaderSize+6], off)
 }
 
 func (p *SlottedPage) slot(idx uint16) (offset uint16, length uint16) {
@@ -163,10 +172,16 @@ func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error
 	}
 
 	availableFreeSpace := int(p.freeEnd()) - int(p.freeStart())
+	if availableFreeSpace < 0 {
+		availableFreeSpace = 0
+	}
 	if availableFreeSpace < recLen+slotHeaderCost {
 		// Try compaction first
 		p.Compact()
 		availableFreeSpace = int(p.freeEnd()) - int(p.freeStart())
+		if availableFreeSpace < 0 {
+			availableFreeSpace = 0
+		}
 		if availableFreeSpace < recLen+slotHeaderCost {
 			return 0, ErrPageFull
 		}
@@ -193,7 +208,7 @@ func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error
 	p.setSlot(slotIdx, newFreeEnd, uint16(recLen))
 
 	// Update page LSN
-	binary.BigEndian.PutUint64(p.buf[40:48], lsn)
+	binary.BigEndian.PutUint64(p.buf[BlockLSNOffset:BlockLSNOffset+8], lsn)
 
 	return uint32(slotIdx), nil
 }
@@ -204,14 +219,20 @@ func (p *SlottedPage) Get(slotIdx uint32) (key string, payload []byte, lsn uint6
 		return "", nil, 0, ErrSlotNotFound
 	}
 	off, l := p.slot(uint16(slotIdx))
-	if off == 0 || l == 0 {
+	if off == 0 || l == 0 || int(off)+int(l) > len(p.buf) {
 		return "", nil, 0, ErrSlotNotFound
 	}
 
 	recBytes := p.buf[off : off+l]
+	if len(recBytes) < 14 {
+		return "", nil, 0, ErrSlotNotFound
+	}
 	keyLen := binary.BigEndian.Uint16(recBytes[0:2])
 	payloadLen := binary.BigEndian.Uint32(recBytes[2:6])
 	lsn = binary.BigEndian.Uint64(recBytes[6:14])
+	if 14+int(keyLen)+int(payloadLen) > len(recBytes) {
+		return "", nil, 0, ErrSlotNotFound
+	}
 	key = string(recBytes[14 : 14+keyLen])
 	payload = recBytes[14+keyLen : 14+int(keyLen)+int(payloadLen)]
 
@@ -225,7 +246,7 @@ func (p *SlottedPage) Delete(slotIdx uint32, lsn uint64) error {
 		return ErrSlotNotFound
 	}
 	p.setSlot(uint16(slotIdx), 0, 0)
-	binary.BigEndian.PutUint64(p.buf[40:48], lsn)
+	binary.BigEndian.PutUint64(p.buf[BlockLSNOffset:BlockLSNOffset+8], lsn)
 	return nil
 }
 
@@ -233,27 +254,34 @@ func (p *SlottedPage) Delete(slotIdx uint32, lsn uint64) error {
 // Invariant: Slot numbers stay stable during compaction.
 func (p *SlottedPage) Compact() {
 	numSlots := p.numSlots()
+	freeStart := BlockHeaderSize + SlottedPageMetaSize + int(numSlots)*SlotEntrySize
 	temp := make([]byte, BlockSize)
 
 	// Copy page header and metadata
-	copy(temp[:BlockHeaderSize+SlottedPageMetaSize+int(numSlots)*SlotEntrySize], p.buf[:BlockHeaderSize+SlottedPageMetaSize+int(numSlots)*SlotEntrySize])
+	copy(temp[:freeStart], p.buf[:freeStart])
 
-	newFreeEnd := uint16(BlockSize)
+	newFreeEnd := int(BlockSize)
 	for i := uint16(0); i < numSlots; i++ {
 		off, l := p.slot(i)
 		if off == 0 || l == 0 {
 			continue // tombstone
 		}
-		newFreeEnd -= l
-		copy(temp[newFreeEnd:newFreeEnd+l], p.buf[off:off+l])
+		newFreeEnd -= int(l)
+		if newFreeEnd < freeStart {
+			// Out of space!
+			newFreeEnd = freeStart
+			break
+		}
+		copy(temp[newFreeEnd:newFreeEnd+int(l)], p.buf[off:off+l])
 
 		// Update slot offset in temp
 		pos := BlockHeaderSize + SlottedPageMetaSize + int(i)*SlotEntrySize
-		binary.BigEndian.PutUint16(temp[pos:pos+2], newFreeEnd)
+		binary.BigEndian.PutUint16(temp[pos:pos+2], uint16(newFreeEnd))
 		binary.BigEndian.PutUint16(temp[pos+2:pos+4], l)
 	}
 
-	binary.BigEndian.PutUint16(temp[68:70], newFreeEnd)
+	binary.BigEndian.PutUint16(temp[BlockHeaderSize+2:BlockHeaderSize+4], uint16(freeStart))
+	binary.BigEndian.PutUint16(temp[BlockHeaderSize+4:BlockHeaderSize+6], uint16(newFreeEnd))
 	copy(p.buf, temp)
 }
 
@@ -286,7 +314,7 @@ type MultiBlockPage struct {
 }
 
 // NewMultiBlockPage creates and encodes a multi-block page holding a single large record at slot 0.
-func NewMultiBlockPage(logicalPage, lsn uint64, dbID [16]byte, key string, payload []byte) (*MultiBlockPage, error) {
+func NewMultiBlockPage(logicalPage, lsn uint64, key string, payload []byte) (*MultiBlockPage, error) {
 	numBlocks, err := CalculateMultiBlockCount(len(payload))
 	if err != nil {
 		return nil, err
@@ -296,7 +324,6 @@ func NewMultiBlockPage(logicalPage, lsn uint64, dbID [16]byte, key string, paylo
 	for i := 0; i < numBlocks; i++ {
 		blocks[i] = make([]byte, BlockSize)
 		hdr := BlockHeader{
-			DBID:        dbID,
 			LogicalPage: logicalPage,
 			LSN:         lsn,
 			BlockIndex:  uint32(i),

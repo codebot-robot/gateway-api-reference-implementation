@@ -22,10 +22,7 @@ import (
 )
 
 func TestSlottedPage_CRUDAndStableSlots(t *testing.T) {
-	var dbID [16]byte
-	copy(dbID[:], []byte("slotted-page-001"))
-
-	page := NewSlottedPage(1, 100, dbID)
+	page := NewSlottedPage(1, 100)
 
 	// Insert 3 records
 	slot0, err := page.Put("key-0", []byte("val-0"), 100)
@@ -78,10 +75,7 @@ func TestSlottedPage_CRUDAndStableSlots(t *testing.T) {
 }
 
 func TestSlottedPage_CompactionPreservesSlotIDs(t *testing.T) {
-	var dbID [16]byte
-	copy(dbID[:], []byte("slotted-page-002"))
-
-	page := NewSlottedPage(2, 200, dbID)
+	page := NewSlottedPage(2, 200)
 
 	// Fill page with multiple records
 	var slots []uint32
@@ -120,16 +114,13 @@ func TestSlottedPage_CompactionPreservesSlotIDs(t *testing.T) {
 }
 
 func TestMultiBlockPage_EncodeDecode(t *testing.T) {
-	var dbID [16]byte
-	copy(dbID[:], []byte("multi-block-db-1"))
-
 	// 10 KB payload (requires 4 blocks)
 	payload := make([]byte, 10240)
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
 
-	mbPage, err := NewMultiBlockPage(10, 500, dbID, "default/large-configmap", payload)
+	mbPage, err := NewMultiBlockPage(10, 500, "default/large-configmap", payload)
 	if err != nil {
 		t.Fatalf("NewMultiBlockPage failed: %v", err)
 	}
@@ -140,7 +131,7 @@ func TestMultiBlockPage_EncodeDecode(t *testing.T) {
 
 	// Verify each block has a valid header and valid CRC
 	for i, blk := range mbPage.Blocks {
-		hdr, err := DecodeBlockHeader(blk, dbID)
+		hdr, err := DecodeBlockHeader(blk)
 		if err != nil {
 			t.Fatalf("block %d header decode failed: %v", i, err)
 		}
@@ -163,9 +154,8 @@ func TestMultiBlockPage_EncodeDecode(t *testing.T) {
 func TestMultiBlockPage_OversizeObject(t *testing.T) {
 	// Payload > MaxPayloadCapacity (~2 MiB)
 	oversize := make([]byte, 3*1024*1024)
-	var dbID [16]byte
 
-	_, err := NewMultiBlockPage(1, 1, dbID, "oversize", oversize)
+	_, err := NewMultiBlockPage(1, 1, "oversize", oversize)
 	if !errors.Is(err, ErrObjectOversize) {
 		t.Fatalf("expected ErrObjectOversize, got %v", err)
 	}
