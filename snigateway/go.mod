@@ -6,7 +6,7 @@ toolchain go1.27.3
 
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261018111514-10cdefd87859
-	github.com/quic-go/quic-go v0.64.0
+	github.com/quic-go/quic-go v0.64.1
 	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
 	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
