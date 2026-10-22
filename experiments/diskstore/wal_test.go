@@ -114,8 +114,8 @@ func TestWAL_StopAtBadCRC(t *testing.T) {
 	size, _ := file.Size()
 	data := make([]byte, size)
 	_, _ = file.ReadAt(data, 0)
-	// Corrupt byte near end of file
-	data[len(data)-10] ^= 0xff
+	// Corrupt byte inside record 4
+	data[200] ^= 0xff
 	_, _ = file.WriteAt(data, 0)
 	_ = file.Close()
 

@@ -41,6 +41,9 @@ const (
 
 	// DefaultMaxSegmentSize is 16 MiB.
 	DefaultMaxSegmentSize = 16 * 1024 * 1024
+
+	// WALBlockSize is 4 KiB block alignment for direct I/O WAL writes.
+	WALBlockSize = 4096
 )
 
 // WAL manages appending, syncing, and segment lifecycle of the write-ahead log.
@@ -53,12 +56,18 @@ type WAL struct {
 	activeFile     File
 	activePath     string
 	activeStartLSN uint64
-	activeSize     int64
+	activeSize     int64 // Total bytes written/committed to current segment file
 
-	maxLSN      atomic.Uint64
-	fsyncedLSN  atomic.Uint64
-	maxSegSize  int64
-	createdLSNs map[uint64]bool // Asserts never reuse/recycle segment file names
+	tailBlock   []byte // Aligned 4 KiB buffer for current block
+	tailOffset  int    // Current offset within tailBlock (0..4096)
+	blockOffset int64  // Physical file offset where tailBlock starts
+
+	nextLSN         uint64 // Next monotonic LSN to allocate under mu
+	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
+	maxLSN          atomic.Uint64
+	fsyncedLSN      atomic.Uint64
+	maxSegSize      int64
+	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
 }
 
 // WALOptions configures a WAL instance.
@@ -81,14 +90,17 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	w := &WAL{
-		fs:          fs,
-		dir:         dir,
-		dbID:        dbID,
-		maxSegSize:  maxSegSize,
-		createdLSNs: make(map[uint64]bool),
+		fs:              fs,
+		dir:             dir,
+		dbID:            dbID,
+		maxSegSize:      maxSegSize,
+		createdLSNs:     make(map[uint64]bool),
+		tailBlock:       make([]byte, WALBlockSize),
+		nextLSN:         initialLSN + 1,
+		lastAppendedLSN: initialLSN,
 	}
 
-	// Scan existing segments to find highest LSN
+	// Scan existing segments to record used start LSNs
 	segments, err := w.listSegments()
 	if err != nil {
 		return nil, err
@@ -98,10 +110,8 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		w.createdLSNs[seg.startLSN] = true
 	}
 
-	if initialLSN > 0 {
-		w.maxLSN.Store(initialLSN)
-		w.fsyncedLSN.Store(initialLSN)
-	}
+	w.maxLSN.Store(initialLSN)
+	w.fsyncedLSN.Store(initialLSN)
 
 	return w, nil
 }
@@ -151,7 +161,7 @@ func segmentFileName(startLSN uint64) string {
 	return fmt.Sprintf("%020d.wal", startLSN)
 }
 
-// createSegment creates a new immutable WAL segment named by starting LSN.
+// createSegmentLocked creates a new immutable WAL segment named by starting LSN.
 // Invariant: Never reuse or recycle a segment file name. Fsync the directory after creation.
 func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	if w.createdLSNs[startLSN] {
@@ -161,19 +171,25 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	name := segmentFileName(startLSN)
 	path := filepath.Join(w.dir, name)
 
-	f, err := w.fs.Create(path)
+	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
+	f, err := w.fs.OpenFile(path, openFlags, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to create WAL segment %s: %w", name, err)
+		// Fallback without DirectIOOpenFlag if not supported by FS
+		f, err = w.fs.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to create WAL segment %s: %w", name, err)
+		}
 	}
 
-	// Write segment header: Magic(4) + Version(4) + Reserved(8) + DBID(16)
-	header := make([]byte, SegmentHeaderSize)
-	binary.BigEndian.PutUint32(header[0:4], WALMagic)
-	binary.BigEndian.PutUint32(header[4:8], WALVersion)
-	// header[8:16] is zero padding
-	copy(header[16:32], w.dbID[:])
+	// Prepare segment header in tail block
+	clearBytes(w.tailBlock)
+	binary.BigEndian.PutUint32(w.tailBlock[0:4], WALMagic)
+	binary.BigEndian.PutUint32(w.tailBlock[4:8], WALVersion)
+	// bytes 8..16 reserved zero padding
+	copy(w.tailBlock[16:32], w.dbID[:])
 
-	if _, err := f.WriteAt(header, 0); err != nil {
+	// Write initial header block
+	if _, err := f.WriteAt(w.tailBlock, 0); err != nil {
 		return errors.Join(fmt.Errorf("failed to write segment header: %w", err), f.Close())
 	}
 
@@ -199,6 +215,8 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	w.activeFile = f
 	w.activePath = path
 	w.activeStartLSN = startLSN
+	w.blockOffset = 0
+	w.tailOffset = SegmentHeaderSize
 	w.activeSize = int64(SegmentHeaderSize)
 	w.createdLSNs[startLSN] = true
 	return nil
@@ -206,7 +224,14 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 
 // NextLSN increments and returns the next 64-bit monotonic LSN.
 func (w *WAL) NextLSN() uint64 {
-	return w.maxLSN.Add(1)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	lsn := w.nextLSN
+	w.nextLSN++
+	if lsn > w.maxLSN.Load() {
+		w.maxLSN.Store(lsn)
+	}
+	return lsn
 }
 
 // MaxLSN returns the current maximum allocated LSN.
@@ -225,21 +250,55 @@ func (w *WAL) Append(r Record) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if r.LSN == 0 {
+		r.LSN = w.nextLSN
+		w.nextLSN++
+	} else if r.LSN >= w.nextLSN {
+		w.nextLSN = r.LSN + 1
+	}
+
 	encoded := EncodeRecord(r)
 
 	// If no active file or file exceeds max size, roll to a new segment
-	if w.activeFile == nil || w.activeSize+int64(len(encoded)) > w.maxSegSize {
+	if w.activeFile == nil || w.blockOffset+int64(w.tailOffset)+int64(len(encoded)) > w.maxSegSize {
 		if err := w.createSegmentLocked(r.LSN); err != nil {
 			return err
 		}
 	}
 
-	n, err := w.activeFile.WriteAt(encoded, w.activeSize)
-	if err != nil {
-		return fmt.Errorf("failed to write WAL record: %w", err)
-	}
-	w.activeSize += int64(n)
+	// Write record into 4 KiB aligned tail buffer and flush full blocks
+	written := 0
+	for written < len(encoded) {
+		space := WALBlockSize - w.tailOffset
+		toCopy := len(encoded) - written
+		if toCopy > space {
+			toCopy = space
+		}
+		copy(w.tailBlock[w.tailOffset:w.tailOffset+toCopy], encoded[written:written+toCopy])
+		w.tailOffset += toCopy
+		written += toCopy
 
+		if w.tailOffset == WALBlockSize {
+			// Flush full 4 KiB block to disk
+			if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
+				return fmt.Errorf("failed to write WAL block: %w", err)
+			}
+			w.blockOffset += WALBlockSize
+			w.activeSize = w.blockOffset
+			w.tailOffset = 0
+			clearBytes(w.tailBlock)
+		}
+	}
+
+	// Also write the dirty partial tail block to disk so direct reads / process restarts see it
+	if w.tailOffset > 0 {
+		if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
+			return fmt.Errorf("failed to write partial WAL block: %w", err)
+		}
+		w.activeSize = w.blockOffset + int64(w.tailOffset)
+	}
+
+	w.lastAppendedLSN = r.LSN
 	if r.LSN > w.maxLSN.Load() {
 		w.maxLSN.Store(r.LSN)
 	}
@@ -247,6 +306,8 @@ func (w *WAL) Append(r Record) error {
 }
 
 // Sync flushes and fsyncs the active WAL file.
+// Invariant: Never rewrite an fsynced block. After fsyncing, pad the tail block and advance
+// so that subsequent appends begin on a fresh block.
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -254,10 +315,30 @@ func (w *WAL) Sync() error {
 	if w.activeFile == nil {
 		return nil
 	}
+
+	toSyncLSN := w.lastAppendedLSN
+
+	if w.tailOffset > 0 {
+		// Zero-pad the remainder of the block
+		for i := w.tailOffset; i < WALBlockSize; i++ {
+			w.tailBlock[i] = 0
+		}
+		// Write the padded block to disk
+		if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
+			return fmt.Errorf("failed to write padded WAL block on sync: %w", err)
+		}
+		// Advance blockOffset so this fsynced block is NEVER rewritten!
+		w.blockOffset += WALBlockSize
+		w.activeSize = w.blockOffset
+		w.tailOffset = 0
+		clearBytes(w.tailBlock)
+	}
+
 	if err := w.activeFile.Sync(); err != nil {
 		return err
 	}
-	w.fsyncedLSN.Store(w.maxLSN.Load())
+
+	w.fsyncedLSN.Store(toSyncLSN)
 	return nil
 }
 
@@ -306,10 +387,20 @@ func (w *WAL) Close() error {
 	defer w.mu.Unlock()
 
 	if w.activeFile != nil {
+		var writeErr error
+		if w.tailOffset > 0 {
+			for i := w.tailOffset; i < WALBlockSize; i++ {
+				w.tailBlock[i] = 0
+			}
+			_, writeErr = w.activeFile.WriteAt(w.tailBlock, w.blockOffset)
+			w.blockOffset += WALBlockSize
+			w.activeSize = w.blockOffset
+			w.tailOffset = 0
+		}
 		syncErr := w.activeFile.Sync()
 		closeErr := w.activeFile.Close()
 		w.activeFile = nil
-		return errors.Join(syncErr, closeErr)
+		return errors.Join(writeErr, syncErr, closeErr)
 	}
 	return nil
 }
@@ -322,6 +413,7 @@ type WALIterator struct {
 	currSegIdx  int
 	currFile    File
 	currOffset  int64
+	startLSN    uint64
 	expectedLSN uint64
 	done        bool
 }
@@ -359,11 +451,22 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64) (*WALIter
 		return segments[i].startLSN < segments[j].startLSN
 	})
 
+	// Find the segment that could contain startLSN
+	startIdx := 0
+	for i, seg := range segments {
+		if seg.startLSN <= startLSN {
+			startIdx = i
+		} else {
+			break
+		}
+	}
+
 	it := &WALIterator{
 		fs:          fs,
 		segments:    segments,
 		dbID:        dbID,
-		currSegIdx:  -1,
+		currSegIdx:  startIdx - 1,
+		startLSN:    startLSN,
 		expectedLSN: 0,
 	}
 
@@ -413,7 +516,7 @@ func (it *WALIterator) nextSegment() error {
 }
 
 // Next reads the next valid record in sequence.
-// Stops and returns io.EOF at first record with a bad CRC or non-contiguous LSN.
+// Honors startLSN and properly handles torn tails when later segments exist.
 func (it *WALIterator) Next() (Record, error) {
 	if it.done {
 		return Record{}, io.EOF
@@ -427,15 +530,60 @@ func (it *WALIterator) Next() (Record, error) {
 		// Read record header at currOffset
 		hdr := make([]byte, RecordHeaderSize)
 		n, err := it.currFile.ReadAt(hdr, it.currOffset)
+
+		// Check if at clean EOF of segment
 		if err == io.EOF && n == 0 {
-			// Try advancing to next segment
 			if segErr := it.nextSegment(); segErr != nil {
 				return Record{}, io.EOF
 			}
 			continue
 		}
-		if err != nil || n < RecordHeaderSize {
-			// Torn / incomplete header -> stop recovery
+
+		// Check for real read I/O error
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			it.done = true
+			return Record{}, fmt.Errorf("read error reading record header at offset %d: %w", it.currOffset, err)
+		}
+
+		// Check for zero-padded block or torn header
+		isZeroPadding := true
+		for _, b := range hdr[:n] {
+			if b != 0 {
+				isZeroPadding = false
+				break
+			}
+		}
+
+		if isZeroPadding {
+			// Check if we can skip zero padding to the next 4 KiB block boundary within this segment
+			nextBlock := ((it.currOffset / WALBlockSize) + 1) * WALBlockSize
+			size, sizeErr := it.currFile.Size()
+			if sizeErr == nil && nextBlock < size {
+				it.currOffset = nextBlock
+				continue
+			}
+			// Reached end of blocks in this segment: check if next segment starts at expected LSN
+			if it.canAdvanceToNextSegment() {
+				if segErr := it.nextSegment(); segErr != nil {
+					it.done = true
+					return Record{}, io.EOF
+				}
+				continue
+			}
+			it.done = true
+			return Record{}, io.EOF
+		}
+
+		if n < RecordHeaderSize {
+			// Torn header: check if next segment starts at expected LSN
+			if it.canAdvanceToNextSegment() {
+				if segErr := it.nextSegment(); segErr != nil {
+					it.done = true
+					return Record{}, io.EOF
+				}
+				continue
+			}
+			// Otherwise, this is the true end of the log
 			it.done = true
 			return Record{}, io.EOF
 		}
@@ -447,26 +595,54 @@ func (it *WALIterator) Next() (Record, error) {
 
 		recordBytes := make([]byte, totalRecordLen)
 		n, err = it.currFile.ReadAt(recordBytes, it.currOffset)
-		if err != nil && err != io.EOF {
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			it.done = true
-			return Record{}, io.EOF
+			return Record{}, fmt.Errorf("read error reading record body at offset %d: %w", it.currOffset, err)
 		}
+
 		if n < totalRecordLen {
-			// Torn record body -> stop recovery
+			// Torn record body: check if next segment starts at expected LSN
+			if it.canAdvanceToNextSegment() {
+				if segErr := it.nextSegment(); segErr != nil {
+					it.done = true
+					return Record{}, io.EOF
+				}
+				continue
+			}
 			it.done = true
 			return Record{}, io.EOF
 		}
 
 		rec, decodeErr := DecodeRecord(bytes.NewReader(recordBytes))
 		if decodeErr != nil {
-			// Stop at first record with bad CRC or corruption
+			// Corrupt record or bad CRC: check if next segment starts at expected LSN
+			if it.canAdvanceToNextSegment() {
+				if segErr := it.nextSegment(); segErr != nil {
+					it.done = true
+					return Record{}, io.EOF
+				}
+				continue
+			}
 			it.done = true
 			return Record{}, io.EOF
 		}
 
+		// If startLSN was specified, skip records prior to startLSN
+		if it.startLSN > 0 && rec.LSN < it.startLSN {
+			it.currOffset += int64(totalRecordLen)
+			continue
+		}
+
 		// Check LSN contiguity
 		if it.expectedLSN > 0 && rec.LSN != it.expectedLSN {
-			// Stop at first non-contiguous LSN
+			// LSN gap: check if next segment can continue
+			if it.canAdvanceToNextSegment() {
+				if segErr := it.nextSegment(); segErr != nil {
+					it.done = true
+					return Record{}, io.EOF
+				}
+				continue
+			}
 			it.done = true
 			return Record{}, io.EOF
 		}
@@ -477,6 +653,17 @@ func (it *WALIterator) Next() (Record, error) {
 	}
 }
 
+// canAdvanceToNextSegment checks if a later segment exists starting at expectedLSN.
+func (it *WALIterator) canAdvanceToNextSegment() bool {
+	if it.currSegIdx+1 < len(it.segments) {
+		nextSeg := it.segments[it.currSegIdx+1]
+		if it.expectedLSN == 0 || nextSeg.startLSN == it.expectedLSN {
+			return true
+		}
+	}
+	return false
+}
+
 // Close closes the iterator.
 func (it *WALIterator) Close() error {
 	if it.currFile != nil {
@@ -485,4 +672,10 @@ func (it *WALIterator) Close() error {
 		return err
 	}
 	return nil
+}
+
+func clearBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
