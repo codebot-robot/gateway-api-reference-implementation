@@ -101,14 +101,6 @@ func (b *BuddyAllocator) removeFree(order int, block uint64) bool {
 	return false
 }
 
-func (b *BuddyAllocator) isFree(order int, block uint64) bool {
-	list := b.freeLists[order]
-	idx := sort.Search(len(list), func(i int) bool {
-		return list[i] >= block
-	})
-	return idx < len(list) && list[idx] == block
-}
-
 func (b *BuddyAllocator) growLocked(growBlocks uint64) {
 	// Round up to multiple of MaxOrder (512 blocks) to ensure natural alignment
 	unit := uint64(1 << MaxOrder)

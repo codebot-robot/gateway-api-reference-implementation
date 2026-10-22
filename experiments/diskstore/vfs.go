@@ -133,8 +133,6 @@ func (o *OSFS) SyncDir(dirname string) error {
 
 // MemFile is an in-memory implementation of File for testing and fault simulation.
 type MemFile struct {
-	fs     *MemFS
-	name   string
 	mu     sync.RWMutex
 	data   []byte
 	closed bool
