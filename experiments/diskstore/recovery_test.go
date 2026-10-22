@@ -16,6 +16,11 @@ package diskstore
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -252,58 +257,297 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 func TestRecovery_CrashConsistency(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
+	dir := "test_crash_consistency_store"
 
-	var dbID [16]byte
-	copy(dbID[:], []byte("rec-crash-db-001"))
+	// Model mapping key -> expected payload value
+	model := make(map[string]string)
 
-	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	// Cycle 1: Open fresh store, put initial keys and a large multi-block object, checkpoint
+	store, err := OpenStore(WithFS(faultFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenWAL failed: %v", err)
+		t.Fatalf("Cycle 1 OpenStore failed: %v", err)
 	}
-	heapFile, err := faultFS.Create("heap.db")
-	if err != nil {
-		t.Fatalf("Create heap failed: %v", err)
-	}
-	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
-	cp := NewCheckpointer(bp, heapFile, wal)
 
-	// Step 1: Put k1, k2, then Checkpoint
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "k1", Payload: []byte("v1"), ResourceVersion: "rv1"})
-	h1, _ := bp.AllocateNewPage(1, 1, 1)
-	s1, _ := WrapSlottedPage(h1.Block(0))
-	_, _ = s1.Put("k1", []byte("v1"), 1)
-	s1.Finalize()
-	h1.Unpin()
+	largeVal := bytes.Repeat([]byte("large-payload-bytes-"), 500) // ~10 KB
+	_ = store.Put("ConfigMap", "key1", []byte("val1-initial"), "1")
+	model["key1"] = "val1-initial"
 
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 2, Key: "k2", Payload: []byte("v2"), ResourceVersion: "rv2"})
-	h2, _ := bp.AllocateNewPage(2, 1, 2)
-	s2, _ := WrapSlottedPage(h2.Block(0))
-	_, _ = s2.Put("k2", []byte("v2"), 2)
-	s2.Finalize()
-	h2.Unpin()
+	_ = store.Put("ConfigMap", "key2", []byte("val2-initial"), "2")
+	model["key2"] = "val2-initial"
 
-	chk1LSN, err := cp.Checkpoint()
+	_ = store.Put("ConfigMap", "key-large", largeVal, "3")
+	model["key-large"] = string(largeVal)
+
+	chk1, err := store.Checkpoint()
 	if err != nil {
 		t.Fatalf("Checkpoint 1 failed: %v", err)
 	}
 
-	// Step 2: Put k3, Delete k1
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: chk1LSN + 1, Key: "k3", Payload: []byte("v3"), ResourceVersion: "rv3"})
-	h3, _ := bp.AllocateNewPage(3, 1, chk1LSN+1)
-	s3, _ := WrapSlottedPage(h3.Block(0))
-	_, _ = s3.Put("k3", []byte("v3"), chk1LSN+1)
-	s3.Finalize()
-	h3.Unpin()
+	// Update key1 and put key3
+	_ = store.Put("ConfigMap", "key1", []byte("val1-updated"), "4")
+	model["key1"] = "val1-updated"
 
-	// Step 3: Simulate crash with random tearing of un-fsynced writes
+	_ = store.Put("ConfigMap", "key3", []byte("val3-initial"), "5")
+	model["key3"] = "val3-initial"
+
+	// Checkpoint 2
+	chk2, err := store.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint 2 failed: %v", err)
+	}
+	if chk2 <= chk1 {
+		t.Fatalf("checkpoint LSN did not advance: chk2=%d <= chk1=%d", chk2, chk1)
+	}
+
+	// Un-checkpointed writes before crash
+	_ = store.Put("ConfigMap", "key4", []byte("val4-uncheckpointed"), "6")
+	model["key4"] = "val4-uncheckpointed"
+
+	// Simulate crash with tearing of un-fsynced writes
 	faultFS.Crash(false, 0.5)
+	_ = store.Close()
 
+	// Cycle 2: Reopen store and verify full contents against model
+	store2, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Cycle 2 OpenStore failed: %v", err)
+	}
+
+	for k, expectedVal := range model {
+		val, exists, err := store2.Get("ConfigMap", k)
+		if err != nil {
+			t.Fatalf("Cycle 2 Get(%s) failed: %v", k, err)
+		}
+		if !exists {
+			t.Fatalf("Cycle 2 Get(%s) missing after recovery", k)
+		}
+		if string(val) != expectedVal {
+			t.Fatalf("Cycle 2 Get(%s) payload mismatch: got %q, want %q", k, string(val), expectedVal)
+		}
+	}
+
+	// In Cycle 2: Delete key1, update key2, put key5, and Checkpoint 3
+	if err := store2.Delete("ConfigMap", "key1"); err != nil {
+		t.Fatalf("Delete key1 failed: %v", err)
+	}
+	delete(model, "key1")
+
+	_ = store2.Put("ConfigMap", "key2", []byte("val2-cycle2"), "7")
+	model["key2"] = "val2-cycle2"
+
+	_ = store2.Put("ConfigMap", "key5", []byte("val5-cycle2"), "8")
+	model["key5"] = "val5-cycle2"
+
+	_, err = store2.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint 3 failed: %v", err)
+	}
+
+	// Crash again with drop of unsynced writes (power loss simulation)
+	faultFS.Crash(true, 0)
+	_ = store2.Close()
+
+	// Cycle 3: Reopen store again and verify full contents against updated model
+	store3, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Cycle 3 OpenStore failed: %v", err)
+	}
+	defer store3.Close()
+
+	// key1 was deleted; must not exist
+	if _, exists, _ := store3.Get("ConfigMap", "key1"); exists {
+		t.Fatalf("deleted key1 resurrected after cycle 3 recovery!")
+	}
+
+	for k, expectedVal := range model {
+		val, exists, err := store3.Get("ConfigMap", k)
+		if err != nil {
+			t.Fatalf("Cycle 3 Get(%s) failed: %v", k, err)
+		}
+		if !exists {
+			t.Fatalf("Cycle 3 Get(%s) missing after recovery", k)
+		}
+		if string(val) != expectedVal {
+			t.Fatalf("Cycle 3 Get(%s) payload mismatch: got %q, want %q", k, string(val), expectedVal)
+		}
+	}
+}
+
+// TestRegression_Item1_LSNReopenContinuation asserts LSNs continue from recovered max and start a new segment.
+func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_reopen_lsn_continuation"
+
+	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	_ = store.Put("ConfigMap", "k1", []byte("v1"), "1")
+	_ = store.Put("ConfigMap", "k2", []byte("v2"), "2")
+	chkLSN, _ := store.Checkpoint()
+	_ = store.Close()
+
+	// Reopen store
+	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Reopen OpenStore failed: %v", err)
+	}
+	defer store2.Close()
+
+	// First Put after reopen must NOT fail with "segment already used" and must have LSN > chkLSN
+	if err := store2.Put("ConfigMap", "k3", []byte("v3"), "3"); err != nil {
+		t.Fatalf("first Put after reopen failed: %v", err)
+	}
+
+	store2.keyMu.RLock()
+	entryK3 := store2.keyIndex[qualifyKey("ConfigMap", "k3")]
+	store2.keyMu.RUnlock()
+
+	if entryK3.LSN <= chkLSN {
+		t.Fatalf("LSN went backwards after reopen: k3 LSN=%d <= checkpoint LSN=%d", entryK3.LSN, chkLSN)
+	}
+}
+
+// TestRegression_Item2_TornTailAdvance asserts WAL iterator advances across segments after a torn tail.
+func TestRegression_Item2_TornTailAdvance(t *testing.T) {
+	memFS := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("wal-torn-test-01"))
+
+	wal, err := OpenWAL(memFS, "wal_dir", dbID, 0, WALOptions{MaxSegmentSize: 4096})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+
+	// Write records to segment 1 (LSN 1..5)
+	for i := uint64(1); i <= 5; i++ {
+		_ = wal.Append(Record{Type: RecordTypePut, LSN: i, Key: fmt.Sprintf("k%d", i), Payload: []byte("v")})
+	}
+	_ = wal.Sync()
+
+	// Write records to segment 2 (LSN 6..10)
+	for i := uint64(6); i <= 10; i++ {
+		_ = wal.Append(Record{Type: RecordTypePut, LSN: i, Key: fmt.Sprintf("k%d", i), Payload: []byte("v")})
+	}
+	_ = wal.Sync()
+	_ = wal.Close()
+
+	// Corrupt tail of segment 1 (simulate torn crash at tail of seg 1)
+	entries, _ := memFS.ReadDir("wal_dir")
+	seg1File, _ := memFS.OpenFile(filepath.Join("wal_dir", entries[0].Name()), os.O_RDWR, 0644)
+	buf := make([]byte, 200)
+	_, _ = seg1File.ReadAt(buf, 200)
+	buf[50] ^= 0xff // corrupt record in seg 1
+	_, _ = seg1File.WriteAt(buf, 200)
+	_ = seg1File.Close()
+
+	// Iterator with expected continuation should advance to segment 2
+	it, err := NewWALIterator(memFS, "wal_dir", dbID, 1)
+	if err != nil {
+		t.Fatalf("NewWALIterator failed: %v", err)
+	}
+	defer it.Close()
+
+	var replayed []uint64
+	for {
+		rec, err := it.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected iterator error: %v", err)
+		}
+		replayed = append(replayed, rec.LSN)
+	}
+
+	// Must have read records from segment 2
+	hasSeg2 := false
+	for _, lsn := range replayed {
+		if lsn >= 6 {
+			hasSeg2 = true
+			break
+		}
+	}
+	if !hasSeg2 {
+		t.Fatalf("iterator failed to advance to segment 2 after torn tail; replayed: %v", replayed)
+	}
+}
+
+// TestRegression_Item3_RedoAppliesPayload asserts un-checkpointed WAL writes apply to page buffers during redo.
+func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	dir := "test_redo_applies_payload"
+
+	store, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+
+	// Write keys without checkpointing
+	_ = store.Put("ConfigMap", "key-redo-1", []byte("payload-redo-1"), "1")
+	_ = store.Put("ConfigMap", "key-redo-2", []byte("payload-redo-2"), "2")
+
+	// Sync WAL so records are durable, but do NOT sync heap
+	_ = store.wal.Sync()
+
+	// Simulate crash
+	_ = store.Close()
+
+	// Reopen store: recovery must redo the puts onto page buffers
+	store2, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Reopen OpenStore failed: %v", err)
+	}
+	defer store2.Close()
+
+	val1, exists, err := store2.Get("ConfigMap", "key-redo-1")
+	if err != nil || !exists || string(val1) != "payload-redo-1" {
+		t.Fatalf("key-redo-1 not recovered: exists=%v, val=%q, err=%v", exists, string(val1), err)
+	}
+
+	val2, exists, err := store2.Get("ConfigMap", "key-redo-2")
+	if err != nil || !exists || string(val2) != "payload-redo-2" {
+		t.Fatalf("key-redo-2 not recovered: exists=%v, val=%q, err=%v", exists, string(val2), err)
+	}
+}
+
+// TestRegression_Item4_HighestLSNKeySelection asserts recovery always picks the copy with the highest LSN.
+func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	faultFS.SetMaxFsyncedLSN(100)
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("rec-highest-lsn-"))
+
+	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	heapFile, _ := faultFS.Create("heap.db")
+	buddy := NewBuddyAllocator(512)
+	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+
+	// Page 1: holds key at LSN 10
+	h1, _ := bp.AllocateNewPage(1, 1, 10)
+	s1, _ := WrapSlottedPage(h1.Block(0))
+	_, _ = s1.Put("target-key", []byte("older-val"), 10)
+	s1.Finalize()
+	h1.Unpin()
+	_ = bp.FlushPage(1)
+
+	// Page 2: holds key at LSN 20 (newer!)
+	h2, _ := bp.AllocateNewPage(2, 1, 20)
+	s2, _ := WrapSlottedPage(h2.Block(0))
+	_, _ = s2.Put("target-key", []byte("newer-val"), 20)
+	s2.Finalize()
+	h2.Unpin()
+	_ = bp.FlushPage(2)
+
+	_ = heapFile.Sync()
 	_ = bp.Close()
 	_ = heapFile.Close()
 	_ = wal.Close()
 
-	// Step 4: Run recovery
 	reopenedHeap, _ := faultFS.OpenFile("heap.db", 0, 0)
 	defer reopenedHeap.Close()
 
@@ -312,22 +556,12 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 		t.Fatalf("Recover failed: %v", err)
 	}
 
-	// State must be at least as recent as Checkpoint 1 (chk1LSN)
-	if res.MaxLSN < chk1LSN {
-		t.Fatalf("recovered MaxLSN %d < checkpoint 1 LSN %d", res.MaxLSN, chk1LSN)
+	entry, exists := res.KeyIndex["target-key"]
+	if !exists {
+		t.Fatalf("target-key missing from recovered index")
 	}
-
-	// Both k1 and k2 must exist and be valid as of checkpoint 1
-	if _, ok := res.KeyIndex["k1"]; !ok {
-		t.Fatalf("k1 missing after recovery")
-	}
-	if _, ok := res.KeyIndex["k2"]; !ok {
-		t.Fatalf("k2 missing after recovery")
-	}
-
-	// Reported resourceVersion must not be empty
-	if res.LastResourceVersion == "" {
-		t.Fatalf("reported resourceVersion is empty")
+	if entry.LSN != 20 {
+		t.Fatalf("recovery chose stale LSN %d instead of highest LSN 20", entry.LSN)
 	}
 }
 

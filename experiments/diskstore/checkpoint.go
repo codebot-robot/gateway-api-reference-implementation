@@ -37,19 +37,20 @@ func NewCheckpointer(bp *BufferPool, heapFile File, wal *WAL) *Checkpointer {
 }
 
 // Checkpoint performs a non-blocking checkpoint:
-// 1. Snapshot dirty pages and determine redo start LSN (min of dirtyLSN).
+// 1. Snapshot dirty pages and capture current max LSN at snapshot time.
 // 2. Flush dirty pages to new physical locations (out-of-place write).
-// 3. Fsync heap file.
-// 4. Promote flushed locations to durable; free older superseded durable locations.
-// 5. Append checkpoint record to WAL giving redo start LSN.
-// 6. Fsync WAL.
-// 7. Truncate eligible WAL segments strictly prior to redo start LSN.
+// 3. Snapshot flushed locations before heap fsync begins (Reuse Rule).
+// 4. Fsync heap file.
+// 5. Promote pre-sync flushed locations to durable; free older superseded durable locations.
+// 6. Append checkpoint record to WAL giving redo start LSN.
+// 7. Fsync WAL.
+// 8. Truncate eligible WAL segments strictly prior to redo start LSN.
 func (c *Checkpointer) Checkpoint() (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 1. Determine redo start LSN from dirty page table before flush
-	dpt := c.bp.DirtyPageTable()
+	// 1. Determine redo start LSN from dirty page table snapshot at start of checkpoint
+	dpt, snapshotLSN := c.bp.DirtyPageTableAndLSN()
 	var redoStartLSN uint64
 
 	for _, dirtyLSN := range dpt {
@@ -57,18 +58,26 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 			redoStartLSN = dirtyLSN
 		}
 	}
+	if redoStartLSN == 0 {
+		// When dirty page table is empty, redo start must be the LSN at the time
+		// the dirty page table was snapshotted (Item 14).
+		redoStartLSN = snapshotLSN
+	}
 
 	// 2. Flush dirty pages to disk under write-ahead rule
 	if err := c.bp.FlushAllDirty(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to flush dirty pages: %w", err)
 	}
 
-	// 3. Fsync heap file
+	// 3. Record locations flushed before fsync begins (Reuse Rule / Item 11)
+	c.bp.SnapshotFlushedForSync()
+
+	// 4. Fsync heap file
 	if err := c.heapFile.Sync(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to fsync heap file: %w", err)
 	}
 
-	// 4. Promote flushed locations to durable (frees superseded locations)
+	// 5. Promote flushed locations to durable (frees superseded locations)
 	if err := c.bp.PromoteFlushedToDurable(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to promote flushed pages: %w", err)
 	}
@@ -78,7 +87,7 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 		redoStartLSN = chkLSN
 	}
 
-	// 5. Append checkpoint record to WAL
+	// 6. Append checkpoint record to WAL
 	chkRec := Record{
 		Type:         RecordTypeCheckpoint,
 		LSN:          chkLSN,
@@ -88,12 +97,12 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 		return 0, fmt.Errorf("checkpoint failed to write WAL record: %w", err)
 	}
 
-	// 6. Fsync WAL
+	// 7. Fsync WAL
 	if err := c.wal.Sync(); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to fsync WAL: %w", err)
 	}
 
-	// 7. Truncate finished WAL segments prior to redoStartLSN
+	// 8. Truncate finished WAL segments prior to redoStartLSN
 	if err := c.wal.TruncateBefore(redoStartLSN); err != nil {
 		return 0, fmt.Errorf("checkpoint failed to truncate WAL: %w", err)
 	}
