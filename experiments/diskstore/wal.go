@@ -36,8 +36,8 @@ const (
 	// WALVersion is 1.
 	WALVersion uint32 = 1
 
-	// SegmentHeaderSize is 24 bytes: Magic(4) + Version(4) + DBID(16).
-	SegmentHeaderSize = 24
+	// SegmentHeaderSize is 32 bytes: Magic(4) + Version(4) + Reserved(8) + DBID(16).
+	SegmentHeaderSize = 32
 
 	// DefaultMaxSegmentSize is 16 MiB.
 	DefaultMaxSegmentSize = 16 * 1024 * 1024
@@ -166,33 +166,34 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 		return fmt.Errorf("failed to create WAL segment %s: %w", name, err)
 	}
 
-	// Write segment header: Magic(4) + Version(4) + DBID(16)
+	// Write segment header: Magic(4) + Version(4) + Reserved(8) + DBID(16)
 	header := make([]byte, SegmentHeaderSize)
 	binary.BigEndian.PutUint32(header[0:4], WALMagic)
 	binary.BigEndian.PutUint32(header[4:8], WALVersion)
-	copy(header[8:24], w.dbID[:])
+	// header[8:16] is zero padding
+	copy(header[16:32], w.dbID[:])
 
 	if _, err := f.WriteAt(header, 0); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("failed to write segment header: %w", err)
+		return errors.Join(fmt.Errorf("failed to write segment header: %w", err), f.Close())
 	}
 
 	// Fsync the segment file
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("failed to sync new segment file: %w", err)
+		return errors.Join(fmt.Errorf("failed to sync new segment file: %w", err), f.Close())
 	}
 
 	// Fsync the directory after creating a segment
 	if err := w.fs.SyncDir(w.dir); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("failed to fsync directory after segment creation: %w", err)
+		return errors.Join(fmt.Errorf("failed to fsync directory after segment creation: %w", err), f.Close())
 	}
 
 	if w.activeFile != nil {
 		// Existing segment becomes finished & immutable; close it
-		_ = w.activeFile.Sync()
-		_ = w.activeFile.Close()
+		syncErr := w.activeFile.Sync()
+		closeErr := w.activeFile.Close()
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			return fmt.Errorf("failed to sync and close active segment: %w", err)
+		}
 	}
 
 	w.activeFile = f
@@ -305,10 +306,10 @@ func (w *WAL) Close() error {
 	defer w.mu.Unlock()
 
 	if w.activeFile != nil {
-		_ = w.activeFile.Sync()
-		err := w.activeFile.Close()
+		syncErr := w.activeFile.Sync()
+		closeErr := w.activeFile.Close()
 		w.activeFile = nil
-		return err
+		return errors.Join(syncErr, closeErr)
 	}
 	return nil
 }
@@ -376,7 +377,9 @@ func NewWALIterator(fs FS, dir string, dbID [16]byte, startLSN uint64) (*WALIter
 
 func (it *WALIterator) nextSegment() error {
 	if it.currFile != nil {
-		_ = it.currFile.Close()
+		if err := it.currFile.Close(); err != nil {
+			return err
+		}
 		it.currFile = nil
 	}
 
@@ -392,18 +395,16 @@ func (it *WALIterator) nextSegment() error {
 		return err
 	}
 
-	// Read and verify segment header: Magic(4) + Version(4) + DBID(16)
+	// Read and verify segment header: Magic(4) + Version(4) + Reserved(8) + DBID(16)
 	header := make([]byte, SegmentHeaderSize)
 	if _, err := f.ReadAt(header, 0); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("corrupt segment header in %s: %w", seg.name, err)
+		return errors.Join(fmt.Errorf("corrupt segment header in %s: %w", seg.name, err), f.Close())
 	}
 
 	magic := binary.BigEndian.Uint32(header[0:4])
 	ver := binary.BigEndian.Uint32(header[4:8])
-	if magic != WALMagic || ver != WALVersion || !bytes.Equal(header[8:24], it.dbID[:]) {
-		_ = f.Close()
-		return fmt.Errorf("foreign or invalid segment header in %s", seg.name)
+	if magic != WALMagic || ver != WALVersion || !bytes.Equal(header[16:32], it.dbID[:]) {
+		return errors.Join(fmt.Errorf("foreign or invalid segment header in %s", seg.name), f.Close())
 	}
 
 	it.currFile = f
@@ -439,9 +440,9 @@ func (it *WALIterator) Next() (Record, error) {
 			return Record{}, io.EOF
 		}
 
-		keyLen := binary.BigEndian.Uint32(hdr[17:21])
-		payloadLen := binary.BigEndian.Uint32(hdr[21:25])
-		rvLen := binary.BigEndian.Uint32(hdr[25:29])
+		keyLen := binary.BigEndian.Uint32(hdr[20:24])
+		payloadLen := binary.BigEndian.Uint32(hdr[24:28])
+		rvLen := binary.BigEndian.Uint32(hdr[28:32])
 		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen) + int(rvLen)
 
 		recordBytes := make([]byte, totalRecordLen)
