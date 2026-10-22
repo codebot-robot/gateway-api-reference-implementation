@@ -92,6 +92,8 @@ func EncodeBlockHeader(hdr BlockHeader, blockBuf []byte) {
 	binary.BigEndian.PutUint32(blockBuf[28:32], hdr.NumBlocks)
 }
 
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
 // FinalizeBlockCRC computes CRC32C over the entire 4096 bytes of blockBuf and stores it at bytes 4..8.
 func FinalizeBlockCRC(blockBuf []byte) uint32 {
 	if len(blockBuf) != BlockSize {
@@ -102,7 +104,7 @@ func FinalizeBlockCRC(blockBuf []byte) uint32 {
 	blockBuf[6] = 0
 	blockBuf[7] = 0
 
-	crc := crc32.Checksum(blockBuf, crc32.MakeTable(crc32.Castagnoli))
+	crc := crc32.Checksum(blockBuf, castagnoliTable)
 	binary.BigEndian.PutUint32(blockBuf[4:8], crc)
 	return crc
 }
@@ -126,15 +128,12 @@ func DecodeBlockHeader(blockBuf []byte) (BlockHeader, error) {
 
 	storedCRC := binary.BigEndian.Uint32(blockBuf[4:8])
 
-	// Verify CRC
-	calcBuf := make([]byte, BlockSize)
-	copy(calcBuf, blockBuf[:BlockSize])
-	calcBuf[4] = 0
-	calcBuf[5] = 0
-	calcBuf[6] = 0
-	calcBuf[7] = 0
+	// Verify CRC over byte ranges on either side of the CRC field without allocating a copy
+	var zeroCRC [4]byte
+	crc := crc32.Update(0, castagnoliTable, blockBuf[:4])
+	crc = crc32.Update(crc, castagnoliTable, zeroCRC[:])
+	actualCRC := crc32.Update(crc, castagnoliTable, blockBuf[8:BlockSize])
 
-	actualCRC := crc32.Checksum(calcBuf, crc32.MakeTable(crc32.Castagnoli))
 	if storedCRC != actualCRC {
 		return BlockHeader{}, ErrBlockCRCMismatch
 	}
