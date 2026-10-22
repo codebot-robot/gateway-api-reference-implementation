@@ -26,6 +26,9 @@ import (
 const (
 	// DefaultBufferPoolFrames is 1024 frames = 4 MiB.
 	DefaultBufferPoolFrames = 1024
+
+	// NoBlock is a sentinel representing an unassigned block location.
+	NoBlock uint64 = ^uint64(0)
 )
 
 var (
@@ -259,12 +262,15 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	}
 
 	desc := &PageDesc{
-		LogicalPage: logicalPage,
-		NumBlocks:   numBlocks,
-		FrameIDs:    frameIDs,
-		Dirty:       true,
-		DirtyLSN:    lsn,
-		PageLSN:     lsn,
+		LogicalPage:   logicalPage,
+		NumBlocks:     numBlocks,
+		FrameIDs:      frameIDs,
+		Dirty:         true,
+		DirtyLSN:      lsn,
+		PageLSN:       lsn,
+		PhysicalBlock: NoBlock,
+		FlushedLoc:    NoBlock,
+		DurableLoc:    NoBlock,
 	}
 	desc.PinCount.Store(1)
 
@@ -374,7 +380,7 @@ func (bp *BufferPool) flushPageLocked(desc *PageDesc) error {
 	}
 
 	// If desc was already written to a location since last heap fsync, that un-fsynced location can be freed immediately
-	if desc.FlushedLoc != 0 && desc.FlushedLoc != desc.DurableLoc {
+	if desc.FlushedLoc != NoBlock && desc.FlushedLoc != desc.DurableLoc {
 		_ = bp.buddy.Free(desc.FlushedLoc)
 	}
 	desc.FlushedLoc = newLoc
@@ -429,13 +435,13 @@ func (bp *BufferPool) PromoteFlushedToDurable() {
 	defer bp.mu.Unlock()
 
 	for _, desc := range bp.pageTable {
-		if desc.FlushedLoc != 0 {
-			if desc.DurableLoc != 0 && desc.DurableLoc != desc.FlushedLoc {
+		if desc.FlushedLoc != NoBlock {
+			if desc.DurableLoc != NoBlock && desc.DurableLoc != desc.FlushedLoc {
 				// Old durable copy is now superseded and can be safely reused
 				_ = bp.buddy.Free(desc.DurableLoc)
 			}
 			desc.DurableLoc = desc.FlushedLoc
-			desc.FlushedLoc = 0
+			desc.FlushedLoc = NoBlock
 		}
 	}
 }
