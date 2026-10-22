@@ -19,7 +19,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -129,7 +128,12 @@ func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error
 	defer f.mu.Unlock()
 	ff, exists := f.files[cleaned]
 	if !exists {
-		ff = newFaultFile(f, cleaned, file)
+		var nErr error
+		ff, nErr = newFaultFile(f, cleaned, file)
+		if nErr != nil {
+			closeErr := file.Close()
+			return nil, errors.Join(nErr, closeErr)
+		}
 		f.files[cleaned] = ff
 	} else {
 		ff.underlying = file
@@ -167,12 +171,16 @@ func (f *FaultFS) SyncDir(dirname string) error {
 // Crash simulates a crash across all files in this filesystem.
 // If dropUnsynced is true, all un-fsynced writes are discarded.
 // If tearFraction > 0, randomly tears un-fsynced blocks.
-func (f *FaultFS) Crash(dropUnsynced bool, tearFraction float64) {
+func (f *FaultFS) Crash(dropUnsynced bool, tearFraction float64) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	var errs []error
 	for _, ff := range f.files {
-		ff.Crash(dropUnsynced, tearFraction)
+		if err := ff.Crash(dropUnsynced, tearFraction); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // FaultFile intercepts reads, writes, and syncs on a specific file.
@@ -193,16 +201,21 @@ type FaultFile struct {
 	isWALFile  bool
 }
 
-func newFaultFile(fs *FaultFS, name string, underlying File) *FaultFile {
+func newFaultFile(fs *FaultFS, name string, underlying File) (*FaultFile, error) {
 	base := filepath.Base(name)
 	isHeap := filepath.Ext(name) == ".db" || filepath.Ext(name) == ".heap" || base == "heap.db"
 	isWAL := filepath.Ext(name) == ".wal"
 
 	// Read initial contents from underlying file
-	size, _ := underlying.Size()
+	size, err := underlying.Size()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get underlying file size: %w", err)
+	}
 	initial := make([]byte, size)
 	if size > 0 {
-		_, _ = underlying.ReadAt(initial, 0)
+		if _, err := underlying.ReadAt(initial, 0); err != nil {
+			return nil, fmt.Errorf("failed to read underlying file: %w", err)
+		}
 	}
 
 	ff := &FaultFile{
@@ -220,7 +233,7 @@ func newFaultFile(fs *FaultFS, name string, underlying File) *FaultFile {
 	if isHeap && len(initial) > 0 {
 		ff.rebuildDurablePagesLocked()
 	}
-	return ff
+	return ff, nil
 }
 
 func (f *FaultFile) ReadAt(p []byte, off int64) (int, error) {
@@ -270,15 +283,9 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 			blockBytes := p[blockOff:blockEnd]
 
 			// Parse block header if at least HeaderSize bytes
-			if len(blockBytes) >= 64 {
-				magic := binary.BigEndian.Uint64(blockBytes[0:8])
-				if magic == BlockMagicValue {
-					logicalPage := binary.BigEndian.Uint64(blockBytes[32:40])
-					lsn := binary.BigEndian.Uint64(blockBytes[40:48])
-					numBlocks := binary.BigEndian.Uint32(blockBytes[52:56])
-
-					_ = logicalPage
-					_ = numBlocks
+			if len(blockBytes) >= BlockHeaderSize {
+				if blockBytes[0] == BlockMagic && blockBytes[1] == FormatVersion {
+					lsn := binary.BigEndian.Uint64(blockBytes[16:24])
 
 					// Assert Write-Ahead Rule:
 					// Before writing any page whose LSN is L, log must be fsynced through L.
@@ -366,51 +373,20 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 	for b < totalBlocks {
 		blockStart := b * DefaultBlockSize
 		blockBytes := f.durableData[blockStart : blockStart+DefaultBlockSize]
-		magic := binary.BigEndian.Uint64(blockBytes[0:8])
-		if magic != BlockMagicValue {
+		hdr, err := DecodeBlockHeader(blockBytes)
+		if err != nil || hdr.BlockIndex != 0 || hdr.NumBlocks == 0 || b+int(hdr.NumBlocks) > totalBlocks {
 			b++
 			continue
 		}
 
-		logicalPage := binary.BigEndian.Uint64(blockBytes[32:40])
-		lsn := binary.BigEndian.Uint64(blockBytes[40:48])
-		blockIndex := binary.BigEndian.Uint32(blockBytes[48:52])
-		numBlocks := binary.BigEndian.Uint32(blockBytes[52:56])
-
-		// Must be the first block of a page
-		if blockIndex != 0 || numBlocks == 0 || b+int(numBlocks) > totalBlocks {
-			b++
-			continue
-		}
-
-		// Verify candidate page run
+		numBlocks := int(hdr.NumBlocks)
 		valid := true
-		for k := 0; k < int(numBlocks); k++ {
+		for k := 0; k < numBlocks; k++ {
 			kbStart := (b + k) * DefaultBlockSize
 			kbBytes := f.durableData[kbStart : kbStart+DefaultBlockSize]
-
-			kMagic := binary.BigEndian.Uint64(kbBytes[0:8])
-			kLogical := binary.BigEndian.Uint64(kbBytes[32:40])
-			kLSN := binary.BigEndian.Uint64(kbBytes[40:48])
-			kIndex := binary.BigEndian.Uint32(kbBytes[48:52])
-			kNum := binary.BigEndian.Uint32(kbBytes[52:56])
-			kCRC := binary.BigEndian.Uint32(kbBytes[56:60])
-
-			if kMagic != BlockMagicValue || kLogical != logicalPage || kLSN != lsn ||
-				kIndex != uint32(k) || kNum != numBlocks {
-				valid = false
-				break
-			}
-
-			// Verify CRC
-			calcBuf := make([]byte, DefaultBlockSize)
-			copy(calcBuf, kbBytes)
-			calcBuf[56] = 0
-			calcBuf[57] = 0
-			calcBuf[58] = 0
-			calcBuf[59] = 0
-			expectedCRC := crc32.Checksum(calcBuf, crc32.MakeTable(crc32.Castagnoli))
-			if kCRC != expectedCRC {
+			kHdr, err := DecodeBlockHeader(kbBytes)
+			if err != nil || kHdr.LogicalPage != hdr.LogicalPage || kHdr.LSN != hdr.LSN ||
+				kHdr.BlockIndex != uint32(k) || kHdr.NumBlocks != hdr.NumBlocks {
 				valid = false
 				break
 			}
@@ -419,19 +395,19 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 		if valid {
 			cand := candidatePage{
 				startBlock:  uint64(b),
-				logicalPage: logicalPage,
-				lsn:         lsn,
-				numBlocks:   numBlocks,
+				logicalPage: hdr.LogicalPage,
+				lsn:         hdr.LSN,
+				numBlocks:   hdr.NumBlocks,
 			}
-			existing, exists := f.durablePages[logicalPage]
+			existing, exists := f.durablePages[hdr.LogicalPage]
 			if !exists || cand.lsn > existing.LSN {
-				f.durablePages[logicalPage] = DurablePageRange{
+				f.durablePages[hdr.LogicalPage] = DurablePageRange{
 					StartBlock: cand.startBlock,
 					NumBlocks:  cand.numBlocks,
 					LSN:        cand.lsn,
 				}
 			}
-			b += int(numBlocks)
+			b += numBlocks
 		} else {
 			b++
 		}
@@ -439,45 +415,23 @@ func (f *FaultFile) rebuildDurablePagesLocked() {
 }
 
 func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
-	// Scan WAL records in durableData to find max LSN
-	// WAL records: Header (24 bytes) at file start, then records.
-	// Record: Type (1), LSN (8), RedoStart (8), KeyLen (4), ValLen (4), RVLen (4), CRC (4)
-	if len(f.durableData) < 24 {
+	if len(f.durableData) < SegmentHeaderSize {
 		return
 	}
-	offset := 24
+	offset := SegmentHeaderSize
 	var maxLSN uint64
-	for offset+33 <= len(f.durableData) {
-		recLSN := binary.BigEndian.Uint64(f.durableData[offset+1 : offset+9])
-		keyLen := binary.BigEndian.Uint32(f.durableData[offset+17 : offset+21])
-		valLen := binary.BigEndian.Uint32(f.durableData[offset+21 : offset+25])
-		rvLen := binary.BigEndian.Uint32(f.durableData[offset+25 : offset+29])
-
-		totalLen := 33 + int(keyLen) + int(valLen) + int(rvLen)
-		if offset+totalLen > len(f.durableData) {
+	for offset+RecordHeaderSize <= len(f.durableData) {
+		r, err := DecodeRecord(bytes.NewReader(f.durableData[offset:]))
+		if err != nil {
 			break
 		}
-
-		// Verify record CRC
-		storedCRC := binary.BigEndian.Uint32(f.durableData[offset+29 : offset+33])
-		headerCopy := make([]byte, 33)
-		copy(headerCopy, f.durableData[offset:offset+33])
-		headerCopy[29] = 0
-		headerCopy[30] = 0
-		headerCopy[31] = 0
-		headerCopy[32] = 0
-
-		h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-		_, _ = h.Write(headerCopy)
-		_, _ = h.Write(f.durableData[offset+33 : offset+totalLen])
-		if h.Sum32() != storedCRC {
-			break
+		if r.LSN > maxLSN {
+			maxLSN = r.LSN
 		}
-
-		if recLSN > maxLSN {
-			maxLSN = recLSN
-		}
-		offset += totalLen
+		keyBytes := len([]byte(r.Key))
+		payloadBytes := len(r.Payload)
+		rvBytes := len([]byte(r.ResourceVersion))
+		offset += RecordHeaderSize + keyBytes + payloadBytes + rvBytes
 	}
 
 	if maxLSN > 0 {
@@ -486,7 +440,7 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 }
 
 // Crash simulates a crash on this file.
-func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) {
+func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -494,10 +448,10 @@ func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) {
 		// Discard pending writes; revert to durable data
 		f.pendingData = bytes.Clone(f.durableData)
 		f.pendingBlocks = make(map[uint64]bool)
-		_ = f.underlying.Truncate(int64(len(f.durableData)))
-		_, _ = f.underlying.WriteAt(f.durableData, 0)
-		_ = f.underlying.Sync()
-		return
+		truncErr := f.underlying.Truncate(int64(len(f.durableData)))
+		_, writeErr := f.underlying.WriteAt(f.durableData, 0)
+		syncErr := f.underlying.Sync()
+		return errors.Join(truncErr, writeErr, syncErr)
 	}
 
 	if tearFraction > 0 && len(f.pendingBlocks) > 0 {
@@ -518,9 +472,10 @@ func (f *FaultFile) Crash(dropUnsynced bool, tearFraction float64) {
 	}
 
 	// Write current crashed image to underlying and sync
-	_ = f.underlying.Truncate(int64(len(f.pendingData)))
-	_, _ = f.underlying.WriteAt(f.pendingData, 0)
-	_ = f.underlying.Sync()
+	truncErr := f.underlying.Truncate(int64(len(f.pendingData)))
+	_, writeErr := f.underlying.WriteAt(f.pendingData, 0)
+	syncErr := f.underlying.Sync()
+	return errors.Join(truncErr, writeErr, syncErr)
 }
 
 func (f *FaultFile) Truncate(size int64) error {

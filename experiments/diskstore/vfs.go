@@ -127,8 +127,9 @@ func (o *OSFS) SyncDir(dirname string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return dir.Sync()
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
 // MemFile is an in-memory implementation of File for testing and fault simulation.

@@ -25,24 +25,14 @@ import (
 
 func makeTestBlock(logicalPage, lsn uint64, blockIndex, numBlocks uint32) []byte {
 	buf := make([]byte, DefaultBlockSize)
-	binary.BigEndian.PutUint64(buf[0:8], BlockMagicValue)
-	binary.BigEndian.PutUint32(buf[8:12], 1) // version
-	binary.BigEndian.PutUint32(buf[12:16], 0)
-	// DBID bytes 16..32 (16 bytes)
-	copy(buf[16:32], []byte("1234567890123456"))
-	binary.BigEndian.PutUint64(buf[32:40], logicalPage)
-	binary.BigEndian.PutUint64(buf[40:48], lsn)
-	binary.BigEndian.PutUint32(buf[48:52], blockIndex)
-	binary.BigEndian.PutUint32(buf[52:56], numBlocks)
-
-	// CRC at 56:60 (zeroed during calculation)
-	buf[56] = 0
-	buf[57] = 0
-	buf[58] = 0
-	buf[59] = 0
-
-	crc := crc32.Checksum(buf, crc32.MakeTable(crc32.Castagnoli))
-	binary.BigEndian.PutUint32(buf[56:60], crc)
+	hdr := BlockHeader{
+		LogicalPage: logicalPage,
+		LSN:         lsn,
+		BlockIndex:  blockIndex,
+		NumBlocks:   numBlocks,
+	}
+	EncodeBlockHeader(hdr, buf)
+	FinalizeBlockCRC(buf)
 	return buf
 }
 
