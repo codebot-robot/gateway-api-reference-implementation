@@ -319,7 +319,9 @@ func (d *DiskIndexer) Replace(list []any, rv string) error {
 
 	// Clear existing items in store
 	for _, k := range d.store.ListKeys() {
-		_ = d.store.Delete(d.bucketName, k)
+		if err := d.store.Delete(d.bucketName, k); err != nil {
+			return err
+		}
 	}
 
 	for _, item := range list {

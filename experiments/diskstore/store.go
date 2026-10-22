@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -115,6 +117,7 @@ type DiskStore struct {
 
 	emptyLogicalPages []uint64
 	nextLogicalPage   uint64
+	activeSlottedPage uint64
 
 	failed    atomic.Bool
 	failedErr error
@@ -173,20 +176,25 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 				return nil, fmt.Errorf("failed to create meta file: %w", err)
 			}
 			if _, wErr := metaFile.WriteAt(dbID[:], 0); wErr != nil {
-				_ = metaFile.Close()
-				return nil, wErr
+				closeErr := metaFile.Close()
+				return nil, errors.Join(wErr, closeErr)
 			}
-			_ = metaFile.Sync()
+			if err := metaFile.Sync(); err != nil {
+				closeErr := metaFile.Close()
+				return nil, errors.Join(fmt.Errorf("failed to sync meta file: %w", err), closeErr)
+			}
 		} else {
 			return nil, err
 		}
 	} else {
 		if _, rErr := metaFile.ReadAt(dbID[:], 0); rErr != nil {
-			_ = metaFile.Close()
-			return nil, fmt.Errorf("failed to read DB ID from meta: %w", rErr)
+			closeErr := metaFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to read DB ID from meta: %w", rErr), closeErr)
 		}
 	}
-	_ = metaFile.Close()
+	if err := metaFile.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close meta file: %w", err)
+	}
 
 	// Open heap file with direct I/O flag
 	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
@@ -200,18 +208,25 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 	}
 
 	// Apply platform specific flags (e.g. F_NOCACHE on Darwin)
-	conn, _ := heapFile.SyscallConn()
-	if conn != nil {
+	conn, connErr := heapFile.SyscallConn()
+	if connErr == nil && conn != nil {
 		if rawConn, ok := conn.(interface{ Control(func(uintptr)) error }); ok {
-			_ = rawConn.Control(func(fd uintptr) {
-				_ = applyPlatformDirectIOFlags(fd)
-			})
+			var ctrlErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				ctrlErr = applyPlatformDirectIOFlags(fd)
+			}); err != nil {
+				klog.V(4).ErrorS(err, "failed to apply direct I/O control")
+			} else if ctrlErr != nil {
+				klog.V(4).ErrorS(ctrlErr, "failed to apply platform direct I/O flags")
+			}
 		}
 	}
 
 	wal, err := OpenWAL(options.FS, walDir, dbID, 0)
 	if err != nil {
-		_ = heapFile.Close()
+		if closeErr := heapFile.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
 		return nil, fmt.Errorf("failed to open WAL: %w", err)
 	}
 
@@ -239,9 +254,9 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 		// Existing store: perform crash recovery scan and WAL redo replay
 		recoveryRes, err := Recover(options.FS, heapFile, walDir, dbID)
 		if err != nil {
-			_ = heapFile.Close()
-			_ = wal.Close()
-			return nil, fmt.Errorf("recovery failed: %w", err)
+			closeErr1 := heapFile.Close()
+			closeErr2 := wal.Close()
+			return nil, errors.Join(fmt.Errorf("recovery failed: %w", err), closeErr1, closeErr2)
 		}
 
 		s.buddy = recoveryRes.Buddy
@@ -254,6 +269,7 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 		}
 
 		s.bp = NewBufferPool(heapFile, wal, s.buddy, dbID, BufferPoolOptions{NumFrames: options.NumFrames})
+		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	}
 
@@ -370,12 +386,16 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 
 		if inIndex && !existing.IsOversize {
 			targetPage = existing.LogicalPage
+		} else if s.activeSlottedPage != 0 {
+			targetPage = s.activeSlottedPage
 		} else if len(s.emptyLogicalPages) > 0 {
 			targetPage = s.emptyLogicalPages[len(s.emptyLogicalPages)-1]
 			s.emptyLogicalPages = s.emptyLogicalPages[:len(s.emptyLogicalPages)-1]
+			s.activeSlottedPage = targetPage
 		} else {
 			targetPage = s.nextLogicalPage
 			s.nextLogicalPage++
+			s.activeSlottedPage = targetPage
 		}
 
 		handle, err := s.bp.PinPage(targetPage)
@@ -397,19 +417,40 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 		}
 
 		slotIdx, err := slotted.Put(key, payload, lsn)
-		if err != nil {
-			// Page is full; allocate a fresh slotted page
+		if err == nil {
+			if inIndex && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
+				if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil {
+					handle.Desc.Mu.Unlock()
+					handle.Unpin()
+					s.setFailed(delErr)
+					return s.failErr()
+				}
+			}
+		} else {
+			// Page is full; allocate a fresh slotted page and update activeSlottedPage
 			handle.Desc.Mu.Unlock()
 			handle.Unpin()
-			targetPage = s.nextLogicalPage
-			s.nextLogicalPage++
+			if len(s.emptyLogicalPages) > 0 {
+				targetPage = s.emptyLogicalPages[len(s.emptyLogicalPages)-1]
+				s.emptyLogicalPages = s.emptyLogicalPages[:len(s.emptyLogicalPages)-1]
+			} else {
+				targetPage = s.nextLogicalPage
+				s.nextLogicalPage++
+			}
+			s.activeSlottedPage = targetPage
 			handle, err = s.bp.AllocateNewPage(targetPage, 1, lsn)
 			if err != nil {
 				s.setFailed(err)
 				return s.failErr()
 			}
 			handle.Desc.Mu.Lock()
-			slotted, _ = WrapSlottedPage(handle.Block(0))
+			slotted, err = WrapSlottedPage(handle.Block(0))
+			if err != nil {
+				handle.Desc.Mu.Unlock()
+				handle.Unpin()
+				s.setFailed(err)
+				return s.failErr()
+			}
 			slotIdx, err = slotted.Put(key, payload, lsn)
 			if err != nil {
 				handle.Desc.Mu.Unlock()
@@ -448,7 +489,7 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 			s.nextLogicalPage++
 		}
 
-		mbPage, err := NewMultiBlockPage(targetPage, lsn, s.dbID, key, payload)
+		mbPage, err := NewMultiBlockPage(targetPage, lsn, key, payload)
 		if err != nil {
 			s.setFailed(err)
 			return s.failErr()
@@ -508,20 +549,12 @@ func (s *DiskStore) Get(bucketName, key string) ([]byte, bool, error) {
 
 	handle, err := s.bp.PinPage(entry.LogicalPage)
 	if err != nil {
-		// Attempt to load from disk
-		s.writerMu.Lock()
-		handle, err = s.bp.PinPageWithLocation(entry.LogicalPage, 0, 1)
-		s.writerMu.Unlock()
-		if err != nil {
-			s.setFailed(fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err))
-			return nil, false, s.failErr()
-		}
+		s.setFailed(fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err))
+		return nil, false, s.failErr()
 	}
 	defer handle.Unpin()
 
 	handle.Desc.Mu.RLock()
-	defer handle.Desc.Mu.RUnlock()
-
 	var recKey string
 	var recPayload []byte
 	var recLSN uint64
@@ -529,6 +562,7 @@ func (s *DiskStore) Get(bucketName, key string) ([]byte, bool, error) {
 	if handle.Desc.NumBlocks == 1 {
 		slotted, wrapErr := WrapSlottedPage(handle.Block(0))
 		if wrapErr != nil {
+			handle.Desc.Mu.RUnlock()
 			s.setFailed(wrapErr)
 			return nil, false, s.failErr()
 		}
@@ -536,6 +570,7 @@ func (s *DiskStore) Get(bucketName, key string) ([]byte, bool, error) {
 	} else {
 		recKey, recPayload, recLSN, err = DecodeMultiBlockPage(handle.Blocks())
 	}
+	handle.Desc.Mu.RUnlock()
 
 	// Invariant: Verify key and LSN match expected. Treat mismatch as corruption.
 	if err != nil || recKey != key || recLSN != entry.LSN {
@@ -582,17 +617,32 @@ func (s *DiskStore) Delete(bucketName, key string) error {
 
 	if !entry.IsOversize {
 		handle, err := s.bp.PinPage(entry.LogicalPage)
-		if err == nil {
+		if err != nil {
+			if !errors.Is(err, ErrPageNotFound) {
+				s.setFailed(err)
+				return s.failErr()
+			}
+		} else {
 			defer handle.Unpin()
 			handle.Desc.Mu.Lock()
 			if handle.Desc.NumBlocks == 1 {
 				slotted, err := WrapSlottedPage(handle.Block(0))
-				if err == nil {
-					_ = slotted.Delete(entry.Slot, lsn)
-					slotted.Finalize()
-					s.bp.MarkDirty(entry.LogicalPage, lsn)
-					if slotted.ActiveSlotsCount() == 0 {
-						s.emptyLogicalPages = append(s.emptyLogicalPages, entry.LogicalPage)
+				if err != nil {
+					handle.Desc.Mu.Unlock()
+					s.setFailed(err)
+					return s.failErr()
+				}
+				if err := slotted.Delete(entry.Slot, lsn); err != nil {
+					handle.Desc.Mu.Unlock()
+					s.setFailed(err)
+					return s.failErr()
+				}
+				slotted.Finalize()
+				s.bp.MarkDirty(entry.LogicalPage, lsn)
+				if slotted.ActiveSlotsCount() == 0 {
+					s.emptyLogicalPages = append(s.emptyLogicalPages, entry.LogicalPage)
+					if s.activeSlottedPage == entry.LogicalPage {
+						s.activeSlottedPage = 0
 					}
 				}
 			} else {
@@ -675,7 +725,9 @@ func (s *DiskStore) Close() error {
 		}
 	}
 	if s.heapFile != nil {
-		_ = s.heapFile.Sync()
+		if err := s.heapFile.Sync(); err != nil {
+			errs = append(errs, err)
+		}
 		if err := s.heapFile.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -687,7 +739,9 @@ func (s *DiskStore) Close() error {
 	}
 
 	if s.autoDelete {
-		_ = os.RemoveAll(s.dir)
+		if err := os.RemoveAll(s.dir); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	return errors.Join(errs...)
