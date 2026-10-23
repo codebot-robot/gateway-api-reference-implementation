@@ -43,6 +43,9 @@ const (
 
 	// PortHTTP is the container target port for HTTP traffic.
 	PortHTTP = 8080
+
+	// LoadBalancerReadyGate is the readiness gate condition type added to data plane pods.
+	LoadBalancerReadyGate = "gcpgateway.gke-labs.io/load-balancer-ready"
 )
 
 // Config configures the NEG registrar.

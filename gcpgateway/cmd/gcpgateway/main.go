@@ -23,9 +23,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
+	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
+	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	compute "google.golang.org/api/compute/v1"
 	corev1 "k8s.io/api/core/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2"
@@ -223,7 +225,21 @@ func runController(ctx context.Context, args []string) error {
 	)
 
 	klog.Infof("Starting gcpgateway controller (clusterID=%s, prefix=%s, project=%s, region=%s)", clusterID, negPrefix, project, region)
-	_ = metadata.Hash(clusterID, "default", "gateway")
+	var gcpClient gcp.ComputeClient
+	computeSvc, err := compute.NewService(ctx)
+	if err == nil {
+		gcpClient = gcp.NewGCEComputeClient(computeSvc)
+	} else {
+		klog.Warningf("Unable to initialize Compute client (running in offline/mock mode): %v", err)
+		gcpClient = gcp.NewFakeComputeClient()
+	}
+
+	reg := registrar.NewRegistrar(nil, gcpClient, registrar.Config{
+		ClusterID: clusterID,
+		NegPrefix: negPrefix,
+		Project:   project,
+	})
+	_ = reg
 	return gari.Run(ctx, opts)
 }
 
