@@ -48,9 +48,19 @@ as this:
 - Adhere to the project's coding style (standard `gofmt`).
 - Follow the PR hygiene mentioned in the project's instructions:
     - Solve only the specific issue.
-    - One idea per PR.
     - Well-structured commits.
     - Reference issues in the commit body.
+
+### Scope
+
+Small, focused issues lead to small, focused PRs. Big PRs are hard to review because reviewers miss things when moves, refactors and behaviour changes arrive together. Big PRs are also harder to write correctly because each additional idea adds more ways for the pieces to interact, and more to keep in mind across review rounds.
+
+- **One idea, one issue, one PR.** If a PR can be split into two ideas, split it.
+- **When an issue contains more than one idea,** don't deliver it as one large PR. Say so on the issue, propose the split, and deliver the parts as separate PRs, or ask for the issue to be split.
+- **Separate mechanical changes from behaviour changes.** Moves, renames and reformatting go in their own PR, or at least their own commit first, with nothing else changed, so the reviewer can confirm nothing changed.
+- **Stay in scope during review.** Fix what the review asks for. Problems found along the way that are outside the PR's idea become new issues, not extra changes in the same PR.
+- **Don't add unrequested improvements,** such as compatibility shims, extra options or opportunistic refactors.
+- **For people and agents writing issues,** write one idea per issue, with acceptance criteria for that idea only. Follow-on ideas become separate issues, with any ordering stated.
 
 ### Commit messages and PR descriptions
 
