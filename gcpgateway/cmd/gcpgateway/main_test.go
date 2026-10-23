@@ -265,9 +265,10 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	})
 
 	bsName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "bs-443")
+	// Initially, load balancer health check reports UNHEALTHY.
 	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
 		HealthStatus: []*compute.HealthStatus{
-			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "UNHEALTHY"},
 		},
 	})
 
@@ -363,10 +364,8 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		t.Fatalf("updating pod status: %v", err)
 	}
 
-	// 4. Assertions with timeout:
-	// a. Pod endpoint attached to zonal NEG in fake GCP
-	// b. Pod readiness gate patched to True
-	// c. Gateway Programmed condition set to True
+	// 4. Assertions:
+	// a. Verify endpoint is attached to zonal NEG while UNHEALTHY
 	var (
 		attachedEps []*compute.NetworkEndpoint
 		updatedPod  corev1.Pod
@@ -375,8 +374,35 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		foundProg   bool
 	)
 
-	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+	for start := time.Now(); time.Since(start) < 60*time.Second; time.Sleep(50 * time.Millisecond) {
 		attachedEps, _ = fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
+		if len(attachedEps) == 1 {
+			break
+		}
+	}
+	if len(attachedEps) != 1 || attachedEps[0].IpAddress != "10.0.1.5" || attachedEps[0].Instance != "gke-node-1" {
+		t.Fatalf("expected pod endpoint attached to NEG while UNHEALTHY, got %+v", attachedEps)
+	}
+
+	// Verify readiness gate remains False while UNHEALTHY
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: "dp-pod-1"}, &updatedPod); err != nil {
+		t.Fatalf("failed to get pod: %v", err)
+	}
+	for _, c := range updatedPod.Status.Conditions {
+		if c.Type == corev1.PodConditionType(LoadBalancerReadyGate) && c.Status == corev1.ConditionTrue {
+			t.Fatalf("readiness gate must NOT be True while fake reports UNHEALTHY: %+v", c)
+		}
+	}
+
+	// b. Fake load balancer switches to HEALTHY with NO Kubernetes event
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	// Assert readiness gate becomes True within bounded time via health polling (no k8s events triggered)
+	for start := time.Now(); time.Since(start) < 60*time.Second; time.Sleep(100 * time.Millisecond) {
 		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: "dp-pod-1"}, &updatedPod)
 		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW)
 
@@ -396,21 +422,17 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 			}
 		}
 
-		if len(attachedEps) > 0 && foundGate && foundProg {
+		if foundGate && foundProg {
 			break
 		}
 	}
 
-	if len(attachedEps) != 1 || attachedEps[0].IpAddress != "10.0.1.5" || attachedEps[0].Instance != "gke-node-1" {
-		t.Errorf("expected pod endpoint attached to NEG, got %+v", attachedEps)
-	}
-
 	if !foundGate {
-		t.Errorf("expected pod readiness gate %s=True, conditions are: %+v", LoadBalancerReadyGate, updatedPod.Status.Conditions)
+		t.Errorf("expected pod readiness gate %s=True after polling, conditions are: %+v", LoadBalancerReadyGate, updatedPod.Status.Conditions)
 	}
 
 	if !foundProg {
-		t.Errorf("expected Gateway Programmed=True, conditions are: %+v", updatedGW.Status.Conditions)
+		t.Errorf("expected Gateway Programmed=True after polling, conditions are: %+v", updatedGW.Status.Conditions)
 	}
 }
 

@@ -43,6 +43,18 @@ const (
 	// DefaultHealthTimeout is the duration after which an unconfirmed endpoint triggers RolloutStalled.
 	DefaultHealthTimeout = 60 * time.Second
 
+	// HealthPollInterval is the interval at which the reconciler requeues to poll load balancer
+	// health when data-plane pods are attached to NEGs but their readiness gates are not yet True.
+	// A 5-second interval balances fast rollout progression (health check convergence typically
+	// takes 10–30s on Google Cloud) against Compute API rate limits and quota usage.
+	HealthPollInterval = 5 * time.Second
+
+	// ResyncInterval is the interval at which every Gateway is periodically requeued in the steady state.
+	// This ensures periodic orphan endpoint pruning (such as endpoints left behind after node crashes
+	// or ungraceful pod deletions without Kubernetes events) and drift correction. A 60-second
+	// interval bounds the lifetime of orphaned endpoints while minimizing background Compute API load.
+	ResyncInterval = 60 * time.Second
+
 	// Condition reasons
 	ReasonAccepted                 = "Accepted"
 	ReasonInvalidParameters        = "InvalidParameters"
@@ -71,6 +83,9 @@ type GatewayReconciler struct {
 	ControllerName string
 	HealthTimeout  time.Duration
 	Registrar      *registrar.Registrar
+
+	healthPollInterval time.Duration
+	resyncInterval     time.Duration
 
 	mu           sync.Mutex
 	waitingSince map[string]time.Time
@@ -171,6 +186,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	pollInterval := r.healthPollInterval
+	if pollInterval <= 0 {
+		pollInterval = HealthPollInterval
+	}
+	resyncInterval := r.resyncInterval
+	if resyncInterval <= 0 {
+		resyncInterval = ResyncInterval
+	}
+
 	var gw gatewayv1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -190,7 +214,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	// 2. Resolve NEG conflicts deterministically across Gateways targeting identical NEGs
-	targetNEG := r.targetNEGKey(&gw)
+	targetNEG, err := r.targetNEGKey(ctx, &gw)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 	var allGateways gatewayv1.GatewayList
 	if err := r.List(ctx, &allGateways); err != nil {
 		return reconcile.Result{}, fmt.Errorf("listing gateways: %w", err)
@@ -200,7 +227,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	for i := range allGateways.Items {
 		candidate := &allGateways.Items[i]
 		if candidate.Spec.GatewayClassName == gw.Spec.GatewayClassName {
-			if r.targetNEGKey(candidate) == targetNEG {
+			candKey, err := r.targetNEGKey(ctx, candidate)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if candKey == targetNEG {
 				conflicting = append(conflicting, candidate)
 			}
 		}
@@ -214,14 +245,17 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			if err := r.Status().Update(ctx, &gw); err != nil {
 				return reconcile.Result{}, err
 			}
-			return reconcile.Result{}, nil
+			return reconcile.Result{RequeueAfter: resyncInterval}, nil
 		}
 	}
 
 	setCondition(&gw, string(gatewayv1.GatewayConditionAccepted), metav1.ConditionTrue, ReasonAccepted, "Gateway spec and parameters are valid.")
 
 	// 3. Resolve external static IP
-	externalIP := r.resolveExternalIP(ctx, &gw)
+	externalIP, err := r.resolveExternalIP(ctx, &gw)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 
 	// 4. Reconcile endpoints with zonal NEGs via the registrar
 	reconcileRes, err := r.Registrar.ReconcileEndpoints(ctx, &gw)
@@ -230,7 +264,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		if updateErr := r.Status().Update(ctx, &gw); updateErr != nil {
 			return reconcile.Result{}, updateErr
 		}
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: pollInterval}, nil
 	}
 
 	if externalIP == "" {
@@ -238,7 +272,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		if err := r.Status().Update(ctx, &gw); err != nil {
 			return reconcile.Result{}, err
 		}
-		return reconcile.Result{}, nil
+		return reconcile.Result{RequeueAfter: resyncInterval}, nil
 	}
 
 	// 5. Poll health status from Google Cloud Load Balancer and update readiness gates
@@ -250,7 +284,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	hasHealthyReplica := false
 	isRolloutStalled := false
 	dataplanePodCount := 0
+	waitingForHealth := false
 	now := time.Now()
+	activePodKeys := make(map[string]bool)
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -266,12 +302,19 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			continue
 		}
 
+		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+		activePodKeys[podKey] = true
+
 		var node corev1.Node
 		if err := r.Get(ctx, types.NamespacedName{Name: pod.Spec.NodeName}, &node); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return reconcile.Result{}, fmt.Errorf("getting node %s: %w", pod.Spec.NodeName, err)
+			}
 			continue
 		}
 		nodeInfo, err := registrar.ResolveNodeInstance(&node)
 		if err != nil {
+			klog.Warningf("Failed to resolve node instance for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 			continue
 		}
 
@@ -280,9 +323,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		negName := metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "8443")
 
 		health, err := r.GCPClient.GetBackendServiceHealth(ctx, r.Project, bsName, negName)
-		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("getting backend service health for %s: %w", bsName, err)
+		}
 		isHealthy := false
-		if err == nil && health != nil {
+		if health != nil {
 			for _, hs := range health.HealthStatus {
 				if (hs.Instance == nodeInfo.Instance || strings.HasSuffix(hs.Instance, "/"+nodeInfo.Instance)) && hs.IpAddress == pod.Status.PodIP && hs.HealthState == "HEALTHY" {
 					isHealthy = true
@@ -295,7 +340,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			delete(r.waitingSince, podKey)
 			hasHealthyReplica = true
 			if err := r.updatePodReadinessGate(ctx, pod, corev1.ConditionTrue, "LoadBalancerHealthy", "Endpoint is healthy on Google Cloud load balancer"); err != nil {
-				klog.Warningf("Failed to update readiness gate for pod %s: %v", podKey, err)
+				return reconcile.Result{}, fmt.Errorf("updating readiness gate for pod %s: %w", podKey, err)
 			}
 		} else {
 			since, exists := r.waitingSince[podKey]
@@ -304,6 +349,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			} else if now.Sub(since) >= r.HealthTimeout {
 				isRolloutStalled = true
 			}
+		}
+
+		if !isPodReadinessGateTrue(pod) {
+			waitingForHealth = true
+		}
+	}
+
+	for k := range r.waitingSince {
+		if !activePodKeys[k] {
+			delete(r.waitingSince, k)
 		}
 	}
 
@@ -330,41 +385,57 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, err
 	}
 
-	return reconcile.Result{}, nil
+	if waitingForHealth {
+		return reconcile.Result{RequeueAfter: pollInterval}, nil
+	}
+	return reconcile.Result{RequeueAfter: resyncInterval}, nil
 }
 
-func (r *GatewayReconciler) targetNEGKey(gw *gatewayv1.Gateway) string {
+func isPodReadinessGateTrue(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	gateType := corev1.PodConditionType(registrar.LoadBalancerReadyGate)
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == gateType {
+			return cond.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func (r *GatewayReconciler) targetNEGKey(ctx context.Context, gw *gatewayv1.Gateway) (string, error) {
 	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
 		ref := gw.Spec.Infrastructure.ParametersRef
 		if ref.Kind == "ConfigMap" && ref.Name != "" {
 			var cm corev1.ConfigMap
-			err := r.Get(context.Background(), types.NamespacedName{Namespace: gw.Namespace, Name: string(ref.Name)}, &cm)
+			err := r.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: string(ref.Name)}, &cm)
 			if err != nil {
 				if !apierrors.IsNotFound(err) {
-					klog.V(4).Infof("error getting parameters ConfigMap %s: %v", ref.Name, err)
+					return "", fmt.Errorf("getting parameters ConfigMap %s: %w", ref.Name, err)
 				}
 			} else {
 				if neg := cm.Data["negHTTPS"]; neg != "" {
-					return neg
+					return neg, nil
 				}
 				if targetGW := cm.Data["gatewayName"]; targetGW != "" {
 					ns := cm.Data["gatewayNamespace"]
 					if ns == "" {
 						ns = gw.Namespace
 					}
-					return metadata.ResourceName(r.NegPrefix, r.ClusterID, ns, targetGW, "8443")
+					return metadata.ResourceName(r.NegPrefix, r.ClusterID, ns, targetGW, "8443"), nil
 				}
 			}
 		}
 	}
-	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "8443")
+	return metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "8443"), nil
 }
 
-func (r *GatewayReconciler) resolveExternalIP(ctx context.Context, gw *gatewayv1.Gateway) string {
+func (r *GatewayReconciler) resolveExternalIP(ctx context.Context, gw *gatewayv1.Gateway) (string, error) {
 	for _, addr := range gw.Spec.Addresses {
 		if addr.Type == nil || *addr.Type == gatewayv1.IPAddressType {
 			if strings.TrimSpace(addr.Value) != "" {
-				return strings.TrimSpace(addr.Value)
+				return strings.TrimSpace(addr.Value), nil
 			}
 		}
 	}
@@ -376,17 +447,17 @@ func (r *GatewayReconciler) resolveExternalIP(ctx context.Context, gw *gatewayv1
 			err := r.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: string(ref.Name)}, &cm)
 			if err != nil {
 				if !apierrors.IsNotFound(err) {
-					klog.V(4).Infof("error getting parameters ConfigMap %s: %v", ref.Name, err)
+					return "", fmt.Errorf("getting parameters ConfigMap %s: %w", ref.Name, err)
 				}
 			} else {
 				if ip, ok := cm.Data["externalIP"]; ok && strings.TrimSpace(ip) != "" {
-					return strings.TrimSpace(ip)
+					return strings.TrimSpace(ip), nil
 				}
 			}
 		}
 	}
 
-	return ""
+	return "", nil
 }
 
 func (r *GatewayReconciler) updatePodReadinessGate(ctx context.Context, pod *corev1.Pod, status corev1.ConditionStatus, reason, message string) error {
