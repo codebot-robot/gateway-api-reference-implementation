@@ -273,8 +273,59 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion(t *testing.T) {
 	}
 }
 
+// TestCRDView_InitialSyncReplayDoesNotLogOrIncrementCounter tests that replaying an
+// initial list of already-served CRDs during startup is silent and does not increment crdChanges.
+func TestCRDView_InitialSyncReplayDoesNotLogOrIncrementCounter(t *testing.T) {
+	snapshot := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+		},
+		BundleVersion: "v1.6.3",
+	}
+	crdView := NewCRDViewFromSnapshot(snapshot)
+
+	if crdView.CRDChangeCount() != 0 {
+		t.Fatalf("expected initial change count 0, got %d", crdView.CRDChangeCount())
+	}
+
+	// Replay initial-sync Add events for all already-served CRDs
+	crdView.HandleAdd(makeTestCRD(GatewayClassCRDName, ""))
+	crdView.HandleAdd(makeTestCRD(GatewayCRDName, "v1.6.3"))
+	crdView.HandleAdd(makeTestCRD(HTTPRouteCRDName, ""))
+
+	if crdView.CRDChangeCount() != 0 {
+		t.Errorf("expected change count still 0 after initial sync of served CRDs, got %d", crdView.CRDChangeCount())
+	}
+
+	// Unrelated update to already-served CRD (e.g. metadata/status bump with same bundle version)
+	updatedHTTPRoute := makeTestCRD(HTTPRouteCRDName, "")
+	updatedHTTPRoute.ResourceVersion = "2"
+	crdView.HandleUpdate(makeTestCRD(HTTPRouteCRDName, ""), updatedHTTPRoute)
+
+	if crdView.CRDChangeCount() != 0 {
+		t.Errorf("expected change count still 0 after non-meaningful update, got %d", crdView.CRDChangeCount())
+	}
+}
+
+// TestNewCRDView_RequiresMapperAndScheme tests that NewCRDView returns an error when
+// mapper or scheme is nil.
+func TestNewCRDView_RequiresMapperAndScheme(t *testing.T) {
+	ctx := t.Context()
+	scheme := newTestSchemeWithApiextensions()
+	mapper := newTestRESTMapper(gwV1.WithKind("GatewayClass"))
+
+	if _, err := NewCRDView(ctx, nil, scheme, nil); err == nil {
+		t.Errorf("expected error when mapper is nil, got nil")
+	}
+	if _, err := NewCRDView(ctx, mapper, nil, nil); err == nil {
+		t.Errorf("expected error when scheme is nil, got nil")
+	}
+}
+
 // TestCRDView_RuntimeCRDChangesIncrementCounter tests that runtime CRD additions, updates,
-// and deletions increment the change counter and log the change without failing.
+// and deletions increment the change counter only for meaningful changes.
 func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 	snapshot := CRDSnapshot{
 		ServedKinds: ServedKinds{
@@ -290,13 +341,13 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 		t.Fatalf("expected initial change count 0, got %d", crdView.CRDChangeCount())
 	}
 
-	// Add an optional CRD
+	// Add an unserved optional CRD -> meaningful change!
 	tlsCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
 	tlsCRD.ResourceVersion = "1"
 	crdView.HandleAdd(tlsCRD)
 
 	if crdView.CRDChangeCount() != 1 {
-		t.Errorf("expected change count 1 after add, got %d", crdView.CRDChangeCount())
+		t.Errorf("expected change count 1 after add of unserved kind, got %d", crdView.CRDChangeCount())
 	}
 
 	// Resync with same ResourceVersion should be ignored
@@ -305,19 +356,28 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 		t.Errorf("expected change count still 1 after resync, got %d", crdView.CRDChangeCount())
 	}
 
-	// Update CRD with new ResourceVersion
+	// Update unserved CRD without bundle version change -> not a change to served kinds
 	tlsCRDUpdated := makeTestCRD(TLSRouteCRDName, "v1.6.3")
 	tlsCRDUpdated.ResourceVersion = "2"
 	crdView.HandleUpdate(tlsCRD, tlsCRDUpdated)
 
-	if crdView.CRDChangeCount() != 2 {
-		t.Errorf("expected change count 2 after update, got %d", crdView.CRDChangeCount())
+	if crdView.CRDChangeCount() != 1 {
+		t.Errorf("expected change count still 1 after update to non-bundle CRD, got %d", crdView.CRDChangeCount())
 	}
 
-	// Delete CRD
-	crdView.HandleDelete(tlsCRDUpdated)
+	// Delete a served CRD -> meaningful change!
+	httpRouteCRD := makeTestCRD(HTTPRouteCRDName, "")
+	crdView.HandleDelete(httpRouteCRD)
+	if crdView.CRDChangeCount() != 2 {
+		t.Errorf("expected change count 2 after deleting served kind, got %d", crdView.CRDChangeCount())
+	}
+
+	// Bundle version change on Gateway CRD -> meaningful change!
+	gatewayUpdated := makeTestCRD(GatewayCRDName, "v1.6.4")
+	gatewayUpdated.ResourceVersion = "2"
+	crdView.HandleUpdate(makeTestCRD(GatewayCRDName, "v1.6.3"), gatewayUpdated)
 	if crdView.CRDChangeCount() != 3 {
-		t.Errorf("expected change count 3 after delete, got %d", crdView.CRDChangeCount())
+		t.Errorf("expected change count 3 after bundle version change, got %d", crdView.CRDChangeCount())
 	}
 
 	// Unrelated CRD should be ignored

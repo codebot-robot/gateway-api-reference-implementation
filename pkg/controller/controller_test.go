@@ -651,10 +651,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: gatewayconsts.BundleVersion})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -663,7 +660,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			CRDView:        crdView,
 		}
 
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -696,10 +693,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: "v1.6.0"})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -708,7 +702,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			CRDView:        crdView,
 		}
 
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -741,10 +735,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: "v1.5.0"})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -753,7 +744,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			CRDView:        crdView,
 		}
 
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -790,10 +781,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -802,7 +790,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			CRDView:        crdView,
 		}
 
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -835,10 +823,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -847,7 +832,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			CRDView:        crdView,
 		}
 
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -872,10 +857,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
 
 		r := &GatewayClassReconciler{
 			Client:         client,
@@ -884,7 +866,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			CRDView:        crdView,
 		}
 
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
 		}
@@ -900,34 +882,13 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		}
 	})
 
-	t.Run("reconciliation syncs CRD bundle version to State", func(t *testing.T) {
+	t.Run("view syncs CRD bundle version to State", func(t *testing.T) {
 		st := state.NewState()
 		st.SetControllerName("test-controller")
 
-		client := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(gc.DeepCopy(), crdWithMatchingVersion).
-			WithStatusSubresource(gc.DeepCopy()).
-			Build()
-
-		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, nil, nil, client)
-		if err != nil {
-			t.Fatalf("unexpected NewCRDView error: %v", err)
-		}
-
-		r := &GatewayClassReconciler{
-			Client:         client,
-			Scheme:         scheme,
-			State:          st,
-			ControllerName: "test-controller",
-			CRDView:        crdView,
-		}
-
-		_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
-		if err != nil {
-			t.Fatalf("unexpected reconcile error: %v", err)
-		}
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: gatewayconsts.BundleVersion})
+		bv := crdView.Snapshot().BundleVersion
+		st.SetGatewayCRDBundleVersion(&bv)
 
 		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != gatewayconsts.BundleVersion {
 			t.Errorf("expected State bundle version %s, got %v", gatewayconsts.BundleVersion, st.GatewayCRDBundleVersion())

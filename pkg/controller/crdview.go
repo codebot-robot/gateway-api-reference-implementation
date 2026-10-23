@@ -29,7 +29,6 @@ import (
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
@@ -56,8 +55,6 @@ var CustomResourceDefinitionGVK = schema.GroupVersionKind{
 	Kind:    "CustomResourceDefinition",
 }
 
-var crdGVK = CustomResourceDefinitionGVK
-
 // ServedKinds represents the set of Gateway API kinds served at the version GARI uses.
 // It is a comparable struct of booleans.
 type ServedKinds struct {
@@ -73,6 +70,106 @@ type ServedKinds struct {
 	ReferenceGrant   bool
 }
 
+type kindDefinition struct {
+	gk       schema.GroupKind
+	version  string
+	crdName  string
+	required bool
+	get      func(s *ServedKinds) bool
+	set      func(s *ServedKinds, v bool)
+}
+
+var knownKinds = []kindDefinition{
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GatewayClass"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  GatewayClassCRDName,
+		required: true,
+		get:      func(s *ServedKinds) bool { return s.GatewayClass },
+		set:      func(s *ServedKinds, v bool) { s.GatewayClass = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  GatewayCRDName,
+		required: true,
+		get:      func(s *ServedKinds) bool { return s.Gateway },
+		set:      func(s *ServedKinds, v bool) { s.Gateway = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  HTTPRouteCRDName,
+		required: true,
+		get:      func(s *ServedKinds) bool { return s.HTTPRoute },
+		set:      func(s *ServedKinds, v bool) { s.HTTPRoute = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  TLSRouteCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.TLSRoute },
+		set:      func(s *ServedKinds, v bool) { s.TLSRoute = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GRPCRoute"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  GRPCRouteCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.GRPCRoute },
+		set:      func(s *ServedKinds, v bool) { s.GRPCRoute = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TCPRoute"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  TCPRouteCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.TCPRoute },
+		set:      func(s *ServedKinds, v bool) { s.TCPRoute = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "UDPRoute"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  UDPRouteCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.UDPRoute },
+		set:      func(s *ServedKinds, v bool) { s.UDPRoute = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "BackendTLSPolicy"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  BackendTLSPolicyCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.BackendTLSPolicy },
+		set:      func(s *ServedKinds, v bool) { s.BackendTLSPolicy = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
+		version:  gatewayv1.GroupVersion.Version,
+		crdName:  ListenerSetCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.ListenerSet },
+		set:      func(s *ServedKinds, v bool) { s.ListenerSet = v },
+	},
+	{
+		gk:       schema.GroupKind{Group: gatewayv1beta1.GroupName, Kind: "ReferenceGrant"},
+		version:  gatewayv1beta1.GroupVersion.Version,
+		crdName:  ReferenceGrantCRDName,
+		required: false,
+		get:      func(s *ServedKinds) bool { return s.ReferenceGrant },
+		set:      func(s *ServedKinds, v bool) { s.ReferenceGrant = v },
+	},
+}
+
+var crdNameToKind = func() map[string]kindDefinition {
+	m := make(map[string]kindDefinition, len(knownKinds))
+	for _, k := range knownKinds {
+		m[k.crdName] = k
+	}
+	return m
+}()
+
 // CRDSnapshot represents an immutable snapshot of Gateway API CRD presence and bundle version.
 // It is a comparable value so snapshots can be compared directly using ==.
 type CRDSnapshot struct {
@@ -82,55 +179,21 @@ type CRDSnapshot struct {
 
 // IsKindServed reports whether the given GroupKind is served.
 func (s CRDSnapshot) IsKindServed(gk schema.GroupKind) bool {
-	switch gk {
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GatewayClass"}:
-		return s.ServedKinds.GatewayClass
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"}:
-		return s.ServedKinds.Gateway
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"}:
-		return s.ServedKinds.HTTPRoute
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}:
-		return s.ServedKinds.TLSRoute
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GRPCRoute"}:
-		return s.ServedKinds.GRPCRoute
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TCPRoute"}:
-		return s.ServedKinds.TCPRoute
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "UDPRoute"}:
-		return s.ServedKinds.UDPRoute
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "BackendTLSPolicy"}:
-		return s.ServedKinds.BackendTLSPolicy
-	case schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"}:
-		return s.ServedKinds.ListenerSet
-	case schema.GroupKind{Group: gatewayv1beta1.GroupName, Kind: "ReferenceGrant"}:
-		return s.ServedKinds.ReferenceGrant
-	default:
-		return false
+	for i := range knownKinds {
+		if knownKinds[i].gk == gk {
+			return knownKinds[i].get(&s.ServedKinds)
+		}
 	}
+	return false
 }
 
 // DisabledKinds returns the sorted names of optional Gateway API kinds that are not served.
 func (s CRDSnapshot) DisabledKinds() []string {
 	var disabled []string
-	if !s.ServedKinds.TLSRoute {
-		disabled = append(disabled, "TLSRoute")
-	}
-	if !s.ServedKinds.GRPCRoute {
-		disabled = append(disabled, "GRPCRoute")
-	}
-	if !s.ServedKinds.TCPRoute {
-		disabled = append(disabled, "TCPRoute")
-	}
-	if !s.ServedKinds.UDPRoute {
-		disabled = append(disabled, "UDPRoute")
-	}
-	if !s.ServedKinds.BackendTLSPolicy {
-		disabled = append(disabled, "BackendTLSPolicy")
-	}
-	if !s.ServedKinds.ListenerSet {
-		disabled = append(disabled, "ListenerSet")
-	}
-	if !s.ServedKinds.ReferenceGrant {
-		disabled = append(disabled, "ReferenceGrant")
+	for i := range knownKinds {
+		if !knownKinds[i].required && !knownKinds[i].get(&s.ServedKinds) {
+			disabled = append(disabled, knownKinds[i].gk.Kind)
+		}
 	}
 	sort.Strings(disabled)
 	return disabled
@@ -138,50 +201,21 @@ func (s CRDSnapshot) DisabledKinds() []string {
 
 // ServedGroupKinds returns a map of GroupKinds to whether they are served.
 func (s CRDSnapshot) ServedGroupKinds() map[schema.GroupKind]bool {
-	m := make(map[schema.GroupKind]bool)
-	if s.ServedKinds.GatewayClass {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GatewayClass"}] = true
-	}
-	if s.ServedKinds.Gateway {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"}] = true
-	}
-	if s.ServedKinds.HTTPRoute {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"}] = true
-	}
-	if s.ServedKinds.TLSRoute {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}] = true
-	}
-	if s.ServedKinds.GRPCRoute {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GRPCRoute"}] = true
-	}
-	if s.ServedKinds.TCPRoute {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TCPRoute"}] = true
-	}
-	if s.ServedKinds.UDPRoute {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "UDPRoute"}] = true
-	}
-	if s.ServedKinds.BackendTLSPolicy {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "BackendTLSPolicy"}] = true
-	}
-	if s.ServedKinds.ListenerSet {
-		m[schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"}] = true
-	}
-	if s.ServedKinds.ReferenceGrant {
-		m[schema.GroupKind{Group: gatewayv1beta1.GroupName, Kind: "ReferenceGrant"}] = true
+	m := make(map[schema.GroupKind]bool, len(knownKinds))
+	for i := range knownKinds {
+		if knownKinds[i].get(&s.ServedKinds) {
+			m[knownKinds[i].gk] = true
+		}
 	}
 	return m
 }
 
 // ValidateRequired verifies that all required Gateway API CRDs (GatewayClass, Gateway, HTTPRoute) are served.
 func (s CRDSnapshot) ValidateRequired() error {
-	if !s.ServedKinds.GatewayClass {
-		return fmt.Errorf("required Gateway API CRD GatewayClass (%s/GatewayClass) is not installed", gatewayv1.GroupName)
-	}
-	if !s.ServedKinds.Gateway {
-		return fmt.Errorf("required Gateway API CRD Gateway (%s/Gateway) is not installed", gatewayv1.GroupName)
-	}
-	if !s.ServedKinds.HTTPRoute {
-		return fmt.Errorf("required Gateway API CRD HTTPRoute (%s/HTTPRoute) is not installed", gatewayv1.GroupName)
+	for i := range knownKinds {
+		if knownKinds[i].required && !knownKinds[i].get(&s.ServedKinds) {
+			return fmt.Errorf("required Gateway API CRD %s (%s) is not installed", knownKinds[i].gk.Kind, knownKinds[i].gk.String())
+		}
 	}
 	return nil
 }
@@ -210,26 +244,16 @@ type CRDView struct {
 // for served kinds at the version GARI uses. If reader is provided, it reads the initial
 // bundle version from the Gateway CRD metadata.
 func NewCRDView(ctx context.Context, mapper meta.RESTMapper, scheme *runtime.Scheme, reader client.Reader) (*CRDView, error) {
-	var servedKinds ServedKinds
-	if mapper != nil && scheme != nil {
-		var err error
-		servedKinds, err = SnapshotFromRESTMapper(mapper, scheme)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		servedKinds = ServedKinds{
-			GatewayClass:     true,
-			Gateway:          true,
-			HTTPRoute:        true,
-			TLSRoute:         true,
-			GRPCRoute:        true,
-			TCPRoute:         true,
-			UDPRoute:         true,
-			BackendTLSPolicy: true,
-			ListenerSet:      true,
-			ReferenceGrant:   true,
-		}
+	if mapper == nil {
+		return nil, fmt.Errorf("RESTMapper is required")
+	}
+	if scheme == nil {
+		return nil, fmt.Errorf("scheme is required")
+	}
+
+	servedKinds, err := SnapshotFromRESTMapper(mapper, scheme)
+	if err != nil {
+		return nil, err
 	}
 
 	v := &CRDView{
@@ -280,7 +304,7 @@ func (v *CRDView) SetOnBundleVersionChanged(fn func(newVersion string)) {
 	v.onBundleVersionChanged = fn
 }
 
-// CRDChangeCount returns the number of CRD change events observed.
+// CRDChangeCount returns the number of meaningful CRD changes observed.
 func (v *CRDView) CRDChangeCount() uint64 {
 	return v.crdChanges.Load()
 }
@@ -317,7 +341,11 @@ func (v *CRDView) RegisterWithManager(mgr ctrl.Manager) error {
 // HandleAdd processes CRD creation events.
 func (v *CRDView) HandleAdd(obj any) {
 	metaObj, ok := toPartialObjectMetadata(obj)
-	if !ok || !isGatewayAPICRD(metaObj.Name) {
+	if !ok {
+		return
+	}
+	kd, ok := crdNameToKind[metaObj.Name]
+	if !ok {
 		return
 	}
 
@@ -336,7 +364,59 @@ func (v *CRDView) HandleAdd(obj any) {
 		ResourceVersion: metaObj.ResourceVersion,
 		BundleVersion:   bv,
 	}
-	v.crdChanges.Add(1)
+
+	isUnservedAdd := !v.snapshot.IsKindServed(kd.gk)
+	var bvChanged bool
+	var newBV string
+	var cb func(string)
+	if metaObj.Name == GatewayCRDName && v.snapshot.BundleVersion != bv {
+		oldBV := v.snapshot.BundleVersion
+		v.snapshot.BundleVersion = bv
+		bvChanged = true
+		newBV = bv
+		cb = v.onBundleVersionChanged
+		setupLog.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", newBV)
+	}
+
+	if isUnservedAdd || bvChanged {
+		v.crdChanges.Add(1)
+	}
+	v.mu.Unlock()
+
+	if isUnservedAdd {
+		setupLog.Info("Gateway API CRD added for unserved kind; restart controller deployment to serve it", "kind", kd.gk.Kind, "crd", metaObj.Name)
+	}
+
+	if bvChanged && cb != nil {
+		cb(newBV)
+	}
+}
+
+// HandleUpdate processes CRD update events.
+func (v *CRDView) HandleUpdate(oldObj, newObj any) {
+	metaObj, ok := toPartialObjectMetadata(newObj)
+	if !ok {
+		return
+	}
+	if !isGatewayAPICRD(metaObj.Name) {
+		return
+	}
+
+	var bv string
+	if metaObj.Name == GatewayCRDName && metaObj.Annotations != nil {
+		bv = metaObj.Annotations[gatewayconsts.BundleVersionAnnotation]
+	}
+
+	v.mu.Lock()
+	existing, found := v.crds[metaObj.Name]
+	if found && existing.ResourceVersion == metaObj.ResourceVersion {
+		v.mu.Unlock()
+		return
+	}
+	v.crds[metaObj.Name] = crdRecord{
+		ResourceVersion: metaObj.ResourceVersion,
+		BundleVersion:   bv,
+	}
 
 	var bvChanged bool
 	var newBV string
@@ -347,20 +427,16 @@ func (v *CRDView) HandleAdd(obj any) {
 		bvChanged = true
 		newBV = bv
 		cb = v.onBundleVersionChanged
-		setupLog.Info("Gateway API bundle-version changed", "oldVersion", oldBV, "newVersion", newBV)
+		v.crdChanges.Add(1)
+		setupLog.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", newBV)
 	}
 	v.mu.Unlock()
 
-	setupLog.Info("Gateway API CRD changed; restart controller deployment to update served kinds", "crd", metaObj.Name)
+	// Regular updates to other CRDs or non-bundle annotations do not change served kinds or bundle version and are silent.
 
 	if bvChanged && cb != nil {
 		cb(newBV)
 	}
-}
-
-// HandleUpdate processes CRD update events.
-func (v *CRDView) HandleUpdate(oldObj, newObj any) {
-	v.HandleAdd(newObj)
 }
 
 // HandleDelete processes CRD deletion events.
@@ -369,18 +445,18 @@ func (v *CRDView) HandleDelete(obj any) {
 		obj = tombstone.Obj
 	}
 	metaObj, ok := toPartialObjectMetadata(obj)
-	if !ok || !isGatewayAPICRD(metaObj.Name) {
+	if !ok {
+		return
+	}
+	kd, ok := crdNameToKind[metaObj.Name]
+	if !ok {
 		return
 	}
 
 	v.mu.Lock()
-	if _, found := v.crds[metaObj.Name]; !found {
-		v.mu.Unlock()
-		return
-	}
 	delete(v.crds, metaObj.Name)
-	v.crdChanges.Add(1)
 
+	isServedDelete := v.snapshot.IsKindServed(kd.gk)
 	var bvChanged bool
 	var cb func(string)
 	if metaObj.Name == GatewayCRDName && v.snapshot.BundleVersion != "" {
@@ -388,11 +464,17 @@ func (v *CRDView) HandleDelete(obj any) {
 		v.snapshot.BundleVersion = ""
 		bvChanged = true
 		cb = v.onBundleVersionChanged
-		setupLog.Info("Gateway API bundle-version changed", "oldVersion", oldBV, "newVersion", "")
+		setupLog.Info("Gateway API bundle-version changed; restart controller deployment to pick up newly served kinds or versions", "oldVersion", oldBV, "newVersion", "")
+	}
+
+	if isServedDelete || bvChanged {
+		v.crdChanges.Add(1)
 	}
 	v.mu.Unlock()
 
-	setupLog.Info("Gateway API CRD deleted; restart controller deployment to update served kinds", "crd", metaObj.Name)
+	if isServedDelete {
+		setupLog.Info("Gateway API CRD deleted for served kind; restart controller deployment to update served kinds", "kind", kd.gk.Kind, "crd", metaObj.Name)
+	}
 
 	if bvChanged && cb != nil {
 		cb("")
@@ -446,50 +528,19 @@ func CRDMetadataTransform(obj any) (any, error) {
 // It verifies that all required and optional Gateway API kinds are served at the specific
 // API versions GARI builds against, serving as the single source of truth for served kinds.
 func SnapshotFromRESTMapper(mapper meta.RESTMapper, scheme *runtime.Scheme) (ServedKinds, error) {
-	type versionedObject struct {
-		obj client.Object
-		set func(s *ServedKinds, val bool)
-	}
-
-	requiredObjects := []versionedObject{
-		{obj: &gatewayv1.GatewayClass{}, set: func(s *ServedKinds, v bool) { s.GatewayClass = v }},
-		{obj: &gatewayv1.Gateway{}, set: func(s *ServedKinds, v bool) { s.Gateway = v }},
-		{obj: &gatewayv1.HTTPRoute{}, set: func(s *ServedKinds, v bool) { s.HTTPRoute = v }},
-	}
-	optionalObjects := []versionedObject{
-		{obj: &gatewayv1.TLSRoute{}, set: func(s *ServedKinds, v bool) { s.TLSRoute = v }},
-		{obj: &gatewayv1.GRPCRoute{}, set: func(s *ServedKinds, v bool) { s.GRPCRoute = v }},
-		{obj: &gatewayv1.TCPRoute{}, set: func(s *ServedKinds, v bool) { s.TCPRoute = v }},
-		{obj: &gatewayv1.UDPRoute{}, set: func(s *ServedKinds, v bool) { s.UDPRoute = v }},
-		{obj: &gatewayv1.BackendTLSPolicy{}, set: func(s *ServedKinds, v bool) { s.BackendTLSPolicy = v }},
-		{obj: &gatewayv1.ListenerSet{}, set: func(s *ServedKinds, v bool) { s.ListenerSet = v }},
-		{obj: &gatewayv1beta1.ReferenceGrant{}, set: func(s *ServedKinds, v bool) { s.ReferenceGrant = v }},
-	}
-
 	var served ServedKinds
-	for _, vo := range requiredObjects {
-		gvk, err := apiutil.GVKForObject(vo.obj, scheme)
+	for _, kd := range knownKinds {
+		_, err := mapper.RESTMapping(kd.gk, kd.version)
 		if err != nil {
-			return ServedKinds{}, fmt.Errorf("error getting GVK for %T: %w", vo.obj, err)
-		}
-		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
-			return ServedKinds{}, fmt.Errorf("required Gateway API CRD %s (%s) is not installed: %w", gvk.Kind, gvk.GroupKind().String(), err)
-		}
-		vo.set(&served, true)
-	}
-
-	for _, vo := range optionalObjects {
-		gvk, err := apiutil.GVKForObject(vo.obj, scheme)
-		if err != nil {
-			return ServedKinds{}, fmt.Errorf("error getting GVK for %T: %w", vo.obj, err)
-		}
-		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
+			if kd.required {
+				return ServedKinds{}, fmt.Errorf("required Gateway API CRD %s (%s) is not installed: %w", kd.gk.Kind, kd.gk.String(), err)
+			}
 			if meta.IsNoMatchError(err) {
 				continue
 			}
-			return ServedKinds{}, fmt.Errorf("failed to check CRD for %s (%s): %w", gvk.Kind, gvk.GroupKind().String(), err)
+			return ServedKinds{}, fmt.Errorf("failed to check CRD for %s (%s): %w", kd.gk.Kind, kd.gk.String(), err)
 		}
-		vo.set(&served, true)
+		kd.set(&served, true)
 	}
 
 	return served, nil

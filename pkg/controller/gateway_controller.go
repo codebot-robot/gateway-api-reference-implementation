@@ -59,10 +59,6 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	if r.State != nil && crdBundleVersion != nil {
-		r.State.SetGatewayCRDBundleVersion(crdBundleVersion)
-	}
-
 	var desired gatewayv1.GatewayClassStatus
 	if r.State != nil {
 		d, ok := r.State.GetDesiredGatewayClassStatus(req.NamespacedName)
