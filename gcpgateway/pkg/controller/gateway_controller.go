@@ -24,6 +24,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -178,10 +179,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Labels["app"] != registrar.AppLabelDataplane {
+		if pod.Labels[singlepod.LabelAppName] != singlepod.AppNameValue {
 			continue
 		}
-		if pod.Labels["gateway.networking.k8s.io/gateway-name"] != gw.Name && pod.Labels["gateway-name"] != gw.Name {
+		if pod.Labels[singlepod.LabelGatewayName] != gw.Name {
 			continue
 		}
 		dataplanePodCount++
