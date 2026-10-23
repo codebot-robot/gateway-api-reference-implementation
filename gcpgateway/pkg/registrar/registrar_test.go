@@ -23,6 +23,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -124,21 +125,15 @@ func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nod
 		conditions[1].Status = corev1.ConditionTrue
 	}
 
-	labels := make(map[string]string)
-	for k, v := range deploy.Spec.Template.Labels {
-		labels[k] = v
-	}
-
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:  gw.Namespace,
-			Name:       name,
-			Labels:     labels,
-			Finalizers: []string{"kubernetes.io/gcpgateway-test"},
-		},
-		Spec: deploy.Spec.Template.Spec,
-	}
-	pod.Spec.NodeName = nodeName
+	pod := testenv.BuildPodFromDeployment(
+		&deploy,
+		testenv.WithPodName(name),
+		testenv.WithNodeName(nodeName),
+		testenv.WithPodIP(ip),
+		testenv.WithContainersReady(containersReady),
+		testenv.WithReady(overallReady),
+	)
+	pod.Finalizers = []string{"kubernetes.io/gcpgateway-test"}
 
 	if err := c.Create(t.Context(), pod); err != nil {
 		t.Fatalf("failed to create pod: %v", err)
