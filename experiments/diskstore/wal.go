@@ -53,9 +53,6 @@ const (
 // It is 8 bytes, lightweight, and prevents calling non-monotonic wall-clock functions.
 type MonotonicTime int64
 
-// monotonicTime is an alias for internal use.
-type monotonicTime = MonotonicTime
-
 // IsZero reports whether m represents the zero timestamp.
 func (m MonotonicTime) IsZero() bool {
 	return m == 0

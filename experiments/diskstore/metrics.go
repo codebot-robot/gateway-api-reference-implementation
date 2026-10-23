@@ -20,7 +20,6 @@ import "sync/atomic"
 type Metrics struct {
 	OversizeObjectsCount  atomic.Int64
 	DirectIOFallbackCount atomic.Int64
-	IndexerErrorCount     atomic.Int64
 }
 
 // GlobalMetrics holds the shared store metrics instance.
@@ -34,9 +33,4 @@ func OversizeCount() int64 {
 // DirectIOFallbackCount returns the number of times direct I/O fell back to buffered I/O.
 func DirectIOFallbackCount() int64 {
 	return GlobalMetrics.DirectIOFallbackCount.Load()
-}
-
-// IndexerErrorCount returns the total number of errors encountered in the indexer layer.
-func IndexerErrorCount() int64 {
-	return GlobalMetrics.IndexerErrorCount.Load()
 }

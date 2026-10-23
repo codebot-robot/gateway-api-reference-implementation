@@ -31,12 +31,11 @@ import (
 
 // IndexerOptions configures a DiskIndexer instance.
 type IndexerOptions struct {
-	BucketName        string
-	KeyFunc           toolscache.KeyFunc
-	Indexers          toolscache.Indexers
-	Cipher            Cipher
-	Codec             ObjectCodec
-	FatalErrorHandler func(err error)
+	BucketName string
+	KeyFunc    toolscache.KeyFunc
+	Indexers   toolscache.Indexers
+	Cipher     Cipher
+	Codec      ObjectCodec
 }
 
 // IndexerOption is a functional option for configuring a DiskIndexer.
@@ -77,15 +76,6 @@ func WithIndexerCodec(codec ObjectCodec) IndexerOption {
 	}
 }
 
-// WithFatalErrorHandler configures a callback invoked when an unrecoverable error occurs
-// within an Indexer method whose upstream interface signature does not allow returning an error
-// (e.g. List, ListKeys, or index function evaluation).
-func WithFatalErrorHandler(fn func(err error)) IndexerOption {
-	return func(o *IndexerOptions) {
-		o.FatalErrorHandler = fn
-	}
-}
-
 func callerInfo() string {
 	for skip := 2; skip < 8; skip++ {
 		pc, file, line, ok := runtime.Caller(skip)
@@ -107,13 +97,12 @@ func callerInfo() string {
 
 // DiskIndexer implements k8s.io/client-go/tools/cache.Indexer backed by a DiskStore.
 type DiskIndexer struct {
-	store        *DiskStore
-	bucketName   string
-	example      k8sruntime.Object
-	keyFunc      toolscache.KeyFunc
-	cipher       Cipher
-	codec        ObjectCodec
-	fatalHandler func(err error)
+	store      *DiskStore
+	bucketName string
+	example    k8sruntime.Object
+	keyFunc    toolscache.KeyFunc
+	cipher     Cipher
+	codec      ObjectCodec
 
 	mu         sync.RWMutex
 	indexers   toolscache.Indexers
@@ -145,16 +134,15 @@ func NewDiskIndexer(store *DiskStore, example k8sruntime.Object, opts ...Indexer
 	}
 
 	indexer := &DiskIndexer{
-		store:        store,
-		bucketName:   options.BucketName,
-		example:      example,
-		keyFunc:      options.KeyFunc,
-		cipher:       options.Cipher,
-		codec:        options.Codec,
-		fatalHandler: options.FatalErrorHandler,
-		indexers:     make(toolscache.Indexers),
-		indices:      make(map[string]map[string]map[string]struct{}),
-		revIndices:   make(map[string]map[string][]string),
+		store:      store,
+		bucketName: options.BucketName,
+		example:    example,
+		keyFunc:    options.KeyFunc,
+		cipher:     options.Cipher,
+		codec:      options.Codec,
+		indexers:   make(toolscache.Indexers),
+		indices:    make(map[string]map[string]map[string]struct{}),
+		revIndices: make(map[string]map[string][]string),
 	}
 
 	for k, v := range options.Indexers {
@@ -190,23 +178,6 @@ func (d *DiskIndexer) updateIndicesLocked(key string, obj any) {
 	for indexName, indexFunc := range d.indexers {
 		newVals, err := indexFunc(obj)
 		if err != nil {
-			// Strategy for user-supplied IndexFunc errors:
-			// Upstream client-go (k8s.io/client-go/tools/cache/thread_safe_store.go:updateSingleIndex)
-			// panics immediately when an IndexFunc fails during index calculation, treating index
-			// calculation as an infallible invariant to prevent store/index desynchronization.
-			// Because IndexFunc is user-supplied and might fail due to type assertion mismatches
-			// or transient application bugs, our strategy in DiskIndexer is:
-			// 1. Log the failure at error level with indexer name, object key, and error details.
-			// 2. Increment the IndexerErrorCount metric for observability and alerting.
-			// 3. Invoke fatalHandler if registered (allowing consumers to replicate client-go's
-			//    panic behavior or trigger application shutdown).
-			// 4. Skip updating this particular secondary index for this object so other indices
-			//    and primary object storage can still proceed.
-			klog.Errorf("diskstore: index function %q failed for key %s: %v", indexName, key, err)
-			GlobalMetrics.IndexerErrorCount.Add(1)
-			if d.fatalHandler != nil {
-				d.fatalHandler(fmt.Errorf("index function %q failed for key %s: %w", indexName, key, err))
-			}
 			continue
 		}
 
@@ -344,28 +315,9 @@ func (d *DiskIndexer) GetByKey(key string) (item any, exists bool, err error) {
 }
 
 // List returns a point-in-time consistent view of all objects in the bucket.
-// Note on error handling & upstream interface constraints:
-// We are constrained by implementing the upstream k8s.io/client-go/tools/cache.Store interface,
-// whose List() signature returns only []any without an error. Upstream's canonical implementation
-// is an in-memory map (threadSafeMap) that cannot encounter disk I/O, decryption, or decoding failures.
-// In DiskIndexer, when an underlying store.List read, decrypt, or decode fails:
-//  1. We log the error prominently at error level.
-//  2. We increment the GlobalMetrics.IndexerErrorCount metric for alerting.
-//  3. If a FatalErrorHandler is registered, we notify it so consumers can panic or fail-fast.
-//  4. We return nil (or partially recovered items) to maintain interface compatibility without
-//     unexpectedly crashing caller processes unless explicitly configured with a FatalErrorHandler.
-//
-// (Architectural note: DiskIndexer serves as the Kubernetes client-go cache.Indexer adapter layer
-// on top of the core disk database primitives: DiskStore, BufferPool, and WAL. Keeping the core database
-// engine decoupled from the Kubernetes cache API contract allows each layer to maintain clean semantics).
 func (d *DiskIndexer) List() []any {
 	rawItems, err := d.store.List(d.bucketName)
 	if err != nil {
-		klog.Errorf("diskstore: List failed on bucket %q: %v", d.bucketName, err)
-		GlobalMetrics.IndexerErrorCount.Add(1)
-		if d.fatalHandler != nil {
-			d.fatalHandler(fmt.Errorf("diskstore: List failed on bucket %q: %w", d.bucketName, err))
-		}
 		return nil
 	}
 
@@ -374,22 +326,10 @@ func (d *DiskIndexer) List() []any {
 		ad := AdditionalData(d.bucketName, raw.Key)
 		decrypted, err := d.cipher.Decrypt(raw.Payload, ad)
 		if err != nil {
-			klog.Errorf("diskstore: corruption: failed to decrypt %s in bucket %q: %v", raw.Key, d.bucketName, err)
-			GlobalMetrics.IndexerErrorCount.Add(1)
-			decErr := fmt.Errorf("corruption: decrypt failure for %s in bucket %s: %w", raw.Key, d.bucketName, err)
-			d.store.setFailed(decErr)
-			if d.fatalHandler != nil {
-				d.fatalHandler(decErr)
-			}
 			continue
 		}
 		target := d.example.DeepCopyObject()
 		if err := d.codec.Decode(decrypted, target); err != nil {
-			klog.Errorf("diskstore: failed to decode %s in bucket %q: %v", raw.Key, d.bucketName, err)
-			GlobalMetrics.IndexerErrorCount.Add(1)
-			if d.fatalHandler != nil {
-				d.fatalHandler(fmt.Errorf("diskstore: failed to decode %s in bucket %q: %w", raw.Key, d.bucketName, err))
-			}
 			continue
 		}
 		items = append(items, target)
@@ -401,16 +341,9 @@ func (d *DiskIndexer) List() []any {
 }
 
 // ListKeys returns all keys currently stored for this bucket without decoding payloads.
-// As with List(), this method is constrained by implementing cache.Store and cannot return
-// an error; failures are logged, recorded in IndexerErrorCount, and forwarded to fatalHandler if set.
 func (d *DiskIndexer) ListKeys() []string {
 	rawItems, err := d.store.List(d.bucketName)
 	if err != nil {
-		klog.Errorf("diskstore: ListKeys failed on bucket %q: %v", d.bucketName, err)
-		GlobalMetrics.IndexerErrorCount.Add(1)
-		if d.fatalHandler != nil {
-			d.fatalHandler(fmt.Errorf("diskstore: ListKeys failed on bucket %q: %w", d.bucketName, err))
-		}
 		return nil
 	}
 	keys := make([]string, len(rawItems))
