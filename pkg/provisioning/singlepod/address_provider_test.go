@@ -142,7 +142,7 @@ func TestSinglePodAddressProvider_GatewayAddresses(t *testing.T) {
 				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
 					"custom-label": "custom-val",
 					// User label with reserved prefix should be ignored
-					"gateway.networking.k8s.io/gateway-name": "malicious-name",
+					gatewayv1.LabelKey(LabelGatewayName): "malicious-name",
 				},
 				Annotations: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
 					"custom-anno": "custom-val",
@@ -366,31 +366,34 @@ func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
 	}()
 	wg.Wait()
 
+	resName1 := ResourceNameForGateway("gw-1")
+	resName2 := ResourceNameForGateway("gw-2")
+
 	// Verify ns-1 has Role, RoleBinding
 	var role1 rbacv1.Role
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: "gw-1-gari"}, &role1); err != nil {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &role1); err != nil {
 		t.Fatalf("failed to get Role for gw-1: %v", err)
 	}
 	var rb1 rbacv1.RoleBinding
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: "gw-1-gari"}, &rb1); err != nil {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &rb1); err != nil {
 		t.Fatalf("failed to get RoleBinding for gw-1: %v", err)
 	}
 	var sec1 corev1.Secret
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: "gw-1-gari"}, &sec1); !apierrors.IsNotFound(err) {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &sec1); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected Secret for gw-1 to not exist before publish, got: %v", err)
 	}
 
 	// Verify ns-2 has Role, RoleBinding
 	var role2 rbacv1.Role
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: "gw-2-gari"}, &role2); err != nil {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &role2); err != nil {
 		t.Fatalf("failed to get Role for gw-2: %v", err)
 	}
 	var rb2 rbacv1.RoleBinding
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: "gw-2-gari"}, &rb2); err != nil {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &rb2); err != nil {
 		t.Fatalf("failed to get RoleBinding for gw-2: %v", err)
 	}
 	var sec2 corev1.Secret
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: "gw-2-gari"}, &sec2); !apierrors.IsNotFound(err) {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-2", Name: resName2}, &sec2); !apierrors.IsNotFound(err) {
 		t.Fatalf("expected Secret for gw-2 to not exist before publish, got: %v", err)
 	}
 
@@ -405,7 +408,7 @@ func TestSinglePodAddressProvider_NamespacedRolesAndSecrets(t *testing.T) {
 		t.Fatalf("PublishDataplaneConfig failed: %v", err)
 	}
 
-	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: "gw-1-gari"}, &sec1); err != nil {
+	if err := client.Get(ctx, types.NamespacedName{Namespace: "ns-1", Name: resName1}, &sec1); err != nil {
 		t.Fatalf("failed to get updated Secret for gw-1: %v", err)
 	}
 	unmarshaled, err := state.UnmarshalDataplaneConfig(sec1.Data[DataplaneSecretDataKey])
@@ -1329,11 +1332,11 @@ func TestSinglePodAddressProvider_InfrastructureUserKeysCannotOverrideReservedLa
 		Spec: gatewayv1.GatewaySpec{
 			Infrastructure: &gatewayv1.GatewayInfrastructure{
 				Labels: map[gatewayv1.LabelKey]gatewayv1.LabelValue{
-					"gateway.networking.k8s.io/gateway-name":      "override-name",
+					gatewayv1.LabelKey(LabelGatewayName):          "override-name",
 					"gateway.networking.k8s.io/gateway-namespace": "override-ns",
 					"gateway.networking.k8s.io/custom-reserved":   "malicious-val",
-					"app.kubernetes.io/managed-by":                "override-managed-by",
-					"app.kubernetes.io/name":                      "override-name",
+					gatewayv1.LabelKey(LabelManagedBy):            "override-managed-by",
+					gatewayv1.LabelKey(LabelAppName):              "override-name",
 					"custom-valid-label":                          "valid-val",
 				},
 			},

@@ -612,7 +612,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 
 	crdWithMatchingVersion := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "gateways.gateway.networking.k8s.io",
+			Name: GatewayCRDName,
 			Annotations: map[string]string{
 				gatewayconsts.BundleVersionAnnotation: gatewayconsts.BundleVersion,
 			},
@@ -621,7 +621,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 
 	crdWithDifferentPatchVersion := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "gateways.gateway.networking.k8s.io",
+			Name: GatewayCRDName,
 			Annotations: map[string]string{
 				gatewayconsts.BundleVersionAnnotation: "v1.6.0",
 			},
@@ -630,7 +630,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 
 	crdWithMismatchedVersion := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "gateways.gateway.networking.k8s.io",
+			Name: GatewayCRDName,
 			Annotations: map[string]string{
 				gatewayconsts.BundleVersionAnnotation: "v1.5.0",
 			},
@@ -639,7 +639,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 
 	crdWithoutAnnotation := &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "gateways.gateway.networking.k8s.io",
+			Name: GatewayCRDName,
 		},
 	}
 
@@ -809,7 +809,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 	t.Run("CRD with empty bundle-version annotation leaves SupportedVersion absent", func(t *testing.T) {
 		crdWithEmptyAnnotation := &apiextensionsv1.CustomResourceDefinition{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "gateways.gateway.networking.k8s.io",
+				Name: GatewayCRDName,
 				Annotations: map[string]string{
 					gatewayconsts.BundleVersionAnnotation: "",
 				},
@@ -1740,7 +1740,8 @@ func TestGatewayReconciler_ErrorHandling(t *testing.T) {
 		t.Fatalf("expected transient error returned from Reconcile, got: %v", err)
 	}
 
-	// 2. OwnershipConflictError: should NOT be returned from Reconcile, but recorded on Gateway status, and requeued after delay
+	// 2. OwnershipConflictError: should NOT be returned from Reconcile, but recorded on Gateway status, and requeued after delay.
+	// The resource name "default/test-gw-gari" is kept as a literal here to avoid an import cycle with pkg/provisioning/singlepod.
 	conflictProvider := &fakeAddressProvider{
 		err: &OwnershipConflictError{
 			Message: "conflict: existing Service default/test-gw-gari is not owned by Gateway test-gw",

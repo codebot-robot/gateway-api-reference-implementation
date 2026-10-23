@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/quic-go/quic-go"
@@ -1555,13 +1556,16 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 		t.Fatalf("failed to marshal config: %v", err)
 	}
 
+	gwName := "test-gw"
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "test-ns",
-			Name:      "test-gw-gari",
+			Name:      secretName,
 		},
 		Data: map[string][]byte{
-			"config.json": configBytes,
+			singlepod.DataplaneSecretDataKey: configBytes,
 		},
 	}
 
@@ -1571,7 +1575,7 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 		opts: Options{
 			DataplaneMode:             true,
 			DataplaneGatewayNamespace: "test-ns",
-			DataplaneGatewayName:      "test-gw",
+			DataplaneGatewayName:      gwName,
 		},
 		proxy: p,
 	}
@@ -1581,14 +1585,14 @@ func TestDataplaneSecretReconciler(t *testing.T) {
 		proxy:            p,
 		proxySynced:      &server.proxySynced,
 		gatewayNamespace: "test-ns",
-		secretName:       "test-gw-gari",
+		secretName:       secretName,
 	}
 
 	ctx := t.Context()
 	req := ctrl.Request{
 		NamespacedName: types.NamespacedName{
 			Namespace: "test-ns",
-			Name:      "test-gw-gari",
+			Name:      secretName,
 		},
 	}
 
@@ -1628,11 +1632,14 @@ func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.
 	p := proxy.NewProxy()
 	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
 
+	gwName := "test-gw"
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
 	server := &Server{
 		opts: Options{
 			DataplaneMode:             true,
 			DataplaneGatewayNamespace: "test-ns",
-			DataplaneGatewayName:      "test-gw",
+			DataplaneGatewayName:      gwName,
 		},
 		proxy: p,
 	}
@@ -1642,14 +1649,14 @@ func TestDataplaneSecretReconciler_MissingSecretLeavesProxyNotSynced(t *testing.
 		proxy:            p,
 		proxySynced:      &server.proxySynced,
 		gatewayNamespace: "test-ns",
-		secretName:       "test-gw-gari",
+		secretName:       secretName,
 	}
 
 	ctx := t.Context()
 	req := ctrl.Request{
 		NamespacedName: types.NamespacedName{
 			Namespace: "test-ns",
-			Name:      "test-gw-gari",
+			Name:      secretName,
 		},
 	}
 

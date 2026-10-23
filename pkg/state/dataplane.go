@@ -52,6 +52,15 @@ const (
 
 	// LabelGatewayName is the Gateway API label key for the parent Gateway name.
 	LabelGatewayName = "gateway.networking.k8s.io/gateway-name"
+
+	// DataPlaneHTTPPort is the default container port for HTTP traffic.
+	DataPlaneHTTPPort = 8080
+
+	// DataPlaneHTTPSPort is the default container port for HTTPS/TLS traffic.
+	DataPlaneHTTPSPort = 8443
+
+	// DataPlaneHealthProbePort is the container port for health probes and metrics.
+	DataPlaneHealthProbePort = 8999
 )
 
 // DataplaneConfig represents the serialized proxy configuration for a single Gateway.

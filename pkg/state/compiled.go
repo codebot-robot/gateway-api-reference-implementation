@@ -1310,9 +1310,9 @@ func areProtocolsCompatible(p1, p2 gatewayv1.ProtocolType) bool {
 }
 
 // IsReservedDataPlanePort returns true if the port is reserved inside the data-plane pod:
-// 8080 (HTTP proxy), 8443 (HTTPS/TLS/HTTP3 proxy), 8999 (metrics and health probes).
+// DataPlaneHTTPPort (HTTP proxy), DataPlaneHTTPSPort (HTTPS/TLS/HTTP3 proxy), DataPlaneHealthProbePort (metrics and health probes).
 func IsReservedDataPlanePort(port gatewayv1.PortNumber) bool {
-	return port == 8080 || port == 8443 || port == 8999
+	return port == DataPlaneHTTPPort || port == DataPlaneHTTPSPort || port == DataPlaneHealthProbePort
 }
 
 func markListenerConflicted(el *EffectiveListener, reason gatewayv1.ListenerConditionReason, message string) {
