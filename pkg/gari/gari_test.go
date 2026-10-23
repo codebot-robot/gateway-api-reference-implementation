@@ -269,6 +269,43 @@ func TestForwardedForModeOptions(t *testing.T) {
 	})
 }
 
+func TestOptions_SetupWithManagerCalled(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.Install(scheme)
+
+	called := false
+	opts := DefaultOptions()
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = "default"
+	opts.DataplaneGatewayName = "test-gw"
+	opts.MetricsAddr = "0"
+	opts.HealthProbeBindAddress = "0"
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.Scheme = scheme
+	opts.SetupWithManager = func(mgr ctrl.Manager) error {
+		called = true
+		return nil
+	}
+
+	mgr, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	_, err = NewWithManager(mgr, opts)
+	if err != nil {
+		t.Fatalf("NewWithManager failed: %v", err)
+	}
+	if !called {
+		t.Errorf("expected SetupWithManager to be called, but was not")
+	}
+}
+
 func TestServerCustomHTTPListener(t *testing.T) {
 	// Create an in-memory TCP listener
 	httpLis, err := net.Listen("tcp", "127.0.0.1:0")

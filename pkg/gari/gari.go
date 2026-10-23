@@ -239,6 +239,11 @@ type Options struct {
 	// If the file exists, the readyz probe reports draining (HTTP 503).
 	// Disabled if empty (default).
 	DrainSentinelPath string
+
+	// SetupWithManager is an optional callback called after the controller-runtime Manager
+	// is created, allowing callers to register additional reconcilers or runnables before
+	// the manager starts.
+	SetupWithManager func(mgr ctrl.Manager) error
 }
 
 // ErrDraining indicates that the server is draining connections.
@@ -460,6 +465,12 @@ func New(opts Options) (*Server, error) {
 
 	if err := s.SetupWithManager(mgr); err != nil {
 		return nil, err
+	}
+
+	if s.opts.SetupWithManager != nil {
+		if err := s.opts.SetupWithManager(mgr); err != nil {
+			return nil, fmt.Errorf("custom SetupWithManager failed: %w", err)
+		}
 	}
 
 	return s, nil
