@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -268,9 +269,12 @@ func NewCRDView(ctx context.Context, mapper meta.RESTMapper, scheme *runtime.Sch
 		gatewayMeta := &metav1.PartialObjectMetadata{}
 		gatewayMeta.SetGroupVersionKind(CustomResourceDefinitionGVK)
 		if err := reader.Get(ctx, client.ObjectKey{Name: GatewayCRDName}, gatewayMeta); err != nil {
-			if !meta.IsNoMatchError(err) && client.IgnoreNotFound(err) != nil {
-				setupLog.V(1).Info("unable to get Gateway CRD metadata", "error", err)
+			if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+				return nil, fmt.Errorf("failed to get Gateway CRD metadata: %w", err)
 			}
+			// NotFound or NoMatch: The Gateway CRD object is not present in the reader
+			// (e.g. in minimal unit test environments). Safe to proceed with an empty
+			// bundle version; the informer watch will deliver the CRD if it is created later.
 		} else {
 			bv := gatewayMeta.Annotations[gatewayconsts.BundleVersionAnnotation]
 			v.crds[GatewayCRDName] = crdRecord{

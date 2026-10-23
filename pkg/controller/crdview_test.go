@@ -16,11 +16,13 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -370,6 +372,43 @@ func TestNewCRDView_RequiresMapperAndScheme(t *testing.T) {
 	}
 	if _, err := NewCRDView(ctx, mapper, nil, nil); err == nil {
 		t.Errorf("expected error when scheme is nil, got nil")
+	}
+}
+
+type errorReader struct {
+	client.Reader
+	err error
+}
+
+func (r *errorReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	return r.err
+}
+
+// TestNewCRDView_ReaderGetError verifies that unexpected reader errors fail NewCRDView,
+// while NotFound errors are safely tolerated with an empty bundle version.
+func TestNewCRDView_ReaderGetError(t *testing.T) {
+	ctx := t.Context()
+	scheme := newTestSchemeWithApiextensions()
+	mapper := newTestRESTMapper(allGatewayAPIGVKs()...)
+
+	// Unexpected error (e.g. apiserver failure) must fail NewCRDView
+	errReader := &errorReader{err: fmt.Errorf("connection refused")}
+	if _, err := NewCRDView(ctx, mapper, scheme, errReader); err == nil {
+		t.Errorf("expected error when reader.Get fails unexpectedly, got nil")
+	} else if !strings.Contains(err.Error(), "failed to get Gateway CRD metadata") {
+		t.Errorf("expected error message to mention Gateway CRD metadata, got: %v", err)
+	}
+
+	// NotFound error must succeed with an empty bundle version
+	notFoundReader := &errorReader{
+		err: apierrors.NewNotFound(schema.GroupResource{Resource: "customresourcedefinitions"}, GatewayCRDName),
+	}
+	v, err := NewCRDView(ctx, mapper, scheme, notFoundReader)
+	if err != nil {
+		t.Fatalf("unexpected error on NotFound reader: %v", err)
+	}
+	if v.Snapshot().BundleVersion != "" {
+		t.Errorf("expected empty bundle version on NotFound, got %q", v.Snapshot().BundleVersion)
 	}
 }
 
