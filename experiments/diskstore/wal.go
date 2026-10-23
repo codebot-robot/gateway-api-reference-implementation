@@ -27,6 +27,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -46,6 +49,13 @@ const (
 	WALBlockSize = 4096
 )
 
+type pendingWALBlock struct {
+	file   File
+	offset int64
+	block  []byte
+	maxLSN uint64
+}
+
 // WAL manages appending, syncing, and segment lifecycle of the write-ahead log.
 type WAL struct {
 	fs   FS
@@ -58,21 +68,36 @@ type WAL struct {
 	activeStartLSN uint64
 	activeSize     int64 // Total bytes written/committed to current segment file
 
-	tailBlock   []byte // Aligned 4 KiB buffer for current block
-	tailOffset  int    // Current offset within tailBlock (0..4096)
-	blockOffset int64  // Physical file offset where tailBlock starts
+	tailBlock         []byte // Aligned 4 KiB buffer for current block
+	tailOffset        int    // Current offset within tailBlock (0..4096)
+	blockOffset       int64  // Physical file offset where tailBlock starts
+	tailBlockOpenTime time.Time
 
 	nextLSN         uint64 // Next monotonic LSN to allocate under mu
 	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
 	maxLSN          atomic.Uint64
-	fsyncedLSN      atomic.Uint64
+	fsyncedLSN      atomic.Uint64 // Highest LSN covered by fdatasync
 	maxSegSize      int64
 	createdLSNs     map[uint64]bool // Asserts never reuse/recycle segment file names
+
+	queueCond      *sync.Cond
+	syncCond       *sync.Cond
+	queue          []pendingWALBlock
+	maxQueueBlocks int
+
+	wakeCh        chan struct{}
+	bgStop        chan struct{}
+	bgDone        chan struct{}
+	stickyErr     error
+	onFailure     func(error)
+	closed        bool
+	syncRequested bool
 }
 
 // WALOptions configures a WAL instance.
 type WALOptions struct {
 	MaxSegmentSize int64
+	OnFailure      func(error)
 }
 
 // OpenWAL opens or creates a WAL in the given directory.
@@ -85,8 +110,12 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 	}
 
 	maxSegSize := int64(DefaultMaxSegmentSize)
-	if len(opts) > 0 && opts[0].MaxSegmentSize > 0 {
-		maxSegSize = opts[0].MaxSegmentSize
+	var onFailure func(error)
+	if len(opts) > 0 {
+		if opts[0].MaxSegmentSize > 0 {
+			maxSegSize = opts[0].MaxSegmentSize
+		}
+		onFailure = opts[0].OnFailure
 	}
 
 	w := &WAL{
@@ -95,10 +124,17 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 		dbID:            dbID,
 		maxSegSize:      maxSegSize,
 		createdLSNs:     make(map[uint64]bool),
-		tailBlock:       make([]byte, WALBlockSize),
+		tailBlock:       AllocateAlignedBlock(WALBlockSize),
 		nextLSN:         initialLSN + 1,
 		lastAppendedLSN: initialLSN,
+		maxQueueBlocks:  1024,
+		wakeCh:          make(chan struct{}, 1),
+		bgStop:          make(chan struct{}),
+		bgDone:          make(chan struct{}),
+		onFailure:       onFailure,
 	}
+	w.queueCond = sync.NewCond(&w.mu)
+	w.syncCond = sync.NewCond(&w.mu)
 
 	// Scan existing segments to record used start LSNs
 	segments, err := w.listSegments()
@@ -112,6 +148,8 @@ func OpenWAL(fs FS, dir string, dbID [16]byte, initialLSN uint64, opts ...WALOpt
 
 	w.maxLSN.Store(initialLSN)
 	w.fsyncedLSN.Store(initialLSN)
+
+	go w.bgWriter()
 
 	return w, nil
 }
@@ -161,11 +199,108 @@ func segmentFileName(startLSN uint64) string {
 	return fmt.Sprintf("%020d.wal", startLSN)
 }
 
+func (w *WAL) bgWriter() {
+	defer close(w.bgDone)
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.bgStop:
+			w.mu.Lock()
+			if err := w.flushQueueAndSyncLocked(true); err != nil {
+				klog.V(4).ErrorS(err, "failed to flush queue and sync on bgStop")
+			}
+			w.mu.Unlock()
+			return
+		case <-w.wakeCh:
+			w.mu.Lock()
+			if err := w.flushQueueAndSyncLocked(w.syncRequested); err != nil {
+				klog.V(4).ErrorS(err, "failed to flush queue and sync on wake")
+			}
+			w.mu.Unlock()
+		case <-ticker.C:
+			w.mu.Lock()
+			shouldSync := w.syncRequested || (w.tailOffset > 0 && !w.tailBlockOpenTime.IsZero() && time.Since(w.tailBlockOpenTime) >= 5*time.Second)
+			if len(w.queue) > 0 || shouldSync {
+				if err := w.flushQueueAndSyncLocked(shouldSync); err != nil {
+					klog.V(4).ErrorS(err, "failed to flush queue and sync on ticker")
+				}
+			}
+			w.mu.Unlock()
+		}
+	}
+}
+
+func (w *WAL) setStickyErrLocked(err error) {
+	if w.stickyErr == nil && err != nil {
+		w.stickyErr = err
+		if w.onFailure != nil {
+			w.onFailure(err)
+		}
+		w.syncCond.Broadcast()
+		w.queueCond.Broadcast()
+	}
+}
+
+func (w *WAL) flushQueueAndSyncLocked(doSync bool) error {
+	if w.stickyErr != nil {
+		return w.stickyErr
+	}
+
+	for len(w.queue) > 0 {
+		p := w.queue[0]
+		w.queue = w.queue[1:]
+		w.queueCond.Signal()
+
+		if _, err := p.file.WriteAt(p.block, p.offset); err != nil {
+			w.setStickyErrLocked(fmt.Errorf("failed to write WAL block at offset %d: %w", p.offset, err))
+			return w.stickyErr
+		}
+	}
+
+	if doSync {
+		if w.activeFile != nil {
+			if w.tailOffset > 0 {
+				for i := w.tailOffset; i < WALBlockSize; i++ {
+					w.tailBlock[i] = 0
+				}
+				if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
+					w.setStickyErrLocked(fmt.Errorf("failed to write padded WAL block on sync: %w", err))
+					return w.stickyErr
+				}
+				w.blockOffset += WALBlockSize
+				w.activeSize = w.blockOffset
+				w.tailOffset = 0
+				w.tailBlockOpenTime = time.Time{}
+				w.tailBlock = AllocateAlignedBlock(WALBlockSize)
+			}
+
+			if err := w.activeFile.Sync(); err != nil {
+				w.setStickyErrLocked(fmt.Errorf("failed to fsync WAL segment: %w", err))
+				return w.stickyErr
+			}
+		}
+		w.fsyncedLSN.Store(w.lastAppendedLSN)
+		w.syncRequested = false
+		w.syncCond.Broadcast()
+	}
+	return nil
+}
+
 // createSegmentLocked creates a new immutable WAL segment named by starting LSN.
 // Invariant: Never reuse or recycle a segment file name. Fsync the directory after creation.
 func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	if w.createdLSNs[startLSN] {
 		return fmt.Errorf("invariant violation: segment file name for LSN %d already used", startLSN)
+	}
+
+	// Flush any queued blocks and sync existing active segment before rolling
+	if w.activeFile != nil {
+		if err := w.flushQueueAndSyncLocked(true); err != nil {
+			return err
+		}
 	}
 
 	name := segmentFileName(startLSN)
@@ -174,6 +309,10 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
 	f, err := w.fs.OpenFile(path, openFlags, 0644)
 	if err != nil {
+		if DirectIOOpenFlag() != 0 {
+			klog.Warningf("diskstore: WAL segment %s failed to open with direct I/O: %v, falling back to buffered I/O", name, err)
+			GlobalMetrics.DirectIOFallbackCount.Add(1)
+		}
 		// Fallback without DirectIOOpenFlag if not supported by FS
 		f, err = w.fs.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 		if err != nil {
@@ -204,11 +343,9 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	}
 
 	if w.activeFile != nil {
-		// Existing segment becomes finished & immutable; close it
-		syncErr := w.activeFile.Sync()
 		closeErr := w.activeFile.Close()
-		if err := errors.Join(syncErr, closeErr); err != nil {
-			return fmt.Errorf("failed to sync and close active segment: %w", err)
+		if closeErr != nil {
+			return fmt.Errorf("failed to close superseded active segment: %w", closeErr)
 		}
 	}
 
@@ -244,11 +381,29 @@ func (w *WAL) FsyncedLSN() uint64 {
 	return w.fsyncedLSN.Load()
 }
 
+// DurableLSN returns the maximum LSN confirmed durable by fdatasync.
+func (w *WAL) DurableLSN() uint64 {
+	return w.fsyncedLSN.Load()
+}
+
 // Append appends a record to the WAL.
 // No fsync is performed on commit.
 func (w *WAL) Append(r Record) error {
+	_, err := w.AppendRecord(&r)
+	return err
+}
+
+// AppendRecord appends a record to the WAL, assigning LSN under WAL lock if LSN == 0.
+func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.stickyErr != nil {
+		return 0, w.stickyErr
+	}
+	if w.closed {
+		return 0, errors.New("wal is closed")
+	}
 
 	if r.LSN == 0 {
 		r.LSN = w.nextLSN
@@ -256,17 +411,31 @@ func (w *WAL) Append(r Record) error {
 	} else if r.LSN >= w.nextLSN {
 		w.nextLSN = r.LSN + 1
 	}
+	if r.LSN > w.maxLSN.Load() {
+		w.maxLSN.Store(r.LSN)
+	}
 
-	encoded := EncodeRecord(r)
+	encoded := EncodeRecord(*r)
+
+	// Block if queue is full (bounded buffer)
+	for len(w.queue) >= w.maxQueueBlocks {
+		if w.stickyErr != nil {
+			return 0, w.stickyErr
+		}
+		w.queueCond.Wait()
+	}
 
 	// If no active file or file exceeds max size, roll to a new segment
 	if w.activeFile == nil || w.blockOffset+int64(w.tailOffset)+int64(len(encoded)) > w.maxSegSize {
 		if err := w.createSegmentLocked(r.LSN); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
-	// Write record into 4 KiB aligned tail buffer and flush full blocks
+	if w.tailOffset == 0 && w.tailBlockOpenTime.IsZero() {
+		w.tailBlockOpenTime = time.Now()
+	}
+
 	written := 0
 	for written < len(encoded) {
 		space := WALBlockSize - w.tailOffset
@@ -279,76 +448,74 @@ func (w *WAL) Append(r Record) error {
 		written += toCopy
 
 		if w.tailOffset == WALBlockSize {
-			// Flush full 4 KiB block to disk
-			if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
-				return fmt.Errorf("failed to write WAL block: %w", err)
-			}
+			// Enqueue full 4 KiB block for background direct I/O writing
+			w.queue = append(w.queue, pendingWALBlock{
+				file:   w.activeFile,
+				offset: w.blockOffset,
+				block:  w.tailBlock,
+				maxLSN: r.LSN,
+			})
 			w.blockOffset += WALBlockSize
 			w.activeSize = w.blockOffset
 			w.tailOffset = 0
-			clearBytes(w.tailBlock)
+			w.tailBlockOpenTime = time.Time{}
+			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
+
+			select {
+			case w.wakeCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 
-	// Also write the dirty partial tail block to disk so direct reads / process restarts see it
-	if w.tailOffset > 0 {
-		if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
-			return fmt.Errorf("failed to write partial WAL block: %w", err)
-		}
-		w.activeSize = w.blockOffset + int64(w.tailOffset)
+	if w.tailOffset > 0 && w.tailBlockOpenTime.IsZero() {
+		w.tailBlockOpenTime = time.Now()
 	}
 
 	w.lastAppendedLSN = r.LSN
-	if r.LSN > w.maxLSN.Load() {
-		w.maxLSN.Store(r.LSN)
-	}
-	return nil
+	return r.LSN, nil
 }
 
 // Sync flushes and fsyncs the active WAL file.
-// Invariant: Never rewrite an fsynced block. After fsyncing, pad the tail block and advance
-// so that subsequent appends begin on a fresh block.
 func (w *WAL) Sync() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.activeFile == nil {
-		return nil
-	}
-
-	toSyncLSN := w.lastAppendedLSN
-
-	if w.tailOffset > 0 {
-		// Zero-pad the remainder of the block
-		for i := w.tailOffset; i < WALBlockSize; i++ {
-			w.tailBlock[i] = 0
-		}
-		// Write the padded block to disk
-		if _, err := w.activeFile.WriteAt(w.tailBlock, w.blockOffset); err != nil {
-			return fmt.Errorf("failed to write padded WAL block on sync: %w", err)
-		}
-		// Advance blockOffset so this fsynced block is NEVER rewritten!
-		w.blockOffset += WALBlockSize
-		w.activeSize = w.blockOffset
-		w.tailOffset = 0
-		clearBytes(w.tailBlock)
-	}
-
-	if err := w.activeFile.Sync(); err != nil {
-		return err
-	}
-
-	w.fsyncedLSN.Store(toSyncLSN)
-	return nil
+	targetLSN := w.lastAppendedLSN
+	w.mu.Unlock()
+	return w.SyncThrough(targetLSN)
 }
 
 // SyncThrough ensures that the WAL is fsynced at least through the given LSN.
 // This fulfills the write-ahead rule: before writing any page with LSN L, the log must be fsynced through L.
 func (w *WAL) SyncThrough(lsn uint64) error {
-	if w.fsyncedLSN.Load() >= lsn {
-		return nil
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for {
+		if w.stickyErr != nil {
+			return w.stickyErr
+		}
+		if w.fsyncedLSN.Load() >= lsn {
+			return nil
+		}
+		if w.fsyncedLSN.Load() >= w.lastAppendedLSN {
+			// All appended WAL records are already fsynced
+			return nil
+		}
+		w.syncRequested = true
+		select {
+		case w.wakeCh <- struct{}{}:
+		default:
+		}
+		w.syncCond.Wait()
 	}
-	return w.Sync()
+}
+
+// Flush flushes all buffered records and fsyncs the WAL.
+func (w *WAL) Flush() error {
+	w.mu.Lock()
+	targetLSN := w.lastAppendedLSN
+	w.mu.Unlock()
+	return w.SyncThrough(targetLSN)
 }
 
 // TruncateBefore removes whole completed segment files whose records are all strictly prior to oldestNeededLSN.
@@ -384,25 +551,32 @@ func (w *WAL) TruncateBefore(oldestNeededLSN uint64) error {
 // Close closes the WAL and flushes remaining writes.
 func (w *WAL) Close() error {
 	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
+	w.closed = true
+	close(w.bgStop)
+	w.mu.Unlock()
+
+	<-w.bgDone
+
+	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	var errs []error
 	if w.activeFile != nil {
-		var writeErr error
-		if w.tailOffset > 0 {
-			for i := w.tailOffset; i < WALBlockSize; i++ {
-				w.tailBlock[i] = 0
-			}
-			_, writeErr = w.activeFile.WriteAt(w.tailBlock, w.blockOffset)
-			w.blockOffset += WALBlockSize
-			w.activeSize = w.blockOffset
-			w.tailOffset = 0
-		}
 		syncErr := w.activeFile.Sync()
 		closeErr := w.activeFile.Close()
 		w.activeFile = nil
-		return errors.Join(writeErr, syncErr, closeErr)
+		if syncErr != nil || closeErr != nil {
+			errs = append(errs, errors.Join(syncErr, closeErr))
+		}
 	}
-	return nil
+	if w.stickyErr != nil {
+		errs = append(errs, w.stickyErr)
+	}
+	return errors.Join(errs...)
 }
 
 // WALIterator replays records across segment files starting from a given LSN.

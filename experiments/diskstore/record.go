@@ -40,6 +40,7 @@ const (
 	RecordTypePut        RecordType = 1
 	RecordTypeDelete     RecordType = 2
 	RecordTypeCheckpoint RecordType = 3
+	RecordTypeBookmark   RecordType = 4
 )
 
 const (
