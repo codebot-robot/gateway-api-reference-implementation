@@ -237,9 +237,12 @@ type Options struct {
 
 	// DrainSentinelPath is the file path checked for connection draining.
 	// If the file exists, the readyz probe reports draining (HTTP 503).
-	// Defaults to "/var/run/gcpgateway/draining".
+	// Disabled if empty (default).
 	DrainSentinelPath string
 }
+
+// ErrDraining indicates that the server is draining connections.
+var ErrDraining = errors.New("draining")
 
 // DefaultOptions returns standard default options for GARI.
 func DefaultOptions() Options {
@@ -257,7 +260,7 @@ func DefaultOptions() Options {
 		TCPIdleTimeout:         proxy.DefaultTCPIdleTimeout,
 		TCPMaxConnections:      proxy.DefaultTCPMaxConnections,
 		ForwardedForMode:       proxy.ForwardedForModeAppend,
-		DrainSentinelPath:      "/var/run/gcpgateway/draining",
+		DrainSentinelPath:      "",
 	}
 }
 
@@ -486,16 +489,14 @@ func samePortOrAddr(addr1, addr2 string) bool {
 
 func (s *Server) readyzChecker() healthz.Checker {
 	return func(req *http.Request) error {
-		sentinel := s.opts.DrainSentinelPath
-		if sentinel == "" {
-			sentinel = "/var/run/gcpgateway/draining"
-		}
-		if _, err := os.Stat(sentinel); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("checking drain sentinel: %w", err)
+		if s.opts.DrainSentinelPath != "" {
+			if _, err := os.Stat(s.opts.DrainSentinelPath); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("checking drain sentinel: %w", err)
+				}
+			} else {
+				return ErrDraining
 			}
-		} else {
-			return errors.New("draining")
 		}
 		if !s.proxySynced.Load() {
 			return errors.New("proxy configuration not yet applied")
@@ -507,8 +508,8 @@ func (s *Server) readyzChecker() healthz.Checker {
 func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Handler) {
 	rHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if err := s.readyzChecker()(req); err != nil {
-			if err.Error() == "draining" {
-				http.Error(w, "draining", http.StatusServiceUnavailable)
+			if errors.Is(err, ErrDraining) {
+				http.Error(w, ErrDraining.Error(), http.StatusServiceUnavailable)
 				return
 			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -609,9 +610,7 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			ProxyProtocol:             dpCfg.ProxyProtocol,
 			ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
 		}
-		if len(opts.AllowedSourceCIDRs) > 0 || opts.ProxyProtocol != "" || len(opts.ProxyProtocolTrustedCIDRs) > 0 {
-			r.onConfigUpdate(opts)
-		}
+		r.onConfigUpdate(opts)
 	}
 
 	return ctrl.Result{}, nil

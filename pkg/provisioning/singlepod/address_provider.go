@@ -125,19 +125,17 @@ func WithAPIReader(reader client.Reader) Option {
 
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 type AddressProvider struct {
-	client              client.Client
-	apiReader           client.Reader
-	dataplaneImage      string
-	enableH2C           bool
-	forwardedForMode    string
-	state               *state.State
-	extraReadinessGates []string
-	preStopCommand      []string
-	extraVolumes        []*corev1ac.VolumeApplyConfiguration
-	extraVolumeMounts   []*corev1ac.VolumeMountApplyConfiguration
-	allowedSourceCIDRs  []string
-	proxyProtocol       string
-	trustedCIDRs        []string
+	client                        client.Client
+	apiReader                     client.Reader
+	dataplaneImage                string
+	enableH2C                     bool
+	forwardedForMode              string
+	state                         *state.State
+	extraReadinessGates           []string
+	preStopCommand                []string
+	extraVolumes                  []*corev1ac.VolumeApplyConfiguration
+	extraVolumeMounts             []*corev1ac.VolumeMountApplyConfiguration
+	terminationGracePeriodSeconds *int64
 }
 
 // WithExtraReadinessGates configures additional readiness gate condition types for the data-plane pods.
@@ -162,12 +160,10 @@ func WithExtraVolumes(volumes []*corev1ac.VolumeApplyConfiguration, mounts []*co
 	}
 }
 
-// WithDefaultListenerOptions sets default listener options when not overridden by Gateway parameters.
-func WithDefaultListenerOptions(allowedSourceCIDRs []string, proxyProtocol string, trustedCIDRs []string) Option {
+// WithTerminationGracePeriodSeconds configures the terminationGracePeriodSeconds on the data-plane pod template.
+func WithTerminationGracePeriodSeconds(seconds int64) Option {
 	return func(p *AddressProvider) {
-		p.allowedSourceCIDRs = allowedSourceCIDRs
-		p.proxyProtocol = proxyProtocol
-		p.trustedCIDRs = trustedCIDRs
+		p.terminationGracePeriodSeconds = &seconds
 	}
 }
 
@@ -439,30 +435,6 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		args = append(args, fmt.Sprintf("--forwarded-for-mode=%s", p.forwardedForMode))
 	}
 
-	allowedCIDRs := p.allowedSourceCIDRs
-	proxyProto := p.proxyProtocol
-	trustedCIDRs := p.trustedCIDRs
-	if params != nil {
-		if len(params.AllowedSourceCIDRs) > 0 {
-			allowedCIDRs = params.AllowedSourceCIDRs
-		}
-		if params.ProxyProtocol != "" {
-			proxyProto = params.ProxyProtocol
-		}
-		if len(params.ProxyProtocolTrustedCIDRs) > 0 {
-			trustedCIDRs = params.ProxyProtocolTrustedCIDRs
-		}
-	}
-	if len(allowedCIDRs) > 0 {
-		args = append(args, fmt.Sprintf("--allowed-source-cidrs=%s", strings.Join(allowedCIDRs, ",")))
-	}
-	if proxyProto != "" {
-		args = append(args, fmt.Sprintf("--proxy-protocol=%s", proxyProto))
-	}
-	if len(trustedCIDRs) > 0 {
-		args = append(args, fmt.Sprintf("--proxy-protocol-trusted-cidrs=%s", strings.Join(trustedCIDRs, ",")))
-	}
-
 	image := p.dataplaneImage
 	if image == "" {
 		image = DefaultDataplaneImage
@@ -600,6 +572,9 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	podSpec := corev1ac.PodSpec().
 		WithServiceAccountName(name).
 		WithContainers(containerApply)
+	if p.terminationGracePeriodSeconds != nil {
+		podSpec.WithTerminationGracePeriodSeconds(*p.terminationGracePeriodSeconds)
+	}
 	if len(p.extraVolumes) > 0 {
 		podSpec.WithVolumes(p.extraVolumes...)
 	}

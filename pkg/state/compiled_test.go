@@ -6116,3 +6116,79 @@ func TestGatewayClassStatus_SupportedVersion(t *testing.T) {
 		}
 	})
 }
+
+func TestGateway_AllInOneMode_RejectsListenerParameters(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "gw-params",
+		},
+		Data: map[string]string{
+			"allowedSourceCIDRs": "35.191.0.0/16",
+			"proxyProtocol":      "enabled",
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "reference-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "gw-params",
+				},
+			},
+		},
+	}
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "reference-class"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+
+	// 1. In all-in-one mode: must reject with Accepted=False, Reason=InvalidParameters
+	inputsAllInOne := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ConfigMaps:     map[types.NamespacedName]*corev1.ConfigMap{{Namespace: "default", Name: "gw-params"}: cm},
+		ControllerName: "test-controller",
+		AllInOneMode:   true,
+	}
+
+	outputsAllInOne := ComputeOutputs(inputsAllInOne)
+	gwStatusAllInOne := outputsAllInOne.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: "my-gw"}]
+	accCond := FindCondition(gwStatusAllInOne.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if accCond == nil || accCond.Status != metav1.ConditionFalse || accCond.Reason != string(gatewayv1.GatewayReasonInvalidParameters) {
+		t.Errorf("in all-in-one mode, expected Accepted=False with InvalidParameters, got %+v", accCond)
+	}
+
+	// 2. In singlepod mode (AllInOneMode: false): must accept
+	inputsSinglepod := ModelInputs{
+		Gateways:       []*gatewayv1.Gateway{gw},
+		GatewayClasses: []*gatewayv1.GatewayClass{gc},
+		ConfigMaps:     map[types.NamespacedName]*corev1.ConfigMap{{Namespace: "default", Name: "gw-params"}: cm},
+		ControllerName: "test-controller",
+		AllInOneMode:   false,
+	}
+
+	outputsSinglepod := ComputeOutputs(inputsSinglepod)
+	gwStatusSinglepod := outputsSinglepod.GatewayStatuses[types.NamespacedName{Namespace: "default", Name: "my-gw"}]
+	accCondSinglepod := FindCondition(gwStatusSinglepod.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if accCondSinglepod == nil || accCondSinglepod.Status != metav1.ConditionTrue {
+		t.Errorf("in singlepod mode, expected Accepted=True, got %+v", accCondSinglepod)
+	}
+}

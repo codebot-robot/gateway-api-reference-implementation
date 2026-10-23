@@ -23,7 +23,28 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/klog/v2"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
+
+var (
+	// RejectedConnectionsTotal tracks the total number of connections rejected by the listener.
+	RejectedConnectionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gari_rejected_connections_total",
+			Help: "Total number of connections rejected by the listener filter.",
+		},
+		[]string{"reason"},
+	)
+)
+
+func init() {
+	if err := crmetrics.Registry.Register(RejectedConnectionsTotal); err != nil {
+		klog.V(4).Infof("registering RejectedConnectionsTotal metric: %v", err)
+	}
+}
 
 // ListenerOptions configures source filtering and PROXY protocol parsing on a Listener.
 type ListenerOptions struct {
@@ -95,7 +116,8 @@ func closeConn(c io.Closer) {
 
 // Accept waits for and returns the next connection to the listener.
 // Connections from sources outside AllowedSourceCIDRs are closed immediately before TLS.
-// For sources within ProxyProtocolTrustedCIDRs, the PROXY header is decoded and stripped.
+// For sources within ProxyProtocolTrustedCIDRs, a connection is returned immediately
+// that parses the PROXY header lazily in its own goroutine on first Read or RemoteAddr.
 func (l *Listener) Accept() (net.Conn, error) {
 	for {
 		conn, err := l.Listener.Accept()
@@ -114,53 +136,160 @@ func (l *Listener) Accept() (net.Conn, error) {
 		// 1. Check allowedSourceCIDRs: close connection immediately if not allowed.
 		if len(allowed) > 0 {
 			if !matchIP(remoteIP, allowed) {
+				RejectedConnectionsTotal.WithLabelValues("disallowed_source").Inc()
+				klog.V(3).Infof("proxyproto: rejecting connection from %v: source IP not in allowedSourceCIDRs", conn.RemoteAddr())
 				closeConn(conn)
 				continue
 			}
 		}
 
-		// 2. Check proxyProtocolTrustedCIDRs: parse PROXY header only if trusted.
+		// 2. Check proxyProtocolTrustedCIDRs: parse PROXY header lazily in the connection's goroutine.
 		if proxyEnabled && len(trusted) > 0 && matchIP(remoteIP, trusted) {
-			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-				closeConn(conn)
-				continue
-			}
-			bufReader := bufio.NewReader(conn)
-			hdr, err := Decode(bufReader)
-			if err != nil {
-				closeConn(conn)
-				continue
-			}
-			if err := conn.SetReadDeadline(time.Time{}); err != nil {
-				closeConn(conn)
-				continue
-			}
-
-			var remaining []byte
-			if bufReader.Buffered() > 0 {
-				remaining = make([]byte, bufReader.Buffered())
-				if _, err := io.ReadFull(bufReader, remaining); err != nil {
-					closeConn(conn)
-					continue
-				}
-			}
-
-			var remoteAddr net.Addr = conn.RemoteAddr()
-			if hdr.Command == CommandProxy && hdr.SrcAddr != nil {
-				remoteAddr = hdr.SrcAddr
-			}
-			var localAddr net.Addr = conn.LocalAddr()
-			if hdr.DstAddr != nil {
-				localAddr = hdr.DstAddr
-			}
-
-			return NewConn(conn, remoteAddr, localAddr, remaining), nil
+			return newLazyConn(conn, 5*time.Second), nil
 		}
 
 		// Remote IP is not in trusted CIDRs or proxy protocol is disabled:
 		// Do not parse PROXY header, preserve real RemoteAddr.
 		return conn, nil
 	}
+}
+
+// lazyConn parses the PROXY protocol header on first Read or RemoteAddr call.
+type lazyConn struct {
+	net.Conn
+	timeout    time.Duration
+	once       sync.Once
+	header     *Header
+	headerErr  error
+	buffered   []byte
+	bufOffset  int
+	remoteAddr net.Addr
+	localAddr  net.Addr
+}
+
+func newLazyConn(conn net.Conn, timeout time.Duration) *lazyConn {
+	return &lazyConn{
+		Conn:    conn,
+		timeout: timeout,
+	}
+}
+
+func (c *lazyConn) parseHeader() {
+	if c.timeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+			c.headerErr = err
+			RejectedConnectionsTotal.WithLabelValues("bad_proxy_header").Inc()
+			klog.V(3).Infof("proxyproto: rejecting connection from %v: set deadline error: %v", c.Conn.RemoteAddr(), err)
+			closeConn(c.Conn)
+			return
+		}
+	}
+
+	bufReader := bufio.NewReader(c.Conn)
+	hdr, err := Decode(bufReader)
+	if c.timeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Time{}); err != nil {
+			c.headerErr = err
+			RejectedConnectionsTotal.WithLabelValues("bad_proxy_header").Inc()
+			klog.V(3).Infof("proxyproto: rejecting connection from %v: clear deadline error: %v", c.Conn.RemoteAddr(), err)
+			closeConn(c.Conn)
+			return
+		}
+	}
+
+	if err != nil {
+		c.headerErr = err
+		RejectedConnectionsTotal.WithLabelValues("bad_proxy_header").Inc()
+		klog.V(3).Infof("proxyproto: rejecting connection from %v: failed to decode PROXY header: %v", c.Conn.RemoteAddr(), err)
+		closeConn(c.Conn)
+		return
+	}
+
+	c.header = hdr
+	if bufReader.Buffered() > 0 {
+		c.buffered = make([]byte, bufReader.Buffered())
+		if _, err := io.ReadFull(bufReader, c.buffered); err != nil {
+			c.headerErr = err
+			RejectedConnectionsTotal.WithLabelValues("bad_proxy_header").Inc()
+			klog.V(3).Infof("proxyproto: rejecting connection from %v: failed to read buffered bytes: %v", c.Conn.RemoteAddr(), err)
+			closeConn(c.Conn)
+			return
+		}
+	}
+
+	if hdr.Command == CommandProxy && hdr.SrcAddr != nil {
+		c.remoteAddr = hdr.SrcAddr
+	} else {
+		c.remoteAddr = c.Conn.RemoteAddr()
+	}
+
+	if hdr.DstAddr != nil {
+		c.localAddr = hdr.DstAddr
+	} else {
+		c.localAddr = c.Conn.LocalAddr()
+	}
+}
+
+func (c *lazyConn) RemoteAddr() net.Addr {
+	c.once.Do(c.parseHeader)
+	if c.remoteAddr != nil {
+		return c.remoteAddr
+	}
+	return c.Conn.RemoteAddr()
+}
+
+func (c *lazyConn) LocalAddr() net.Addr {
+	c.once.Do(c.parseHeader)
+	if c.localAddr != nil {
+		return c.localAddr
+	}
+	return c.Conn.LocalAddr()
+}
+
+func (c *lazyConn) Read(b []byte) (int, error) {
+	c.once.Do(c.parseHeader)
+	if c.headerErr != nil {
+		return 0, c.headerErr
+	}
+	if len(c.buffered) > 0 {
+		n := copy(b, c.buffered[c.bufOffset:])
+		c.bufOffset += n
+		if c.bufOffset >= len(c.buffered) {
+			c.buffered = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *lazyConn) WriteTo(w io.Writer) (int64, error) {
+	c.once.Do(c.parseHeader)
+	if c.headerErr != nil {
+		return 0, c.headerErr
+	}
+	var n int64
+	if c.buffered != nil {
+		rem := c.buffered[c.bufOffset:]
+		c.buffered = nil
+		nw, err := w.Write(rem)
+		n += int64(nw)
+		if err != nil {
+			return n, err
+		}
+	}
+	if wt, ok := c.Conn.(io.WriterTo); ok {
+		nw, err := wt.WriteTo(w)
+		return n + nw, err
+	}
+	nw, err := io.Copy(w, c.Conn)
+	return n + nw, err
+}
+
+func (c *lazyConn) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.Conn.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(c.Conn, r)
 }
 
 // ParseCIDRs parses a list of CIDR strings into []*net.IPNet.

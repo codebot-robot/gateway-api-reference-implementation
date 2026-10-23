@@ -1612,12 +1612,18 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				gwParams = p
 			}
 		}
-		cg.ParametersRefError = paramsErr
 		if paramsErr == nil {
-			cg.Parameters = MergeParameters(gcParams, gwParams)
+			mergedParams := MergeParameters(gcParams, gwParams)
+			if inputs.AllInOneMode && (len(mergedParams.AllowedSourceCIDRs) > 0 || mergedParams.ProxyProtocol != "" || len(mergedParams.ProxyProtocolTrustedCIDRs) > 0) {
+				paramsErr = fmt.Errorf("per-Gateway listener parameters (allowedSourceCIDRs, proxyProtocol) are not supported in all-in-one mode")
+				cg.Parameters = nil
+			} else {
+				cg.Parameters = mergedParams
+			}
 		} else {
 			cg.Parameters = nil
 		}
+		cg.ParametersRefError = paramsErr
 
 		clientCert, resolvedRefsCond := resolveGatewayBackendClientCert(gw, inputs.Secrets, refValidator)
 		cg.BackendClientCert = clientCert

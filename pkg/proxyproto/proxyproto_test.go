@@ -505,3 +505,134 @@ func TestListener_UntrustedSource_PROXYNotHonoured(t *testing.T) {
 		t.Errorf("untrusted PROXY header should not produce HTTP 200 OK")
 	}
 }
+
+func TestListener_IdleTrustedConnectionDoesNotDelayAccept(t *testing.T) {
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer rawLis.Close()
+
+	filterLis, err := NewListener(rawLis, ListenerOptions{
+		AllowedSourceCIDRs:        []string{"127.0.0.0/8"},
+		ProxyProtocolTrustedCIDRs: []string{"127.0.0.0/8"},
+		ProxyProtocol:             "enabled",
+	})
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+	defer filterLis.Close()
+
+	// Connect Client 1 and send NO bytes (idle connection)
+	client1, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("client1 dial failed: %v", err)
+	}
+	defer client1.Close()
+
+	// Accept Client 1 immediately
+	startAccept1 := time.Now()
+	conn1, err := filterLis.Accept()
+	if err != nil {
+		t.Fatalf("Accept client1 failed: %v", err)
+	}
+	defer conn1.Close()
+	if dur := time.Since(startAccept1); dur > 500*time.Millisecond {
+		t.Errorf("Accept client1 was delayed: %v", dur)
+	}
+
+	// Connect Client 2 while Client 1 is still completely idle
+	client2, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("client2 dial failed: %v", err)
+	}
+	defer client2.Close()
+
+	// Accept Client 2 must return immediately without waiting for Client 1's header!
+	startAccept2 := time.Now()
+	conn2, err := filterLis.Accept()
+	if err != nil {
+		t.Fatalf("Accept client2 failed: %v", err)
+	}
+	defer conn2.Close()
+	if dur := time.Since(startAccept2); dur > 500*time.Millisecond {
+		t.Errorf("Accept client2 was delayed by idle client1: %v", dur)
+	}
+
+	// Client 2 sends PROXY header and payload
+	go func() {
+		_, _ = client2.Write([]byte("PROXY TCP4 203.0.113.1 127.0.0.1 12345 80\r\nhello"))
+	}()
+
+	buf := make([]byte, 5)
+	n, err := conn2.Read(buf)
+	if err != nil || string(buf[:n]) != "hello" {
+		t.Errorf("expected 'hello' from conn2, got %q, err=%v", string(buf[:n]), err)
+	}
+	if !strings.HasPrefix(conn2.RemoteAddr().String(), "203.0.113.1:12345") {
+		t.Errorf("expected RemoteAddr 203.0.113.1:12345, got %v", conn2.RemoteAddr())
+	}
+}
+
+func TestListener_UpdateOptionsClearing(t *testing.T) {
+	rawLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer rawLis.Close()
+
+	// Initially only allow 10.0.0.0/8 (127.0.0.1 is rejected)
+	filterLis, err := NewListener(rawLis, ListenerOptions{
+		AllowedSourceCIDRs: []string{"10.0.0.0/8"},
+	})
+	if err != nil {
+		t.Fatalf("NewListener failed: %v", err)
+	}
+	defer filterLis.Close()
+
+	serverAccepted := make(chan net.Conn, 1)
+	go func() {
+		for {
+			c, err := filterLis.Accept()
+			if err != nil {
+				return
+			}
+			serverAccepted <- c
+		}
+	}()
+
+	// Dial from 127.0.0.1: should be closed immediately by Accept() loop
+	client1, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer client1.Close()
+
+	buf := make([]byte, 10)
+	n, readErr := client1.Read(buf)
+	if n != 0 || readErr != io.EOF {
+		t.Errorf("expected EOF for disallowed source, got n=%d, err=%v", n, readErr)
+	}
+
+	// Clear allowedSourceCIDRs by updating with empty list
+	if err := filterLis.UpdateOptions(ListenerOptions{}); err != nil {
+		t.Fatalf("UpdateOptions clearing failed: %v", err)
+	}
+
+	// Dial from 127.0.0.1 again: now it should be accepted!
+	client2, err := net.Dial("tcp", rawLis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial after clear failed: %v", err)
+	}
+	defer client2.Close()
+
+	select {
+	case sConn := <-serverAccepted:
+		if sConn == nil {
+			t.Fatalf("expected accepted connection after clearing allowlist, got nil")
+		}
+		sConn.Close()
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for accept after clearing allowlist")
+	}
+}

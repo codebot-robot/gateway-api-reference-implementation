@@ -3675,7 +3675,7 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 		WithExtraReadinessGates("gcpgateway.gke-labs.io/load-balancer-ready"),
 		WithPreStopCommand("/gcpgateway", "hook", "pre-stop", "--drain-seconds=35"),
 		WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{volApply}, []*corev1ac.VolumeMountApplyConfiguration{mountApply}),
-		WithDefaultListenerOptions([]string{"35.191.0.0/16"}, "enabled", []string{"35.191.0.0/16"}),
+		WithTerminationGracePeriodSeconds(60),
 	)
 
 	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, nil)
@@ -3690,6 +3690,11 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 	}
 
 	podSpec := deploy.Spec.Template.Spec
+
+	// Check terminationGracePeriodSeconds
+	if podSpec.TerminationGracePeriodSeconds == nil || *podSpec.TerminationGracePeriodSeconds != 60 {
+		t.Errorf("expected TerminationGracePeriodSeconds=60, got %v", podSpec.TerminationGracePeriodSeconds)
+	}
 
 	// Check readiness gate
 	foundGate := false
@@ -3727,13 +3732,10 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 
 	// Check args
 	argsStr := strings.Join(container.Args, " ")
-	if !strings.Contains(argsStr, "--allowed-source-cidrs=35.191.0.0/16") {
-		t.Errorf("expected --allowed-source-cidrs in args: %s", argsStr)
+	if !strings.Contains(argsStr, "--dataplane-mode") {
+		t.Errorf("expected --dataplane-mode in args: %s", argsStr)
 	}
-	if !strings.Contains(argsStr, "--proxy-protocol=enabled") {
-		t.Errorf("expected --proxy-protocol in args: %s", argsStr)
-	}
-	if !strings.Contains(argsStr, "--proxy-protocol-trusted-cidrs=35.191.0.0/16") {
-		t.Errorf("expected --proxy-protocol-trusted-cidrs in args: %s", argsStr)
+	if !strings.Contains(argsStr, "--gateway-name=my-gw") {
+		t.Errorf("expected --gateway-name in args: %s", argsStr)
 	}
 }
