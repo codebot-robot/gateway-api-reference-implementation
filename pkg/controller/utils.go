@@ -62,24 +62,6 @@ type ReconcilerOptions struct {
 	CRDView              *CRDView
 }
 
-// CheckGatewayAPICRDs inspects the cluster's served API resources using the RESTMapper.
-// It verifies that all required Gateway API CRDs (GatewayClass, Gateway, HTTPRoute) are served,
-// and returns the set of served GroupKinds and the names of any disabled optional kinds.
-func CheckGatewayAPICRDs(mapper meta.RESTMapper, scheme *runtime.Scheme) (map[schema.GroupKind]bool, []string, error) {
-	if mapper == nil {
-		return nil, nil, fmt.Errorf("RESTMapper is required")
-	}
-	if scheme == nil {
-		return nil, nil, fmt.Errorf("scheme is required")
-	}
-
-	snapshot, err := snapshotFromRESTMapper(mapper, scheme)
-	if err != nil {
-		return nil, nil, err
-	}
-	return snapshot.ServedKinds, snapshot.DisabledKinds, nil
-}
-
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
 func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts ReconcilerOptions) error {
 	controllerName := opts.ControllerName
@@ -89,21 +71,19 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 
 	crdView := opts.CRDView
 	if crdView == nil {
+		var mapper meta.RESTMapper
+		var scheme *runtime.Scheme
 		var reader client.Reader
 		if mgr != nil {
+			mapper = mgr.GetRESTMapper()
+			scheme = mgr.GetScheme()
 			reader = mgr.GetAPIReader()
 			if reader == nil {
 				reader = mgr.GetClient()
 			}
 		}
-		var mapper meta.RESTMapper
-		var scheme *runtime.Scheme
-		if mgr != nil {
-			mapper = mgr.GetRESTMapper()
-			scheme = mgr.GetScheme()
-		}
 		var err error
-		crdView, err = NewCRDView(context.Background(), reader, WithRESTMapper(mapper, scheme))
+		crdView, err = NewCRDView(context.Background(), mapper, scheme, reader)
 		if err != nil {
 			return err
 		}
@@ -113,8 +93,8 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 	if err := snapshot.ValidateRequired(); err != nil {
 		return err
 	}
-	servedKinds := snapshot.ServedKinds
-	disabledKinds := snapshot.DisabledKinds
+	servedKinds := snapshot.ServedGroupKinds()
+	disabledKinds := snapshot.DisabledKinds()
 	if len(disabledKinds) > 0 {
 		sort.Strings(disabledKinds)
 		setupLog.Info("optional Gateway API CRDs disabled (not served by cluster)", "kinds", disabledKinds)
@@ -134,9 +114,17 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 	if st != nil {
 		st.SetDisabledRouteKinds(disabledRouteKinds)
 		st.SetControllerName(controllerName)
-		st.SetGatewayCRDBundleVersion(snapshot.BundleVersion)
-		crdView.OnBundleVersionChanged(func(newVersion *string) {
-			st.SetGatewayCRDBundleVersion(newVersion)
+		var bvPtr *string
+		if snapshot.BundleVersion != "" {
+			bvPtr = &snapshot.BundleVersion
+		}
+		st.SetGatewayCRDBundleVersion(bvPtr)
+		crdView.SetOnBundleVersionChanged(func(newVersion string) {
+			var newBVPtr *string
+			if newVersion != "" {
+				newBVPtr = &newVersion
+			}
+			st.SetGatewayCRDBundleVersion(newBVPtr)
 		})
 		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
 		st.SetGatewayFilter(opts.GatewayFilter)

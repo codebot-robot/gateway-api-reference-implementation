@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,8 +39,8 @@ import (
 func makeTestCRD(name string, bundleVersion string) *metav1.PartialObjectMetadata {
 	m := &metav1.PartialObjectMetadata{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: crdGVK.GroupVersion().String(),
-			Kind:       crdGVK.Kind,
+			APIVersion: CustomResourceDefinitionGVK.GroupVersion().String(),
+			Kind:       CustomResourceDefinitionGVK.Kind,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -71,60 +72,99 @@ func newTestSchemeWithApiextensions() *runtime.Scheme {
 	return s
 }
 
-// Acceptance criteria: installing an optional CRD after startup triggers the restart path
-func TestCRDView_InstallingOptionalCRDTriggersRestart(t *testing.T) {
-	var ctx context.Context = t.Context()
+// TestSnapshotFromRESTMapper_CRDExistsWithDifferentVersion tests that when a CRD exists
+// on the cluster but only serves a different version than GARI uses (e.g. TLSRoute at v1alpha2
+// instead of v1), it is correctly identified as not served.
+func TestSnapshotFromRESTMapper_CRDExistsWithDifferentVersion(t *testing.T) {
 	scheme := newTestSchemeWithApiextensions()
 
-	// Initial startup with only required CRDs (optional kinds absent)
-	initCRDs := requiredGatewayAPICRDs("v1.6.3")
-	var initObjs []runtime.Object
-	for _, c := range initCRDs {
-		initObjs = append(initObjs, c)
-	}
+	// Cluster serves required CRDs at v1, but TLSRoute only at v1alpha2
+	mapper := newTestRESTMapper(
+		gwV1.WithKind("GatewayClass"),
+		gwV1.WithKind("Gateway"),
+		gwV1.WithKind("HTTPRoute"),
+		schema.GroupVersion{Group: gatewayv1.GroupName, Version: "v1alpha2"}.WithKind("TLSRoute"),
+	)
 
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithRuntimeObjects(initObjs...).
-		Build()
-
-	var restarted bool
-	restartChan := make(chan struct{}, 1)
-	crdView, err := NewCRDView(ctx, cl, WithRestartFunc(func() {
-		restarted = true
-		restartChan <- struct{}{}
-	}))
+	servedKinds, err := SnapshotFromRESTMapper(mapper, scheme)
 	if err != nil {
-		t.Fatalf("unexpected NewCRDView error: %v", err)
+		t.Fatalf("unexpected SnapshotFromRESTMapper error: %v", err)
 	}
 
-	snapshot := crdView.Snapshot()
-	if err := snapshot.ValidateRequired(); err != nil {
-		t.Fatalf("expected required CRDs to be valid: %v", err)
-	}
+	snapshot := CRDSnapshot{ServedKinds: servedKinds}
 	if snapshot.IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
-		t.Fatalf("expected TLSRoute to not be served initially")
+		t.Errorf("expected TLSRoute NOT to be served because cluster only serves v1alpha2, but GARI requires v1")
 	}
 
-	// Install optional CRD TLSRoute after startup
-	tlsRouteCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
-	tlsRouteCRD.ResourceVersion = "2"
-	crdView.HandleAdd(tlsRouteCRD)
-
-	if !restarted {
-		t.Errorf("expected installing an optional CRD after startup to trigger the restart path")
+	disabled := snapshot.DisabledKinds()
+	foundTLSRoute := false
+	for _, k := range disabled {
+		if k == "TLSRoute" {
+			foundTLSRoute = true
+			break
+		}
 	}
-	if !crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
-		t.Errorf("expected TLSRoute to be served in updated snapshot")
+	if !foundTLSRoute {
+		t.Errorf("expected TLSRoute to be in disabled kinds, got %v", disabled)
 	}
 }
 
-// Acceptance criteria: upgrading the bundle-version annotation updates SupportedVersion without a restart
-func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersionWithoutRestart(t *testing.T) {
+// TestCRDSnapshot_Comparable tests that CRDSnapshot values can be compared directly using ==.
+func TestCRDSnapshot_Comparable(t *testing.T) {
+	s1 := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+		},
+		BundleVersion: "v1.6.3",
+	}
+
+	s2 := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+		},
+		BundleVersion: "v1.6.3",
+	}
+
+	s3 := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+			TLSRoute:     true,
+		},
+		BundleVersion: "v1.6.3",
+	}
+
+	s4 := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+		},
+		BundleVersion: "v1.6.4",
+	}
+
+	if s1 != s2 {
+		t.Errorf("expected s1 == s2")
+	}
+	if s1 == s3 {
+		t.Errorf("expected s1 != s3 (different served kinds)")
+	}
+	if s1 == s4 {
+		t.Errorf("expected s1 != s4 (different bundle version)")
+	}
+}
+
+// TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion tests that upgrading the
+// bundle-version annotation updates the snapshot and notifies State without restart.
+func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersion(t *testing.T) {
 	ctx := t.Context()
 	scheme := newTestSchemeWithApiextensions()
 
-	// Initial startup with required CRDs having bundle version v1.6.0
 	initCRDs := requiredGatewayAPICRDs("v1.6.0")
 	var initObjs []runtime.Object
 	for _, c := range initCRDs {
@@ -148,23 +188,31 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersionWithoutRestart(t *
 		WithStatusSubresource(gc).
 		Build()
 
-	var restarted bool
-	crdView, err := NewCRDView(ctx, cl, WithRestartFunc(func() {
-		restarted = true
-	}))
+	mapper := newTestRESTMapper(
+		gwV1.WithKind("GatewayClass"),
+		gwV1.WithKind("Gateway"),
+		gwV1.WithKind("HTTPRoute"),
+	)
+
+	crdView, err := NewCRDView(ctx, mapper, scheme, cl)
 	if err != nil {
 		t.Fatalf("unexpected NewCRDView error: %v", err)
 	}
 
+	if crdView.Snapshot().BundleVersion != "v1.6.0" {
+		t.Fatalf("expected initial bundle version v1.6.0, got %q", crdView.Snapshot().BundleVersion)
+	}
+
 	st := state.NewState()
 	st.SetControllerName("test-controller")
-	st.SetGatewayCRDBundleVersion(crdView.Snapshot().BundleVersion)
+	initBV := crdView.Snapshot().BundleVersion
+	st.SetGatewayCRDBundleVersion(&initBV)
 	st.UpsertGatewayClass(gc)
 	st.Recompute()
 
 	// Hook crdView to state
-	crdView.OnBundleVersionChanged(func(newVersion *string) {
-		st.SetGatewayCRDBundleVersion(newVersion)
+	crdView.SetOnBundleVersionChanged(func(newVersion string) {
+		st.SetGatewayCRDBundleVersion(&newVersion)
 	})
 
 	r := &GatewayClassReconciler{
@@ -200,11 +248,8 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersionWithoutRestart(t *
 
 	crdView.HandleUpdate(oldGatewayCRD, newGatewayCRD)
 
-	if restarted {
-		t.Errorf("expected upgrading bundle-version annotation NOT to trigger restart")
-	}
-	if crdView.Snapshot().BundleVersion == nil || *crdView.Snapshot().BundleVersion != "v1.6.3" {
-		t.Errorf("expected snapshot bundle version to be v1.6.3, got %v", crdView.Snapshot().BundleVersion)
+	if crdView.Snapshot().BundleVersion != "v1.6.3" {
+		t.Errorf("expected snapshot bundle version to be v1.6.3, got %q", crdView.Snapshot().BundleVersion)
 	}
 
 	// State was updated via callback; recompute outputs
@@ -228,185 +273,68 @@ func TestCRDView_UpgradingBundleVersionUpdatesSupportedVersionWithoutRestart(t *
 	}
 }
 
-// Acceptance criteria: removing a required CRD triggers the restart path (startup then fails fast)
-func TestCRDView_RemovingRequiredCRDTriggersRestartAndFailsFast(t *testing.T) {
-	ctx := t.Context()
-	scheme := newTestSchemeWithApiextensions()
+// TestCRDView_RuntimeCRDChangesIncrementCounter tests that runtime CRD additions, updates,
+// and deletions increment the change counter and log the change without failing.
+func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
+	snapshot := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+		},
+		BundleVersion: "v1.6.3",
+	}
+	crdView := NewCRDViewFromSnapshot(snapshot)
 
-	initCRDs := requiredGatewayAPICRDs("v1.6.3")
-	var initObjs []runtime.Object
-	for _, c := range initCRDs {
-		initObjs = append(initObjs, c)
+	if crdView.CRDChangeCount() != 0 {
+		t.Fatalf("expected initial change count 0, got %d", crdView.CRDChangeCount())
 	}
 
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithRuntimeObjects(initObjs...).
-		Build()
+	// Add an optional CRD
+	tlsCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
+	tlsCRD.ResourceVersion = "1"
+	crdView.HandleAdd(tlsCRD)
 
-	var restarted bool
-	crdView, err := NewCRDView(ctx, cl, WithRestartFunc(func() {
-		restarted = true
-	}))
-	if err != nil {
-		t.Fatalf("unexpected NewCRDView error: %v", err)
+	if crdView.CRDChangeCount() != 1 {
+		t.Errorf("expected change count 1 after add, got %d", crdView.CRDChangeCount())
 	}
 
-	if err := crdView.Snapshot().ValidateRequired(); err != nil {
-		t.Fatalf("expected required CRDs to be valid initially: %v", err)
+	// Resync with same ResourceVersion should be ignored
+	crdView.HandleAdd(tlsCRD)
+	if crdView.CRDChangeCount() != 1 {
+		t.Errorf("expected change count still 1 after resync, got %d", crdView.CRDChangeCount())
 	}
 
-	// Remove a required CRD: HTTPRoute
-	httpRouteCRD := makeTestCRD(HTTPRouteCRDName, "")
-	crdView.HandleDelete(httpRouteCRD)
+	// Update CRD with new ResourceVersion
+	tlsCRDUpdated := makeTestCRD(TLSRouteCRDName, "v1.6.3")
+	tlsCRDUpdated.ResourceVersion = "2"
+	crdView.HandleUpdate(tlsCRD, tlsCRDUpdated)
 
-	if !restarted {
-		t.Errorf("expected removing a required CRD to trigger the restart path")
+	if crdView.CRDChangeCount() != 2 {
+		t.Errorf("expected change count 2 after update, got %d", crdView.CRDChangeCount())
 	}
 
-	// On restart, the controller validates required CRDs and fails fast
-	startupErr := crdView.Snapshot().ValidateRequired()
-	if startupErr == nil {
-		t.Fatalf("expected startup validation to fail after removing HTTPRoute, got nil")
-	}
-	if !strings.Contains(startupErr.Error(), "HTTPRoute") {
-		t.Errorf("expected error to name HTTPRoute, got: %v", startupErr)
-	}
-}
-
-func TestCRDView_RemovingOptionalCRDTriggersRestart(t *testing.T) {
-	ctx := t.Context()
-	scheme := newTestSchemeWithApiextensions()
-
-	initCRDs := append(requiredGatewayAPICRDs("v1.6.3"), makeTestCRD(TLSRouteCRDName, "v1.6.3"))
-	var initObjs []runtime.Object
-	for _, c := range initCRDs {
-		initObjs = append(initObjs, c)
+	// Delete CRD
+	crdView.HandleDelete(tlsCRDUpdated)
+	if crdView.CRDChangeCount() != 3 {
+		t.Errorf("expected change count 3 after delete, got %d", crdView.CRDChangeCount())
 	}
 
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithRuntimeObjects(initObjs...).
-		Build()
-
-	var restarted bool
-	crdView, err := NewCRDView(ctx, cl, WithRestartFunc(func() {
-		restarted = true
-	}))
-	if err != nil {
-		t.Fatalf("unexpected NewCRDView error: %v", err)
-	}
-
-	if !crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
-		t.Fatalf("expected TLSRoute to be served initially")
-	}
-
-	// Remove optional CRD: TLSRoute
-	tlsRouteCRD := makeTestCRD(TLSRouteCRDName, "")
-	crdView.HandleDelete(tlsRouteCRD)
-
-	if !restarted {
-		t.Errorf("expected removing an optional CRD to trigger the restart path")
-	}
-	if crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
-		t.Errorf("expected TLSRoute to not be served after deletion")
-	}
-}
-
-func TestCRDView_UnrelatedCRDIgnored(t *testing.T) {
-	ctx := t.Context()
-	scheme := newTestSchemeWithApiextensions()
-
-	initCRDs := requiredGatewayAPICRDs("v1.6.3")
-	var initObjs []runtime.Object
-	for _, c := range initCRDs {
-		initObjs = append(initObjs, c)
-	}
-
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithRuntimeObjects(initObjs...).
-		Build()
-
-	var restarted bool
-	var bvChanged bool
-	crdView, err := NewCRDView(ctx, cl, WithRestartFunc(func() {
-		restarted = true
-	}))
-	if err != nil {
-		t.Fatalf("unexpected NewCRDView error: %v", err)
-	}
-	crdView.OnBundleVersionChanged(func(newVersion *string) {
-		bvChanged = true
-	})
-
-	// Add an unrelated CRD (e.g. cert-manager)
+	// Unrelated CRD should be ignored
 	unrelatedCRD := makeTestCRD("certificates.cert-manager.io", "v1.0.0")
 	crdView.HandleAdd(unrelatedCRD)
-
-	if restarted {
-		t.Errorf("unrelated CRD should not trigger restart")
-	}
-	if bvChanged {
-		t.Errorf("unrelated CRD should not trigger bundle version change")
+	if crdView.CRDChangeCount() != 3 {
+		t.Errorf("expected change count still 3 after unrelated CRD, got %d", crdView.CRDChangeCount())
 	}
 }
 
-// Acceptance criteria: The cache holds no CRD specs (metadata only), if the watch approach is chosen.
-func TestCRDView_RegistersMetadataOnlyInformer(t *testing.T) {
-	scheme := newTestSchemeWithApiextensions()
-
-	var capturedObj any
-	fakeCache := &informerCaptureCache{
-		scheme: scheme,
-		onGetInformer: func(obj any) {
-			capturedObj = obj
-		},
-	}
-
-	mgr := &mockManager{
-		scheme: scheme,
-		cache:  fakeCache,
-	}
-
-	crdView := NewCRDViewFromSnapshot(&CRDSnapshot{})
-	if err := crdView.RegisterWithManager(mgr); err != nil {
-		t.Fatalf("unexpected RegisterWithManager error: %v", err)
-	}
-
-	if capturedObj == nil {
-		t.Fatalf("expected GetInformer to be called with CRD object, got nil")
-	}
-
-	metaObj, ok := capturedObj.(*metav1.PartialObjectMetadata)
-	if !ok {
-		t.Fatalf("expected GetInformer to be called with *metav1.PartialObjectMetadata, got %T (CRD specs must not be cached)", capturedObj)
-	}
-
-	gvk := metaObj.GetObjectKind().GroupVersionKind()
-	if gvk != crdGVK {
-		t.Errorf("expected GVK %v, got %v", crdGVK, gvk)
-	}
-}
-
-type informerCaptureCache struct {
-	fakeCache
-	scheme        *runtime.Scheme
-	onGetInformer func(obj any)
-}
-
-func (c *informerCaptureCache) GetInformer(ctx context.Context, obj client.Object, opts ...ctrlcache.InformerGetOption) (ctrlcache.Informer, error) {
-	if c.onGetInformer != nil {
-		c.onGetInformer(obj)
-	}
-	return &fakeInformer{}, nil
-}
-
-func TestCRDView_FiltersManagedFieldsAndClientSideAnnotations(t *testing.T) {
+// TestCRDMetadataTransform_DropsManagedFieldsAndAnnotations tests that CRDMetadataTransform
+// clears managedFields and drops all annotations except the Gateway API bundle-version annotation.
+func TestCRDMetadataTransform_DropsManagedFieldsAndAnnotations(t *testing.T) {
 	crd := &metav1.PartialObjectMetadata{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: crdGVK.GroupVersion().String(),
-			Kind:       crdGVK.Kind,
+			APIVersion: CustomResourceDefinitionGVK.GroupVersion().String(),
+			Kind:       CustomResourceDefinitionGVK.Kind,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            GatewayCRDName,
@@ -427,63 +355,140 @@ func TestCRDView_FiltersManagedFieldsAndClientSideAnnotations(t *testing.T) {
 		},
 	}
 
-	crdView := NewCRDViewFromSnapshot(&CRDSnapshot{})
-	crdView.HandleAdd(crd)
+	transformed, err := CRDMetadataTransform(crd)
+	if err != nil {
+		t.Fatalf("unexpected CRDMetadataTransform error: %v", err)
+	}
 
-	crdView.mu.RLock()
-	stored, exists := crdView.crds[GatewayCRDName]
-	crdView.mu.RUnlock()
-
-	if !exists {
-		t.Fatalf("expected Gateway CRD to be stored")
+	metaObj := transformed.(*metav1.PartialObjectMetadata)
+	if metaObj.ManagedFields != nil {
+		t.Errorf("expected ManagedFields to be nil, got: %v", metaObj.ManagedFields)
 	}
-	if _, hasLastApplied := stored.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; hasLastApplied {
-		t.Errorf("expected kubectl.kubernetes.io/last-applied-configuration to be filtered out")
+	if _, hasLastApplied := metaObj.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; hasLastApplied {
+		t.Errorf("expected kubectl.kubernetes.io/last-applied-configuration to be dropped")
 	}
-	if _, hasClientSide := stored.Annotations["kubectl.kubernetes.io/client-side-filter"]; hasClientSide {
-		t.Errorf("expected kubectl.kubernetes.io/client-side-filter to be filtered out")
+	if _, hasCustom := metaObj.Annotations["custom.company.org/team"]; hasCustom {
+		t.Errorf("expected custom annotation to be dropped")
 	}
-	if bv, ok := stored.Annotations[gatewayconsts.BundleVersionAnnotation]; !ok || bv != "v1.6.3" {
+	if bv, ok := metaObj.Annotations[gatewayconsts.BundleVersionAnnotation]; !ok || bv != "v1.6.3" {
 		t.Errorf("expected bundle version annotation v1.6.3, got %q", bv)
-	}
-	if team, ok := stored.Annotations["custom.company.org/team"]; !ok || team != "networking" {
-		t.Errorf("expected custom annotation to be preserved, got %q", team)
 	}
 }
 
-func TestCRDView_DefaultDoesNotRestartOnServedKindsChange(t *testing.T) {
-	ctx := t.Context()
+// TestCRDInformer_CacheTransformInspectStore tests that an informer configured with
+// CRDMetadataTransform stores only stripped metadata in its cache store.
+func TestCRDInformer_CacheTransformInspectStore(t *testing.T) {
+	crd := &metav1.PartialObjectMetadata{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: CustomResourceDefinitionGVK.GroupVersion().String(),
+			Kind:       CustomResourceDefinitionGVK.Kind,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            GatewayCRDName,
+			ResourceVersion: "1",
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{
+					Manager:   "kubectl",
+					Operation: metav1.ManagedFieldsOperationApply,
+				},
+			},
+			Annotations: map[string]string{
+				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"apiextensions.k8s.io/v1"}`,
+				gatewayconsts.BundleVersionAnnotation:              "v1.6.3",
+			},
+		},
+	}
+
+	indexer := toolscache.NewIndexer(toolscache.MetaNamespaceKeyFunc, toolscache.Indexers{})
+	fifo := toolscache.NewDeltaFIFOWithOptions(toolscache.DeltaFIFOOptions{
+		KnownObjects: indexer,
+		Transformer:  toolscache.TransformFunc(CRDMetadataTransform),
+	})
+
+	if err := fifo.Add(crd); err != nil {
+		t.Fatalf("failed to add to fifo: %v", err)
+	}
+
+	_, err := fifo.Pop(func(obj any, isInInitialList bool) error {
+		deltas := obj.(toolscache.Deltas)
+		for _, d := range deltas {
+			if err := indexer.Add(d.Object); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to pop from fifo: %v", err)
+	}
+
+	items := indexer.List()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item in store, got %d", len(items))
+	}
+
+	storedObj, ok := items[0].(*metav1.PartialObjectMetadata)
+	if !ok {
+		t.Fatalf("expected *metav1.PartialObjectMetadata in store, got %T", items[0])
+	}
+
+	if storedObj.ManagedFields != nil {
+		t.Errorf("expected informer cache to store nil ManagedFields, got: %v", storedObj.ManagedFields)
+	}
+	if _, exists := storedObj.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; exists {
+		t.Errorf("expected informer cache to not contain last-applied-configuration")
+	}
+	if bv := storedObj.Annotations[gatewayconsts.BundleVersionAnnotation]; bv != "v1.6.3" {
+		t.Errorf("expected informer cache to retain bundle version v1.6.3, got %q", bv)
+	}
+}
+
+// Acceptance criteria: The cache holds no CRD specs (metadata only), if the watch approach is chosen.
+func TestCRDView_RegistersMetadataOnlyInformer(t *testing.T) {
 	scheme := newTestSchemeWithApiextensions()
 
-	initCRDs := requiredGatewayAPICRDs("v1.6.3")
-	var initObjs []runtime.Object
-	for _, c := range initCRDs {
-		initObjs = append(initObjs, c)
+	var capturedObj any
+	fakeCache := &informerCaptureCache{
+		scheme: scheme,
+		onGetInformer: func(obj any) {
+			capturedObj = obj
+		},
 	}
 
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithRuntimeObjects(initObjs...).
-		Build()
-
-	// Create CRDView without WithRestartFunc (default behavior)
-	crdView, err := NewCRDView(ctx, cl)
-	if err != nil {
-		t.Fatalf("unexpected NewCRDView error: %v", err)
+	mgr := &mockManager{
+		scheme: scheme,
+		cache:  fakeCache,
 	}
 
-	if crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
-		t.Fatalf("expected TLSRoute not to be served initially")
+	crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
+	if err := crdView.RegisterWithManager(mgr); err != nil {
+		t.Fatalf("unexpected RegisterWithManager error: %v", err)
 	}
 
-	// Install optional CRD TLSRoute at runtime
-	tlsRouteCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
-	tlsRouteCRD.ResourceVersion = "2"
-
-	// Should update snapshot and NOT panic or exit
-	crdView.HandleAdd(tlsRouteCRD)
-
-	if !crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
-		t.Errorf("expected TLSRoute to be served in updated snapshot")
+	if capturedObj == nil {
+		t.Fatalf("expected GetInformer to be called with CRD object, got nil")
 	}
+
+	metaObj, ok := capturedObj.(*metav1.PartialObjectMetadata)
+	if !ok {
+		t.Fatalf("expected GetInformer to be called with *metav1.PartialObjectMetadata, got %T (CRD specs must not be cached)", capturedObj)
+	}
+
+	gvk := metaObj.GetObjectKind().GroupVersionKind()
+	if gvk != CustomResourceDefinitionGVK {
+		t.Errorf("expected GVK %v, got %v", CustomResourceDefinitionGVK, gvk)
+	}
+}
+
+type informerCaptureCache struct {
+	fakeCache
+	scheme        *runtime.Scheme
+	onGetInformer func(obj any)
+}
+
+func (c *informerCaptureCache) GetInformer(ctx context.Context, obj client.Object, opts ...ctrlcache.InformerGetOption) (ctrlcache.Informer, error) {
+	if c.onGetInformer != nil {
+		c.onGetInformer(obj)
+	}
+	return &fakeInformer{}, nil
 }

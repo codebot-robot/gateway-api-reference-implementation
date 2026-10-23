@@ -651,7 +651,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -696,7 +696,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -741,7 +741,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -790,7 +790,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -835,7 +835,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -872,7 +872,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -911,7 +911,7 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			Build()
 
 		ctx := t.Context()
-		crdView, err := NewCRDView(ctx, client)
+		crdView, err := NewCRDView(ctx, nil, nil, client)
 		if err != nil {
 			t.Fatalf("unexpected NewCRDView error: %v", err)
 		}
@@ -2374,10 +2374,12 @@ func TestGatewayReconciler_PartialCRDInstallation_ReconcilesGatewayAndHTTPRoute(
 	// Simulate GKE standard channel: 6 of 10 CRDs served, 4 optional CRDs absent
 	mapper := newTestRESTMapper(gkeStandardGatewayAPIGVKs()...)
 
-	servedKinds, disabledKinds, err := CheckGatewayAPICRDs(mapper, scheme)
+	servedKinds, err := SnapshotFromRESTMapper(mapper, scheme)
 	if err != nil {
-		t.Fatalf("unexpected CheckGatewayAPICRDs error: %v", err)
+		t.Fatalf("unexpected SnapshotFromRESTMapper error: %v", err)
 	}
+	snapshot := CRDSnapshot{ServedKinds: servedKinds}
+	disabledKinds := snapshot.DisabledKinds()
 	if len(disabledKinds) != 4 {
 		t.Fatalf("expected 4 disabled kinds, got %d: %v", len(disabledKinds), disabledKinds)
 	}

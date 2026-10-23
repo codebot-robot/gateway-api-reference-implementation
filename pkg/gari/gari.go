@@ -37,6 +37,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -386,6 +387,8 @@ func New(opts Options) (*Server, error) {
 				},
 			})
 		} else {
+			crdMeta := &metav1.PartialObjectMetadata{}
+			crdMeta.SetGroupVersionKind(controller.CustomResourceDefinitionGVK)
 			mgr, err = ctrl.NewManager(cfg, ctrl.Options{
 				Scheme:  opts.Scheme,
 				Metrics: metricsOpts,
@@ -395,6 +398,13 @@ func New(opts Options) (*Server, error) {
 				HealthProbeBindAddress: healthProbeBindAddress,
 				LeaderElection:         opts.LeaderElection,
 				LeaderElectionID:       opts.LeaderElectionID,
+				Cache: cache.Options{
+					ByObject: map[client.Object]cache.ByObject{
+						crdMeta: {
+							Transform: controller.CRDMetadataTransform,
+						},
+					},
+				},
 			})
 		}
 		if err != nil {

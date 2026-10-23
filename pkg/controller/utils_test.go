@@ -160,18 +160,21 @@ func gkeStandardGatewayAPIGVKs() []schema.GroupVersionKind {
 	}
 }
 
-func TestCheckGatewayAPICRDs(t *testing.T) {
+func TestSnapshotFromRESTMapper(t *testing.T) {
 	scheme := newTestScheme()
 
 	t.Run("all CRDs served", func(t *testing.T) {
 		mapper := newTestRESTMapper(allGatewayAPIGVKs()...)
-		served, disabled, err := CheckGatewayAPICRDs(mapper, scheme)
+		servedKinds, err := SnapshotFromRESTMapper(mapper, scheme)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		snapshot := CRDSnapshot{ServedKinds: servedKinds}
+		disabled := snapshot.DisabledKinds()
 		if len(disabled) != 0 {
 			t.Errorf("expected 0 disabled kinds, got %v", disabled)
 		}
+		served := snapshot.ServedGroupKinds()
 		if len(served) != 10 {
 			t.Errorf("expected 10 served kinds, got %d", len(served))
 		}
@@ -179,10 +182,13 @@ func TestCheckGatewayAPICRDs(t *testing.T) {
 
 	t.Run("partial installation with 4 optional CRDs missing", func(t *testing.T) {
 		mapper := newTestRESTMapper(gkeStandardGatewayAPIGVKs()...)
-		served, disabled, err := CheckGatewayAPICRDs(mapper, scheme)
+		servedKinds, err := SnapshotFromRESTMapper(mapper, scheme)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		snapshot := CRDSnapshot{ServedKinds: servedKinds}
+		disabled := snapshot.DisabledKinds()
+		served := snapshot.ServedGroupKinds()
 		if len(served) != 6 {
 			t.Errorf("expected 6 served kinds, got %d", len(served))
 		}
@@ -208,7 +214,7 @@ func TestCheckGatewayAPICRDs(t *testing.T) {
 			gwV1.WithKind("Gateway"),
 			gwV1.WithKind("HTTPRoute"),
 		)
-		_, _, err := CheckGatewayAPICRDs(mapper, scheme)
+		_, err := SnapshotFromRESTMapper(mapper, scheme)
 		if err == nil {
 			t.Fatalf("expected error when GatewayClass is missing, got nil")
 		}
@@ -223,7 +229,7 @@ func TestCheckGatewayAPICRDs(t *testing.T) {
 			gwV1.WithKind("GatewayClass"),
 			gwV1.WithKind("HTTPRoute"),
 		)
-		_, _, err := CheckGatewayAPICRDs(mapper, scheme)
+		_, err := SnapshotFromRESTMapper(mapper, scheme)
 		if err == nil {
 			t.Fatalf("expected error when Gateway is missing, got nil")
 		}
@@ -238,7 +244,7 @@ func TestCheckGatewayAPICRDs(t *testing.T) {
 			gwV1.WithKind("GatewayClass"),
 			gwV1.WithKind("Gateway"),
 		)
-		_, _, err := CheckGatewayAPICRDs(mapper, scheme)
+		_, err := SnapshotFromRESTMapper(mapper, scheme)
 		if err == nil {
 			t.Fatalf("expected error when HTTPRoute is missing, got nil")
 		}

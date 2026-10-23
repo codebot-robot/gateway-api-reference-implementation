@@ -51,8 +51,16 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
-	if r.State != nil && r.CRDView != nil && r.CRDView.Snapshot() != nil {
-		r.State.SetGatewayCRDBundleVersion(r.CRDView.Snapshot().BundleVersion)
+	var crdBundleVersion *string
+	if r.CRDView != nil {
+		snapshot := r.CRDView.Snapshot()
+		if snapshot.BundleVersion != "" {
+			crdBundleVersion = &snapshot.BundleVersion
+		}
+	}
+
+	if r.State != nil && crdBundleVersion != nil {
+		r.State.SetGatewayCRDBundleVersion(crdBundleVersion)
 	}
 
 	var desired gatewayv1.GatewayClassStatus
@@ -63,10 +71,6 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		desired = d
 	} else {
-		var crdBundleVersion *string
-		if r.CRDView != nil && r.CRDView.Snapshot() != nil {
-			crdBundleVersion = r.CRDView.Snapshot().BundleVersion
-		}
 		desired = state.ComputeDesiredGatewayClassStatus(&gc, r.ControllerName, crdBundleVersion)
 	}
 
