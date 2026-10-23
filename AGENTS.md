@@ -1,4 +1,4 @@
-# GEMINI.md
+# AGENTS.md
 
 This file provides context and instructions for LLM coding agents working on the `gateway-api-reference-implementation` project.
 
