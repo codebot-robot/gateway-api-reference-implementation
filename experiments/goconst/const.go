@@ -20,7 +20,7 @@ package goconst
 type Const[T any] *T
 
 // WrapConst wraps a pointer as an immutable Const[T] reference.
-// This is a zero-cost compile-time type conversion.
+// This is a compile-time type conversion with no runtime conversion code.
 func WrapConst[T any](val *T) Const[T] {
 	return Const[T](val)
 }

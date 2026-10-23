@@ -53,8 +53,8 @@ type ConstCompiledTCPRoute struct {
 }
 
 // ConstState implements an informer-driven state cache for TCPRoutes using Const[T].
-// Unlike the baseline State which deep-copies every incoming object to defend against
-// mutations, ConstState stores Const[TCPRoute] directly with zero allocations.
+// ConstState stores Const[TCPRoute] directly, retaining the informer cache pointer
+// rather than allocating a deep copy.
 type ConstState struct {
 	mu        sync.RWMutex
 	tcpRoutes map[types.NamespacedName]*ConstTCPRouteState
@@ -93,7 +93,7 @@ func (s *ConstState) InformerEventHandler() toolscache.ResourceEventHandlerFuncs
 }
 
 // UpsertTCPRoute inserts or updates a TCPRoute in state.
-// With Const[T], no DeepCopy() is performed: the informer pointer is retained safely.
+// It stores the route pointer directly as Const[TCPRoute] without calling DeepCopy.
 func (s *ConstState) UpsertTCPRoute(route Const[gatewayv1.TCPRoute]) {
 	if route == nil {
 		return

@@ -91,7 +91,7 @@ func TestConstTCPRouteReadPath_EndToEnd(t *testing.T) {
 		t.Fatalf("expected route-1 in state, got nil")
 	}
 
-	// Verify zero-copy pointer preservation
+	// Verify pointer preservation
 	if s1.Route != WrapConst(r1) {
 		t.Fatalf("expected s1.Route to share the informer pointer %p, got %p", r1, s1.Route)
 	}
