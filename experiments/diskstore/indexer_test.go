@@ -16,6 +16,7 @@ package diskstore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -274,5 +275,172 @@ func TestDiskIndexer_ReplaceAndResourceVersion(t *testing.T) {
 	indexer.Bookmark("50000")
 	if rv := indexer.LastStoreSyncResourceVersion(); rv != "50000" {
 		t.Fatalf("expected Bookmark RV 50000, got %s", rv)
+	}
+}
+
+func TestDiskIndexer_IndexFuncError_LoggedAndMetric(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := OpenStore(WithFS(memFS), WithDir("idx_err_store"))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	indexer, err := NewDiskIndexer(store, &corev1.ConfigMap{})
+	if err != nil {
+		t.Fatalf("NewDiskIndexer failed: %v", err)
+	}
+
+	// Add an indexer that fails for specific objects
+	err = indexer.AddIndexers(toolscache.Indexers{
+		"failing-index": func(obj any) ([]string, error) {
+			cm, ok := obj.(*corev1.ConfigMap)
+			if ok && cm.Name == "fail-me" {
+				return nil, errors.New("simulated index function failure")
+			}
+			return []string{"ok"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddIndexers failed: %v", err)
+	}
+
+	beforeCount := IndexerErrorCount()
+
+	// Add an object that triggers the error
+	badCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "fail-me",
+		},
+	}
+	if err := indexer.Add(badCM); err != nil {
+		t.Fatalf("Add unexpectedly failed: %v", err)
+	}
+
+	afterCount := IndexerErrorCount()
+	if afterCount <= beforeCount {
+		t.Fatalf("expected IndexerErrorCount to increment on index func error: before=%d, after=%d",
+			beforeCount, afterCount)
+	}
+}
+
+func TestDiskIndexer_List_DecodeError_Metric(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := OpenStore(WithFS(memFS), WithDir("idx_decode_err_store"))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	indexer, err := NewDiskIndexer(store, &corev1.ConfigMap{})
+	if err != nil {
+		t.Fatalf("NewDiskIndexer failed: %v", err)
+	}
+
+	// Add valid ConfigMap
+	validCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-cm"},
+		Data:       map[string]string{"foo": "bar"},
+	}
+	if err := indexer.Add(validCM); err != nil {
+		t.Fatalf("Add validCM failed: %v", err)
+	}
+
+	// Inject corrupt encoded payload into the underlying store
+	corruptPayload := []byte("this is not valid CBOR or JSON encoded runtime.Object")
+	if err := store.Put(indexer.bucketName, "default/corrupt-cm", corruptPayload, "999"); err != nil {
+		t.Fatalf("store.Put corrupt payload failed: %v", err)
+	}
+
+	beforeCount := IndexerErrorCount()
+
+	// List() should skip the corrupt object, decode the valid one, log error, and increment metric
+	items := indexer.List()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 valid item from List(), got %d", len(items))
+	}
+
+	afterCount := IndexerErrorCount()
+	if afterCount <= beforeCount {
+		t.Fatalf("expected IndexerErrorCount to increment on decode failure: before=%d, after=%d",
+			beforeCount, afterCount)
+	}
+}
+
+func TestDiskIndexer_List_DecryptError_CorruptionAndFailedState(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := OpenStore(WithFS(memFS), WithDir("idx_decrypt_fail_store"))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	var key [32]byte
+	copy(key[:], []byte("01234567890123456789012345678901"))
+	cipher, err := NewAESGCMCipher(key[:])
+	if err != nil {
+		t.Fatalf("NewAESGCMCipher failed: %v", err)
+	}
+
+	indexer, err := NewDiskIndexer(store, &corev1.Secret{}, WithIndexerCipher(cipher))
+	if err != nil {
+		t.Fatalf("NewDiskIndexer failed: %v", err)
+	}
+
+	// Add valid Secret
+	validSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-secret"},
+		Data:       map[string][]byte{"pass": []byte("valid-pass")},
+	}
+	if err := indexer.Add(validSecret); err != nil {
+		t.Fatalf("Add validSecret failed: %v", err)
+	}
+
+	// Inject corrupted ciphertext payload into the store
+	corruptCiphertext := []byte("completely invalid ciphertext bytes that will fail GCM auth")
+	if err := store.Put(indexer.bucketName, "default/corrupt-secret", corruptCiphertext, "999"); err != nil {
+		t.Fatalf("store.Put corrupt ciphertext failed: %v", err)
+	}
+
+	if store.isFailed() {
+		t.Fatalf("store should not be failed prior to detecting corruption")
+	}
+
+	beforeCount := IndexerErrorCount()
+
+	// List() should detect decrypt failure, log corruption at error level,
+	// increment metric, and put the store into the failed state!
+	items := indexer.List()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+
+	afterCount := IndexerErrorCount()
+	if afterCount <= beforeCount {
+		t.Fatalf("expected IndexerErrorCount to increment on decrypt corruption: before=%d, after=%d",
+			beforeCount, afterCount)
+	}
+
+	// Assert store entered permanent failed state
+	if !store.isFailed() {
+		t.Fatalf("expected store to enter failed state after decrypt corruption")
+	}
+
+	// Verify subsequent operations fail with ErrStoreFailed
+	putErr := store.Put(indexer.bucketName, "default/new-secret", []byte("data"), "1000")
+	if !errors.Is(putErr, ErrStoreFailed) {
+		t.Fatalf("expected ErrStoreFailed on subsequent Put, got: %v", putErr)
+	}
+
+	_, _, getErr := store.Get(indexer.bucketName, "default/valid-secret")
+	if !errors.Is(getErr, ErrStoreFailed) {
+		t.Fatalf("expected ErrStoreFailed on subsequent Get, got: %v", getErr)
+	}
+
+	// Subsequent indexer.List() returns nil because store.List fails
+	failedList := indexer.List()
+	if failedList != nil {
+		t.Fatalf("expected nil from List() on failed store, got %v", failedList)
 	}
 }

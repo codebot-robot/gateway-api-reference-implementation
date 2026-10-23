@@ -516,9 +516,6 @@ func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
 		return fmt.Errorf("failed to allocate disk block for page %d: %w", desc.LogicalPage, err)
 	}
 
-	oldFlushed := desc.FlushedLoc
-	desc.FlushedLoc = newLoc
-	desc.PhysicalBlock = newLoc
 	desc.InFlight = true
 	desc.PinCount.Add(1)
 
@@ -563,11 +560,18 @@ func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
 
 	flushErr := errors.Join(syncErr, writeErr)
 	if flushErr != nil {
+		if freeErr := bp.buddy.Free(newLoc); freeErr != nil {
+			klog.V(4).ErrorS(freeErr, "failed to free allocated block on flush failure")
+		}
 		if bp.onFailure != nil {
 			bp.onFailure(flushErr)
 		}
 		return flushErr
 	}
+
+	oldFlushed := desc.FlushedLoc
+	desc.FlushedLoc = newLoc
+	desc.PhysicalBlock = newLoc
 
 	if oldFlushed != NoBlock && oldFlushed != desc.DurableLoc && oldFlushed != desc.FlushedBeforeSync {
 		if err := bp.buddy.Free(oldFlushed); err != nil {
@@ -607,7 +611,7 @@ func (bp *BufferPool) SnapshotFlushedForSync() {
 	defer bp.mu.Unlock()
 
 	for _, desc := range bp.pageTable {
-		if desc.FlushedLoc != NoBlock {
+		if !desc.InFlight && desc.FlushedLoc != NoBlock {
 			desc.FlushedBeforeSync = desc.FlushedLoc
 		}
 	}

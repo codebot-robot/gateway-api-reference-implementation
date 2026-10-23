@@ -61,10 +61,18 @@ type StoreOptions struct {
 	Codec      ObjectCodec
 	NumFrames  int
 	AutoDelete bool
+	Clock      Clock
 }
 
 // StoreOption is a functional option for configuring a DiskStore.
 type StoreOption func(*StoreOptions)
+
+// WithClock sets the Clock used for WAL timing.
+func WithClock(clock Clock) StoreOption {
+	return func(o *StoreOptions) {
+		o.Clock = clock
+	}
+}
 
 // WithDir sets the directory for store files.
 func WithDir(dir string) StoreOption {
@@ -272,7 +280,10 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 	}
 
 	if isNewStore {
-		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{OnFailure: s.setFailed})
+		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{
+			OnFailure: s.setFailed,
+			Clock:     options.Clock,
+		})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
@@ -306,7 +317,10 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 		}
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
-		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{OnFailure: s.setFailed})
+		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{
+			OnFailure: s.setFailed,
+			Clock:     options.Clock,
+		})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)

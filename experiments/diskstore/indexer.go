@@ -178,6 +178,8 @@ func (d *DiskIndexer) updateIndicesLocked(key string, obj any) {
 	for indexName, indexFunc := range d.indexers {
 		newVals, err := indexFunc(obj)
 		if err != nil {
+			klog.Errorf("diskstore: index function %q failed for key %s: %v", indexName, key, err)
+			GlobalMetrics.IndexerErrorCount.Add(1)
 			continue
 		}
 
@@ -318,6 +320,8 @@ func (d *DiskIndexer) GetByKey(key string) (item any, exists bool, err error) {
 func (d *DiskIndexer) List() []any {
 	rawItems, err := d.store.List(d.bucketName)
 	if err != nil {
+		klog.Errorf("diskstore: List failed on bucket %q: %v", d.bucketName, err)
+		GlobalMetrics.IndexerErrorCount.Add(1)
 		return nil
 	}
 
@@ -326,10 +330,15 @@ func (d *DiskIndexer) List() []any {
 		ad := AdditionalData(d.bucketName, raw.Key)
 		decrypted, err := d.cipher.Decrypt(raw.Payload, ad)
 		if err != nil {
+			klog.Errorf("diskstore: corruption: failed to decrypt %s in bucket %q: %v", raw.Key, d.bucketName, err)
+			GlobalMetrics.IndexerErrorCount.Add(1)
+			d.store.setFailed(fmt.Errorf("corruption: decrypt failure for %s in bucket %s: %w", raw.Key, d.bucketName, err))
 			continue
 		}
 		target := d.example.DeepCopyObject()
 		if err := d.codec.Decode(decrypted, target); err != nil {
+			klog.Errorf("diskstore: failed to decode %s in bucket %q: %v", raw.Key, d.bucketName, err)
+			GlobalMetrics.IndexerErrorCount.Add(1)
 			continue
 		}
 		items = append(items, target)
@@ -344,6 +353,8 @@ func (d *DiskIndexer) List() []any {
 func (d *DiskIndexer) ListKeys() []string {
 	rawItems, err := d.store.List(d.bucketName)
 	if err != nil {
+		klog.Errorf("diskstore: ListKeys failed on bucket %q: %v", d.bucketName, err)
+		GlobalMetrics.IndexerErrorCount.Add(1)
 		return nil
 	}
 	keys := make([]string, len(rawItems))
