@@ -62,6 +62,9 @@ type FaultFS struct {
 
 	writeErr error
 	syncErr  error
+
+	beforeWriteAt func(path string, p []byte, off int64)
+	beforeSync    func(path string)
 }
 
 // NewFaultFS creates a new FaultFS wrapping an underlying FS.
@@ -115,6 +118,20 @@ func (f *FaultFS) SetSyncError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.syncErr = err
+}
+
+// SetBeforeWriteAt sets a callback invoked before WriteAt execution.
+func (f *FaultFS) SetBeforeWriteAt(fn func(path string, p []byte, off int64)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.beforeWriteAt = fn
+}
+
+// SetBeforeSync sets a callback invoked before Sync execution.
+func (f *FaultFS) SetBeforeSync(fn func(path string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.beforeSync = fn
 }
 
 func (f *FaultFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
@@ -267,7 +284,12 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 	assertReuse := f.fs.assertReuseRule
 	assertWAL := f.fs.assertWriteAheadRule
 	maxFsyncedLSN := f.fs.MaxFsyncedLSN()
+	beforeWriteAt := f.fs.beforeWriteAt
 	f.fs.mu.RUnlock()
+
+	if beforeWriteAt != nil {
+		beforeWriteAt(f.name, p, off)
+	}
 
 	if writeErr != nil {
 		return 0, writeErr
@@ -343,7 +365,12 @@ func (f *FaultFile) WriteAt(p []byte, off int64) (int, error) {
 func (f *FaultFile) Sync() error {
 	f.fs.mu.RLock()
 	syncErr := f.fs.syncErr
+	beforeSync := f.fs.beforeSync
 	f.fs.mu.RUnlock()
+
+	if beforeSync != nil {
+		beforeSync(f.name)
+	}
 
 	if syncErr != nil {
 		return syncErr

@@ -18,7 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestWAL_AppendAndIterate(t *testing.T) {
@@ -183,4 +186,218 @@ func TestWAL_TruncateSegments(t *testing.T) {
 
 	// First remaining segment must have startLSN >= 4 (or be the active segment)
 	_ = wal.Close()
+}
+
+// TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked asserts that AppendRecord completes
+// while a WAL write or fsync is blocked in the fault filesystem (Item 2).
+func TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+	var dbID [16]byte
+	copy(dbID[:], []byte("wal-test-db-0004"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+
+	// Initial append and sync to initialize active segment and header
+	_, err = wal.AppendRecord(&Record{
+		Type:    RecordTypePut,
+		Key:     "init",
+		Payload: []byte("init"),
+	})
+	if err != nil {
+		t.Fatalf("initial append failed: %v", err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("initial sync failed: %v", err)
+	}
+
+	syncBlocked := make(chan struct{})
+	releaseSync := make(chan struct{})
+
+	faultFS.SetBeforeSync(func(path string) {
+		if strings.HasSuffix(path, ".wal") {
+			select {
+			case <-syncBlocked:
+				// Already triggered
+			default:
+				close(syncBlocked)
+				<-releaseSync
+			}
+		}
+	})
+
+	// Start a background sync on record 2
+	syncDone := make(chan error, 1)
+	go func() {
+		_, aErr := wal.AppendRecord(&Record{
+			Type:    RecordTypePut,
+			Key:     "k1",
+			Payload: []byte("v1"),
+		})
+		if aErr != nil {
+			syncDone <- aErr
+			return
+		}
+		syncDone <- wal.Sync()
+	}()
+
+	// Wait until WAL writer is blocked in fsync
+	select {
+	case <-syncBlocked:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for WAL sync to block")
+	}
+
+	// Now call AppendRecord from this goroutine: it must complete immediately without waiting for fsync!
+	appendDone := make(chan error, 1)
+	go func() {
+		_, aErr := wal.AppendRecord(&Record{
+			Type:    RecordTypePut,
+			Key:     "k2",
+			Payload: []byte("v2"),
+		})
+		appendDone <- aErr
+	}()
+
+	select {
+	case err := <-appendDone:
+		if err != nil {
+			t.Fatalf("AppendRecord failed while sync was blocked: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		close(releaseSync)
+		t.Fatalf("AppendRecord stalled while WAL writer was performing fsync!")
+	}
+
+	// Unblock the fsync
+	close(releaseSync)
+	if err := <-syncDone; err != nil {
+		t.Fatalf("background sync failed: %v", err)
+	}
+
+	if err := wal.Sync(); err != nil {
+		t.Fatalf("final sync failed: %v", err)
+	}
+	_ = wal.Close()
+
+	// Verify both records are present and recoverable in order
+	it, err := NewWALIterator(faultFS, "wal_dir", dbID, 1)
+	if err != nil {
+		t.Fatalf("NewWALIterator failed: %v", err)
+	}
+	defer it.Close()
+
+	var keys []string
+	for {
+		rec, err := it.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("iteration error: %v", err)
+		}
+		keys = append(keys, rec.Key)
+	}
+
+	expected := []string{"init", "k1", "k2"}
+	if len(keys) != len(expected) {
+		t.Fatalf("expected keys %v, got %v", expected, keys)
+	}
+	for i, k := range keys {
+		if k != expected[i] {
+			t.Fatalf("key %d mismatch: got %s, expected %s", i, k, expected[i])
+		}
+	}
+}
+
+type testClock struct {
+	mu  sync.Mutex
+	now MonotonicTime
+}
+
+func (c *testClock) Now() MonotonicTime {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now += MonotonicTime(d)
+}
+
+// TestWAL_FiveSecondBound_UnsyncedBlocks asserts that written but unsynced blocks are fsynced
+// within 5 seconds when appends stop on exact block boundaries (Item 3).
+func TestWAL_FiveSecondBound_UnsyncedBlocks(t *testing.T) {
+	fs := NewMemFS()
+	var dbID [16]byte
+	copy(dbID[:], []byte("wal-test-db-0005"))
+
+	clk := &testClock{now: MonotonicTime(time.Hour)}
+	wal, err := OpenWAL(fs, "wal_dir", dbID, 0, WALOptions{
+		Clock:        clk,
+		TickInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	// Append record 1 that fills exactly the rest of the first 4 KiB block.
+	// Block 0 has 32 bytes segment header.
+	// Space remaining in block 0: 4096 - 32 = 4064 bytes.
+	// Record header is 36 bytes.
+	// Payload needed: 4064 - 36 = 4028 bytes.
+	p1 := make([]byte, 4028)
+	_, err = wal.AppendRecord(&Record{
+		Type:    RecordTypePut,
+		Payload: p1,
+	})
+	if err != nil {
+		t.Fatalf("AppendRecord 1 failed: %v", err)
+	}
+
+	// Append record 2 that fills exactly the next 4 KiB block (4096 bytes).
+	// Payload needed: 4096 - 36 = 4060 bytes.
+	p2 := make([]byte, 4060)
+	lsn2, err := wal.AppendRecord(&Record{
+		Type:    RecordTypePut,
+		Payload: p2,
+	})
+	if err != nil {
+		t.Fatalf("AppendRecord 2 failed: %v", err)
+	}
+
+	// Verify tailOffset is exactly 0 (filled whole blocks)
+	wal.mu.Lock()
+	tailOff := wal.tailOffset
+	wal.mu.Unlock()
+	if tailOff != 0 {
+		t.Fatalf("expected tailOffset to be 0, got %d", tailOff)
+	}
+
+	// Allow background writer to flush the queued blocks to disk without sync
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify that blocks were NOT yet fsynced
+	if wal.FsyncedLSN() >= lsn2 {
+		t.Fatalf("expected blocks to not be fsynced immediately, fsyncedLSN=%d, lsn2=%d", wal.FsyncedLSN(), lsn2)
+	}
+
+	// Advance clock by 5 seconds without injecting any sync or appends
+	clk.Advance(5 * time.Second)
+
+	// Poll for fsync to occur within a short timeout
+	deadline := time.Now().Add(2 * time.Second)
+	for wal.FsyncedLSN() < lsn2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if wal.FsyncedLSN() < lsn2 {
+		t.Fatalf("expected WAL to fsync within 5s bound, fsyncedLSN=%d, expected at least %d", wal.FsyncedLSN(), lsn2)
+	}
 }

@@ -282,6 +282,11 @@ Recompute Latency Comparison:
 4. **Crash Recovery Time:**
    - `DiskStore` scans and recovers 10,000 objects across a 160 MB heap file in **486 ms**, a 14x improvement achieved by reading disk blocks sequentially in physical order and eliminating buffer cache thrashing.
 
+5. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
+   - **Point-in-Time Consistency:** `DiskStore.List(bucketName)` acquires `s.writerMu.RLock()` for the duration of the broad bucket read and object decoding. This provides point-in-time consistency across the bucket: concurrent writes (`Put`) or deletions (`Delete`) cannot mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
+   - **Scope and Trade-off Analysis:** Because `writerMu` is store-wide, holding `writerMu.RLock()` stalls writes to every bucket for the duration of a `List` while all objects in the bucket are iterated and decoded into memory. An alternative architecture would provide non-blocking concurrency via per-page versioning or multi-version concurrency control (MVCC); however, MVCC introduces additional memory overhead, garbage collection complexity, and page table churn. The trade-off is that writes stall for the duration of a `List`, in exchange for a consistent view without per-page versioning.
+   - **Alignment with Informer Access Patterns:** GARI consumes these caches through informer event handlers and doesn't call `List` on them, so broad reads mostly happen at startup and relist. Other controllers may differ in their access patterns, so workloads that frequently invoke `List` concurrently with active write streams would experience write stalls under this locking model.
+
 ---
 
 ## Conclusion
