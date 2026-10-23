@@ -14,6 +14,34 @@ The `gateway-api-reference-implementation` is intended to be a simple, pure Go, 
 - **Full Feature Set**: When implementing features, aim for complete support of the Gateway API specification.
 - **Testability**: Ensure that implementations are well-tested with unit and integration tests.
 
+## Writing
+
+Code comments, docstrings, commit messages, PR descriptions and docs should read clearly to someone new to the code. Follow Google's [Technical Writing One](https://developers.google.com/tech-writing/one) and, for details, the [Google developer documentation style guide](https://developers.google.com/style). For doc comments, see [Go doc comments](https://go.dev/doc/comment) and the docstring section of the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings).
+
+The rules that matter most here:
+- **Use active voice.** Say who does what: "the router claims the executor before it asks it to serve", not "the executor is claimed before it is asked to serve".
+- **Write full sentences, one idea each.** Don't chain clauses with colons, semicolons and parenthetical asides.
+- **Define a term before you use it,** and use the project's existing words. Don't coin shorthand.
+- **Say what the code does and why,** not how it got that way.
+- **Check all the prose in your change** before you send it. Start from the diff, and check every file that holds prose: docs (such as `design.md` and `README.md`), code comments, docstrings, proto and script comments, error and log messages, flag help, the commit message and the PR description.
+- **Don't oversell. State what you measured or can show, and qualify it.** Avoid superlatives and absolutes such as "optimal", "guaranteed", "zero", "always", "strictly", "drastically" and "cryptographically", unless the statement really is absolute and the text says why. Report performance numbers with how and where they were measured. Describe trade-offs as trade-offs, including what is given up.
+
+For example, rewrite this:
+
+> The inputs of this engine's range that are numbers, not tensors (a prefill's length one segment hands another): from the network they come as tensors, and are turned back.
+
+as this:
+
+> The names of this range's inputs that are plain numbers rather than tensors, such as a prefill's length. The wire format carries only tensors, so the range server turns these back into numbers when they arrive.
+
+To avoid overselling, rewrite this:
+
+> ...preserving point-in-time consistency via `writerMu.RLock()` offers the optimal balance of architectural simplicity, zero steady-state memory overhead, and data integrity...
+
+as this:
+
+> ...preserving point-in-time consistency via `writerMu.RLock()` offers a balance of architectural simplicity, zero steady-state memory overhead, and data integrity...
+
 ## Development Workflow
 
 - Use standard Go tooling (`go build`, `go test`, `go mod`).
