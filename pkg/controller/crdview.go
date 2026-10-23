@@ -17,7 +17,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -152,11 +151,20 @@ type CRDViewReader interface {
 	Snapshot() *CRDSnapshot
 }
 
+// crdMetadata is a lightweight representation of CRD metadata stored by CRDView.
+// Storing only name, resourceVersion, and filtered annotations saves significant memory
+// by avoiding retention of managedFields and large client-side apply annotations.
+type crdMetadata struct {
+	Name            string
+	ResourceVersion string
+	Annotations     map[string]string
+}
+
 // CRDView manages the Gateway API CRD view: tracking served kinds, bundle version,
 // and reacting to CRD changes at runtime.
 type CRDView struct {
 	mu                     sync.RWMutex
-	crds                   map[string]*metav1.PartialObjectMetadata
+	crds                   map[string]*crdMetadata
 	snapshot               *CRDSnapshot
 	restartFunc            func()
 	onBundleVersionChanged []func(newVersion *string)
@@ -170,7 +178,16 @@ type crdViewConfig struct {
 	scheme *runtime.Scheme
 }
 
-// WithRestartFunc overrides the restart function called when served kinds change.
+// WithRestartFunc configures an optional callback invoked when the set of served
+// Gateway API kinds changes at runtime (for example, when an optional CRD is
+// installed or a CRD is removed).
+//
+// An automated restart is not performed by default because restarting all controller
+// replicas simultaneously upon CRD changes can cause thundering herd problems against
+// the Kubernetes API server. In production environments, administrators should perform
+// a controlled rolling restart of the controller deployment when new CRD kinds are installed.
+// WithRestartFunc can be used in tests to detect served-kind transitions, or in custom
+// environments where an automated restart or external coordination is explicitly desired.
 func WithRestartFunc(fn func()) CRDViewOption {
 	return func(v *CRDView, _ *crdViewConfig) {
 		v.restartFunc = fn
@@ -188,35 +205,16 @@ func WithRESTMapper(mapper meta.RESTMapper, scheme *runtime.Scheme) CRDViewOptio
 // NewCRDView initializes a new CRDView by querying CRD metadata using reader.
 func NewCRDView(ctx context.Context, reader client.Reader, opts ...CRDViewOption) (*CRDView, error) {
 	v := &CRDView{
-		crds: make(map[string]*metav1.PartialObjectMetadata),
-		restartFunc: func() {
-			setupLog.Info("Gateway API served CRD kinds changed; exiting for restart")
-			os.Exit(1)
-		},
+		crds: make(map[string]*crdMetadata),
 	}
 	cfg := &crdViewConfig{}
 	for _, opt := range opts {
 		opt(v, cfg)
 	}
 
-	crdsFound := false
-	if reader != nil {
-		crdList := &metav1.PartialObjectMetadataList{}
-		crdList.SetGroupVersionKind(crdGVK)
-		if err := reader.List(ctx, crdList); err != nil {
-			if cfg.mapper == nil {
-				return nil, fmt.Errorf("failed to list CustomResourceDefinition metadata: %w", err)
-			}
-			setupLog.V(1).Info("unable to list CRD metadata from reader, falling back to RESTMapper", "error", err)
-		} else {
-			for i := range crdList.Items {
-				item := &crdList.Items[i]
-				if isGatewayAPICRD(item.Name) {
-					v.crds[item.Name] = item
-					crdsFound = true
-				}
-			}
-		}
+	crdsFound, err := v.initFromReader(ctx, reader, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	if !crdsFound && cfg.mapper != nil && cfg.scheme != nil {
@@ -232,15 +230,40 @@ func NewCRDView(ctx context.Context, reader client.Reader, opts ...CRDViewOption
 	return v, nil
 }
 
+// initFromReader queries CRD metadata from the given reader and populates v.crds by calling HandleAdd.
+// Returns true if any Gateway API CRDs were found.
+func (v *CRDView) initFromReader(ctx context.Context, reader client.Reader, cfg *crdViewConfig) (bool, error) {
+	if reader == nil {
+		return false, nil
+	}
+
+	// TODO: Calling reader.List allocates memory for the full list of CRD metadata.
+	// Switch to a version that calls us back for each object.
+	crdList := &metav1.PartialObjectMetadataList{}
+	crdList.SetGroupVersionKind(crdGVK)
+	if err := reader.List(ctx, crdList); err != nil {
+		if cfg.mapper == nil {
+			return false, fmt.Errorf("failed to list CustomResourceDefinition metadata: %w", err)
+		}
+		setupLog.V(1).Info("unable to list CRD metadata from reader, falling back to RESTMapper", "error", err)
+		return false, nil
+	}
+
+	for i := range crdList.Items {
+		v.HandleAdd(&crdList.Items[i])
+	}
+
+	v.mu.RLock()
+	crdsFound := len(v.crds) > 0
+	v.mu.RUnlock()
+	return crdsFound, nil
+}
+
 // NewCRDViewFromSnapshot creates a CRDView with a pre-configured snapshot (useful for unit testing).
 func NewCRDViewFromSnapshot(snapshot *CRDSnapshot, opts ...CRDViewOption) *CRDView {
 	v := &CRDView{
-		crds:     make(map[string]*metav1.PartialObjectMetadata),
+		crds:     make(map[string]*crdMetadata),
 		snapshot: snapshot,
-		restartFunc: func() {
-			setupLog.Info("Gateway API served CRD kinds changed; exiting for restart")
-			os.Exit(1)
-		},
 	}
 	cfg := &crdViewConfig{}
 	for _, opt := range opts {
@@ -294,7 +317,7 @@ func (v *CRDView) RegisterWithManager(mgr ctrl.Manager) error {
 
 // HandleAdd processes CRD creation events.
 func (v *CRDView) HandleAdd(obj any) {
-	metaObj, ok := toPartialObjectMetadata(obj)
+	metaObj, ok := toCRDMetadata(obj)
 	if !ok || !isGatewayAPICRD(metaObj.Name) {
 		return
 	}
@@ -306,6 +329,10 @@ func (v *CRDView) HandleAdd(obj any) {
 		return
 	}
 	v.crds[metaObj.Name] = metaObj
+	if v.snapshot == nil {
+		v.mu.Unlock()
+		return
+	}
 	oldSnapshot := v.snapshot
 	newSnapshot := v.computeSnapshotLocked()
 	v.snapshot = newSnapshot
@@ -319,27 +346,7 @@ func (v *CRDView) HandleAdd(obj any) {
 
 // HandleUpdate processes CRD update events.
 func (v *CRDView) HandleUpdate(oldObj, newObj any) {
-	metaObj, ok := toPartialObjectMetadata(newObj)
-	if !ok || !isGatewayAPICRD(metaObj.Name) {
-		return
-	}
-
-	v.mu.Lock()
-	existing, found := v.crds[metaObj.Name]
-	if found && existing.ResourceVersion == metaObj.ResourceVersion {
-		v.mu.Unlock()
-		return
-	}
-	v.crds[metaObj.Name] = metaObj
-	oldSnapshot := v.snapshot
-	newSnapshot := v.computeSnapshotLocked()
-	v.snapshot = newSnapshot
-	restartFn := v.restartFunc
-	bvCallbacks := make([]func(newVersion *string), len(v.onBundleVersionChanged))
-	copy(bvCallbacks, v.onBundleVersionChanged)
-	v.mu.Unlock()
-
-	v.evaluateChange(oldSnapshot, newSnapshot, restartFn, bvCallbacks)
+	v.HandleAdd(newObj)
 }
 
 // HandleDelete processes CRD deletion events.
@@ -347,7 +354,7 @@ func (v *CRDView) HandleDelete(obj any) {
 	if tombstone, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
-	metaObj, ok := toPartialObjectMetadata(obj)
+	metaObj, ok := toCRDMetadata(obj)
 	if !ok || !isGatewayAPICRD(metaObj.Name) {
 		return
 	}
@@ -358,6 +365,10 @@ func (v *CRDView) HandleDelete(obj any) {
 		return
 	}
 	delete(v.crds, metaObj.Name)
+	if v.snapshot == nil {
+		v.mu.Unlock()
+		return
+	}
 	oldSnapshot := v.snapshot
 	newSnapshot := v.computeSnapshotLocked()
 	v.snapshot = newSnapshot
@@ -374,13 +385,16 @@ func (v *CRDView) evaluateChange(oldSnapshot, newSnapshot *CRDSnapshot, restartF
 		return
 	}
 	if !oldSnapshot.EqualKinds(newSnapshot) {
-		setupLog.Info("Gateway API served kinds changed, triggering restart",
+		if restartFn != nil {
+			setupLog.Info("Gateway API served kinds changed; invoking restart function",
+				"oldDisabled", oldSnapshot.DisabledKinds,
+				"newDisabled", newSnapshot.DisabledKinds)
+			restartFn()
+			return
+		}
+		setupLog.Info("Gateway API served kinds changed; restart controller deployment to reconcile newly installed kinds",
 			"oldDisabled", oldSnapshot.DisabledKinds,
 			"newDisabled", newSnapshot.DisabledKinds)
-		if restartFn != nil {
-			restartFn()
-		}
-		return
 	}
 	if !oldSnapshot.EqualBundleVersion(newSnapshot) {
 		oldVer := "<nil>"
@@ -432,26 +446,44 @@ func isGatewayAPICRD(name string) bool {
 	return strings.HasSuffix(name, ".gateway.networking.k8s.io")
 }
 
-func toPartialObjectMetadata(obj any) (*metav1.PartialObjectMetadata, bool) {
-	if m, ok := obj.(*metav1.PartialObjectMetadata); ok {
+func toCRDMetadata(obj any) (*crdMetadata, bool) {
+	if m, ok := obj.(*crdMetadata); ok {
 		return m, true
 	}
+	if pom, ok := obj.(*metav1.PartialObjectMetadata); ok {
+		return &crdMetadata{
+			Name:            pom.Name,
+			ResourceVersion: pom.ResourceVersion,
+			Annotations:     filterAnnotations(pom.Annotations),
+		}, true
+	}
 	if clientObj, ok := obj.(client.Object); ok {
-		return &metav1.PartialObjectMetadata{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: crdGVK.GroupVersion().String(),
-				Kind:       crdGVK.Kind,
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            clientObj.GetName(),
-				Namespace:       clientObj.GetNamespace(),
-				Labels:          clientObj.GetLabels(),
-				Annotations:     clientObj.GetAnnotations(),
-				ResourceVersion: clientObj.GetResourceVersion(),
-			},
+		return &crdMetadata{
+			Name:            clientObj.GetName(),
+			ResourceVersion: clientObj.GetResourceVersion(),
+			Annotations:     filterAnnotations(clientObj.GetAnnotations()),
 		}, true
 	}
 	return nil, false
+}
+
+// filterAnnotations returns a copy of annotations omitting unneeded entries,
+// specifically client-side apply annotations such as kubectl.kubernetes.io/last-applied-configuration.
+func filterAnnotations(annotations map[string]string) map[string]string {
+	if len(annotations) == 0 {
+		return nil
+	}
+	filtered := make(map[string]string)
+	for k, v := range annotations {
+		if strings.HasPrefix(k, "kubectl.kubernetes.io/") {
+			continue
+		}
+		filtered[k] = v
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
 }
 
 func snapshotFromRESTMapper(mapper meta.RESTMapper, scheme *runtime.Scheme) (*CRDSnapshot, error) {

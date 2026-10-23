@@ -401,3 +401,89 @@ func (c *informerCaptureCache) GetInformer(ctx context.Context, obj client.Objec
 	}
 	return &fakeInformer{}, nil
 }
+
+func TestCRDView_FiltersManagedFieldsAndClientSideAnnotations(t *testing.T) {
+	crd := &metav1.PartialObjectMetadata{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: crdGVK.GroupVersion().String(),
+			Kind:       crdGVK.Kind,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            GatewayCRDName,
+			ResourceVersion: "100",
+			ManagedFields: []metav1.ManagedFieldsEntry{
+				{
+					Manager:    "kubectl",
+					Operation:  metav1.ManagedFieldsOperationApply,
+					APIVersion: "apiextensions.k8s.io/v1",
+				},
+			},
+			Annotations: map[string]string{
+				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition"}`,
+				"kubectl.kubernetes.io/client-side-filter":         "true",
+				gatewayconsts.BundleVersionAnnotation:              "v1.6.3",
+				"custom.company.org/team":                          "networking",
+			},
+		},
+	}
+
+	crdView := NewCRDViewFromSnapshot(&CRDSnapshot{})
+	crdView.HandleAdd(crd)
+
+	crdView.mu.RLock()
+	stored, exists := crdView.crds[GatewayCRDName]
+	crdView.mu.RUnlock()
+
+	if !exists {
+		t.Fatalf("expected Gateway CRD to be stored")
+	}
+	if _, hasLastApplied := stored.Annotations["kubectl.kubernetes.io/last-applied-configuration"]; hasLastApplied {
+		t.Errorf("expected kubectl.kubernetes.io/last-applied-configuration to be filtered out")
+	}
+	if _, hasClientSide := stored.Annotations["kubectl.kubernetes.io/client-side-filter"]; hasClientSide {
+		t.Errorf("expected kubectl.kubernetes.io/client-side-filter to be filtered out")
+	}
+	if bv, ok := stored.Annotations[gatewayconsts.BundleVersionAnnotation]; !ok || bv != "v1.6.3" {
+		t.Errorf("expected bundle version annotation v1.6.3, got %q", bv)
+	}
+	if team, ok := stored.Annotations["custom.company.org/team"]; !ok || team != "networking" {
+		t.Errorf("expected custom annotation to be preserved, got %q", team)
+	}
+}
+
+func TestCRDView_DefaultDoesNotRestartOnServedKindsChange(t *testing.T) {
+	ctx := t.Context()
+	scheme := newTestSchemeWithApiextensions()
+
+	initCRDs := requiredGatewayAPICRDs("v1.6.3")
+	var initObjs []runtime.Object
+	for _, c := range initCRDs {
+		initObjs = append(initObjs, c)
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(initObjs...).
+		Build()
+
+	// Create CRDView without WithRestartFunc (default behavior)
+	crdView, err := NewCRDView(ctx, cl)
+	if err != nil {
+		t.Fatalf("unexpected NewCRDView error: %v", err)
+	}
+
+	if crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
+		t.Fatalf("expected TLSRoute not to be served initially")
+	}
+
+	// Install optional CRD TLSRoute at runtime
+	tlsRouteCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
+	tlsRouteCRD.ResourceVersion = "2"
+
+	// Should update snapshot and NOT panic or exit
+	crdView.HandleAdd(tlsRouteCRD)
+
+	if !crdView.Snapshot().IsKindServed(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"}) {
+		t.Errorf("expected TLSRoute to be served in updated snapshot")
+	}
+}
