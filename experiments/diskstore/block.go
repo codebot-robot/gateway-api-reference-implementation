@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"unsafe"
 )
 
 const (
@@ -152,4 +153,13 @@ func DecodeBlockHeader(blockBuf []byte) (BlockHeader, error) {
 		NumBlocks:   numBlocks,
 		CRC32C:      storedCRC,
 	}, nil
+}
+
+// AllocateAlignedBlock allocates a slice of size bytes aligned to a 4096-byte boundary.
+func AllocateAlignedBlock(size int) []byte {
+	raw := make([]byte, size+BlockSize)
+	rawPtr := uintptr(unsafe.Pointer(&raw[0]))
+	alignedPtr := (rawPtr + uintptr(BlockSize-1)) &^ uintptr(BlockSize-1)
+	offset := int(alignedPtr - rawPtr)
+	return raw[offset : offset+size]
 }
