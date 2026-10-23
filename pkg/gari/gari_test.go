@@ -24,6 +24,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -265,6 +267,43 @@ func TestForwardedForModeOptions(t *testing.T) {
 			t.Fatalf("expected error for invalid forwarded-for-mode, got nil")
 		}
 	})
+}
+
+func TestOptions_SetupWithManagerCalled(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.Install(scheme)
+
+	called := false
+	opts := DefaultOptions()
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = "default"
+	opts.DataplaneGatewayName = "test-gw"
+	opts.MetricsAddr = "0"
+	opts.HealthProbeBindAddress = "0"
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.Scheme = scheme
+	opts.SetupWithManager = func(mgr ctrl.Manager) error {
+		called = true
+		return nil
+	}
+
+	mgr, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	_, err = NewWithManager(mgr, opts)
+	if err != nil {
+		t.Fatalf("NewWithManager failed: %v", err)
+	}
+	if !called {
+		t.Errorf("expected SetupWithManager to be called, but was not")
+	}
 }
 
 func TestServerCustomHTTPListener(t *testing.T) {
@@ -2156,5 +2195,66 @@ func TestHTTP_SlowProgressingResponseBody_NotCutOff(t *testing.T) {
 	expected := "chunk-0\nchunk-1\nchunk-2\nchunk-3\nchunk-4\n"
 	if string(bodyBytes) != expected {
 		t.Errorf("expected body %q, got %q", expected, string(bodyBytes))
+	}
+}
+
+func TestGari_HealthProbeReadyz_And_DrainingSentinel(t *testing.T) {
+	sentinelDir := t.TempDir()
+	sentinelPath := filepath.Join(sentinelDir, "draining")
+
+	opts := DefaultOptions()
+	opts.DrainSentinelPath = sentinelPath
+
+	server := &Server{
+		opts: opts,
+	}
+
+	checker := server.readyzChecker()
+	readyzHandler, _ := server.healthzHandlers()
+	gariReadyzHandler := http.StripPrefix("/_gari/readyz", readyzHandler)
+
+	// 1. Not synced yet: should return 500
+	req, _ := http.NewRequestWithContext(t.Context(), "GET", "/_gari/readyz", nil)
+	rr := httptest.NewRecorder()
+	gariReadyzHandler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 when not synced, got %d", rr.Code)
+	}
+
+	// 2. Mark synced: should return 200 OK
+	server.proxySynced.Store(true)
+	if err := checker(req); err != nil {
+		t.Fatalf("expected nil error when synced and not draining, got %v", err)
+	}
+	rr = httptest.NewRecorder()
+	gariReadyzHandler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 OK when synced and not draining, got %d", rr.Code)
+	}
+
+	// 3. Write drain sentinel: should return 503 Service Unavailable (draining)
+	if err := os.WriteFile(sentinelPath, []byte("draining\n"), 0644); err != nil {
+		t.Fatalf("failed to write sentinel file: %v", err)
+	}
+	if err := checker(req); err == nil || err.Error() != "draining" {
+		t.Fatalf("expected draining error, got %v", err)
+	}
+	rr = httptest.NewRecorder()
+	gariReadyzHandler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 Service Unavailable when draining, got %d", rr.Code)
+	}
+
+	// 4. Remove drain sentinel: should recover to 200 OK
+	if err := os.Remove(sentinelPath); err != nil {
+		t.Fatalf("failed to remove sentinel file: %v", err)
+	}
+	if err := checker(req); err != nil {
+		t.Fatalf("expected nil error after sentinel removed, got %v", err)
+	}
+	rr = httptest.NewRecorder()
+	gariReadyzHandler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 OK after sentinel removed, got %d", rr.Code)
 	}
 }

@@ -5,3 +5,7 @@
 # Go
 vendor/
 *.log
+
+# Python
+__pycache__/
+*.pyc

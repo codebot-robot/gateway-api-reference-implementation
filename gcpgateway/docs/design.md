@@ -276,44 +276,47 @@ Once attachment completes:
 
 ## NEG Naming, Ownership, & Conflict Resolution
 
-### Per-Gateway NEG Identity & 63-Character Safe Naming Scheme
+### Per-Gateway NEG Identity & Hash-Based Naming Scheme
 
 In `gcpgateway`, **each Gateway has its own front-end load balancer and its own dedicated set of zonal NEGs**.
 Sharing a single set of NEGs across multiple Gateways in a cluster is strictly forbidden: doing so would cause connections to one Gateway's public IP to be routed to another Gateway's data-plane pods, which do not have its routes, hostnames, or TLS certificates.
 
-#### RFC 1035 Constraints & Namespace Isolation
-1. **63-Character Limit**: Google Cloud Compute Engine resource names must adhere to RFC 1035 (`^[a-z]([-a-z0-9]*[a-z0-9])?$`) and cannot exceed **63 characters**.
-2. **Namespace Collision**: Gateway names are only unique within a namespace. Two Gateways with the same name in different namespaces (e.g. `team-a/my-gateway` and `team-b/my-gateway`) must never collide.
+#### Naming Scheme (Configured Prefix Plus Hash)
+Following the maintainer's direction:
+- **Names are the configured prefix plus an 8-character hash**: for example, `gcpgw-<8-char-hash>-<suffix>`.
+- The 8-character hash is computed from `cluster_id/namespace/gateway_name`:
+  `hash = sha256(f"{cluster_id}/{namespace}/{gateway_name}").hexdigest()[:8]`
+- **No readable cluster, namespace, or Gateway names are encoded in the resource name**, and no truncation logic is used.
+- Example names:
+  - Zonal NEG (HTTPS): `gcpgw-9df5ee22-8443`
+  - Zonal NEG (HTTP): `gcpgw-9df5ee22-8080`
+  - Backend Service (HTTPS): `gcpgw-9df5ee22-bs-443`
+  - Backend Service (HTTP): `gcpgw-9df5ee22-bs-80`
+  - Target TCP Proxy (HTTPS): `gcpgw-9df5ee22-proxy-443`
+  - Target TCP Proxy (HTTP): `gcpgw-9df5ee22-proxy-80`
+  - Forwarding Rule (HTTPS): `gcpgw-9df5ee22-fr-443`
+  - Health Check: `gcpgw-9df5ee22-hc`
+  - Static IP: `gcpgw-9df5ee22-ip`
+  - Firewall Rule: `gcpgw-9df5ee22-allow-gfe`
 
-To satisfy both constraints simultaneously, all resources use a deterministic naming and truncation scheme:
-- Primary base name: `{prefix}-{cluster_id}-{namespace}-{gateway_name}`
-- If the candidate resource name (including suffix such as `-8443` or `-proxy-443`) is `<= 63` characters, it is used directly.
-- If the candidate resource name exceeds 63 characters:
-  1. Compute an 8-character SHA-256 hash of the full unique identifier:
-     `hash = sha256(f"{cluster_id}/{namespace}/{gateway_name}").hexdigest()[:8]`
-  2. Truncate the prefix portion and format as:
-     `{truncated_prefix}-{hash}-{suffix}`
-     ensuring the total length is guaranteed to be `<= 63` characters.
+Total name length is always under 25 characters, safely well below Google Cloud's 63-character limit without requiring any truncation logic.
 
-#### Example Resource Naming
+#### Identity via Resource Description Metadata
+NEGs in Google Cloud do not support resource labels. Therefore, **identity lives in metadata on each GCP resource**, stored as JSON in the resource `description` field, as GKE's NEG controller does:
+```json
+{
+  "cluster-id": "cluster-1",
+  "namespace": "default",
+  "gateway-name": "my-gateway",
+  "port": 8443
+}
+```
 
-| Resource | Suffix | Max Suffix Len | Example Formatted Name (<= 63 chars) |
-| --- | --- | --- | --- |
-| Zonal NEG (HTTPS) | `-8443` | 5 | `gcpgw-c1-prod-my-gateway-8443` |
-| Zonal NEG (HTTP) | `-8080` | 5 | `gcpgw-c1-prod-my-gateway-8080` |
-| Backend Service (HTTPS) | `-bs-443` | 7 | `gcpgw-c1-prod-my-gateway-bs-443` |
-| Backend Service (HTTP) | `-bs-80` | 6 | `gcpgw-c1-prod-my-gateway-bs-80` |
-| Target TCP Proxy (HTTPS)| `-proxy-443` | 10 | `gcpgw-c1-prod-my-gateway-proxy-443` |
-| Target TCP Proxy (HTTP) | `-proxy-80` | 9 | `gcpgw-c1-prod-my-gateway-proxy-80` |
-| Global Forwarding Rule | `-fr-443` | 7 | `gcpgw-c1-prod-my-gateway-fr-443` |
-| Health Check | `-hc` | 3 | `gcpgw-c1-prod-my-gateway-hc` |
-| Static IP Address | `-ip` | 3 | `gcpgw-c1-prod-my-gateway-ip` |
-| Firewall Rule | `-allow-gfe` | 10 | `gcpgw-c1-prod-my-gateway-allow-gfe` |
-
-When long cluster, namespace, or gateway names are used (e.g. `cluster-us-central1-enterprise`, namespace `production-telemetry-ingress`, gateway `external-traffic-gateway`):
-`hash = sha256("cluster-us-central1-enterprise/production-telemetry-ingress/external-traffic-gateway").hexdigest()[:8]` (e.g. `e3b0c442`)
-The name is truncated cleanly:
-`gcpgw-cluster-us-cent-production-tele-e3b0c442-8443` (exactly 52 characters, safely under 63).
+#### Metadata-Based Matching and Ownership Protection
+- **The controller lists by prefix and matches by metadata**: It lists every NEG with the configured prefix and manages only those whose metadata matches its own cluster ID and the Gateway being reconciled.
+- The controller **never infers ownership from the resource name**.
+- Any NEG with the prefix but missing, unparseable, or foreign metadata is logged and **never mutated, attached, detached, or pruned**.
+- The Python provisioning scripts write this identical metadata, and the teardown script deletes only resources whose metadata matches.
 
 ### Deterministic Conflict Resolution (Gateway API Conventions)
 
@@ -725,8 +728,11 @@ Therefore, permissions are cleanly separated into **two custom IAM roles**:
 
 | Custom Role | Permissions | Target Resource Type | IAM Condition Support |
 | --- | --- | --- | --- |
-| **`gcpgatewayNegRegistrar`** | `compute.networkEndpointGroups.get`<br>`compute.networkEndpointGroups.listNetworkEndpoints`<br>`compute.networkEndpointGroups.attachNetworkEndpoints`<br>`compute.networkEndpointGroups.detachNetworkEndpoints` | Network Endpoint Group | Scoped by IAM Condition to cluster NEGs (`gcpgw-${CLUSTER_ID}-*`) |
-| **`gcpgatewayOperatorHelper`** | `compute.instances.use`<br>`compute.zoneOperations.get`<br>`compute.backendServices.getHealth` | Instances, Operations, Backend Services | Unconditioned (or scoped by instance/backend-service naming) |
+| **`gcpgatewayNegRegistrar`** | `compute.networkEndpointGroups.get`<br>`compute.networkEndpointGroups.listNetworkEndpoints`<br>`compute.networkEndpointGroups.attachNetworkEndpoints`<br>`compute.networkEndpointGroups.detachNetworkEndpoints`<br>`compute.backendServices.get`<br>`compute.backendServices.getHealth`<br>`compute.zoneOperations.get` | Network Endpoint Groups, Backend Services, Zone Operations | Scoped by prefix if prefixes differ per cluster (`${PREFIX}-*`) |
+| **`gcpgatewayOperatorHelper`** | Full load balancer management (`compute.addresses.*`, `compute.healthChecks.*`, `compute.networkEndpointGroups.*`, `compute.backendServices.*`, `compute.targetTcpProxies.*`, `compute.forwardingRules.*`, `compute.firewalls.*`) | All front-end resources | Provisioning helper for operators |
+
+> **Important Note on Name-Based IAM Conditions**:
+> Because resource names use `<prefix>-<8-char-hash>-<suffix>` without readable cluster names, a name-based IAM condition (e.g. `resource.name.startsWith(...)`) **can no longer separate clusters unless the prefix itself differs per cluster** (e.g., `--neg-prefix=gcpgw-${CLUSTER_ID}-`). If the prefix is shared (e.g., `gcpgw-`), IAM conditions cannot separate clusters, so clusters sharing a GCP project must use distinct prefixes to achieve IAM-level isolation. Identity and ownership within the controller are strictly established via the JSON metadata in each resource's `description`.
 
 *Note: The controller does NOT require `compute.networkEndpointGroups.create`, `compute.backendServices.create`, `compute.forwardingRules.*`, or `compute.firewalls.*`.*
 
@@ -843,12 +849,9 @@ def run_gcloud(args: List[str], check: bool = True) -> Optional[Dict[str, Any]]:
 def make_resource_name(cluster_id: str, namespace: str, gateway_name: str, suffix: str, prefix: str = "gcpgw") -> str:
     full_id = f"{cluster_id}/{namespace}/{gateway_name}"
     digest = hashlib.sha256(full_id.encode("utf-8")).hexdigest()[:8]
-    candidate = f"{prefix}-{cluster_id}-{namespace}-{gateway_name}-{suffix}".lower()
-    if len(candidate) <= 63:
-        return candidate
-    max_base_len = 63 - len(digest) - len(suffix) - 2
-    truncated_base = f"{prefix}-{cluster_id}-{namespace}-{gateway_name}"[:max_base_len].rstrip("-")
-    return f"{truncated_base}-{digest}-{suffix}".lower()
+    if suffix:
+        return f"{prefix}-{digest}-{suffix}"
+    return f"{prefix}-{digest}"
 
 
 def main():

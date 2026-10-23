@@ -125,12 +125,46 @@ func WithAPIReader(reader client.Reader) Option {
 
 // AddressProvider manages per-Gateway ServiceAccounts, Deployments, LoadBalancer Services, and ClusterRoleBinding subjects.
 type AddressProvider struct {
-	client           client.Client
-	apiReader        client.Reader
-	dataplaneImage   string
-	enableH2C        bool
-	forwardedForMode string
-	state            *state.State
+	client                        client.Client
+	apiReader                     client.Reader
+	dataplaneImage                string
+	enableH2C                     bool
+	forwardedForMode              string
+	state                         *state.State
+	extraReadinessGates           []string
+	preStopCommand                []string
+	extraVolumes                  []*corev1ac.VolumeApplyConfiguration
+	extraVolumeMounts             []*corev1ac.VolumeMountApplyConfiguration
+	terminationGracePeriodSeconds *int64
+}
+
+// WithExtraReadinessGates configures additional readiness gate condition types for the data-plane pods.
+func WithExtraReadinessGates(gates ...string) Option {
+	return func(p *AddressProvider) {
+		p.extraReadinessGates = append(p.extraReadinessGates, gates...)
+	}
+}
+
+// WithPreStopCommand configures a lifecycle preStop exec command on the data-plane container.
+func WithPreStopCommand(cmd ...string) Option {
+	return func(p *AddressProvider) {
+		p.preStopCommand = cmd
+	}
+}
+
+// WithExtraVolumes configures additional volumes and volume mounts for the data-plane pod.
+func WithExtraVolumes(volumes []*corev1ac.VolumeApplyConfiguration, mounts []*corev1ac.VolumeMountApplyConfiguration) Option {
+	return func(p *AddressProvider) {
+		p.extraVolumes = append(p.extraVolumes, volumes...)
+		p.extraVolumeMounts = append(p.extraVolumeMounts, mounts...)
+	}
+}
+
+// WithTerminationGracePeriodSeconds configures the terminationGracePeriodSeconds on the data-plane pod template.
+func WithTerminationGracePeriodSeconds(seconds int64) Option {
+	return func(p *AddressProvider) {
+		p.terminationGracePeriodSeconds = &seconds
+	}
 }
 
 // WithState sets the State reference for the AddressProvider.
@@ -510,26 +544,47 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 		)
 	}
 
-	podTemplate := corev1ac.PodTemplateSpec().
-		WithLabels(labels).
-		WithSpec(corev1ac.PodSpec().
-			WithServiceAccountName(name).
-			WithContainers(corev1ac.Container().
-				WithName("dataplane").
-				WithImage(image).
-				WithImagePullPolicy(corev1.PullIfNotPresent).
-				WithArgs(args...).
-				WithPorts(containerPorts...).
-				WithReadinessProbe(corev1ac.Probe().
-					WithHTTPGet(corev1ac.HTTPGetAction().
-						WithPath("/readyz").
-						WithPort(intstr.FromInt32(DataPlaneHealthProbePort)),
-					).
-					WithInitialDelaySeconds(1).
-					WithPeriodSeconds(2),
-				),
+	containerApply := corev1ac.Container().
+		WithName("dataplane").
+		WithImage(image).
+		WithImagePullPolicy(corev1.PullIfNotPresent).
+		WithArgs(args...).
+		WithPorts(containerPorts...).
+		WithReadinessProbe(corev1ac.Probe().
+			WithHTTPGet(corev1ac.HTTPGetAction().
+				WithPath("/readyz").
+				WithPort(intstr.FromInt32(DataPlaneHealthProbePort)),
+			).
+			WithInitialDelaySeconds(1).
+			WithPeriodSeconds(2),
+		)
+	if len(p.extraVolumeMounts) > 0 {
+		containerApply.WithVolumeMounts(p.extraVolumeMounts...)
+	}
+	if len(p.preStopCommand) > 0 {
+		containerApply.WithLifecycle(corev1ac.Lifecycle().
+			WithPreStop(corev1ac.LifecycleHandler().
+				WithExec(corev1ac.ExecAction().WithCommand(p.preStopCommand...)),
 			),
 		)
+	}
+
+	podSpec := corev1ac.PodSpec().
+		WithServiceAccountName(name).
+		WithContainers(containerApply)
+	if p.terminationGracePeriodSeconds != nil {
+		podSpec.WithTerminationGracePeriodSeconds(*p.terminationGracePeriodSeconds)
+	}
+	if len(p.extraVolumes) > 0 {
+		podSpec.WithVolumes(p.extraVolumes...)
+	}
+	for _, gate := range p.extraReadinessGates {
+		podSpec.WithReadinessGates(corev1ac.PodReadinessGate().WithConditionType(corev1.PodConditionType(gate)))
+	}
+
+	podTemplate := corev1ac.PodTemplateSpec().
+		WithLabels(labels).
+		WithSpec(podSpec)
 	if len(annotations) > 0 {
 		podTemplate.WithAnnotations(annotations)
 	}

@@ -131,6 +131,78 @@ func TestParseConfigMapParameters(t *testing.T) {
 		}
 	})
 
+	t.Run("valid allowedSourceCIDRs and proxyProtocolTrustedCIDRs", func(t *testing.T) {
+		cm := &corev1.ConfigMap{
+			Data: map[string]string{
+				ParameterKeyAllowedSourceCIDRs:        "35.191.0.0/16, 130.211.0.0/22",
+				ParameterKeyProxyProtocol:             "enabled",
+				ParameterKeyProxyProtocolTrustedCIDRs: "35.191.0.0/16,130.211.0.0/22",
+				ParameterKeyExternalIP:                "34.120.254.10",
+				ParameterKeyClusterID:                 "cluster-1",
+				ParameterKeyGatewayNamespace:          "prod",
+				ParameterKeyGatewayName:               "gw",
+				ParameterKeyNEGHTTPS:                  "neg-8443",
+				ParameterKeyNEGHTTP:                   "neg-8080",
+				ParameterKeyNEGPrefix:                 "gcpgw",
+			},
+		}
+		p, err := ParseConfigMapParameters(cm)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(p.AllowedSourceCIDRs) != 2 || p.AllowedSourceCIDRs[0] != "35.191.0.0/16" || p.AllowedSourceCIDRs[1] != "130.211.0.0/22" {
+			t.Errorf("unexpected AllowedSourceCIDRs: %v", p.AllowedSourceCIDRs)
+		}
+		if p.ProxyProtocol != "enabled" {
+			t.Errorf("unexpected ProxyProtocol: %s", p.ProxyProtocol)
+		}
+		if len(p.ProxyProtocolTrustedCIDRs) != 2 || p.ProxyProtocolTrustedCIDRs[0] != "35.191.0.0/16" {
+			t.Errorf("unexpected ProxyProtocolTrustedCIDRs: %v", p.ProxyProtocolTrustedCIDRs)
+		}
+		if p.ExternalIP != "34.120.254.10" {
+			t.Errorf("unexpected ExternalIP: %s", p.ExternalIP)
+		}
+		if p.ClusterID != "cluster-1" || p.GatewayNamespace != "prod" || p.GatewayName != "gw" {
+			t.Errorf("unexpected metadata fields: %+v", p)
+		}
+	})
+
+	t.Run("invalid allowedSourceCIDRs", func(t *testing.T) {
+		cm := &corev1.ConfigMap{
+			Data: map[string]string{
+				ParameterKeyAllowedSourceCIDRs: "invalid-cidr",
+			},
+		}
+		_, err := ParseConfigMapParameters(cm)
+		if err == nil {
+			t.Fatalf("expected error for invalid CIDR, got nil")
+		}
+	})
+
+	t.Run("invalid proxyProtocol", func(t *testing.T) {
+		cm := &corev1.ConfigMap{
+			Data: map[string]string{
+				ParameterKeyProxyProtocol: "unsupported",
+			},
+		}
+		_, err := ParseConfigMapParameters(cm)
+		if err == nil {
+			t.Fatalf("expected error for invalid proxyProtocol, got nil")
+		}
+	})
+
+	t.Run("invalid externalIP", func(t *testing.T) {
+		cm := &corev1.ConfigMap{
+			Data: map[string]string{
+				ParameterKeyExternalIP: "not-an-ip",
+			},
+		}
+		_, err := ParseConfigMapParameters(cm)
+		if err == nil {
+			t.Fatalf("expected error for invalid externalIP, got nil")
+		}
+	})
+
 	t.Run("invalid serviceAnnotations non-map", func(t *testing.T) {
 		cm := &corev1.ConfigMap{
 			Data: map[string]string{
@@ -445,6 +517,33 @@ func TestMergeParameters(t *testing.T) {
 		}
 		if res.ServiceAnnotations["gc-only"] != "1" || res.ServiceAnnotations["gw-only"] != "2" {
 			t.Errorf("unexpected annotations: %+v", res.ServiceAnnotations)
+		}
+	})
+
+	t.Run("Gateway merges CIDRs and GCP fields", func(t *testing.T) {
+		gc := &Parameters{
+			AllowedSourceCIDRs: []string{"10.0.0.0/8"},
+			ClusterID:          "cluster-gc",
+		}
+		gw := &Parameters{
+			AllowedSourceCIDRs:        []string{"35.191.0.0/16"},
+			ProxyProtocol:             "enabled",
+			ProxyProtocolTrustedCIDRs: []string{"35.191.0.0/16"},
+			ExternalIP:                "34.120.254.10",
+			ClusterID:                 "cluster-gw",
+		}
+		res := MergeParameters(gc, gw)
+		if len(res.AllowedSourceCIDRs) != 1 || res.AllowedSourceCIDRs[0] != "35.191.0.0/16" {
+			t.Errorf("expected gw AllowedSourceCIDRs, got %v", res.AllowedSourceCIDRs)
+		}
+		if res.ProxyProtocol != "enabled" {
+			t.Errorf("expected ProxyProtocol enabled, got %s", res.ProxyProtocol)
+		}
+		if res.ExternalIP != "34.120.254.10" {
+			t.Errorf("expected ExternalIP 34.120.254.10, got %s", res.ExternalIP)
+		}
+		if res.ClusterID != "cluster-gw" {
+			t.Errorf("expected ClusterID cluster-gw, got %s", res.ClusterID)
 		}
 	})
 }
