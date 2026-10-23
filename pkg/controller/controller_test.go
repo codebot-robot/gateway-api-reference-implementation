@@ -650,14 +650,16 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: gatewayconsts.BundleVersion})
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
@@ -690,14 +692,16 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: "v1.6.0"})
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
@@ -730,14 +734,16 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: "v1.5.0"})
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
@@ -774,14 +780,16 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
@@ -814,14 +822,16 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
@@ -846,14 +856,16 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 			WithStatusSubresource(gc.DeepCopy()).
 			Build()
 
+		ctx := t.Context()
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{})
+
 		r := &GatewayClassReconciler{
 			Client:         client,
-			APIReader:      client,
 			Scheme:         scheme,
 			ControllerName: "test-controller",
+			CRDView:        crdView,
 		}
 
-		ctx := t.Context()
 		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
 		if err != nil {
 			t.Fatalf("unexpected reconcile error: %v", err)
@@ -870,32 +882,50 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		}
 	})
 
-	t.Run("reconciliation syncs CRD bundle version to State", func(t *testing.T) {
+	t.Run("view syncs CRD bundle version to State via real wiring", func(t *testing.T) {
 		st := state.NewState()
 		st.SetControllerName("test-controller")
 
-		client := fake.NewClientBuilder().
-			WithScheme(scheme).
-			WithObjects(gc.DeepCopy(), crdWithMatchingVersion).
-			WithStatusSubresource(gc.DeepCopy()).
-			Build()
+		// Construct the view with an initial version
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{
+			ServedKinds:   ServedKinds{GatewayClass: true, Gateway: true, HTTPRoute: true},
+			BundleVersion: "v1.6.0",
+		})
 
-		r := &GatewayClassReconciler{
-			Client:         client,
-			APIReader:      client,
-			Scheme:         scheme,
-			State:          st,
-			ControllerName: "test-controller",
+		// Wire the view to State exactly as RegisterReconcilers does in utils.go
+		snapshot := crdView.Snapshot()
+		var bvPtr *string
+		if snapshot.BundleVersion != "" {
+			bvPtr = &snapshot.BundleVersion
+		}
+		st.SetGatewayCRDBundleVersion(bvPtr)
+		crdView.SetOnBundleVersionChanged(func(newVersion string) {
+			var newBVPtr *string
+			if newVersion != "" {
+				newBVPtr = &newVersion
+			}
+			st.SetGatewayCRDBundleVersion(newBVPtr)
+		})
+
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != "v1.6.0" {
+			t.Fatalf("expected initial State bundle version v1.6.0, got %v", st.GatewayCRDBundleVersion())
 		}
 
-		ctx := t.Context()
-		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-gc"}})
-		if err != nil {
-			t.Fatalf("unexpected reconcile error: %v", err)
+		// Deliver a CRD update with a new bundle-version annotation
+		oldCRD := makeTestCRD(GatewayCRDName, "v1.6.0")
+		newCRD := makeTestCRD(GatewayCRDName, "v1.6.3")
+		newCRD.ResourceVersion = "2"
+		crdView.HandleUpdate(oldCRD, newCRD)
+
+		// Assert on State
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != "v1.6.3" {
+			t.Errorf("expected State bundle version v1.6.3 after update, got %v", st.GatewayCRDBundleVersion())
 		}
 
-		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != gatewayconsts.BundleVersion {
-			t.Errorf("expected State bundle version %s, got %v", gatewayconsts.BundleVersion, st.GatewayCRDBundleVersion())
+		// Deliver a CRD deletion clearing bundle-version
+		crdView.HandleDelete(newCRD)
+		if st.GatewayCRDBundleVersion() != nil {
+			t.Errorf("expected State bundle version nil after delete, got %v", st.GatewayCRDBundleVersion())
 		}
 	})
 }
@@ -2339,10 +2369,12 @@ func TestGatewayReconciler_PartialCRDInstallation_ReconcilesGatewayAndHTTPRoute(
 	// Simulate GKE standard channel: 6 of 10 CRDs served, 4 optional CRDs absent
 	mapper := newTestRESTMapper(gkeStandardGatewayAPIGVKs()...)
 
-	servedKinds, disabledKinds, err := CheckGatewayAPICRDs(mapper, scheme)
+	servedKinds, err := SnapshotFromRESTMapper(mapper, scheme)
 	if err != nil {
-		t.Fatalf("unexpected CheckGatewayAPICRDs error: %v", err)
+		t.Fatalf("unexpected SnapshotFromRESTMapper error: %v", err)
 	}
+	snapshot := CRDSnapshot{ServedKinds: servedKinds}
+	disabledKinds := snapshot.DisabledKinds()
 	if len(disabledKinds) != 4 {
 		t.Fatalf("expected 4 disabled kinds, got %d: %v", len(disabledKinds), disabledKinds)
 	}

@@ -59,63 +59,7 @@ type ReconcilerOptions struct {
 	AddressProvider      AddressProvider
 	GatewayFilter        func(gw *gatewayv1.Gateway) bool
 	DisableStatusUpdates bool
-}
-
-// CheckGatewayAPICRDs inspects the cluster's served API resources using the RESTMapper.
-// It verifies that all required Gateway API CRDs (GatewayClass, Gateway, HTTPRoute) are served,
-// and returns the set of served GroupKinds and the names of any disabled optional kinds.
-func CheckGatewayAPICRDs(mapper meta.RESTMapper, scheme *runtime.Scheme) (map[schema.GroupKind]bool, []string, error) {
-	if mapper == nil {
-		return nil, nil, fmt.Errorf("RESTMapper is required")
-	}
-	if scheme == nil {
-		return nil, nil, fmt.Errorf("scheme is required")
-	}
-
-	requiredObjects := []client.Object{
-		&gatewayv1.GatewayClass{},
-		&gatewayv1.Gateway{},
-		&gatewayv1.HTTPRoute{},
-	}
-	optionalObjects := []client.Object{
-		&gatewayv1.TLSRoute{},
-		&gatewayv1.GRPCRoute{},
-		&gatewayv1.TCPRoute{},
-		&gatewayv1.UDPRoute{},
-		&gatewayv1.BackendTLSPolicy{},
-		&gatewayv1.ListenerSet{},
-		&gatewayv1beta1.ReferenceGrant{},
-	}
-
-	served := make(map[schema.GroupKind]bool)
-	for _, obj := range requiredObjects {
-		gvk, err := apiutil.GVKForObject(obj, scheme)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error getting GVK for %T: %w", obj, err)
-		}
-		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
-			return nil, nil, fmt.Errorf("required Gateway API CRD %s (%s) is not installed: %w", gvk.Kind, gvk.GroupKind().String(), err)
-		}
-		served[gvk.GroupKind()] = true
-	}
-
-	var disabledKinds []string
-	for _, obj := range optionalObjects {
-		gvk, err := apiutil.GVKForObject(obj, scheme)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error getting GVK for %T: %w", obj, err)
-		}
-		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
-			if meta.IsNoMatchError(err) {
-				disabledKinds = append(disabledKinds, gvk.Kind)
-				continue
-			}
-			return nil, nil, fmt.Errorf("failed to check CRD for %s (%s): %w", gvk.Kind, gvk.GroupKind().String(), err)
-		}
-		served[gvk.GroupKind()] = true
-	}
-
-	return served, disabledKinds, nil
+	CRDView              *CRDView
 }
 
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
@@ -125,10 +69,32 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		controllerName = DefaultControllerName
 	}
 
-	servedKinds, disabledKinds, err := CheckGatewayAPICRDs(mgr.GetRESTMapper(), mgr.GetScheme())
-	if err != nil {
+	crdView := opts.CRDView
+	if crdView == nil {
+		var mapper meta.RESTMapper
+		var scheme *runtime.Scheme
+		var reader client.Reader
+		if mgr != nil {
+			mapper = mgr.GetRESTMapper()
+			scheme = mgr.GetScheme()
+			reader = mgr.GetAPIReader()
+			if reader == nil {
+				reader = mgr.GetClient()
+			}
+		}
+		var err error
+		crdView, err = NewCRDView(context.Background(), mapper, scheme, reader)
+		if err != nil {
+			return err
+		}
+	}
+
+	snapshot := crdView.Snapshot()
+	if err := snapshot.ValidateRequired(); err != nil {
 		return err
 	}
+	servedKinds := snapshot.ServedGroupKinds()
+	disabledKinds := snapshot.DisabledKinds()
 	if len(disabledKinds) > 0 {
 		sort.Strings(disabledKinds)
 		setupLog.Info("optional Gateway API CRDs disabled (not served by cluster)", "kinds", disabledKinds)
@@ -148,6 +114,18 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 	if st != nil {
 		st.SetDisabledRouteKinds(disabledRouteKinds)
 		st.SetControllerName(controllerName)
+		var bvPtr *string
+		if snapshot.BundleVersion != "" {
+			bvPtr = &snapshot.BundleVersion
+		}
+		st.SetGatewayCRDBundleVersion(bvPtr)
+		crdView.SetOnBundleVersionChanged(func(newVersion string) {
+			var newBVPtr *string
+			if newVersion != "" {
+				newBVPtr = &newVersion
+			}
+			st.SetGatewayCRDBundleVersion(newBVPtr)
+		})
 		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
 		st.SetGatewayFilter(opts.GatewayFilter)
 		st.SetSynced(false)
@@ -169,6 +147,10 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		if err := mgr.Add(st); err != nil {
 			return fmt.Errorf("error adding state runner to manager: %w", err)
 		}
+	}
+
+	if err := crdView.RegisterWithManager(mgr); err != nil {
+		return fmt.Errorf("error registering CRD informer: %w", err)
 	}
 
 	if opts.DisableStatusUpdates {
@@ -230,10 +212,10 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 
 	if err := (&GatewayClassReconciler{
 		Client:         mgr.GetClient(),
-		APIReader:      mgr.GetAPIReader(),
 		Scheme:         mgr.GetScheme(),
 		State:          st,
 		ControllerName: controllerName,
+		CRDView:        crdView,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating GatewayClass controller: %w", err)
 	}

@@ -21,16 +21,13 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
 
 type GatewayClassReconciler struct {
@@ -39,6 +36,7 @@ type GatewayClassReconciler struct {
 	Scheme         *runtime.Scheme
 	State          *state.State
 	ControllerName string
+	CRDView        CRDViewReader
 }
 
 func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -54,23 +52,11 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	var crdBundleVersion *string
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-	if reader != nil {
-		var crd apiextensionsv1.CustomResourceDefinition
-		if err := reader.Get(ctx, types.NamespacedName{Name: "gateways.gateway.networking.k8s.io"}, &crd); err != nil {
-			l.Info("Unable to read Gateway CRD for SupportedVersion condition", "error", err)
-		} else if val, ok := crd.Annotations[gatewayconsts.BundleVersionAnnotation]; ok && val != "" {
-			crdBundleVersion = &val
-		} else {
-			l.Info("Gateway CRD missing bundle-version annotation")
+	if r.CRDView != nil {
+		snapshot := r.CRDView.Snapshot()
+		if snapshot.BundleVersion != "" {
+			crdBundleVersion = &snapshot.BundleVersion
 		}
-	}
-
-	if r.State != nil {
-		r.State.SetGatewayCRDBundleVersion(crdBundleVersion)
 	}
 
 	var desired gatewayv1.GatewayClassStatus
@@ -97,9 +83,6 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ControllerName == "" {
 		return fmt.Errorf("ControllerName is required")
-	}
-	if r.APIReader == nil && mgr != nil {
-		r.APIReader = mgr.GetAPIReader()
 	}
 	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.GatewayClass{})
