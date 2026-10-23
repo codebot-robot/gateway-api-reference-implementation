@@ -26,12 +26,15 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -89,6 +92,77 @@ func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp
 		Registrar:     reg,
 		waitingSince:  make(map[string]time.Time),
 	}
+}
+
+// SetupWithManager registers GatewayReconciler with the controller-runtime Manager,
+// watching Gateways, data-plane Pods, and EndpointSlices.
+func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&gatewayv1.Gateway{}).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.podToGateway)).
+		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.endpointSliceToGateway)).
+		Complete(r)
+}
+
+func (r *GatewayReconciler) podToGateway(ctx context.Context, obj client.Object) []reconcile.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || pod == nil {
+		return nil
+	}
+	if pod.Labels[singlepod.LabelAppName] != singlepod.AppNameValue {
+		return nil
+	}
+	gwName := pod.Labels[singlepod.LabelGatewayName]
+	if gwName == "" {
+		return nil
+	}
+	return []reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Namespace: pod.Namespace,
+				Name:      gwName,
+			},
+		},
+	}
+}
+
+func (r *GatewayReconciler) endpointSliceToGateway(ctx context.Context, obj client.Object) []reconcile.Request {
+	slice, ok := obj.(*discoveryv1.EndpointSlice)
+	if !ok || slice == nil {
+		return nil
+	}
+	gwName := slice.Labels[singlepod.LabelGatewayName]
+	if gwName != "" {
+		return []reconcile.Request{
+			{
+				NamespacedName: types.NamespacedName{
+					Namespace: slice.Namespace,
+					Name:      gwName,
+				},
+			},
+		}
+	}
+	svcName := slice.Labels["kubernetes.io/service-name"]
+	if svcName != "" {
+		var gwList gatewayv1.GatewayList
+		if err := r.Client.List(ctx, &gwList, client.InNamespace(slice.Namespace)); err != nil {
+			klog.V(4).Infof("endpointSliceToGateway: listing gateways: %v", err)
+			return nil
+		}
+		for _, gw := range gwList.Items {
+			if singlepod.ResourceNameForGateway(gw.Name) == svcName {
+				return []reconcile.Request{
+					{
+						NamespacedName: types.NamespacedName{
+							Namespace: slice.Namespace,
+							Name:      gw.Name,
+						},
+					},
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Reconcile performs the full reconciliation loop for a Gateway.
