@@ -242,7 +242,7 @@ func runClientCLI(args []string) {
 				fmt.Printf("Connection rejected as expected: %v\n", err)
 				return
 			}
-			defer closeBody(resp.Body)
+			closeBody(resp.Body)
 			log.Fatalf("Expected connection to fail, but request succeeded with status %s", resp.Status)
 		}
 

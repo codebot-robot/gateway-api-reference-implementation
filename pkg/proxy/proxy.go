@@ -2079,47 +2079,51 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 			continue
 		}
 
-		defer closeConn(resp.Body)
-
-		resp.Header.Del("Alt-Svc")
-
-		effectiveCORS := respCORS
-		if backend.CORS != nil {
-			effectiveCORS = backend.CORS
-		}
-		if effectiveCORS != nil {
-			applyCORSHeaders(resp.Header, r, effectiveCORS, false)
-		}
-
-		if backend.ResponseHeaderModifier != nil {
-			modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
-		}
-		if respHeaderModifier != nil {
-			modifyHeaders(resp.Header, *respHeaderModifier)
-		}
-
-		removeHopByHopHeaders(resp.Header)
-
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, resp.Body); err != nil {
-			if !isNormalClose(err) {
-				log.Log.Error(err, "Failed to copy response body")
-			}
-			panic(http.ErrAbortHandler)
-		}
-		closeConn(resp.Body)
-
-		for k, vv := range resp.Trailer {
-			for _, v := range vv {
-				w.Header().Add(http.TrailerPrefix+k, v)
-			}
-		}
+		writeHTTPResponse(w, r, resp, backend, respHeaderModifier, respCORS)
 		return
+	}
+}
+
+func writeHTTPResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, backend state.InternalBackend, respHeaderModifier *gatewayv1.HTTPHeaderFilter, respCORS *gatewayv1.HTTPCORSFilter) {
+	defer closeConn(resp.Body)
+
+	resp.Header.Del("Alt-Svc")
+
+	effectiveCORS := respCORS
+	if backend.CORS != nil {
+		effectiveCORS = backend.CORS
+	}
+	if effectiveCORS != nil {
+		applyCORSHeaders(resp.Header, r, effectiveCORS, false)
+	}
+
+	if backend.ResponseHeaderModifier != nil {
+		modifyHeaders(resp.Header, *backend.ResponseHeaderModifier)
+	}
+	if respHeaderModifier != nil {
+		modifyHeaders(resp.Header, *respHeaderModifier)
+	}
+
+	removeHopByHopHeaders(resp.Header)
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		if !isNormalClose(err) {
+			log.Log.Error(err, "Failed to copy response body")
+		}
+		panic(http.ErrAbortHandler)
+	}
+	closeConn(resp.Body)
+
+	for k, vv := range resp.Trailer {
+		for _, v := range vv {
+			w.Header().Add(http.TrailerPrefix+k, v)
+		}
 	}
 }
 
