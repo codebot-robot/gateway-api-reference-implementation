@@ -291,9 +291,9 @@ func TestCRDView_InitialSyncReplayDoesNotLogOrIncrementCounter(t *testing.T) {
 	}
 
 	// Replay initial-sync Add events for all already-served CRDs
-	crdView.HandleAdd(makeTestCRD(GatewayClassCRDName, ""))
-	crdView.HandleAdd(makeTestCRD(GatewayCRDName, "v1.6.3"))
-	crdView.HandleAdd(makeTestCRD(HTTPRouteCRDName, ""))
+	crdView.HandleAdd(makeTestCRD(GatewayClassCRDName, ""), true)
+	crdView.HandleAdd(makeTestCRD(GatewayCRDName, "v1.6.3"), true)
+	crdView.HandleAdd(makeTestCRD(HTTPRouteCRDName, ""), true)
 
 	if crdView.CRDChangeCount() != 0 {
 		t.Errorf("expected change count still 0 after initial sync of served CRDs, got %d", crdView.CRDChangeCount())
@@ -306,6 +306,55 @@ func TestCRDView_InitialSyncReplayDoesNotLogOrIncrementCounter(t *testing.T) {
 
 	if crdView.CRDChangeCount() != 0 {
 		t.Errorf("expected change count still 0 after non-meaningful update, got %d", crdView.CRDChangeCount())
+	}
+}
+
+// TestCRDView_InitialListAddForUnservedKindDoesNotLogOrCount tests that when a CRD exists
+// on the cluster but its version isn't served by GARI (e.g. older bundle with TLSRoute at v1alpha2),
+// the informer's initial list delivers an Add event (isInInitialList=true) which must NOT log
+// a restart or increment the counter, but must still record the resourceVersion.
+func TestCRDView_InitialListAddForUnservedKindDoesNotLogOrCount(t *testing.T) {
+	snapshot := CRDSnapshot{
+		ServedKinds: ServedKinds{
+			GatewayClass: true,
+			Gateway:      true,
+			HTTPRoute:    true,
+			TLSRoute:     false, // Unserved kind (e.g. older cluster bundle only serves v1alpha2)
+		},
+		BundleVersion: "v1.6.0",
+	}
+	crdView := NewCRDViewFromSnapshot(snapshot)
+
+	if crdView.CRDChangeCount() != 0 {
+		t.Fatalf("expected initial change count 0, got %d", crdView.CRDChangeCount())
+	}
+
+	// CRD exists on cluster, but comes from initial list (isInInitialList = true)
+	tlsCRD := makeTestCRD(TLSRouteCRDName, "v1.6.0")
+	tlsCRD.ResourceVersion = "42"
+	crdView.HandleAdd(tlsCRD, true)
+
+	// Should not be counted or log restart
+	if crdView.CRDChangeCount() != 0 {
+		t.Errorf("expected change count 0 for initial-list add of unserved kind, got %d", crdView.CRDChangeCount())
+	}
+
+	// Should still record the resourceVersion in private tracking
+	crdView.mu.RLock()
+	record, exists := crdView.crds[TLSRouteCRDName]
+	crdView.mu.RUnlock()
+	if !exists {
+		t.Fatalf("expected TLSRoute to be recorded in crds map")
+	}
+	if record.ResourceVersion != "42" {
+		t.Errorf("expected recorded ResourceVersion 42, got %q", record.ResourceVersion)
+	}
+
+	// Now deliver a runtime add (isInInitialList = false) for a different unserved kind -> should count!
+	grpcCRD := makeTestCRD(GRPCRouteCRDName, "v1.6.0")
+	crdView.HandleAdd(grpcCRD, false)
+	if crdView.CRDChangeCount() != 1 {
+		t.Errorf("expected change count 1 after runtime add of unserved kind, got %d", crdView.CRDChangeCount())
 	}
 }
 
@@ -341,17 +390,17 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 		t.Fatalf("expected initial change count 0, got %d", crdView.CRDChangeCount())
 	}
 
-	// Add an unserved optional CRD -> meaningful change!
+	// Add an unserved optional CRD at runtime -> meaningful change!
 	tlsCRD := makeTestCRD(TLSRouteCRDName, "v1.6.3")
 	tlsCRD.ResourceVersion = "1"
-	crdView.HandleAdd(tlsCRD)
+	crdView.HandleAdd(tlsCRD, false)
 
 	if crdView.CRDChangeCount() != 1 {
 		t.Errorf("expected change count 1 after add of unserved kind, got %d", crdView.CRDChangeCount())
 	}
 
 	// Resync with same ResourceVersion should be ignored
-	crdView.HandleAdd(tlsCRD)
+	crdView.HandleAdd(tlsCRD, false)
 	if crdView.CRDChangeCount() != 1 {
 		t.Errorf("expected change count still 1 after resync, got %d", crdView.CRDChangeCount())
 	}
@@ -382,7 +431,7 @@ func TestCRDView_RuntimeCRDChangesIncrementCounter(t *testing.T) {
 
 	// Unrelated CRD should be ignored
 	unrelatedCRD := makeTestCRD("certificates.cert-manager.io", "v1.0.0")
-	crdView.HandleAdd(unrelatedCRD)
+	crdView.HandleAdd(unrelatedCRD, false)
 	if crdView.CRDChangeCount() != 3 {
 		t.Errorf("expected change count still 3 after unrelated CRD, got %d", crdView.CRDChangeCount())
 	}

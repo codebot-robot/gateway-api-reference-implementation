@@ -29,6 +29,7 @@ import (
 	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
@@ -71,94 +72,94 @@ type ServedKinds struct {
 }
 
 type kindDefinition struct {
-	gk       schema.GroupKind
-	version  string
-	crdName  string
-	required bool
-	get      func(s *ServedKinds) bool
-	set      func(s *ServedKinds, v bool)
+	gk        schema.GroupKind
+	crdName   string
+	required  bool
+	prototype client.Object
+	get       func(s *ServedKinds) bool
+	set       func(s *ServedKinds, v bool)
 }
 
 var knownKinds = []kindDefinition{
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GatewayClass"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  GatewayClassCRDName,
-		required: true,
-		get:      func(s *ServedKinds) bool { return s.GatewayClass },
-		set:      func(s *ServedKinds, v bool) { s.GatewayClass = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GatewayClass"},
+		crdName:   GatewayClassCRDName,
+		required:  true,
+		prototype: &gatewayv1.GatewayClass{},
+		get:       func(s *ServedKinds) bool { return s.GatewayClass },
+		set:       func(s *ServedKinds, v bool) { s.GatewayClass = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  GatewayCRDName,
-		required: true,
-		get:      func(s *ServedKinds) bool { return s.Gateway },
-		set:      func(s *ServedKinds, v bool) { s.Gateway = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "Gateway"},
+		crdName:   GatewayCRDName,
+		required:  true,
+		prototype: &gatewayv1.Gateway{},
+		get:       func(s *ServedKinds) bool { return s.Gateway },
+		set:       func(s *ServedKinds, v bool) { s.Gateway = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  HTTPRouteCRDName,
-		required: true,
-		get:      func(s *ServedKinds) bool { return s.HTTPRoute },
-		set:      func(s *ServedKinds, v bool) { s.HTTPRoute = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "HTTPRoute"},
+		crdName:   HTTPRouteCRDName,
+		required:  true,
+		prototype: &gatewayv1.HTTPRoute{},
+		get:       func(s *ServedKinds) bool { return s.HTTPRoute },
+		set:       func(s *ServedKinds, v bool) { s.HTTPRoute = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  TLSRouteCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.TLSRoute },
-		set:      func(s *ServedKinds, v bool) { s.TLSRoute = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TLSRoute"},
+		crdName:   TLSRouteCRDName,
+		required:  false,
+		prototype: &gatewayv1.TLSRoute{},
+		get:       func(s *ServedKinds) bool { return s.TLSRoute },
+		set:       func(s *ServedKinds, v bool) { s.TLSRoute = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GRPCRoute"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  GRPCRouteCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.GRPCRoute },
-		set:      func(s *ServedKinds, v bool) { s.GRPCRoute = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "GRPCRoute"},
+		crdName:   GRPCRouteCRDName,
+		required:  false,
+		prototype: &gatewayv1.GRPCRoute{},
+		get:       func(s *ServedKinds) bool { return s.GRPCRoute },
+		set:       func(s *ServedKinds, v bool) { s.GRPCRoute = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TCPRoute"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  TCPRouteCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.TCPRoute },
-		set:      func(s *ServedKinds, v bool) { s.TCPRoute = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "TCPRoute"},
+		crdName:   TCPRouteCRDName,
+		required:  false,
+		prototype: &gatewayv1.TCPRoute{},
+		get:       func(s *ServedKinds) bool { return s.TCPRoute },
+		set:       func(s *ServedKinds, v bool) { s.TCPRoute = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "UDPRoute"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  UDPRouteCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.UDPRoute },
-		set:      func(s *ServedKinds, v bool) { s.UDPRoute = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "UDPRoute"},
+		crdName:   UDPRouteCRDName,
+		required:  false,
+		prototype: &gatewayv1.UDPRoute{},
+		get:       func(s *ServedKinds) bool { return s.UDPRoute },
+		set:       func(s *ServedKinds, v bool) { s.UDPRoute = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "BackendTLSPolicy"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  BackendTLSPolicyCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.BackendTLSPolicy },
-		set:      func(s *ServedKinds, v bool) { s.BackendTLSPolicy = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "BackendTLSPolicy"},
+		crdName:   BackendTLSPolicyCRDName,
+		required:  false,
+		prototype: &gatewayv1.BackendTLSPolicy{},
+		get:       func(s *ServedKinds) bool { return s.BackendTLSPolicy },
+		set:       func(s *ServedKinds, v bool) { s.BackendTLSPolicy = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
-		version:  gatewayv1.GroupVersion.Version,
-		crdName:  ListenerSetCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.ListenerSet },
-		set:      func(s *ServedKinds, v bool) { s.ListenerSet = v },
+		gk:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
+		crdName:   ListenerSetCRDName,
+		required:  false,
+		prototype: &gatewayv1.ListenerSet{},
+		get:       func(s *ServedKinds) bool { return s.ListenerSet },
+		set:       func(s *ServedKinds, v bool) { s.ListenerSet = v },
 	},
 	{
-		gk:       schema.GroupKind{Group: gatewayv1beta1.GroupName, Kind: "ReferenceGrant"},
-		version:  gatewayv1beta1.GroupVersion.Version,
-		crdName:  ReferenceGrantCRDName,
-		required: false,
-		get:      func(s *ServedKinds) bool { return s.ReferenceGrant },
-		set:      func(s *ServedKinds, v bool) { s.ReferenceGrant = v },
+		gk:        schema.GroupKind{Group: gatewayv1beta1.GroupName, Kind: "ReferenceGrant"},
+		crdName:   ReferenceGrantCRDName,
+		required:  false,
+		prototype: &gatewayv1beta1.ReferenceGrant{},
+		get:       func(s *ServedKinds) bool { return s.ReferenceGrant },
+		set:       func(s *ServedKinds, v bool) { s.ReferenceGrant = v },
 	},
 }
 
@@ -327,8 +328,10 @@ func (v *CRDView) RegisterWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return fmt.Errorf("failed to get informer for CustomResourceDefinition metadata: %w", err)
 	}
-	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
-		AddFunc:    v.HandleAdd,
+	_, err = informer.AddEventHandler(toolscache.ResourceEventHandlerDetailedFuncs{
+		AddFunc: func(obj any, isInInitialList bool) {
+			v.HandleAdd(obj, isInInitialList)
+		},
 		UpdateFunc: v.HandleUpdate,
 		DeleteFunc: v.HandleDelete,
 	})
@@ -339,7 +342,7 @@ func (v *CRDView) RegisterWithManager(mgr ctrl.Manager) error {
 }
 
 // HandleAdd processes CRD creation events.
-func (v *CRDView) HandleAdd(obj any) {
+func (v *CRDView) HandleAdd(obj any, isInInitialList bool) {
 	metaObj, ok := toPartialObjectMetadata(obj)
 	if !ok {
 		return
@@ -365,7 +368,7 @@ func (v *CRDView) HandleAdd(obj any) {
 		BundleVersion:   bv,
 	}
 
-	isUnservedAdd := !v.snapshot.IsKindServed(kd.gk)
+	isUnservedAdd := !isInInitialList && !v.snapshot.IsKindServed(kd.gk)
 	var bvChanged bool
 	var newBV string
 	var cb func(string)
@@ -530,7 +533,11 @@ func CRDMetadataTransform(obj any) (any, error) {
 func SnapshotFromRESTMapper(mapper meta.RESTMapper, scheme *runtime.Scheme) (ServedKinds, error) {
 	var served ServedKinds
 	for _, kd := range knownKinds {
-		_, err := mapper.RESTMapping(kd.gk, kd.version)
+		gvk, err := apiutil.GVKForObject(kd.prototype, scheme)
+		if err != nil {
+			return ServedKinds{}, fmt.Errorf("error getting GVK for %T: %w", kd.prototype, err)
+		}
+		_, err = mapper.RESTMapping(kd.gk, gvk.Version)
 		if err != nil {
 			if kd.required {
 				return ServedKinds{}, fmt.Errorf("required Gateway API CRD %s (%s) is not installed: %w", kd.gk.Kind, kd.gk.String(), err)

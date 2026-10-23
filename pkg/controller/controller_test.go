@@ -882,16 +882,50 @@ func TestGatewayClassReconciler_SupportedVersion(t *testing.T) {
 		}
 	})
 
-	t.Run("view syncs CRD bundle version to State", func(t *testing.T) {
+	t.Run("view syncs CRD bundle version to State via real wiring", func(t *testing.T) {
 		st := state.NewState()
 		st.SetControllerName("test-controller")
 
-		crdView := NewCRDViewFromSnapshot(CRDSnapshot{BundleVersion: gatewayconsts.BundleVersion})
-		bv := crdView.Snapshot().BundleVersion
-		st.SetGatewayCRDBundleVersion(&bv)
+		// Construct the view with an initial version
+		crdView := NewCRDViewFromSnapshot(CRDSnapshot{
+			ServedKinds:   ServedKinds{GatewayClass: true, Gateway: true, HTTPRoute: true},
+			BundleVersion: "v1.6.0",
+		})
 
-		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != gatewayconsts.BundleVersion {
-			t.Errorf("expected State bundle version %s, got %v", gatewayconsts.BundleVersion, st.GatewayCRDBundleVersion())
+		// Wire the view to State exactly as RegisterReconcilers does in utils.go
+		snapshot := crdView.Snapshot()
+		var bvPtr *string
+		if snapshot.BundleVersion != "" {
+			bvPtr = &snapshot.BundleVersion
+		}
+		st.SetGatewayCRDBundleVersion(bvPtr)
+		crdView.SetOnBundleVersionChanged(func(newVersion string) {
+			var newBVPtr *string
+			if newVersion != "" {
+				newBVPtr = &newVersion
+			}
+			st.SetGatewayCRDBundleVersion(newBVPtr)
+		})
+
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != "v1.6.0" {
+			t.Fatalf("expected initial State bundle version v1.6.0, got %v", st.GatewayCRDBundleVersion())
+		}
+
+		// Deliver a CRD update with a new bundle-version annotation
+		oldCRD := makeTestCRD(GatewayCRDName, "v1.6.0")
+		newCRD := makeTestCRD(GatewayCRDName, "v1.6.3")
+		newCRD.ResourceVersion = "2"
+		crdView.HandleUpdate(oldCRD, newCRD)
+
+		// Assert on State
+		if st.GatewayCRDBundleVersion() == nil || *st.GatewayCRDBundleVersion() != "v1.6.3" {
+			t.Errorf("expected State bundle version v1.6.3 after update, got %v", st.GatewayCRDBundleVersion())
+		}
+
+		// Deliver a CRD deletion clearing bundle-version
+		crdView.HandleDelete(newCRD)
+		if st.GatewayCRDBundleVersion() != nil {
+			t.Errorf("expected State bundle version nil after delete, got %v", st.GatewayCRDBundleVersion())
 		}
 	})
 }
