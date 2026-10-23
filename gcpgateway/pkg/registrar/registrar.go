@@ -23,6 +23,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	compute "google.golang.org/api/compute/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,9 +35,6 @@ import (
 const (
 	// MaxBatchSize is the maximum number of endpoints attached or detached per Compute API call.
 	MaxBatchSize = 500
-
-	// AppLabelDataplane is the label selector identifying GARI data plane pods.
-	AppLabelDataplane = "gari-dataplane"
 
 	// PortHTTPS is the container target port for HTTPS traffic.
 	PortHTTPS = 8443
@@ -216,10 +214,10 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Labels["app"] != AppLabelDataplane {
+		if pod.Labels[singlepod.LabelAppName] != singlepod.AppNameValue {
 			continue
 		}
-		if pod.Labels["gateway.networking.k8s.io/gateway-name"] != gw.Name && pod.Labels["gateway-name"] != gw.Name {
+		if pod.Labels[singlepod.LabelGatewayName] != gw.Name {
 			continue
 		}
 		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" {

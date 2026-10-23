@@ -22,11 +22,16 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	compute "google.golang.org/api/compute/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -34,6 +39,7 @@ import (
 func setupTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(s)
+	_ = appsv1.AddToScheme(s)
 	_ = gatewayv1.Install(s)
 	return s
 }
@@ -43,6 +49,7 @@ func makeTestGateway(ns, name string, createdAt time.Time) *gatewayv1.Gateway {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         ns,
 			Name:              name,
+			UID:               types.UID(fmt.Sprintf("%s-%s-uid", ns, name)),
 			CreationTimestamp: metav1.NewTime(createdAt),
 		},
 		Spec: gatewayv1.GatewaySpec{
@@ -72,7 +79,34 @@ func makeTestNode(name, zone, instance string) *corev1.Node {
 	}
 }
 
-func makeTestPod(ns, name, gwName, nodeName, ip string, containersReady, overallReady bool, isTerminating bool) *corev1.Pod {
+func makeTestPod(t *testing.T, c client.Client, gw *gatewayv1.Gateway, name, nodeName, ip string, containersReady, overallReady bool, isTerminating bool) *corev1.Pod {
+	drainVol := corev1ac.Volume().
+		WithName("drain-volume").
+		WithEmptyDir(corev1ac.EmptyDirVolumeSource().WithMedium(corev1.StorageMediumMemory))
+	drainMount := corev1ac.VolumeMount().
+		WithName("drain-volume").
+		WithMountPath("/var/run/gcpgateway")
+	preStopCmd := []string{"/gcpgateway", "hook", "pre-stop", "--drain-seconds=35"}
+
+	p := singlepod.NewAddressProvider(
+		c,
+		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
+		singlepod.WithPreStopCommand(preStopCmd...),
+		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
+		singlepod.WithTerminationGracePeriodSeconds(60),
+	)
+
+	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	if err != nil {
+		t.Fatalf("failed to reconcile deployment for pod template: %v", err)
+	}
+
+	resName := singlepod.ResourceNameForGateway(gw.Name)
+	var deploy appsv1.Deployment
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
 	conditions := []corev1.PodCondition{
 		{
 			Type:   corev1.ContainersReady,
@@ -90,28 +124,39 @@ func makeTestPod(ns, name, gwName, nodeName, ip string, containersReady, overall
 		conditions[1].Status = corev1.ConditionTrue
 	}
 
+	labels := make(map[string]string)
+	for k, v := range deploy.Spec.Template.Labels {
+		labels[k] = v
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: ns,
-			Name:      name,
-			Labels: map[string]string{
-				"app":                                    AppLabelDataplane,
-				"gateway.networking.k8s.io/gateway-name": gwName,
-			},
+			Namespace:  gw.Namespace,
+			Name:       name,
+			Labels:     labels,
+			Finalizers: []string{"kubernetes.io/gcpgateway-test"},
 		},
-		Spec: corev1.PodSpec{
-			NodeName: nodeName,
-		},
-		Status: corev1.PodStatus{
-			PodIP:      ip,
-			Conditions: conditions,
-		},
+		Spec: deploy.Spec.Template.Spec,
+	}
+	pod.Spec.NodeName = nodeName
+
+	if err := c.Create(t.Context(), pod); err != nil {
+		t.Fatalf("failed to create pod: %v", err)
+	}
+
+	pod.Status = corev1.PodStatus{
+		PodIP:      ip,
+		Conditions: conditions,
+	}
+	if err := c.Status().Update(t.Context(), pod); err != nil {
+		t.Fatalf("failed to update pod status: %v", err)
 	}
 
 	if isTerminating {
-		now := metav1.Now()
-		pod.DeletionTimestamp = &now
-		pod.Finalizers = []string{"kubernetes.io/gcpgateway-test"}
+		if err := c.Delete(t.Context(), pod); err != nil {
+			t.Fatalf("failed to delete pod: %v", err)
+		}
+		_ = c.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: name}, pod)
 	}
 
 	return pod
@@ -124,13 +169,14 @@ func TestRegistrar_ReadinessGateDeadlockPrevention(t *testing.T) {
 	gw := makeTestGateway("default", "my-gw", time.Now())
 	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
 
-	// Pod has ContainersReady=true, but Ready=false!
-	pod := makeTestPod("default", "dp-pod-1", "my-gw", "node-1", "10.0.1.5", true, false, false)
-
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw, node, pod).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
 		Build()
+
+	// Pod has ContainersReady=true, but Ready=false!
+	makeTestPod(t, k8sClient, gw, "dp-pod-1", "node-1", "10.0.1.5", true, false, false)
 
 	fakeGCP := gcp.NewFakeComputeClient()
 	negDesc, _ := (&metadata.NegMetadata{
@@ -181,13 +227,14 @@ func TestRegistrar_ImmediateDetachOfTerminatingPod(t *testing.T) {
 	gw := makeTestGateway("default", "my-gw", time.Now())
 	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
 
-	// Pod is terminating: ContainersReady=true, but DeletionTimestamp != nil
-	pod := makeTestPod("default", "dp-pod-1", "my-gw", "node-1", "10.0.1.5", true, true, true)
-
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw, node, pod).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
 		Build()
+
+	// Pod is terminating: ContainersReady=true, but DeletionTimestamp != nil
+	makeTestPod(t, k8sClient, gw, "dp-pod-1", "node-1", "10.0.1.5", true, true, true)
 
 	fakeGCP := gcp.NewFakeComputeClient()
 	negDesc, _ := (&metadata.NegMetadata{
@@ -322,12 +369,14 @@ func TestRegistrar_OwnershipProtection(t *testing.T) {
 	scheme := setupTestScheme()
 	gw := makeTestGateway("default", "my-gw", time.Now())
 	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
-	pod := makeTestPod("default", "dp-pod-1", "my-gw", "node-1", "10.0.1.5", true, true, false)
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw, node, pod).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
 		Build()
+
+	makeTestPod(t, k8sClient, gw, "dp-pod-1", "node-1", "10.0.1.5", true, true, false)
 
 	fakeGCP := gcp.NewFakeComputeClient()
 
@@ -448,12 +497,14 @@ func TestRegistrar_ErrorHandling(t *testing.T) {
 	scheme := setupTestScheme()
 	gw := makeTestGateway("default", "my-gw", time.Now())
 	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
-	pod := makeTestPod("default", "dp-pod-1", "my-gw", "node-1", "10.0.1.5", true, true, false)
 
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(gw, node, pod).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
 		Build()
+
+	makeTestPod(t, k8sClient, gw, "dp-pod-1", "node-1", "10.0.1.5", true, true, false)
 
 	negDesc, _ := (&metadata.NegMetadata{
 		ClusterID:   "cluster-1",
