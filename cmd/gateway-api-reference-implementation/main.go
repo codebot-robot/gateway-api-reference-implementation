@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
@@ -31,10 +32,12 @@ func main() {
 	opts := gari.DefaultOptions()
 
 	var (
-		dataplaneMode    bool
-		gatewayNamespace string
-		gatewayName      string
-		dataplaneImage   string
+		dataplaneMode                bool
+		gatewayNamespace             string
+		gatewayName                  string
+		dataplaneImage               string
+		allowedSourceCIDRsStr        string
+		proxyProtocolTrustedCIDRsStr string
 	)
 
 	defaultImg := os.Getenv("GARI_IMAGE")
@@ -46,6 +49,10 @@ func main() {
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
 	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
 	flag.StringVar(&dataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
+	flag.StringVar(&allowedSourceCIDRsStr, "allowed-source-cidrs", "", "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners.")
+	flag.StringVar(&opts.ProxyProtocol, "proxy-protocol", opts.ProxyProtocol, "Enable PROXY protocol ('enabled').")
+	flag.StringVar(&proxyProtocolTrustedCIDRsStr, "proxy-protocol-trusted-cidrs", "", "Comma-separated list of trusted CIDRs for PROXY protocol.")
+	flag.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", opts.DrainSentinelPath, "Path to the sentinel file that marks the pod as draining.")
 	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to for HTTP.")
@@ -70,6 +77,21 @@ func main() {
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
 	flag.Parse()
+
+	if allowedSourceCIDRsStr != "" {
+		for _, part := range strings.Split(allowedSourceCIDRsStr, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				opts.AllowedSourceCIDRs = append(opts.AllowedSourceCIDRs, trimmed)
+			}
+		}
+	}
+	if proxyProtocolTrustedCIDRsStr != "" {
+		for _, part := range strings.Split(proxyProtocolTrustedCIDRsStr, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				opts.ProxyProtocolTrustedCIDRs = append(opts.ProxyProtocolTrustedCIDRs, trimmed)
+			}
+		}
+	}
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 

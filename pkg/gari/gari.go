@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -221,6 +223,22 @@ type Options struct {
 	// TCPMaxConnections is the maximum number of concurrent TCP connections per listener.
 	// Defaults to 10000.
 	TCPMaxConnections int
+
+	// AllowedSourceCIDRs is an optional list of CIDRs permitted to connect to HTTP and HTTPS listeners.
+	// Connections from outside these CIDRs are closed immediately before TLS.
+	AllowedSourceCIDRs []string
+
+	// ProxyProtocol enables PROXY protocol parsing on HTTP and HTTPS listeners when set to "enabled".
+	ProxyProtocol string
+
+	// ProxyProtocolTrustedCIDRs is an optional list of CIDRs from which PROXY headers are parsed.
+	// If a connection's source IP is not in this list, PROXY headers are not honoured.
+	ProxyProtocolTrustedCIDRs []string
+
+	// DrainSentinelPath is the file path checked for connection draining.
+	// If the file exists, the readyz probe reports draining (HTTP 503).
+	// Defaults to "/var/run/gcpgateway/draining".
+	DrainSentinelPath string
 }
 
 // DefaultOptions returns standard default options for GARI.
@@ -239,6 +257,7 @@ func DefaultOptions() Options {
 		TCPIdleTimeout:         proxy.DefaultTCPIdleTimeout,
 		TCPMaxConnections:      proxy.DefaultTCPMaxConnections,
 		ForwardedForMode:       proxy.ForwardedForModeAppend,
+		DrainSentinelPath:      "/var/run/gcpgateway/draining",
 	}
 }
 
@@ -287,6 +306,21 @@ type Server struct {
 	state       *state.State
 	proxy       *proxy.Proxy
 	proxySynced atomic.Bool
+	httpFilter  *proxyproto.Listener
+	httpsFilter *proxyproto.Listener
+}
+
+func (s *Server) updateListenerFilters(opts proxyproto.ListenerOptions) {
+	if s.httpFilter != nil {
+		if err := s.httpFilter.UpdateOptions(opts); err != nil {
+			setupLog.Error(err, "failed to update HTTP listener options")
+		}
+	}
+	if s.httpsFilter != nil {
+		if err := s.httpsFilter.UpdateOptions(opts); err != nil {
+			setupLog.Error(err, "failed to update HTTPS listener options")
+		}
+	}
 }
 
 // State returns the internal state store.
@@ -356,13 +390,20 @@ func New(opts Options) (*Server, error) {
 			BindAddress: opts.MetricsAddr,
 		}
 		healthProbeBindAddress := opts.HealthProbeBindAddress
+		extraHandlers := map[string]http.Handler{
+			"/healthz":       http.StripPrefix("/healthz", healthzHandler),
+			"/healthz/":      http.StripPrefix("/healthz", healthzHandler),
+			"/readyz":        http.StripPrefix("/readyz", readyzHandler),
+			"/readyz/":       http.StripPrefix("/readyz", readyzHandler),
+			"/_gari/readyz":  http.StripPrefix("/_gari/readyz", readyzHandler),
+			"/_gari/readyz/": http.StripPrefix("/_gari/readyz", readyzHandler),
+		}
 		if samePortOrAddr(opts.MetricsAddr, opts.HealthProbeBindAddress) && opts.MetricsAddr != "" && opts.MetricsAddr != "0" && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
-			metricsOpts.ExtraHandlers = map[string]http.Handler{
-				"/healthz":  http.StripPrefix("/healthz", healthzHandler),
-				"/healthz/": http.StripPrefix("/healthz", healthzHandler),
-				"/readyz":   http.StripPrefix("/readyz", readyzHandler),
-				"/readyz/":  http.StripPrefix("/readyz", readyzHandler),
-			}
+			metricsOpts.ExtraHandlers = extraHandlers
+			healthProbeBindAddress = ""
+		} else if (opts.MetricsAddr == "" || opts.MetricsAddr == "0") && opts.HealthProbeBindAddress != "" && opts.HealthProbeBindAddress != "0" {
+			metricsOpts.BindAddress = opts.HealthProbeBindAddress
+			metricsOpts.ExtraHandlers = extraHandlers
 			healthProbeBindAddress = ""
 		}
 
@@ -445,6 +486,17 @@ func samePortOrAddr(addr1, addr2 string) bool {
 
 func (s *Server) readyzChecker() healthz.Checker {
 	return func(req *http.Request) error {
+		sentinel := s.opts.DrainSentinelPath
+		if sentinel == "" {
+			sentinel = "/var/run/gcpgateway/draining"
+		}
+		if _, err := os.Stat(sentinel); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("checking drain sentinel: %w", err)
+			}
+		} else {
+			return errors.New("draining")
+		}
 		if !s.proxySynced.Load() {
 			return errors.New("proxy configuration not yet applied")
 		}
@@ -453,7 +505,20 @@ func (s *Server) readyzChecker() healthz.Checker {
 }
 
 func (s *Server) healthzHandlers() (readyz http.Handler, healthzHandler http.Handler) {
-	rHandler := &healthz.Handler{Checks: map[string]healthz.Checker{"readyz": s.readyzChecker()}}
+	rHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if err := s.readyzChecker()(req); err != nil {
+			if err.Error() == "draining" {
+				http.Error(w, "draining", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("ok")); err != nil {
+			klog.V(4).Infof("failed to write readyz response: %v", err)
+		}
+	})
 	hHandler := &healthz.Handler{Checks: map[string]healthz.Checker{"ping": healthz.Ping}}
 	return rHandler, hHandler
 }
@@ -475,6 +540,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 			proxySynced:      &s.proxySynced,
 			gatewayNamespace: s.opts.DataplaneGatewayNamespace,
 			secretName:       secretName,
+			onConfigUpdate:   s.updateListenerFilters,
 		}
 		if err := ctrl.NewControllerManagedBy(mgr).
 			For(&corev1.Secret{}).
@@ -507,6 +573,7 @@ type dataplaneSecretReconciler struct {
 	proxySynced      *atomic.Bool
 	gatewayNamespace string
 	secretName       string
+	onConfigUpdate   func(opts proxyproto.ListenerOptions)
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -531,6 +598,21 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, fmt.Errorf("failed to apply dataplane config: %w", err)
 	}
 	r.proxySynced.Store(true)
+
+	if r.onConfigUpdate != nil {
+		dpCfg, err := state.UnmarshalDataplaneConfig(data)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to unmarshal dataplane config: %w", err)
+		}
+		opts := proxyproto.ListenerOptions{
+			AllowedSourceCIDRs:        dpCfg.AllowedSourceCIDRs,
+			ProxyProtocol:             dpCfg.ProxyProtocol,
+			ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
+		}
+		if len(opts.AllowedSourceCIDRs) > 0 || opts.ProxyProtocol != "" || len(opts.ProxyProtocolTrustedCIDRs) > 0 {
+			r.onConfigUpdate(opts)
+		}
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -628,7 +710,20 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				}
 			}
 
-			setupLog.Info("starting proxy server", "addr", lis.Addr().String())
+			filterLis, err := proxyproto.NewListener(lis, proxyproto.ListenerOptions{
+				AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
+				ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
+				ProxyProtocol:             s.opts.ProxyProtocol,
+			})
+			if err != nil {
+				if closeErr := lis.Close(); closeErr != nil {
+					klog.V(4).Infof("closing HTTP listener: %v", closeErr)
+				}
+				return fmt.Errorf("failed to create HTTP listener filter: %w", err)
+			}
+			s.httpFilter = filterLis
+
+			setupLog.Info("starting proxy server", "addr", filterLis.Addr().String())
 			var handler http.Handler = s.proxy
 			if s.opts.EnableH2C {
 				h2s := &http2.Server{}
@@ -644,7 +739,7 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 					klog.Warningf("failed to shut down proxy server: %v", err)
 				}
 			}()
-			if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
+			if err := srv.Serve(filterLis); err != nil && err != http.ErrServerClosed {
 				return fmt.Errorf("proxy server failed: %w", err)
 			}
 			return nil
@@ -695,7 +790,20 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				}
 			}
 
-			setupLog.Info("starting proxy HTTPS server", "addr", lis.Addr().String())
+			filterLis, err := proxyproto.NewListener(lis, proxyproto.ListenerOptions{
+				AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
+				ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
+				ProxyProtocol:             s.opts.ProxyProtocol,
+			})
+			if err != nil {
+				if closeErr := lis.Close(); closeErr != nil {
+					klog.V(4).Infof("closing HTTPS listener: %v", closeErr)
+				}
+				return fmt.Errorf("failed to create HTTPS listener filter: %w", err)
+			}
+			s.httpsFilter = filterLis
+
+			setupLog.Info("starting proxy HTTPS server", "addr", filterLis.Addr().String())
 
 			var handler http.Handler = s.proxy
 			if hasHTTP3 && advertisedH3Port > 0 {
@@ -711,7 +819,7 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 			if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
 				return fmt.Errorf("failed to configure HTTP/2 on HTTPS proxy: %w", err)
 			}
-			sniLis := s.proxy.NewSNIListener(lis)
+			sniLis := s.proxy.NewSNIListener(filterLis)
 			tlsLis := tls.NewListener(sniLis, tlsConfig)
 			go func() {
 				<-ctx.Done()

@@ -65,13 +65,16 @@ const (
 
 // DataplaneConfig represents the serialized proxy configuration for a single Gateway.
 type DataplaneConfig struct {
-	GatewayName         types.NamespacedName       `json:"gatewayName"`
-	Listeners           []InternalListener         `json:"listeners"`
-	Routes              []InternalRoute            `json:"routes"`
-	Certificates        map[string]CertificateData `json:"certificates,omitempty"`     // certID -> CertificateData
-	HostCertificates    map[string]string          `json:"hostCertificates,omitempty"` // hostname -> certID
-	DefaultCertID       string                     `json:"defaultCertID,omitempty"`
-	BackendClientCertID string                     `json:"backendClientCertID,omitempty"`
+	GatewayName               types.NamespacedName       `json:"gatewayName"`
+	Listeners                 []InternalListener         `json:"listeners"`
+	Routes                    []InternalRoute            `json:"routes"`
+	Certificates              map[string]CertificateData `json:"certificates,omitempty"`     // certID -> CertificateData
+	HostCertificates          map[string]string          `json:"hostCertificates,omitempty"` // hostname -> certID
+	DefaultCertID             string                     `json:"defaultCertID,omitempty"`
+	BackendClientCertID       string                     `json:"backendClientCertID,omitempty"`
+	AllowedSourceCIDRs        []string                   `json:"allowedSourceCIDRs,omitempty"`
+	ProxyProtocol             string                     `json:"proxyProtocol,omitempty"`
+	ProxyProtocolTrustedCIDRs []string                   `json:"proxyProtocolTrustedCIDRs,omitempty"`
 }
 
 // DataplanePublisher defines the interface for publishing a Gateway's compiled data-plane configuration.
@@ -286,7 +289,16 @@ func BuildGatewayDataplaneConfig(
 	certsMap, defaultCert := ExtractCertificates([]*CompiledGateway{cg}, secrets, refValidator)
 	backendClientCert := cg.BackendClientCert
 
-	return BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert, backendClientCert)
+	cfg, err := BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert, backendClientCert)
+	if err != nil {
+		return nil, err
+	}
+	if cg.Parameters != nil {
+		cfg.AllowedSourceCIDRs = cg.Parameters.AllowedSourceCIDRs
+		cfg.ProxyProtocol = cg.Parameters.ProxyProtocol
+		cfg.ProxyProtocolTrustedCIDRs = cg.Parameters.ProxyProtocolTrustedCIDRs
+	}
+	return cfg, nil
 }
 
 // Marshal serializes DataplaneConfig to JSON.

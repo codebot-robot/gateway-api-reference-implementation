@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -3632,5 +3634,106 @@ func TestSinglePodAddressProvider_UpgradeUpdatesServiceAndDeploymentInPlace(t *t
 	probe := updatedDeploy.Spec.Template.Spec.Containers[0].ReadinessProbe
 	if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Port.IntValue() != 8999 {
 		t.Errorf("expected readiness probe on port 8999, got %+v", probe)
+	}
+}
+
+func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.Install(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      "my-gw",
+			UID:       types.UID("test-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "my-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+
+	volApply := corev1ac.Volume().WithName("drain-volume").WithEmptyDir(corev1ac.EmptyDirVolumeSource())
+	mountApply := corev1ac.VolumeMount().WithName("drain-volume").WithMountPath("/var/run/gcpgateway")
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw).
+		WithReturnManagedFields().
+		WithInterceptorFuncs(ssaNoOpInterceptor()).
+		Build()
+
+	p := NewAddressProvider(
+		c,
+		WithExtraReadinessGates("gcpgateway.gke-labs.io/load-balancer-ready"),
+		WithPreStopCommand("/gcpgateway", "hook", "pre-stop", "--drain-seconds=35"),
+		WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{volApply}, []*corev1ac.VolumeMountApplyConfiguration{mountApply}),
+		WithDefaultListenerOptions([]string{"35.191.0.0/16"}, "enabled", []string{"35.191.0.0/16"}),
+	)
+
+	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resName := ResourceNameForGateway("my-gw")
+	var deploy appsv1.Deployment
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	podSpec := deploy.Spec.Template.Spec
+
+	// Check readiness gate
+	foundGate := false
+	for _, gate := range podSpec.ReadinessGates {
+		if string(gate.ConditionType) == "gcpgateway.gke-labs.io/load-balancer-ready" {
+			foundGate = true
+			break
+		}
+	}
+	if !foundGate {
+		t.Errorf("readiness gate gcpgateway.gke-labs.io/load-balancer-ready not found in podSpec: %+v", podSpec.ReadinessGates)
+	}
+
+	// Check preStop command
+	container := podSpec.Containers[0]
+	if container.Lifecycle == nil || container.Lifecycle.PreStop == nil || container.Lifecycle.PreStop.Exec == nil {
+		t.Fatalf("expected preStop exec hook on container")
+	}
+	expectedCmd := []string{"/gcpgateway", "hook", "pre-stop", "--drain-seconds=35"}
+	if !slices.Equal(container.Lifecycle.PreStop.Exec.Command, expectedCmd) {
+		t.Errorf("expected preStop command %v, got %v", expectedCmd, container.Lifecycle.PreStop.Exec.Command)
+	}
+
+	// Check volume mount
+	foundMount := false
+	for _, m := range container.VolumeMounts {
+		if m.Name == "drain-volume" && m.MountPath == "/var/run/gcpgateway" {
+			foundMount = true
+			break
+		}
+	}
+	if !foundMount {
+		t.Errorf("expected volume mount drain-volume at /var/run/gcpgateway")
+	}
+
+	// Check args
+	argsStr := strings.Join(container.Args, " ")
+	if !strings.Contains(argsStr, "--allowed-source-cidrs=35.191.0.0/16") {
+		t.Errorf("expected --allowed-source-cidrs in args: %s", argsStr)
+	}
+	if !strings.Contains(argsStr, "--proxy-protocol=enabled") {
+		t.Errorf("expected --proxy-protocol in args: %s", argsStr)
+	}
+	if !strings.Contains(argsStr, "--proxy-protocol-trusted-cidrs=35.191.0.0/16") {
+		t.Errorf("expected --proxy-protocol-trusted-cidrs in args: %s", argsStr)
 	}
 }

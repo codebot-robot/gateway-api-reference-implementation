@@ -17,6 +17,9 @@ package state
 import (
 	"fmt"
 	"maps"
+	"net"
+	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -26,16 +29,36 @@ import (
 
 // Supported parameter keys in ConfigMap.
 const (
-	ParameterKeyServiceType           = "serviceType"
-	ParameterKeyExternalTrafficPolicy = "externalTrafficPolicy"
-	ParameterKeyServiceAnnotations    = "serviceAnnotations"
+	ParameterKeyServiceType               = "serviceType"
+	ParameterKeyExternalTrafficPolicy     = "externalTrafficPolicy"
+	ParameterKeyServiceAnnotations        = "serviceAnnotations"
+	ParameterKeyAllowedSourceCIDRs        = "allowedSourceCIDRs"
+	ParameterKeyProxyProtocol             = "proxyProtocol"
+	ParameterKeyProxyProtocolTrustedCIDRs = "proxyProtocolTrustedCIDRs"
+	ParameterKeyExternalIP                = "externalIP"
+	ParameterKeyClusterID                 = "clusterId"
+	ParameterKeyGatewayNamespace          = "gatewayNamespace"
+	ParameterKeyGatewayName               = "gatewayName"
+	ParameterKeyNEGHTTPS                  = "negHTTPS"
+	ParameterKeyNEGHTTP                   = "negHTTP"
+	ParameterKeyNEGPrefix                 = "negPrefix"
 )
 
 // Parameters represents configuration parsed from a ConfigMap for Gateway/GatewayClass.
 type Parameters struct {
-	ServiceType           corev1.ServiceType
-	ExternalTrafficPolicy corev1.ServiceExternalTrafficPolicy
-	ServiceAnnotations    map[string]string
+	ServiceType               corev1.ServiceType
+	ExternalTrafficPolicy     corev1.ServiceExternalTrafficPolicy
+	ServiceAnnotations        map[string]string
+	AllowedSourceCIDRs        []string
+	ProxyProtocol             string
+	ProxyProtocolTrustedCIDRs []string
+	ExternalIP                string
+	ClusterID                 string
+	GatewayNamespace          string
+	GatewayName               string
+	NEGHTTPS                  string
+	NEGHTTP                   string
+	NEGPrefix                 string
 }
 
 // DefaultParameters returns default parameters (LoadBalancer, Cluster).
@@ -45,6 +68,25 @@ func DefaultParameters() *Parameters {
 		ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster,
 		ServiceAnnotations:    make(map[string]string),
 	}
+}
+
+func parseCIDRList(val, paramKey string) ([]string, error) {
+	if val == "" {
+		return nil, nil
+	}
+	parts := strings.Split(val, ",")
+	var result []string
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(trimmed); err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q in %s: %w", trimmed, paramKey, err)
+		}
+		result = append(result, trimmed)
+	}
+	return result, nil
 }
 
 // ParseConfigMapParameters parses and validates parameters from a ConfigMap.
@@ -64,7 +106,19 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 
 	for k := range cm.Data {
 		switch k {
-		case ParameterKeyServiceType, ParameterKeyExternalTrafficPolicy, ParameterKeyServiceAnnotations:
+		case ParameterKeyServiceType,
+			ParameterKeyExternalTrafficPolicy,
+			ParameterKeyServiceAnnotations,
+			ParameterKeyAllowedSourceCIDRs,
+			ParameterKeyProxyProtocol,
+			ParameterKeyProxyProtocolTrustedCIDRs,
+			ParameterKeyExternalIP,
+			ParameterKeyClusterID,
+			ParameterKeyGatewayNamespace,
+			ParameterKeyGatewayName,
+			ParameterKeyNEGHTTPS,
+			ParameterKeyNEGHTTP,
+			ParameterKeyNEGPrefix:
 		default:
 			return nil, fmt.Errorf("unknown key %q in ConfigMap", k)
 		}
@@ -114,6 +168,61 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 				p.ServiceAnnotations[k] = strVal
 			}
 		}
+	}
+
+	if val, ok := cm.Data[ParameterKeyAllowedSourceCIDRs]; ok && val != "" {
+		cidrs, err := parseCIDRList(val, ParameterKeyAllowedSourceCIDRs)
+		if err != nil {
+			return nil, err
+		}
+		p.AllowedSourceCIDRs = cidrs
+	}
+
+	if val, ok := cm.Data[ParameterKeyProxyProtocol]; ok && val != "" {
+		if !strings.EqualFold(val, "enabled") && !strings.EqualFold(val, "disabled") {
+			return nil, fmt.Errorf("invalid proxyProtocol %q: must be enabled or disabled", val)
+		}
+		p.ProxyProtocol = val
+	}
+
+	if val, ok := cm.Data[ParameterKeyProxyProtocolTrustedCIDRs]; ok && val != "" {
+		cidrs, err := parseCIDRList(val, ParameterKeyProxyProtocolTrustedCIDRs)
+		if err != nil {
+			return nil, err
+		}
+		p.ProxyProtocolTrustedCIDRs = cidrs
+	}
+
+	if val, ok := cm.Data[ParameterKeyExternalIP]; ok && val != "" {
+		trimmed := strings.TrimSpace(val)
+		if net.ParseIP(trimmed) == nil {
+			return nil, fmt.Errorf("invalid externalIP %q: must be a valid IP address", val)
+		}
+		p.ExternalIP = trimmed
+	}
+
+	if val, ok := cm.Data[ParameterKeyClusterID]; ok {
+		p.ClusterID = strings.TrimSpace(val)
+	}
+
+	if val, ok := cm.Data[ParameterKeyGatewayNamespace]; ok {
+		p.GatewayNamespace = strings.TrimSpace(val)
+	}
+
+	if val, ok := cm.Data[ParameterKeyGatewayName]; ok {
+		p.GatewayName = strings.TrimSpace(val)
+	}
+
+	if val, ok := cm.Data[ParameterKeyNEGHTTPS]; ok {
+		p.NEGHTTPS = strings.TrimSpace(val)
+	}
+
+	if val, ok := cm.Data[ParameterKeyNEGHTTP]; ok {
+		p.NEGHTTP = strings.TrimSpace(val)
+	}
+
+	if val, ok := cm.Data[ParameterKeyNEGPrefix]; ok {
+		p.NEGPrefix = strings.TrimSpace(val)
 	}
 
 	return p, nil
@@ -194,6 +303,36 @@ func MergeParameters(gcParams, gwParams *Parameters) *Parameters {
 		for k, v := range gcParams.ServiceAnnotations {
 			res.ServiceAnnotations[k] = v
 		}
+		if len(gcParams.AllowedSourceCIDRs) > 0 {
+			res.AllowedSourceCIDRs = gcParams.AllowedSourceCIDRs
+		}
+		if gcParams.ProxyProtocol != "" {
+			res.ProxyProtocol = gcParams.ProxyProtocol
+		}
+		if len(gcParams.ProxyProtocolTrustedCIDRs) > 0 {
+			res.ProxyProtocolTrustedCIDRs = gcParams.ProxyProtocolTrustedCIDRs
+		}
+		if gcParams.ExternalIP != "" {
+			res.ExternalIP = gcParams.ExternalIP
+		}
+		if gcParams.ClusterID != "" {
+			res.ClusterID = gcParams.ClusterID
+		}
+		if gcParams.GatewayNamespace != "" {
+			res.GatewayNamespace = gcParams.GatewayNamespace
+		}
+		if gcParams.GatewayName != "" {
+			res.GatewayName = gcParams.GatewayName
+		}
+		if gcParams.NEGHTTPS != "" {
+			res.NEGHTTPS = gcParams.NEGHTTPS
+		}
+		if gcParams.NEGHTTP != "" {
+			res.NEGHTTP = gcParams.NEGHTTP
+		}
+		if gcParams.NEGPrefix != "" {
+			res.NEGPrefix = gcParams.NEGPrefix
+		}
 	}
 
 	if gwParams != nil {
@@ -205,6 +344,36 @@ func MergeParameters(gcParams, gwParams *Parameters) *Parameters {
 		}
 		for k, v := range gwParams.ServiceAnnotations {
 			res.ServiceAnnotations[k] = v
+		}
+		if len(gwParams.AllowedSourceCIDRs) > 0 {
+			res.AllowedSourceCIDRs = gwParams.AllowedSourceCIDRs
+		}
+		if gwParams.ProxyProtocol != "" {
+			res.ProxyProtocol = gwParams.ProxyProtocol
+		}
+		if len(gwParams.ProxyProtocolTrustedCIDRs) > 0 {
+			res.ProxyProtocolTrustedCIDRs = gwParams.ProxyProtocolTrustedCIDRs
+		}
+		if gwParams.ExternalIP != "" {
+			res.ExternalIP = gwParams.ExternalIP
+		}
+		if gwParams.ClusterID != "" {
+			res.ClusterID = gwParams.ClusterID
+		}
+		if gwParams.GatewayNamespace != "" {
+			res.GatewayNamespace = gwParams.GatewayNamespace
+		}
+		if gwParams.GatewayName != "" {
+			res.GatewayName = gwParams.GatewayName
+		}
+		if gwParams.NEGHTTPS != "" {
+			res.NEGHTTPS = gwParams.NEGHTTPS
+		}
+		if gwParams.NEGHTTP != "" {
+			res.NEGHTTP = gwParams.NEGHTTP
+		}
+		if gwParams.NEGPrefix != "" {
+			res.NEGPrefix = gwParams.NEGPrefix
 		}
 	}
 
@@ -225,5 +394,35 @@ func ParametersEqual(a, b *Parameters) bool {
 	if a.ExternalTrafficPolicy != b.ExternalTrafficPolicy {
 		return false
 	}
-	return maps.Equal(a.ServiceAnnotations, b.ServiceAnnotations)
+	if !maps.Equal(a.ServiceAnnotations, b.ServiceAnnotations) {
+		return false
+	}
+	if !slices.Equal(a.AllowedSourceCIDRs, b.AllowedSourceCIDRs) {
+		return false
+	}
+	if a.ProxyProtocol != b.ProxyProtocol {
+		return false
+	}
+	if !slices.Equal(a.ProxyProtocolTrustedCIDRs, b.ProxyProtocolTrustedCIDRs) {
+		return false
+	}
+	if a.ExternalIP != b.ExternalIP {
+		return false
+	}
+	if a.ClusterID != b.ClusterID {
+		return false
+	}
+	if a.GatewayNamespace != b.GatewayNamespace {
+		return false
+	}
+	if a.GatewayName != b.GatewayName {
+		return false
+	}
+	if a.NEGHTTPS != b.NEGHTTPS {
+		return false
+	}
+	if a.NEGHTTP != b.NEGHTTP {
+		return false
+	}
+	return a.NEGPrefix == b.NEGPrefix
 }
