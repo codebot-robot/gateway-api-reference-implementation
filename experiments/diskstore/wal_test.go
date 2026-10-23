@@ -315,10 +315,10 @@ func TestWAL_AppendRecordCompletesWhileWriteOrSyncBlocked(t *testing.T) {
 
 type testClock struct {
 	mu  sync.Mutex
-	now time.Time
+	now MonotonicTime
 }
 
-func (c *testClock) Now() time.Time {
+func (c *testClock) Now() MonotonicTime {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.now
@@ -327,7 +327,7 @@ func (c *testClock) Now() time.Time {
 func (c *testClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
+	c.now += MonotonicTime(d)
 }
 
 // TestWAL_FiveSecondBound_UnsyncedBlocks asserts that written but unsynced blocks are fsynced
@@ -337,7 +337,7 @@ func TestWAL_FiveSecondBound_UnsyncedBlocks(t *testing.T) {
 	var dbID [16]byte
 	copy(dbID[:], []byte("wal-test-db-0005"))
 
-	clk := &testClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	clk := &testClock{now: MonotonicTime(time.Hour)}
 	wal, err := OpenWAL(fs, "wal_dir", dbID, 0, WALOptions{
 		Clock:        clk,
 		TickInterval: 10 * time.Millisecond,

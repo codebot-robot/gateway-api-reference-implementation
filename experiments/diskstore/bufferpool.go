@@ -560,8 +560,18 @@ func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
 
 	flushErr := errors.Join(syncErr, writeErr)
 	if flushErr != nil {
+		// Attempt to reclaim the newly allocated block so it is not leaked in-memory.
+		// If Free fails, we do not panic because:
+		// 1. The primary failure (flushErr) is already propagated to the caller and
+		//    bp.onFailure transitions the store into a terminal failed state (ErrStoreFailed),
+		//    terminating further mutating operations.
+		// 2. The BuddyAllocator is an in-memory structure that is never persisted directly.
+		//    On restart, the allocator is reconstructed from scratch by scanning valid pages
+		//    in the heap file (MarkAllocated). Since newLoc was never successfully flushed or
+		//    checkpointed, it will naturally be reclaimed as free space during recovery.
 		if freeErr := bp.buddy.Free(newLoc); freeErr != nil {
-			klog.V(4).ErrorS(freeErr, "failed to free allocated block on flush failure")
+			klog.Errorf("diskstore: failed to free allocated block %d on flush failure: %v", newLoc, freeErr)
+			flushErr = errors.Join(flushErr, fmt.Errorf("failed to free allocated block %d on flush failure: %w", newLoc, freeErr))
 		}
 		if bp.onFailure != nil {
 			bp.onFailure(flushErr)

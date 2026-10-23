@@ -444,3 +444,61 @@ func TestDiskIndexer_List_DecryptError_CorruptionAndFailedState(t *testing.T) {
 		t.Fatalf("expected nil from List() on failed store, got %v", failedList)
 	}
 }
+
+func TestDiskIndexer_FatalErrorHandler(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := OpenStore(WithFS(memFS), WithDir("fatal_err_store"))
+	if err != nil {
+		t.Fatalf("OpenStore failed: %v", err)
+	}
+	defer store.Close()
+
+	var fatalErrs []error
+	handler := func(err error) {
+		fatalErrs = append(fatalErrs, err)
+	}
+
+	indexer, err := NewDiskIndexer(store, &corev1.ConfigMap{},
+		WithFatalErrorHandler(handler),
+		WithIndexers(toolscache.Indexers{
+			"failing-index": func(obj any) ([]string, error) {
+				return nil, errors.New("simulated index failure")
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewDiskIndexer failed: %v", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-cm",
+		},
+	}
+	_ = indexer.Add(cm)
+	if len(fatalErrs) == 0 {
+		t.Fatalf("expected fatal error handler to be called on index function failure")
+	}
+
+	// Now simulate store entering failed state
+	store.setFailed(errors.New("fatal disk corruption"))
+	fatalErrs = nil
+
+	list := indexer.List()
+	if list != nil {
+		t.Fatalf("expected nil list from failed store, got %v", list)
+	}
+	if len(fatalErrs) == 0 {
+		t.Fatalf("expected fatal error handler to be called on List() failure")
+	}
+
+	fatalErrs = nil
+	keys := indexer.ListKeys()
+	if keys != nil {
+		t.Fatalf("expected nil keys from failed store, got %v", keys)
+	}
+	if len(fatalErrs) == 0 {
+		t.Fatalf("expected fatal error handler to be called on ListKeys() failure")
+	}
+}

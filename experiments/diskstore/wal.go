@@ -49,15 +49,37 @@ const (
 	WALBlockSize = 4096
 )
 
-// Clock abstracts current time for deterministic testing.
-type Clock interface {
-	Now() time.Time
+// MonotonicTime represents an opaque monotonic timestamp in nanoseconds.
+// It is 8 bytes, lightweight, and prevents calling non-monotonic wall-clock functions.
+type MonotonicTime int64
+
+// monotonicTime is an alias for internal use.
+type monotonicTime = MonotonicTime
+
+// IsZero reports whether m represents the zero timestamp.
+func (m MonotonicTime) IsZero() bool {
+	return m == 0
 }
+
+// Sub returns the duration elapsed between m and earlier timestamp other.
+func (m MonotonicTime) Sub(other MonotonicTime) time.Duration {
+	return time.Duration(m - other)
+}
+
+// Clock abstracts current monotonic time for deterministic testing.
+type Clock interface {
+	Now() MonotonicTime
+}
+
+var processStart = time.Now()
 
 type realClock struct{}
 
-func (realClock) Now() time.Time {
-	return time.Now()
+func (realClock) Now() MonotonicTime {
+	// time.Since utilizes the monotonic clock reading present in processStart and time.Now().
+	// We add 1 nanosecond so valid readings are non-zero, allowing IsZero()
+	// to cleanly distinguish an uninitialized timestamp from a valid reading.
+	return MonotonicTime(time.Since(processStart)) + 1
 }
 
 type pendingWALBlock struct {
@@ -65,7 +87,7 @@ type pendingWALBlock struct {
 	offset    int64
 	block     []byte
 	maxLSN    uint64
-	createdAt time.Time
+	createdAt MonotonicTime
 }
 
 // WAL manages appending, syncing, and segment lifecycle of the write-ahead log.
@@ -83,7 +105,7 @@ type WAL struct {
 	tailBlock         []byte // Aligned 4 KiB buffer for current block
 	tailOffset        int    // Current offset within tailBlock (0..4096)
 	blockOffset       int64  // Physical file offset where tailBlock starts
-	tailBlockOpenTime time.Time
+	tailBlockOpenTime MonotonicTime
 
 	nextLSN         uint64 // Next monotonic LSN to allocate under mu
 	lastAppendedLSN uint64 // Highest LSN successfully written to buffer
@@ -102,7 +124,7 @@ type WAL struct {
 
 	clock              Clock
 	tickInterval       time.Duration
-	oldestUnsyncedTime time.Time
+	oldestUnsyncedTime MonotonicTime
 
 	wakeCh        chan struct{}
 	bgStop        chan struct{}
@@ -312,7 +334,7 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 			w.blockOffset += WALBlockSize
 			w.activeSize = w.blockOffset
 			w.tailOffset = 0
-			w.tailBlockOpenTime = time.Time{}
+			w.tailBlockOpenTime = 0
 			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
 		}
 	}
@@ -372,14 +394,14 @@ func (w *WAL) flushQueueAndSync(isStop bool) {
 		}
 		if w.fsyncedLSN.Load() >= w.lastAppendedLSN && len(w.queue) == 0 && w.tailOffset == 0 {
 			w.syncRequested = false
-			w.oldestUnsyncedTime = time.Time{}
+			w.oldestUnsyncedTime = 0
 		} else {
 			if len(w.queue) > 0 {
 				w.oldestUnsyncedTime = w.queue[0].createdAt
 			} else if w.tailOffset > 0 {
 				w.oldestUnsyncedTime = w.tailBlockOpenTime
 			} else {
-				w.oldestUnsyncedTime = time.Time{}
+				w.oldestUnsyncedTime = 0
 			}
 		}
 		w.syncCond.Broadcast()
@@ -417,7 +439,7 @@ func (w *WAL) flushQueueAndSyncDirectLocked(doSync bool) error {
 			w.blockOffset += WALBlockSize
 			w.activeSize = w.blockOffset
 			w.tailOffset = 0
-			w.tailBlockOpenTime = time.Time{}
+			w.tailBlockOpenTime = 0
 			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
 		}
 
@@ -429,7 +451,7 @@ func (w *WAL) flushQueueAndSyncDirectLocked(doSync bool) error {
 		if targetLSN > w.fsyncedLSN.Load() {
 			w.fsyncedLSN.Store(targetLSN)
 		}
-		w.oldestUnsyncedTime = time.Time{}
+		w.oldestUnsyncedTime = 0
 		w.syncRequested = false
 		w.syncCond.Broadcast()
 	}
@@ -617,7 +639,7 @@ func (w *WAL) AppendRecord(r *Record) (uint64, error) {
 			w.blockOffset += WALBlockSize
 			w.activeSize = w.blockOffset
 			w.tailOffset = 0
-			w.tailBlockOpenTime = time.Time{}
+			w.tailBlockOpenTime = 0
 			w.tailBlock = AllocateAlignedBlock(WALBlockSize)
 
 			select {
