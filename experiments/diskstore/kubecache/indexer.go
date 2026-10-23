@@ -100,9 +100,6 @@ type Indexer struct {
 
 var _ toolscache.Indexer = (*Indexer)(nil)
 
-// DiskIndexer is an alias for Indexer for backwards compatibility.
-type DiskIndexer = Indexer
-
 // New creates a new Indexer for the given example object type backed by the database engine.
 // Construction requires a non-nil onFatal callback (e.g. DefaultOnFatal).
 func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opts ...IndexerOption) (*Indexer, error) {
@@ -176,11 +173,6 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 	}
 
 	return d, nil
-}
-
-// NewDiskIndexer is an alias for New.
-func NewDiskIndexer(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opts ...IndexerOption) (*Indexer, error) {
-	return New(eng, example, onFatal, opts...)
 }
 
 func (d *Indexer) fatal(err error) {
@@ -551,7 +543,7 @@ func (d *Indexer) Bookmark(rv string) {
 	d.lastSyncRV = rv
 	d.mu.Unlock()
 
-	if err := d.eng.RecordBookmark(d.bucketName, rv); err != nil {
+	if err := d.eng.SetToken(d.bucketName, rv); err != nil {
 		d.fatal(err)
 	}
 }

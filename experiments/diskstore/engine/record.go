@@ -23,14 +23,11 @@ import (
 )
 
 var (
-	// ErrBadCRC indicates a record failed CRC32C verification.
-	ErrBadCRC = errors.New("bad CRC32C checksum in record")
+	// ErrCorruptRecord indicates that a WAL record has an invalid magic or version.
+	ErrCorruptRecord = errors.New("corrupt record")
 
-	// ErrNonContiguousLSN indicates a record LSN did not match the expected sequential LSN.
-	ErrNonContiguousLSN = errors.New("non-contiguous LSN encountered during replay")
-
-	// ErrCorruptRecord indicates malformed record fields.
-	ErrCorruptRecord = errors.New("corrupt record data")
+	// ErrBadCRC indicates a CRC32C checksum mismatch in a WAL record.
+	ErrBadCRC = errors.New("record CRC mismatch")
 )
 
 // RecordType defines the operation type of a WAL log record.
@@ -40,7 +37,7 @@ const (
 	RecordTypePut        RecordType = 1
 	RecordTypeDelete     RecordType = 2
 	RecordTypeCheckpoint RecordType = 3
-	RecordTypeBookmark   RecordType = 4
+	RecordTypeToken      RecordType = 4
 )
 
 const (
@@ -51,7 +48,7 @@ const (
 	RecordFormatVersion byte = 1
 
 	// RecordHeaderSize is 36 bytes:
-	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + RedoStartLSN(8) + KeyLen(4) + PayloadLen(4) + RVLen(4) + CRC32C(4)
+	// Magic(1) + Version(1) + Type(1) + Reserved(1) + LSN(8) + RedoStartLSN(8) + KeyLen(4) + PayloadLen(4) + TokenLen(4) + CRC32C(4)
 	RecordHeaderSize = 36
 
 	// MaxRecordFieldLength is a sanity check limit (64 MiB).
@@ -60,26 +57,21 @@ const (
 
 // Record represents a single write-ahead log record.
 type Record struct {
-	Type            RecordType
-	LSN             uint64
-	RedoStartLSN    uint64 // Redo start LSN for Checkpoint records
-	Key             string
-	Payload         []byte
-	Token           string // Opaque per-bucket progress token (persisted in RV field on disk)
-	ResourceVersion string // Alias / compatibility mapping to Token
-	CRC32C          uint32
+	Type         RecordType
+	LSN          uint64
+	RedoStartLSN uint64 // Redo start LSN for Checkpoint records
+	Key          string
+	Payload      []byte
+	Token        string // Opaque per-bucket progress token
+	CRC32C       uint32
 }
 
 // EncodeRecord serializes a record into binary format with a valid CRC32C.
 func EncodeRecord(r Record) []byte {
-	token := r.Token
-	if token == "" {
-		token = r.ResourceVersion
-	}
 	keyBytes := []byte(r.Key)
-	rvBytes := []byte(token)
+	tokenBytes := []byte(r.Token)
 
-	totalLen := RecordHeaderSize + len(keyBytes) + len(r.Payload) + len(rvBytes)
+	totalLen := RecordHeaderSize + len(keyBytes) + len(r.Payload) + len(tokenBytes)
 	buf := make([]byte, totalLen)
 
 	buf[0] = RecordMagic
@@ -91,7 +83,7 @@ func EncodeRecord(r Record) []byte {
 	binary.BigEndian.PutUint64(buf[12:20], r.RedoStartLSN)
 	binary.BigEndian.PutUint32(buf[20:24], uint32(len(keyBytes)))
 	binary.BigEndian.PutUint32(buf[24:28], uint32(len(r.Payload)))
-	binary.BigEndian.PutUint32(buf[28:32], uint32(len(rvBytes)))
+	binary.BigEndian.PutUint32(buf[28:32], uint32(len(tokenBytes)))
 
 	// Zero CRC field before calculation
 	buf[32] = 0
@@ -104,7 +96,7 @@ func EncodeRecord(r Record) []byte {
 	off += len(keyBytes)
 	copy(buf[off:], r.Payload)
 	off += len(r.Payload)
-	copy(buf[off:], rvBytes)
+	copy(buf[off:], tokenBytes)
 
 	// Compute CRC32C over header + body
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
@@ -133,14 +125,14 @@ func DecodeRecord(r io.Reader) (Record, error) {
 	redoStartLSN := binary.BigEndian.Uint64(header[12:20])
 	keyLen := binary.BigEndian.Uint32(header[20:24])
 	payloadLen := binary.BigEndian.Uint32(header[24:28])
-	rvLen := binary.BigEndian.Uint32(header[28:32])
+	tokenLen := binary.BigEndian.Uint32(header[28:32])
 	storedCRC := binary.BigEndian.Uint32(header[32:36])
 
-	if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength || rvLen > MaxRecordFieldLength {
+	if keyLen > MaxRecordFieldLength || payloadLen > MaxRecordFieldLength || tokenLen > MaxRecordFieldLength {
 		return Record{}, fmt.Errorf("%w: field length exceeds limit", ErrCorruptRecord)
 	}
 
-	bodyLen := int(keyLen) + int(payloadLen) + int(rvLen)
+	bodyLen := int(keyLen) + int(payloadLen) + int(tokenLen)
 	body := make([]byte, bodyLen)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return Record{}, fmt.Errorf("%w: incomplete record body", ErrCorruptRecord)
@@ -165,16 +157,15 @@ func DecodeRecord(r io.Reader) (Record, error) {
 
 	key := string(body[:keyLen])
 	payload := body[keyLen : keyLen+payloadLen]
-	rv := string(body[keyLen+payloadLen:])
+	token := string(body[keyLen+payloadLen:])
 
 	return Record{
-		Type:            recType,
-		LSN:             lsn,
-		RedoStartLSN:    redoStartLSN,
-		Key:             key,
-		Payload:         payload,
-		Token:           rv,
-		ResourceVersion: rv,
-		CRC32C:          storedCRC,
+		Type:         recType,
+		LSN:          lsn,
+		RedoStartLSN: redoStartLSN,
+		Key:          key,
+		Payload:      payload,
+		Token:        token,
+		CRC32C:       storedCRC,
 	}, nil
 }

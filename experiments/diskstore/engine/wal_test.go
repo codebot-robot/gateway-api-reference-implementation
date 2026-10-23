@@ -37,11 +37,11 @@ func TestWAL_AppendAndIterate(t *testing.T) {
 	// Write 10 records. With MaxSegmentSize=200, this should roll across multiple segments.
 	for i := uint64(1); i <= 10; i++ {
 		rec := Record{
-			Type:            RecordTypePut,
-			LSN:             i,
-			Key:             fmt.Sprintf("ns/cm-%d", i),
-			Payload:         []byte(fmt.Sprintf("payload-%d", i)),
-			ResourceVersion: fmt.Sprintf("rv-%d", i),
+			Type:    RecordTypePut,
+			LSN:     i,
+			Key:     fmt.Sprintf("ns/cm-%d", i),
+			Payload: []byte(fmt.Sprintf("payload-%d", i)),
+			Token:   fmt.Sprintf("rv-%d", i),
 		}
 		if err := wal.Append(rec); err != nil {
 			t.Fatalf("Append failed: %v", err)
@@ -100,11 +100,11 @@ func TestWAL_StopAtBadCRC(t *testing.T) {
 
 	for i := uint64(1); i <= 5; i++ {
 		_ = wal.Append(Record{
-			Type:            RecordTypePut,
-			LSN:             i,
-			Key:             fmt.Sprintf("key-%d", i),
-			Payload:         []byte("payload"),
-			ResourceVersion: "100",
+			Type:    RecordTypePut,
+			LSN:     i,
+			Key:     fmt.Sprintf("key-%d", i),
+			Payload: []byte("payload"),
+			Token:   "100",
 		})
 	}
 	_ = wal.Sync()
@@ -159,11 +159,11 @@ func TestWAL_TruncateSegments(t *testing.T) {
 
 	for i := uint64(1); i <= 6; i++ {
 		_ = wal.Append(Record{
-			Type:            RecordTypePut,
-			LSN:             i,
-			Key:             fmt.Sprintf("k%d", i),
-			Payload:         []byte("short"),
-			ResourceVersion: "1",
+			Type:    RecordTypePut,
+			LSN:     i,
+			Key:     fmt.Sprintf("k%d", i),
+			Payload: []byte("short"),
+			Token:   "1",
 		})
 	}
 	_ = wal.Sync()

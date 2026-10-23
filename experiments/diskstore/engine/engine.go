@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,9 +36,6 @@ var (
 	// ErrFailed is returned when the engine has entered the failed state due to corruption or I/O error.
 	ErrFailed = errors.New("engine failed")
 
-	// ErrStoreFailed is an alias for ErrFailed for backwards compatibility.
-	ErrStoreFailed = ErrFailed
-
 	// ErrKeyNotFound indicates the requested key does not exist.
 	ErrKeyNotFound = errors.New("key not found")
 
@@ -49,6 +45,11 @@ var (
 	// ErrDecrypt indicates a failure during payload decryption.
 	ErrDecrypt = errors.New("payload decryption failed")
 )
+
+// TestHookFail is an internal hook used by tests to trigger the failed state without exposing a method on Engine.
+var TestHookFail = func(e *Engine, err error) {
+	e.setFailed(err)
+}
 
 func qualifyKey(bucketName, key string) string {
 	return bucketName + "\x00" + key
@@ -62,8 +63,8 @@ func unqualifyKey(qualified string) (string, string) {
 	return "", qualified
 }
 
-// StoreOptions configures an Engine instance.
-type StoreOptions struct {
+// Options configures an Engine instance.
+type Options struct {
 	Dir        string
 	FS         FS
 	Cipher     Cipher
@@ -72,50 +73,47 @@ type StoreOptions struct {
 	Clock      Clock
 }
 
-// StoreOption is a functional option for configuring an Engine.
-type StoreOption func(*StoreOptions)
-
-// Option is an alias for StoreOption.
-type Option = StoreOption
+// Option is a functional option for configuring an Engine.
+type Option func(*Options)
 
 // WithClock sets the Clock used for WAL timing.
-func WithClock(clock Clock) StoreOption {
-	return func(o *StoreOptions) {
+func WithClock(clock Clock) Option {
+	return func(o *Options) {
 		o.Clock = clock
 	}
 }
 
 // WithDir sets the directory for engine files.
-func WithDir(dir string) StoreOption {
-	return func(o *StoreOptions) {
+func WithDir(dir string) Option {
+	return func(o *Options) {
 		o.Dir = dir
 	}
 }
 
 // WithFS sets the filesystem implementation (e.g. for fault injection).
-func WithFS(fs FS) StoreOption {
-	return func(o *StoreOptions) {
+func WithFS(fs FS) Option {
+	return func(o *Options) {
 		o.FS = fs
 	}
 }
 
 // WithCipher sets the cipher for payload encryption.
-func WithCipher(cipher Cipher) StoreOption {
-	return func(o *StoreOptions) {
+func WithCipher(cipher Cipher) Option {
+	return func(o *Options) {
 		o.Cipher = cipher
 	}
 }
 
 // WithNumFrames sets the buffer pool frame count.
-func WithNumFrames(n int) StoreOption {
-	return func(o *StoreOptions) {
+func WithNumFrames(n int) Option {
+	return func(o *Options) {
 		o.NumFrames = n
 	}
 }
 
 // WithBufferPoolSize sets the buffer pool size in bytes (rounded to 4096-byte frames).
-func WithBufferPoolSize(bytes int) StoreOption {
-	return func(o *StoreOptions) {
+func WithBufferPoolSize(bytes int) Option {
+	return func(o *Options) {
 		frames := bytes / 4096
 		if frames < 16 {
 			frames = 16
@@ -125,8 +123,8 @@ func WithBufferPoolSize(bytes int) StoreOption {
 }
 
 // WithAutoDelete specifies whether to delete the directory on Close.
-func WithAutoDelete(autoDelete bool) StoreOption {
-	return func(o *StoreOptions) {
+func WithAutoDelete(autoDelete bool) Option {
+	return func(o *Options) {
 		o.AutoDelete = autoDelete
 	}
 }
@@ -168,39 +166,61 @@ type Engine struct {
 	closed                     atomic.Bool
 }
 
-// DiskStore is an alias for Engine for backwards compatibility.
-type DiskStore = Engine
-
-func wipeDirectory(fs FS, dir string) error {
+func removeDirRecursive(fs FS, dir string) error {
 	entries, err := fs.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
 	var errs []error
 	for _, e := range entries {
 		sub := filepath.Join(dir, e.Name())
 		if e.IsDir() {
-			if err := wipeDirectory(fs, sub); err != nil {
-				errs = append(errs, err)
-			}
-			if err := fs.Remove(sub); err != nil && !os.IsNotExist(err) {
-				errs = append(errs, err)
-			}
-		} else {
-			if err := fs.Remove(sub); err != nil && !os.IsNotExist(err) {
+			if err := removeDirRecursive(fs, sub); err != nil {
 				errs = append(errs, err)
 			}
 		}
+		if err := fs.Remove(sub); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
 	}
-	if err := fs.SyncDir(dir); err != nil {
+	if err := fs.Remove(dir); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
 
+func wipeStoreFiles(fs FS, dir string) error {
+	var errs []error
+
+	// Remove known store files only
+	for _, name := range []string{"FAILED", "meta.db", "heap.db"} {
+		p := filepath.Join(dir, name)
+		if err := fs.Remove(p); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("failed to remove %s: %w", p, err))
+		}
+	}
+
+	// Remove known store subdirectories recursively only
+	for _, name := range []string{"wal", "oversize"} {
+		targetDir := filepath.Join(dir, name)
+		if err := removeDirRecursive(fs, targetDir); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("failed to remove %s: %w", targetDir, err))
+		}
+	}
+
+	if err := fs.SyncDir(dir); err != nil {
+		errs = append(errs, fmt.Errorf("failed to sync store dir after wipe: %w", err))
+	}
+
+	return errors.Join(errs...)
+}
+
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
-	options := StoreOptions{
+	options := Options{
 		FS:         NewOSFS(),
 		Cipher:     NoopCipher{},
 		NumFrames:  DefaultBufferPoolFrames,
@@ -234,16 +254,13 @@ func Open(opts ...Option) (*Engine, error) {
 	wiped := false
 	f, err := options.FS.OpenFile(markerPath, os.O_RDONLY, 0)
 	if err == nil {
-		if cErr := f.Close(); cErr != nil {
-			log.Printf("diskstore: failed to close failure marker: %v", cErr)
-		}
-		if wErr := wipeDirectory(options.FS, dir); wErr != nil {
-			log.Printf("diskstore: failed to wipe directory: %v", wErr)
+		_ = f.Close()
+		if err := wipeStoreFiles(options.FS, dir); err != nil {
+			return nil, fmt.Errorf("failed to wipe store files after failure marker: %w", err)
 		}
 		wiped = true
-		log.Printf("diskstore: detected failure marker in %s; wiped store directory and reinitialized database", dir)
 	} else if !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("diskstore: error checking failure marker in %s: %v", dir, err)
+		return nil, fmt.Errorf("failed to check failure marker: %w", err)
 	}
 
 	metaPath := filepath.Join(dir, "meta.db")
@@ -299,7 +316,6 @@ func Open(opts ...Option) (*Engine, error) {
 	heapFile, err := options.FS.OpenFile(heapPath, openFlags, 0644)
 	if err != nil {
 		if DirectIOOpenFlag() != 0 {
-			log.Printf("diskstore: heap file failed to open with direct I/O: %v, falling back to buffered I/O", err)
 			GlobalMetrics.DirectIOFallbackCount.Add(1)
 		}
 		// Fallback without O_DIRECT if filesystem doesn't support it (e.g. tmpfs)
@@ -313,15 +329,9 @@ func Open(opts ...Option) (*Engine, error) {
 	conn, connErr := heapFile.SyscallConn()
 	if connErr == nil && conn != nil {
 		if rawConn, ok := conn.(interface{ Control(func(uintptr)) error }); ok {
-			var ctrlErr error
-			if cErr := rawConn.Control(func(fd uintptr) {
-				ctrlErr = applyPlatformDirectIOFlags(fd)
-			}); cErr != nil {
-				log.Printf("diskstore: rawConn.Control failed: %v", cErr)
-			}
-			if ctrlErr != nil {
-				log.Printf("diskstore: failed to apply platform direct I/O flags: %v", ctrlErr)
-			}
+			_ = rawConn.Control(func(fd uintptr) {
+				_ = applyPlatformDirectIOFlags(fd)
+			})
 		}
 	}
 
@@ -406,11 +416,6 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 
 	return s, nil
-}
-
-// OpenStore is an alias for Open.
-func OpenStore(opts ...StoreOption) (*DiskStore, error) {
-	return Open(opts...)
 }
 
 const (
@@ -571,9 +576,7 @@ func (s *Engine) loadOversizeObjects() error {
 
 		if strings.HasPrefix(name, ".tmp-") {
 			// Clean up abandoned temporary files from previous crashes
-			if rErr := s.fs.Remove(filePath); rErr != nil {
-				log.Printf("diskstore: failed to remove abandoned temp file %s: %v", filePath, rErr)
-			}
+			_ = s.fs.Remove(filePath)
 			continue
 		}
 
@@ -642,26 +645,11 @@ func (s *Engine) writeFailureMarker(err error) {
 	markerPath := filepath.Join(s.dir, "FAILED")
 	f, mErr := s.fs.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if mErr == nil {
-		if _, wErr := f.WriteAt([]byte(err.Error()+"\n"), 0); wErr != nil {
-			log.Printf("diskstore: failed to write failure marker: %v", wErr)
-		}
-		if sErr := f.Sync(); sErr != nil {
-			log.Printf("diskstore: failed to sync failure marker: %v", sErr)
-		}
-		if cErr := f.Close(); cErr != nil {
-			log.Printf("diskstore: failed to close failure marker: %v", cErr)
-		}
-		if dErr := s.fs.SyncDir(s.dir); dErr != nil {
-			log.Printf("diskstore: failed to sync dir for failure marker: %v", dErr)
-		}
-	} else {
-		log.Printf("diskstore: failed to open failure marker: %v", mErr)
+		_, _ = f.WriteAt([]byte(err.Error()+"\n"), 0)
+		_ = f.Sync()
+		_ = f.Close()
+		_ = s.fs.SyncDir(s.dir)
 	}
-}
-
-// SimulateFailure transitions the engine into the failed state and writes the failure marker.
-func (s *Engine) SimulateFailure(err error) {
-	s.setFailed(err)
 }
 
 func (s *Engine) isFailed() bool {
@@ -714,26 +702,14 @@ func (s *Engine) Tokens() map[string]string {
 	return res
 }
 
-// LastRecoveredResourceVersion returns the token / resourceVersion of the last record processed during recovery.
-func (s *Engine) LastRecoveredResourceVersion(bucketName ...string) string {
-	s.keyMu.RLock()
-	defer s.keyMu.RUnlock()
-	if len(bucketName) > 0 && bucketName[0] != "" {
-		if rv, ok := s.lastRecoveredTokenByBucket[bucketName[0]]; ok && rv != "" {
-			return rv
-		}
-	}
-	return s.lastRecoveredToken
-}
-
-// RecordBookmark records a progress token in the WAL without creating a key/value object.
-func (s *Engine) RecordBookmark(bucketName, token string) error {
+// SetToken records a progress token in the WAL for a bucket without creating a key/value object.
+func (s *Engine) SetToken(bucketName, token string) error {
 	if s.isFailed() {
 		return s.failErr()
 	}
 
 	rec := Record{
-		Type:  RecordTypeBookmark,
+		Type:  RecordTypeToken,
 		Key:   qualifyKey(bucketName, ""),
 		Token: token,
 	}
@@ -1202,6 +1178,11 @@ func (s *Engine) Delete(bucketName, key string, token ...string) error {
 
 	qKey := qualifyKey(bucketName, key)
 
+	tok := ""
+	if len(token) > 0 {
+		tok = token[0]
+	}
+
 	s.keyMu.Lock()
 	entry, exists := s.keyIndex[qKey]
 	if !exists {
@@ -1213,9 +1194,7 @@ func (s *Engine) Delete(bucketName, key string, token ...string) error {
 		delete(s.oversizeObjects, qKey)
 		GlobalMetrics.OversizeObjectsCount.Add(-1)
 	}
-	tok := ""
-	if len(token) > 0 {
-		tok = token[0]
+	if tok != "" {
 		s.lastRecoveredTokenByBucket[bucketName] = tok
 	}
 	s.keyMu.Unlock()

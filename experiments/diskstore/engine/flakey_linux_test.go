@@ -43,9 +43,9 @@ func TestDMFlakey(t *testing.T) {
 	mountPoint := filepath.Join(tmpDir, "mnt")
 	_ = os.MkdirAll(mountPoint, 0755)
 
-	store, err := OpenStore(WithDir(mountPoint))
+	store, err := Open(WithDir(mountPoint))
 	if err != nil {
-		t.Fatalf("OpenStore on flakey mount failed: %v", err)
+		t.Fatalf("Open on flakey mount failed: %v", err)
 	}
 	defer store.Close()
 
@@ -55,7 +55,7 @@ func TestDMFlakey(t *testing.T) {
 	store.setFailed(errors.New("dm-flakey simulated write failure"))
 
 	_, _, err = store.Get("ConfigMap", "test/key")
-	if !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("expected ErrStoreFailed, got %v", err)
+	if !errors.Is(err, ErrFailed) {
+		t.Fatalf("expected ErrFailed, got %v", err)
 	}
 }

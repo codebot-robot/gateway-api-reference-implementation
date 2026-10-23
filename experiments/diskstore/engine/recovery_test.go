@@ -38,7 +38,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 
 	// 1. Write Version 1 of a multi-block page (LSN 10) and make it durable
 	payloadV1 := bytes.Repeat([]byte("v1-payload-"), 1000) // ~11 KB -> 4 blocks
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "large-obj", Payload: payloadV1, ResourceVersion: "10"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "large-obj", Payload: payloadV1, Token: "10"})
 	_ = wal.Sync()
 
 	mbV1, err := NewMultiBlockPage(1, 10, "large-obj", payloadV1)
@@ -51,7 +51,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 
 	// 2. Write Version 2 of the multi-block page (LSN 20) to a new location, but TEAR one of its blocks
 	payloadV2 := bytes.Repeat([]byte("v2-payload-"), 1000)
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "large-obj", Payload: payloadV2, ResourceVersion: "20"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "large-obj", Payload: payloadV2, Token: "20"})
 	_ = wal.Sync()
 
 	mbV2, err := NewMultiBlockPage(1, 20, "large-obj", payloadV2)
@@ -141,7 +141,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	cp := NewCheckpointer(bp, heapFile, wal)
 
 	// Add key-1, checkpoint, then delete key-1 and checkpoint again
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "key-1", Payload: []byte("val-1"), ResourceVersion: "1"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 1, Key: "key-1", Payload: []byte("val-1"), Token: "1"})
 	h1, _ := bp.AllocateNewPage(1, 1, 1)
 	slotted, _ := WrapSlottedPage(h1.Block(0))
 	_, _ = slotted.Put("key-1", []byte("val-1"), 1)
@@ -151,7 +151,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	_, _ = cp.Checkpoint()
 
 	// Now delete key-1
-	_ = wal.Append(Record{Type: RecordTypeDelete, LSN: 3, Key: "key-1", ResourceVersion: "3"})
+	_ = wal.Append(Record{Type: RecordTypeDelete, LSN: 3, Key: "key-1", Token: "3"})
 	h1Reload, _ := bp.PinPage(1)
 	slottedReload, _ := WrapSlottedPage(h1Reload.Block(0))
 	_ = slottedReload.Delete(0, 3)
@@ -210,7 +210,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	}
 
 	// Store real legitimate object first at LSN 5
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "legit-key", Payload: []byte("legit-val"), ResourceVersion: "5"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 5, Key: "legit-key", Payload: []byte("legit-val"), Token: "5"})
 	h1, _ := bp.AllocateNewPage(1, 1, 5)
 	s1, _ := WrapSlottedPage(h1.Block(0))
 	_, _ = s1.Put("legit-key", []byte("legit-val"), 5)
@@ -219,7 +219,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	_ = bp.FlushPage(1)
 
 	// Now store the malicious object containing forged headers at LSN 10
-	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload, ResourceVersion: "10"})
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "malicious-key", Payload: maliciousPayload, Token: "10"})
 	_ = wal.Sync()
 	mbPage, err := NewMultiBlockPage(2, 10, "malicious-key", maliciousPayload)
 	if err != nil {
@@ -263,9 +263,9 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	model := make(map[string]string)
 
 	// Cycle 1: Open fresh store, put initial keys and a large multi-block object, checkpoint
-	store, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	store, err := Open(WithFS(faultFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("Cycle 1 OpenStore failed: %v", err)
+		t.Fatalf("Cycle 1 Open failed: %v", err)
 	}
 
 	largeVal := bytes.Repeat([]byte("large-payload-bytes-"), 500) // ~10 KB
@@ -308,9 +308,9 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	_ = store.Close()
 
 	// Cycle 2: Reopen store and verify full contents against model
-	store2, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	store2, err := Open(WithFS(faultFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("Cycle 2 OpenStore failed: %v", err)
+		t.Fatalf("Cycle 2 Open failed: %v", err)
 	}
 
 	for k, expectedVal := range model {
@@ -348,9 +348,9 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	_ = store2.Close()
 
 	// Cycle 3: Reopen store again and verify full contents against updated model
-	store3, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	store3, err := Open(WithFS(faultFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("Cycle 3 OpenStore failed: %v", err)
+		t.Fatalf("Cycle 3 Open failed: %v", err)
 	}
 	defer store3.Close()
 
@@ -378,9 +378,9 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_reopen_lsn_continuation"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	_ = store.Put("ConfigMap", "k1", []byte("v1"), "1")
@@ -389,9 +389,9 @@ func TestRegression_Item1_LSNReopenContinuation(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("Reopen OpenStore failed: %v", err)
+		t.Fatalf("Reopen Open failed: %v", err)
 	}
 	defer store2.Close()
 
@@ -480,9 +480,9 @@ func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
 	faultFS := NewFaultFS(memFS)
 	dir := "test_redo_applies_payload"
 
-	store, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	store, err := Open(WithFS(faultFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	// Write keys without checkpointing
@@ -496,9 +496,9 @@ func TestRegression_Item3_RedoAppliesPayload(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store: recovery must redo the puts onto page buffers
-	store2, err := OpenStore(WithFS(faultFS), WithDir(dir))
+	store2, err := Open(WithFS(faultFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("Reopen OpenStore failed: %v", err)
+		t.Fatalf("Reopen Open failed: %v", err)
 	}
 	defer store2.Close()
 

@@ -26,9 +26,9 @@ func TestDiskStore_BasicCRUD(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := OpenStore(WithFS(faultFS), WithDir("test_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_store"))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -61,9 +61,9 @@ func TestDiskStore_OversizeObject(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := OpenStore(WithFS(faultFS), WithDir("test_oversize_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_oversize_store"))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -107,9 +107,9 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := OpenStore(WithFS(faultFS), WithDir("test_fail_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_fail_store"))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -130,8 +130,8 @@ func TestDiskStore_FailedStateOnErrors(t *testing.T) {
 
 	// Invariant: Failed store returns error rather than stale data on ANY subsequent read
 	_, _, err = store.Get("ConfigMap", "default/cm-1")
-	if !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("expected ErrStoreFailed on read after failure, got %v", err)
+	if !errors.Is(err, ErrFailed) {
+		t.Fatalf("expected ErrFailed on read after failure, got %v", err)
 	}
 }
 
@@ -139,9 +139,9 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := OpenStore(WithFS(faultFS), WithDir("test_stale_store"))
+	store, err := Open(WithFS(faultFS), WithDir("test_stale_store"))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -177,8 +177,8 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 
 	// Read must detect mismatch, report corruption, and put store in failed state
 	_, _, err = store.Get("ConfigMap", "default/cm-stale")
-	if !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("expected ErrStoreFailed on stale read detection, got %v", err)
+	if !errors.Is(err, ErrFailed) {
+		t.Fatalf("expected ErrFailed on stale read detection, got %v", err)
 	}
 }
 
@@ -187,9 +187,9 @@ func TestRegression_Item11_ReuseRulePromoteFlushedBeforeSync(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
-	store, err := OpenStore(WithFS(faultFS), WithDir("test_reuse_rule_promote"))
+	store, err := Open(WithFS(faultFS), WithDir("test_reuse_rule_promote"))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -233,9 +233,9 @@ func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_no_old_record_resurrection"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	largeVal := bytes.Repeat([]byte("multi-block-payload-"), 500) // ~10 KB
@@ -254,7 +254,7 @@ func TestRegression_Item15_16_NoOldRecordResurrection(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store: large-cm must NOT resurrect!
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
@@ -270,9 +270,9 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_persistence"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	oversizeVal := bytes.Repeat([]byte("0123456789abcdef"), 150000) // ~2.4 MiB
@@ -285,7 +285,7 @@ func TestRegression_Item17_OversizeObjectPersistence(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store: oversize object must still be readable!
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
@@ -305,9 +305,9 @@ func TestRegression_Item19_BucketIsolation(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_bucket_isolation"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -342,18 +342,18 @@ func TestRegression_Item20_EngineScanConsistent(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_scan_rebuild"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	_ = store.Put("ConfigMap", "cm-1", []byte("val-1"), "1")
 	_ = store.Put("ConfigMap", "cm-2", []byte("val-2"), "2")
 	_ = store.Close()
 
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("Reopen OpenStore failed: %v", err)
+		t.Fatalf("Reopen Open failed: %v", err)
 	}
 	defer store2.Close()
 
@@ -372,9 +372,9 @@ func TestRegression_Round2_Item1_OversizeDeleteThenReopen(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_delete_reopen"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	oversizeVal := bytes.Repeat([]byte("0123456789abcdef"), 150000) // ~2.4 MiB
@@ -390,7 +390,7 @@ func TestRegression_Round2_Item1_OversizeDeleteThenReopen(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store: must not panic in recovery redo
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
@@ -407,9 +407,9 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_to_small_reopen"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	initialCount := OversizeCount()
@@ -434,7 +434,7 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store: must not revert to 3 MiB value!
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
@@ -458,9 +458,9 @@ func TestRegression_Round2_Item3_OversizeLongNameAndTornFiles(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_oversize_long_name"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	// 60-character namespace, 253-character name
@@ -481,7 +481,7 @@ func TestRegression_Round2_Item3_OversizeLongNameAndTornFiles(t *testing.T) {
 	_ = store.Close()
 
 	// Reopen store successfully
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}
@@ -499,9 +499,9 @@ func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_page_reuse_no_leak"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir), WithNumFrames(64))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithNumFrames(64))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
@@ -524,31 +524,26 @@ func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	}
 }
 
-// TestEngine_BookmarkNoFakeObject asserts that bookmarks do not store fake objects in buckets.
-func TestEngine_BookmarkNoFakeObject(t *testing.T) {
+// TestEngine_SetTokenNoFakeObject asserts that SetToken does not store fake objects in buckets.
+func TestEngine_SetTokenNoFakeObject(t *testing.T) {
 	memFS := NewMemFS()
-	dir := "test_bookmark_fake_obj"
+	dir := "test_token_no_fake_obj"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
-	// Record bookmark
-	if err := store.RecordBookmark("ConfigMap", "99999"); err != nil {
-		t.Fatalf("RecordBookmark failed: %v", err)
+	// Set progress token
+	if err := store.SetToken("ConfigMap", "99999"); err != nil {
+		t.Fatalf("SetToken failed: %v", err)
 	}
 
 	// ListKeys must be empty
 	keys := store.ListKeys("ConfigMap")
-	for _, k := range keys {
-		if strings.Contains(k, "bookmark") {
-			t.Fatalf("fake bookmark object leaked into ListKeys: %q", k)
-		}
-	}
 	if len(keys) != 0 {
-		t.Fatalf("expected 0 keys in store, got %d", len(keys))
+		t.Fatalf("expected 0 keys in store, got %d: %v", len(keys), keys)
 	}
 
 	// List must return empty
@@ -566,21 +561,21 @@ func TestEngine_TokenPerBucket(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_rv_per_bucket"
 
-	store, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
-		t.Fatalf("OpenStore failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
 
 	_ = store.Put("ConfigMap", "cm-1", []byte("val-1"), "cm-rv-100")
 	_ = store.Put("Secret", "sec-1", []byte("sec-1"), "secret-rv-500")
 
 	// Secret watch is ahead of ConfigMap watch
-	_ = store.RecordBookmark("Secret", "secret-rv-600")
+	_ = store.SetToken("Secret", "secret-rv-600")
 
 	_ = store.Close()
 
 	// Reopen store
-	store2, err := OpenStore(WithFS(memFS), WithDir(dir))
+	store2, err := Open(WithFS(memFS), WithDir(dir))
 	if err != nil {
 		t.Fatalf("Reopen failed: %v", err)
 	}

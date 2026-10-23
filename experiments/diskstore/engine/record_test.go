@@ -22,12 +22,12 @@ import (
 
 func TestRecord_EncodeDecode(t *testing.T) {
 	orig := Record{
-		Type:            RecordTypePut,
-		LSN:             105,
-		RedoStartLSN:    90,
-		Key:             "default/my-configmap",
-		Payload:         []byte("sample payload data 12345"),
-		ResourceVersion: "123456",
+		Type:         RecordTypePut,
+		LSN:          105,
+		RedoStartLSN: 90,
+		Key:          "default/my-configmap",
+		Payload:      []byte("sample payload data 12345"),
+		Token:        "123456",
 	}
 
 	encoded := EncodeRecord(orig)
@@ -41,18 +41,18 @@ func TestRecord_EncodeDecode(t *testing.T) {
 		decoded.RedoStartLSN != orig.RedoStartLSN ||
 		decoded.Key != orig.Key ||
 		!bytes.Equal(decoded.Payload, orig.Payload) ||
-		decoded.ResourceVersion != orig.ResourceVersion {
+		decoded.Token != orig.Token {
 		t.Fatalf("decoded record does not match original: got %+v, want %+v", decoded, orig)
 	}
 }
 
 func TestRecord_BadCRC(t *testing.T) {
 	orig := Record{
-		Type:            RecordTypePut,
-		LSN:             1,
-		Key:             "test/key",
-		Payload:         []byte("data"),
-		ResourceVersion: "10",
+		Type:    RecordTypePut,
+		LSN:     1,
+		Key:     "test/key",
+		Payload: []byte("data"),
+		Token:   "10",
 	}
 
 	encoded := EncodeRecord(orig)
@@ -67,10 +67,10 @@ func TestRecord_BadCRC(t *testing.T) {
 
 func TestRecord_TornRecord(t *testing.T) {
 	orig := Record{
-		Type:            RecordTypeDelete,
-		LSN:             2,
-		Key:             "test/key",
-		ResourceVersion: "11",
+		Type:  RecordTypeDelete,
+		LSN:   2,
+		Key:   "test/key",
+		Token: "11",
 	}
 
 	encoded := EncodeRecord(orig)

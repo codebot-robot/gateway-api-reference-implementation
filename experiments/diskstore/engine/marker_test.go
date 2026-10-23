@@ -15,7 +15,10 @@
 package engine_test
 
 import (
+	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine"
@@ -43,8 +46,8 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	if err := eng1.Put("bucketB", "k2", []byte("val2"), "token-B-1"); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
-	if err := eng1.RecordBookmark("bucketA", "token-A-2"); err != nil {
-		t.Fatalf("RecordBookmark failed: %v", err)
+	if err := eng1.SetToken("bucketA", "token-A-2"); err != nil {
+		t.Fatalf("SetToken failed: %v", err)
 	}
 	if err := eng1.Sync(); err != nil {
 		t.Fatalf("Sync failed: %v", err)
@@ -133,5 +136,86 @@ func TestEngine_FailureMarkerRecovery(t *testing.T) {
 	}
 	if tok := eng3.Token("bucketC"); tok != "token-C-1" {
 		t.Fatalf("expected token-C-1 after clean reopen, got %q", tok)
+	}
+}
+
+func TestEngine_FailureMarkerPreservesUnrelatedFiles(t *testing.T) {
+	memFS := engine.NewMemFS()
+	dir := "test_preserve_unrelated"
+
+	eng1, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := eng1.Put("bucket1", "k1", []byte("val1"), "tok-1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := eng1.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// Create an unrelated file and directory inside the store directory
+	unrelatedFilePath := filepath.Join(dir, "user_data.txt")
+	f1, err := memFS.OpenFile(unrelatedFilePath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("create user_data.txt failed: %v", err)
+	}
+	if _, err := f1.WriteAt([]byte("important user payload"), 0); err != nil {
+		t.Fatalf("write user_data.txt failed: %v", err)
+	}
+	_ = f1.Close()
+
+	unrelatedDirPath := filepath.Join(dir, "other_dir")
+	if err := memFS.MkdirAll(unrelatedDirPath, 0755); err != nil {
+		t.Fatalf("mkdir other_dir failed: %v", err)
+	}
+	unrelatedSubFilePath := filepath.Join(unrelatedDirPath, "other.json")
+	f2, err := memFS.OpenFile(unrelatedSubFilePath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("create other.json failed: %v", err)
+	}
+	if _, err := f2.WriteAt([]byte(`{"unrelated": true}`), 0); err != nil {
+		t.Fatalf("write other.json failed: %v", err)
+	}
+	_ = f2.Close()
+
+	// Simulate failure
+	eng1.SimulateFailure(errors.New("simulated crash"))
+	_ = eng1.Close()
+
+	// Reopen
+	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open after failure failed: %v", err)
+	}
+	defer eng2.Close()
+
+	if !eng2.Wiped() {
+		t.Fatalf("expected Wiped() == true")
+	}
+
+	// Verify that unrelated file survived
+	fCheck, err := memFS.OpenFile(unrelatedFilePath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("unrelated file user_data.txt was deleted during wipe: %v", err)
+	}
+	buf := make([]byte, 22)
+	n, _ := fCheck.ReadAt(buf, 0)
+	_ = fCheck.Close()
+	if !bytes.Equal(buf[:n], []byte("important user payload")) {
+		t.Fatalf("unrelated file content corrupted: %s", string(buf[:n]))
+	}
+
+	// Verify that unrelated directory and subfile survived
+	fSubCheck, err := memFS.OpenFile(unrelatedSubFilePath, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("unrelated subfile other_dir/other.json was deleted during wipe: %v", err)
+	}
+	subBuf := make([]byte, 19)
+	sn, _ := fSubCheck.ReadAt(subBuf, 0)
+	_ = fSubCheck.Close()
+	if !bytes.Equal(subBuf[:sn], []byte(`{"unrelated": true}`)) {
+		t.Fatalf("unrelated subfile content corrupted: %s", string(subBuf[:sn]))
 	}
 }

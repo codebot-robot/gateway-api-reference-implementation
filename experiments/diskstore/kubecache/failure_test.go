@@ -67,7 +67,7 @@ func TestAdapterFailure_EngineError(t *testing.T) {
 	}
 
 	// Trigger engine failure
-	eng.SimulateFailure(errors.New("simulated fatal disk failure"))
+	engine.TestHookFail(eng, errors.New("simulated fatal disk failure"))
 
 	// An operation encountering the engine error calls onFatal
 	cm3 := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-3"}}
@@ -143,7 +143,7 @@ func TestAdapterFailure_BackgroundFailureNotification(t *testing.T) {
 	}
 
 	// Simulate background engine failure
-	eng.SimulateFailure(errors.New("simulated background flush error"))
+	engine.TestHookFail(eng, errors.New("simulated background flush error"))
 
 	// Wait for background notification to reach adapter
 	select {

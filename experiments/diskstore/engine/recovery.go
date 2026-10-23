@@ -34,17 +34,15 @@ type KeyIndexEntry struct {
 
 // RecoveryResult contains the state reconstructed after a crash scan and log replay.
 type RecoveryResult struct {
-	DBID                        [16]byte
-	PageDescs                   map[uint64]*PageDesc
-	Buddy                       *BuddyAllocator
-	KeyIndex                    map[string]KeyIndexEntry
-	EmptyLogicalPages           []uint64
-	LastResourceVersion         string
-	LastResourceVersionByBucket map[string]string
-	LastToken                   string
-	LastTokenByBucket           map[string]string
-	MaxLSN                      uint64
-	NextLogicalPage             uint64
+	DBID              [16]byte
+	PageDescs         map[uint64]*PageDesc
+	Buddy             *BuddyAllocator
+	KeyIndex          map[string]KeyIndexEntry
+	EmptyLogicalPages []uint64
+	LastToken         string
+	LastTokenByBucket map[string]string
+	MaxLSN            uint64
+	NextLogicalPage   uint64
 }
 
 type candidatePageCopy struct {
@@ -325,9 +323,9 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 
 	// Step 4: Scan WAL to find the last checkpoint's redo start LSN
 	var redoStartLSN uint64 = 1
-	var lastResourceVersion string
+	var lastToken string
 	var maxWAL_LSN uint64
-	lastRVByBucket := make(map[string]string)
+	lastTokenByBucket := make(map[string]string)
 
 	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1)
 	if err == nil {
@@ -342,14 +340,14 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			if rec.LSN > maxWAL_LSN {
 				maxWAL_LSN = rec.LSN
 			}
-			if rec.ResourceVersion != "" {
-				lastResourceVersion = rec.ResourceVersion
+			if rec.Token != "" {
+				lastToken = rec.Token
 				bucket, _ := unqualifyKey(rec.Key)
 				if bucket != "" {
-					lastRVByBucket[bucket] = rec.ResourceVersion
+					lastTokenByBucket[bucket] = rec.Token
 				}
 			}
-			if rec.Type == RecordTypeBookmark {
+			if rec.Type == RecordTypeToken {
 				continue
 			}
 			if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
@@ -380,14 +378,14 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			if rec.LSN > maxWAL_LSN {
 				maxWAL_LSN = rec.LSN
 			}
-			if rec.ResourceVersion != "" {
-				lastResourceVersion = rec.ResourceVersion
+			if rec.Token != "" {
+				lastToken = rec.Token
 				bucket, _ := unqualifyKey(rec.Key)
 				if bucket != "" {
-					lastRVByBucket[bucket] = rec.ResourceVersion
+					lastTokenByBucket[bucket] = rec.Token
 				}
 			}
-			if rec.Type == RecordTypeBookmark {
+			if rec.Type == RecordTypeToken {
 				continue
 			}
 
@@ -645,16 +643,14 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	}
 
 	return &RecoveryResult{
-		DBID:                        dbID,
-		PageDescs:                   pageDescs,
-		Buddy:                       buddy,
-		KeyIndex:                    keyIndex,
-		EmptyLogicalPages:           emptyPages,
-		LastResourceVersion:         lastResourceVersion,
-		LastResourceVersionByBucket: lastRVByBucket,
-		LastToken:                   lastResourceVersion,
-		LastTokenByBucket:           lastRVByBucket,
-		MaxLSN:                      maxWAL_LSN,
-		NextLogicalPage:             maxRecoveredLogicalPage + 1,
+		DBID:              dbID,
+		PageDescs:         pageDescs,
+		Buddy:             buddy,
+		KeyIndex:          keyIndex,
+		EmptyLogicalPages: emptyPages,
+		LastToken:         lastToken,
+		LastTokenByBucket: lastTokenByBucket,
+		MaxLSN:            maxWAL_LSN,
+		NextLogicalPage:   maxRecoveredLogicalPage + 1,
 	}, nil
 }

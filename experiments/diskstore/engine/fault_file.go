@@ -479,8 +479,8 @@ func (f *FaultFile) updateMaxFsyncedWAL_LSNLocked() {
 		}
 		keyBytes := len([]byte(r.Key))
 		payloadBytes := len(r.Payload)
-		rvBytes := len([]byte(r.ResourceVersion))
-		offset += RecordHeaderSize + keyBytes + payloadBytes + rvBytes
+		tokenBytes := len([]byte(r.Token))
+		offset += RecordHeaderSize + keyBytes + payloadBytes + tokenBytes
 	}
 
 	if maxLSN > 0 {

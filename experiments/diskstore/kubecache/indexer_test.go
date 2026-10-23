@@ -26,7 +26,7 @@ import (
 	toolscache "k8s.io/client-go/tools/cache"
 )
 
-func TestDiskIndexer_CRUD(t *testing.T) {
+func TestIndexer_CRUD(t *testing.T) {
 	memFS := engine.NewMemFS()
 	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crud_store"))
 	if err != nil {
@@ -100,7 +100,7 @@ func TestDiskIndexer_CRUD(t *testing.T) {
 	}
 }
 
-func TestDiskIndexer_SecondaryIndexing(t *testing.T) {
+func TestIndexer_SecondaryIndexing(t *testing.T) {
 	memFS := engine.NewMemFS()
 	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_sec_store"))
 	if err != nil {
@@ -193,7 +193,7 @@ func TestDiskIndexer_SecondaryIndexing(t *testing.T) {
 	}
 }
 
-func TestDiskIndexer_WithEncryption(t *testing.T) {
+func TestIndexer_WithEncryption(t *testing.T) {
 	memFS := engine.NewMemFS()
 	cipher, err := engine.NewEphemeralAESGCMCipher()
 	if err != nil {
@@ -254,7 +254,7 @@ func TestDiskIndexer_WithEncryption(t *testing.T) {
 	}
 }
 
-func TestDiskIndexer_ReplaceAndResourceVersion(t *testing.T) {
+func TestIndexer_ReplaceAndResourceVersion(t *testing.T) {
 	memFS := engine.NewMemFS()
 	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_rv_store"))
 	if err != nil {

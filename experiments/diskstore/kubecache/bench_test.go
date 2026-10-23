@@ -333,7 +333,7 @@ func measureRecomputeBBolt(store *bboltcache.Store, resolver *bboltcache.LazyRes
 	return cold, warm
 }
 
-func measureRecomputeDiskStore(indexer *DiskIndexer, stateKeys map[types.NamespacedName]string, refs int) (cold time.Duration, warm time.Duration) {
+func measureRecomputeDiskStore(indexer *Indexer, stateKeys map[types.NamespacedName]string, refs int) (cold time.Duration, warm time.Duration) {
 	startCold := time.Now()
 	for i := 0; i < refs; i++ {
 		key := types.NamespacedName{Namespace: fmt.Sprintf("ns-%02d", i%20), Name: fmt.Sprintf("cm-%05d", i)}

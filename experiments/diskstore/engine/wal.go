@@ -28,8 +28,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"log"
 )
 
 const (
@@ -482,7 +480,6 @@ func (w *WAL) createSegmentLocked(startLSN uint64) error {
 	f, err := w.fs.OpenFile(path, openFlags, 0644)
 	if err != nil {
 		if DirectIOOpenFlag() != 0 {
-			log.Printf("diskstore: WAL segment %s failed to open with direct I/O: %v, falling back to buffered I/O", name, err)
 			GlobalMetrics.DirectIOFallbackCount.Add(1)
 		}
 		// Fallback without DirectIOOpenFlag if not supported by FS
@@ -944,8 +941,8 @@ func (it *WALIterator) Next() (Record, error) {
 
 		keyLen := binary.BigEndian.Uint32(hdr[20:24])
 		payloadLen := binary.BigEndian.Uint32(hdr[24:28])
-		rvLen := binary.BigEndian.Uint32(hdr[28:32])
-		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen) + int(rvLen)
+		tokenLen := binary.BigEndian.Uint32(hdr[28:32])
+		totalRecordLen := RecordHeaderSize + int(keyLen) + int(payloadLen) + int(tokenLen)
 
 		recordBytes := make([]byte, totalRecordLen)
 		n, err = it.currFile.ReadAt(recordBytes, it.currOffset)
