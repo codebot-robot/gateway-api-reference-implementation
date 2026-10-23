@@ -30,6 +30,60 @@ The new `DiskStore` architecture introduces:
 
 ---
 
+## Layered Architecture: Engine and Kubernetes Cache Adapter
+
+To maintain separation of concerns and avoid exposing Kubernetes dependencies to low-level storage routines, the implementation is split into two packages under `experiments/diskstore`:
+
+### 1. Core Database Engine (`experiments/diskstore/engine`)
+
+The engine provides a byte-oriented key-value store with crash consistency, bounded memory usage, and no dependencies on `k8s.io/...`:
+- **Data abstraction:** All keys and values are processed as raw byte slices (`[]byte`) partitioned across buckets.
+- **Operations:** Supports `Open`, `Put(bucket, key, value, token)`, `Delete(bucket, key, token)`, `Get(bucket, key)`, point-in-time consistent `Scan(bucket, fn)`, `Flush`, `Sync`, `Checkpoint`, and `Close`.
+- **Progress tokens:** Write and delete operations accept an opaque string `token` persisted in the WAL record. During crash recovery, the engine tracks the highest token for each bucket and exposes them via `Token(bucket)` and `Tokens()`.
+- **Payload encryption:** If a cipher is configured, encryption and decryption occur inside the engine using the bucket and key as authenticated additional data.
+- **Sticky error state and notifications:** Once an unrecoverable error occurs (such as an fsync failure or page corruption), the engine transitions permanently into a failed state where all subsequent calls return `ErrFailed`. Callers receive asynchronous notification via `Err()` and `Failed() <-chan struct{}`.
+- **Failure marker:** Upon entering the failed state, the engine writes a `FAILED` marker file to the storage directory. If a subsequent `Open` encounters this marker, it wipes the directory, reports the wipe via `Wiped() bool`, and initializes a fresh database with a new ID and no progress tokens.
+
+### 2. Kubernetes Adapter (`experiments/diskstore/kubecache`)
+
+The adapter implements client-go's `cache.Indexer` on top of the engine:
+- **Object serialization:** Handles conversion between `runtime.Object` instances and raw bytes using protobuf or JSON codecs (`ObjectCodec`).
+- **Secondary indexes:** Maintains index functions and index tables (`Indexers`, `Indices`) in memory, reconstructing them on startup via `engine.Scan`.
+- **ResourceVersion tracking:** Maps the Kubernetes `resourceVersion` and watch bookmarks to the engine's per-bucket progress tokens.
+- **Fail-fast policy:** Holds the unified error policy required to safely back client-go informer caches with persistent storage.
+
+---
+
+## Fail-Fast Error Policy and Trade-offs
+
+### The Problem with Partial Informer Failures
+
+client-go's cache interfaces are designed around in-memory hash maps that assume storage never fails:
+- Read methods such as `List() []any` and `ListKeys() []string` provide no error return in their signatures.
+- The reflector logs errors from `Add`, `Update`, and `Delete` via `utilruntime.HandleError` but continues watching without retrying the failed cache write.
+- Secondary indexing functions in `threadSafeMap` panic when an index function returns an error.
+
+If a disk-backed cache logs an error or returns partial data during a read, the reflector continues processing events while the local cache drifts silently out of sync with the Kubernetes apiserver. This desynchronization can lead to stale routing state, missing endpoints, or incorrect gateway configuration.
+
+### Error Handling Policy
+
+The adapter enforces a single fail-fast policy across all operations:
+1. **Mandatory fatal handler:** Construction of `Indexer` requires an `OnFatal func(error)` callback. The provided `DefaultOnFatal` logs the error at error level and exits the process (`os.Exit(1)`).
+2. **Unified trigger conditions:** `OnFatal` is invoked (via `sync.Once` to ensure execution exactly once) upon:
+   - Any engine error returned from `Put`, `Delete`, `Get`, `Scan`, or `Sync`;
+   - Asynchronous engine failure notifications delivered via `engine.Failed()`;
+   - Object serialization or deserialization failures;
+   - Decryption failures;
+   - Index-function errors returned by registered secondary indexers.
+3. **No partial results:** Methods without error returns (`List`, `ListKeys`) and methods with error returns (`ByIndex`) discard any accumulated items and return empty results if an error occurs mid-traversal. If the fatal handler does not terminate the process (as in unit test harnesses), subsequent operations continue to return errors or empty results.
+
+### Trade-offs
+
+- **Process restarts vs. silent divergence:** Halting the process when storage fails relies on the pod supervisor (kubelet) to restart the container. The restarted container wipes corrupted state (if marked as failed) and relists all objects from the apiserver. This incurs startup latency and apiserver load during relisting, but prevents controllers from operating on partial or inconsistent state.
+- **Simplicity vs. in-flight retry:** The fail-fast model avoids complex in-memory staging queues, retry loops, or multi-version rollback mechanisms in the cache layer.
+
+---
+
 ## Architecture and On-Disk Formats
 
 ### 1. Write-Ahead Log (WAL)
