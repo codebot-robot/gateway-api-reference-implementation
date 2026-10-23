@@ -19,6 +19,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine"
@@ -217,5 +218,125 @@ func TestEngine_FailureMarkerPreservesUnrelatedFiles(t *testing.T) {
 	_ = fSubCheck.Close()
 	if !bytes.Equal(subBuf[:sn], []byte(`{"unrelated": true}`)) {
 		t.Fatalf("unrelated subfile content corrupted: %s", string(subBuf[:sn]))
+	}
+}
+
+type failRemoveFS struct {
+	engine.FS
+	failOnSuffix string
+	callCount    int
+}
+
+func (f *failRemoveFS) Remove(name string) error {
+	if f.failOnSuffix != "" && strings.HasSuffix(name, f.failOnSuffix) {
+		f.callCount++
+		return errors.New("injected fault removing file during wipe")
+	}
+	return f.FS.Remove(name)
+}
+
+func TestEngine_InterruptedWipe_FailurePartWay(t *testing.T) {
+	baseFS := engine.NewMemFS()
+	faultyFS := &failRemoveFS{FS: baseFS}
+	dir := "test_interrupted_wipe"
+
+	// 1. Initialize store with data
+	eng1, err := engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if err := eng1.Put("bucketA", "k1", []byte("val1"), "tok-1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	if err := eng1.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	// 2. Trigger failure, creating FAILED marker
+	eng1.SimulateFailure(errors.New("simulated crash before wipe"))
+	_ = eng1.Close()
+
+	// 3. Inject failure when removing heap.db during wipe
+	faultyFS.failOnSuffix = "heap.db"
+
+	// Open must attempt wipe, fail on heap.db, and return error
+	_, err = engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir))
+	if err == nil {
+		t.Fatalf("expected Open to fail when wipe fails")
+	}
+	if faultyFS.callCount == 0 {
+		t.Fatalf("expected injected fault to be called")
+	}
+
+	// Because wipe failed, FAILED marker must still be present on disk
+	markerPath := filepath.Join(dir, "FAILED")
+	mf, mErr := faultyFS.OpenFile(markerPath, os.O_RDONLY, 0)
+	if mErr != nil {
+		t.Fatalf("FAILED marker was prematurely removed when wipe failed: %v", mErr)
+	}
+	_ = mf.Close()
+
+	// 4. Clear the fault and reopen: next Open must complete the wipe and produce a clean store
+	faultyFS.failOnSuffix = ""
+	eng2, err := engine.Open(engine.WithFS(faultyFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("reopening store after interrupted wipe failed: %v", err)
+	}
+	defer eng2.Close()
+
+	if !eng2.Wiped() {
+		t.Fatalf("expected Wiped() == true on successful recovery from interrupted wipe")
+	}
+	if len(eng2.Tokens()) != 0 {
+		t.Fatalf("expected 0 tokens after wipe, got %v", eng2.Tokens())
+	}
+	if keys := eng2.ListKeys(); len(keys) != 0 {
+		t.Fatalf("expected 0 keys after wipe, got %v", keys)
+	}
+
+	// Verify fresh store can write and read normally
+	if err := eng2.Put("bucketA", "k2", []byte("val2"), "tok-2"); err != nil {
+		t.Fatalf("Put on recovered store failed: %v", err)
+	}
+	val, exists, err := eng2.Get("bucketA", "k2")
+	if err != nil || !exists || !bytes.Equal(val, []byte("val2")) {
+		t.Fatalf("Get on recovered store failed: exists=%v, val=%s, err=%v", exists, string(val), err)
+	}
+}
+
+func TestEngine_OrphanedStoreFilesWithoutMeta_TreatedAsCorrupt(t *testing.T) {
+	memFS := engine.NewMemFS()
+	dir := "test_orphaned_store"
+
+	// 1. Set up a store, write data, sync
+	eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	_ = eng.Put("bucketA", "k1", []byte("val1"), "tok-1")
+	_ = eng.Sync()
+	_ = eng.Close()
+
+	// 2. Simulate a crash that removed meta.db (e.g. partial wipe or corruption) but left heap.db and wal/
+	metaPath := filepath.Join(dir, "meta.db")
+	if err := memFS.Remove(metaPath); err != nil {
+		t.Fatalf("remove meta.db failed: %v", err)
+	}
+
+	// 3. Reopen without meta.db: Open must detect existing heap.db/wal, wipe them, and report Wiped()
+	eng2, err := engine.Open(engine.WithFS(memFS), engine.WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open on orphaned store failed: %v", err)
+	}
+	defer eng2.Close()
+
+	if !eng2.Wiped() {
+		t.Fatalf("expected Wiped() == true when opening orphaned store without meta.db")
+	}
+	if len(eng2.Tokens()) != 0 {
+		t.Fatalf("expected no tokens from orphaned store, got %v", eng2.Tokens())
+	}
+	if keys := eng2.ListKeys(); len(keys) != 0 {
+		t.Fatalf("expected 0 keys from orphaned store, got %v", keys)
 	}
 }

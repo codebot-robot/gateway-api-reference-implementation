@@ -195,8 +195,8 @@ func removeDirRecursive(fs FS, dir string) error {
 func wipeStoreFiles(fs FS, dir string) error {
 	var errs []error
 
-	// Remove known store files only
-	for _, name := range []string{"FAILED", "meta.db", "heap.db"} {
+	// Remove known store files (excluding FAILED marker)
+	for _, name := range []string{"meta.db", "heap.db"} {
 		p := filepath.Join(dir, name)
 		if err := fs.Remove(p); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("failed to remove %s: %w", p, err))
@@ -212,10 +212,24 @@ func wipeStoreFiles(fs FS, dir string) error {
 	}
 
 	if err := fs.SyncDir(dir); err != nil {
-		errs = append(errs, fmt.Errorf("failed to sync store dir after wipe: %w", err))
+		errs = append(errs, fmt.Errorf("failed to sync store dir before removing marker: %w", err))
 	}
 
-	return errors.Join(errs...)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	// Remove failure marker LAST, only after all store files are removed and synced
+	markerPath := filepath.Join(dir, "FAILED")
+	if err := fs.Remove(markerPath); err != nil && !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to remove failure marker %s: %w", markerPath, err)
+	}
+
+	if err := fs.SyncDir(dir); err != nil {
+		return fmt.Errorf("failed to sync store dir after removing marker: %w", err)
+	}
+
+	return nil
 }
 
 // Open opens or initializes an Engine in dir.
@@ -252,15 +266,17 @@ func Open(opts ...Option) (*Engine, error) {
 	// Check for failure marker from a prior failed instance
 	markerPath := filepath.Join(dir, "FAILED")
 	wiped := false
-	f, err := options.FS.OpenFile(markerPath, os.O_RDONLY, 0)
-	if err == nil {
-		_ = f.Close()
+	markerFile, markerErr := options.FS.OpenFile(markerPath, os.O_RDONLY, 0)
+	if markerErr == nil {
+		if cErr := markerFile.Close(); cErr != nil {
+			return nil, fmt.Errorf("failed to close failure marker: %w", cErr)
+		}
 		if err := wipeStoreFiles(options.FS, dir); err != nil {
 			return nil, fmt.Errorf("failed to wipe store files after failure marker: %w", err)
 		}
 		wiped = true
-	} else if !os.IsNotExist(err) && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed to check failure marker: %w", err)
+	} else if !os.IsNotExist(markerErr) && !errors.Is(markerErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to check failure marker: %w", markerErr)
 	}
 
 	metaPath := filepath.Join(dir, "meta.db")
@@ -279,6 +295,42 @@ func Open(opts ...Option) (*Engine, error) {
 	metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, 0644)
 	if err != nil {
 		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
+			// meta.db does not exist. Check if orphaned store files exist (heap.db, wal/, or oversize/)
+			hasOrphaned := false
+			hf, hErr := options.FS.OpenFile(heapPath, os.O_RDONLY, 0)
+			if hErr == nil {
+				if cErr := hf.Close(); cErr != nil {
+					return nil, fmt.Errorf("failed to close heap.db check file: %w", cErr)
+				}
+				hasOrphaned = true
+			} else if !os.IsNotExist(hErr) && !errors.Is(hErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("failed to check heap.db: %w", hErr)
+			}
+
+			wEntries, wErr := options.FS.ReadDir(walDir)
+			if wErr == nil {
+				if len(wEntries) > 0 {
+					hasOrphaned = true
+				}
+			} else if !os.IsNotExist(wErr) && !errors.Is(wErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("failed to check wal directory: %w", wErr)
+			}
+
+			oEntries, oErr := options.FS.ReadDir(oversizeDir)
+			if oErr == nil {
+				if len(oEntries) > 0 {
+					hasOrphaned = true
+				}
+			} else if !os.IsNotExist(oErr) && !errors.Is(oErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("failed to check oversize directory: %w", oErr)
+			}
+			if hasOrphaned {
+				if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
+					return nil, fmt.Errorf("failed to wipe orphaned store files: %w", wipeErr)
+				}
+				wiped = true
+			}
+
 			isNewStore = true
 			if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
 				return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
@@ -327,11 +379,16 @@ func Open(opts ...Option) (*Engine, error) {
 
 	// Apply platform specific flags (e.g. F_NOCACHE on Darwin)
 	conn, connErr := heapFile.SyscallConn()
-	if connErr == nil && conn != nil {
+	if connErr != nil {
+		GlobalMetrics.DirectIOFallbackCount.Add(1)
+	} else if conn != nil {
 		if rawConn, ok := conn.(interface{ Control(func(uintptr)) error }); ok {
-			_ = rawConn.Control(func(fd uintptr) {
-				_ = applyPlatformDirectIOFlags(fd)
-			})
+			var ctrlErr error
+			if cErr := rawConn.Control(func(fd uintptr) {
+				ctrlErr = applyPlatformDirectIOFlags(fd)
+			}); cErr != nil || ctrlErr != nil {
+				GlobalMetrics.DirectIOFallbackCount.Add(1)
+			}
 		}
 	}
 
@@ -576,7 +633,9 @@ func (s *Engine) loadOversizeObjects() error {
 
 		if strings.HasPrefix(name, ".tmp-") {
 			// Clean up abandoned temporary files from previous crashes
-			_ = s.fs.Remove(filePath)
+			if rErr := s.fs.Remove(filePath); rErr != nil && !os.IsNotExist(rErr) {
+				return fmt.Errorf("failed to remove abandoned temp file %s: %w", filePath, rErr)
+			}
 			continue
 		}
 
@@ -636,20 +695,33 @@ func (s *Engine) setFailed(err error) {
 	if s.failedErr == nil {
 		s.failedErr = fmt.Errorf("%w: %v", ErrFailed, err)
 		close(s.failedCh)
-		s.writeFailureMarker(err)
+		if mErr := s.writeFailureMarker(err); mErr != nil {
+			s.failedErr = fmt.Errorf("%w (marker error: %v)", s.failedErr, mErr)
+		}
 	}
 	s.failMu.Unlock()
 }
 
-func (s *Engine) writeFailureMarker(err error) {
+func (s *Engine) writeFailureMarker(err error) error {
 	markerPath := filepath.Join(s.dir, "FAILED")
 	f, mErr := s.fs.OpenFile(markerPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if mErr == nil {
-		_, _ = f.WriteAt([]byte(err.Error()+"\n"), 0)
-		_ = f.Sync()
-		_ = f.Close()
-		_ = s.fs.SyncDir(s.dir)
+	if mErr != nil {
+		return mErr
 	}
+	var errs []error
+	if _, wErr := f.WriteAt([]byte(err.Error()+"\n"), 0); wErr != nil {
+		errs = append(errs, wErr)
+	}
+	if sErr := f.Sync(); sErr != nil {
+		errs = append(errs, sErr)
+	}
+	if cErr := f.Close(); cErr != nil {
+		errs = append(errs, cErr)
+	}
+	if dErr := s.fs.SyncDir(s.dir); dErr != nil {
+		errs = append(errs, dErr)
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Engine) isFailed() bool {
@@ -737,6 +809,11 @@ func (s *Engine) Cipher() Cipher {
 // Path returns the store directory.
 func (s *Engine) Path() string {
 	return s.dir
+}
+
+// DirectIOFallbackCount returns the number of times direct I/O could not be used and fell back to buffered I/O.
+func (s *Engine) DirectIOFallbackCount() int64 {
+	return GlobalMetrics.DirectIOFallbackCount.Load()
 }
 
 // Put writes an object to the engine, encrypting if a cipher is configured.

@@ -328,15 +328,21 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 			oldDesc.FrameIDs = nil
 		}
 		if oldDesc.DurableLoc != NoBlock {
-			_ = bp.buddy.Free(oldDesc.DurableLoc)
+			if err := bp.buddy.Free(oldDesc.DurableLoc); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old durable block %d: %w", oldDesc.DurableLoc, err))
+			}
 			oldDesc.DurableLoc = NoBlock
 		}
 		if oldDesc.FlushedLoc != NoBlock && oldDesc.FlushedLoc != oldDesc.DurableLoc {
-			_ = bp.buddy.Free(oldDesc.FlushedLoc)
+			if err := bp.buddy.Free(oldDesc.FlushedLoc); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old flushed block %d: %w", oldDesc.FlushedLoc, err))
+			}
 			oldDesc.FlushedLoc = NoBlock
 		}
 		if oldDesc.PhysicalBlock != NoBlock && oldDesc.PhysicalBlock != oldDesc.DurableLoc && oldDesc.PhysicalBlock != oldDesc.FlushedLoc {
-			_ = bp.buddy.Free(oldDesc.PhysicalBlock)
+			if err := bp.buddy.Free(oldDesc.PhysicalBlock); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old physical block %d: %w", oldDesc.PhysicalBlock, err))
+			}
 			oldDesc.PhysicalBlock = NoBlock
 		}
 	}
@@ -392,15 +398,21 @@ func (bp *BufferPool) FreePage(logicalPage uint64) {
 			desc.FrameIDs = nil
 		}
 		if desc.DurableLoc != NoBlock {
-			_ = bp.buddy.Free(desc.DurableLoc)
+			if err := bp.buddy.Free(desc.DurableLoc); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free durable block %d: %w", desc.DurableLoc, err))
+			}
 			desc.DurableLoc = NoBlock
 		}
 		if desc.FlushedLoc != NoBlock && desc.FlushedLoc != desc.DurableLoc {
-			_ = bp.buddy.Free(desc.FlushedLoc)
+			if err := bp.buddy.Free(desc.FlushedLoc); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free flushed block %d: %w", desc.FlushedLoc, err))
+			}
 			desc.FlushedLoc = NoBlock
 		}
 		if desc.PhysicalBlock != NoBlock && desc.PhysicalBlock != desc.DurableLoc && desc.PhysicalBlock != desc.FlushedLoc {
-			_ = bp.buddy.Free(desc.PhysicalBlock)
+			if err := bp.buddy.Free(desc.PhysicalBlock); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free physical block %d: %w", desc.PhysicalBlock, err))
+			}
 			desc.PhysicalBlock = NoBlock
 		}
 		delete(bp.pageTable, logicalPage)
@@ -569,7 +581,9 @@ func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
 	desc.PhysicalBlock = newLoc
 
 	if oldFlushed != NoBlock && oldFlushed != desc.DurableLoc && oldFlushed != desc.FlushedBeforeSync {
-		_ = bp.buddy.Free(oldFlushed)
+		if err := bp.buddy.Free(oldFlushed); err != nil && bp.onFailure != nil {
+			bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free superseded flushed block %d: %w", oldFlushed, err))
+		}
 	}
 	if desc.PageLSN.Load() == pageLSN {
 		desc.Dirty = false
