@@ -15,28 +15,24 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -97,7 +93,6 @@ func TestSetupController_NoSilentFallback(t *testing.T) {
 		// Error returned instead of silent fallback is valid
 		return
 	}
-	// If compute.NewService succeeded, opts.SetupWithManager is configured with real client.
 	if opts.SetupWithManager == nil {
 		t.Errorf("expected SetupWithManager to be set")
 	}
@@ -116,43 +111,31 @@ func TestSetupController_FakeComputeFlag(t *testing.T) {
 	}
 }
 
-type testManagerWithFakeClient struct {
-	ctrl.Manager
-	client     client.Client
-	scheme     *runtime.Scheme
-	reconciler reconcile.Reconciler
-}
-
-func (m *testManagerWithFakeClient) GetClient() client.Client {
-	return m.client
-}
-
-func (m *testManagerWithFakeClient) GetScheme() *runtime.Scheme {
-	return m.scheme
-}
-
-func (m *testManagerWithFakeClient) Add(r manager.Runnable) error {
-	if rec, ok := r.(reconcile.Reconciler); ok {
-		m.reconciler = rec
-	}
-	return m.Manager.Add(r)
-}
-
 // TestSetupController_EndToEndRealSetup verifies that the full controller setup wiring
 // (SetupController -> AddressProvider -> Deployment -> Pod template -> SetupWithManager -> Reconciler)
-// runs end-to-end, attaches data-plane pods to zonal NEGs, sets the readiness gate, and marks the Gateway Programmed.
+// runs against an envtest control plane, attaches data-plane pods to zonal NEGs,
+// sets the readiness gate, and marks the Gateway Programmed.
 func TestSetupController_EndToEndRealSetup(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
-	_ = gatewayv1.Install(scheme)
+	env := testenv.Start(t)
+
+	// Create GatewayClass
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gcpgateway",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+	if err := env.Client.Create(t.Context(), gc); err != nil {
+		t.Fatalf("creating GatewayClass: %v", err)
+	}
 
 	ipAddrType := gatewayv1.IPAddressType
 	gw := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "default",
 			Name:      "my-gw",
-			UID:       types.UID("my-gw-uid"),
 		},
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: "gcpgateway",
@@ -171,6 +154,9 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 			},
 		},
 	}
+	if err := env.Client.Create(t.Context(), gw); err != nil {
+		t.Fatalf("creating Gateway: %v", err)
+	}
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
@@ -183,12 +169,9 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 			ProviderID: "gce://my-project/us-central1-a/gke-node-1",
 		},
 	}
-
-	fakeK8s := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
-		WithObjects(gw, node).
-		Build()
+	if err := env.Client.Create(t.Context(), node); err != nil {
+		t.Fatalf("creating Node: %v", err)
+	}
 
 	fakeGCP := gcp.NewFakeComputeClient()
 	negDesc, _ := (&metadata.NegMetadata{
@@ -226,25 +209,20 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	}
 
 	// 2. Provision data plane Deployment via AddressProvider
-	sap, ok := opts.AddressProvider.(*singlepod.AddressProvider)
-	if !ok || sap == nil {
-		t.Fatalf("expected singlepod.AddressProvider to be configured")
-	}
-
-	sap = singlepod.NewAddressProvider(
-		fakeK8s,
+	ap := singlepod.NewAddressProvider(
+		env.Client,
 		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
 		singlepod.WithTerminationGracePeriodSeconds(60),
 	)
 
-	_, _, err = sap.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	_, _, err = ap.GatewayAddressesWithReadiness(t.Context(), gw, nil)
 	if err != nil {
 		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
 	}
 
 	resName := singlepod.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
-	if err := fakeK8s.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
 		t.Fatalf("failed to get created Deployment: %v", err)
 	}
 
@@ -253,105 +231,100 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		t.Errorf("expected TerminationGracePeriodSeconds=60, got %v", deploy.Spec.Template.Spec.TerminationGracePeriodSeconds)
 	}
 
-	// 3. Create real data-plane Pod matching the Deployment template
-	labels := make(map[string]string)
-	for k, v := range deploy.Spec.Template.Labels {
-		labels[k] = v
+	// 3. Create real data-plane Pod matching the Deployment template via testenv.BuildPodFromDeployment
+	pod := testenv.BuildPodFromDeployment(
+		&deploy,
+		testenv.WithPodName("dp-pod-1"),
+		testenv.WithNodeName("node-1"),
+		testenv.WithPodIP("10.0.1.5"),
+		testenv.WithContainersReady(true),
+	)
+	// Readiness gate starts false
+	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+		Type:   corev1.PodConditionType(LoadBalancerReadyGate),
+		Status: corev1.ConditionFalse,
+	})
+
+	if err := env.Client.Create(t.Context(), pod); err != nil {
+		t.Fatalf("creating pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.1.5"
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+	}
+	if err := env.Client.Status().Update(t.Context(), pod); err != nil {
+		t.Fatalf("updating pod status: %v", err)
 	}
 
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: gw.Namespace,
-			Name:      "dp-pod-1",
-			Labels:    labels,
-		},
-		Spec: deploy.Spec.Template.Spec,
-	}
-	pod.Spec.NodeName = "node-1"
-
-	if err := fakeK8s.Create(t.Context(), pod); err != nil {
-		t.Fatalf("failed to create pod: %v", err)
-	}
-	pod.Status = corev1.PodStatus{
-		PodIP: "10.0.1.5",
-		Conditions: []corev1.PodCondition{
-			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
-			{Type: corev1.PodConditionType(LoadBalancerReadyGate), Status: corev1.ConditionFalse},
-		},
-	}
-	if err := fakeK8s.Status().Update(t.Context(), pod); err != nil {
-		t.Fatalf("failed to update pod status: %v", err)
-	}
-
-	// 4. Initialize Manager and execute opts.SetupWithManager
-	baseMgr, err := ctrl.NewManager(&rest.Config{Host: "http://localhost:8080"}, ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsserver.Options{BindAddress: "0"},
+	// 4. Initialize real controller-runtime Manager and execute opts.SetupWithManager
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:                 env.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
 	})
 	if err != nil {
-		t.Fatalf("failed to create base manager: %v", err)
+		t.Fatalf("failed to create manager: %v", err)
 	}
 
-	testMgr := &testManagerWithFakeClient{
-		Manager: baseMgr,
-		client:  fakeK8s,
-		scheme:  scheme,
-	}
-
-	if err := opts.SetupWithManager(testMgr); err != nil {
+	if err := opts.SetupWithManager(mgr); err != nil {
 		t.Fatalf("SetupWithManager failed: %v", err)
 	}
 
-	if testMgr.reconciler == nil {
-		t.Fatalf("expected reconciler to be registered with manager")
-	}
+	// 5. Start manager in background
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	defer cancelMgr()
+	go func() {
+		_ = mgr.Start(mgrCtx)
+	}()
 
-	// 5. Trigger reconciliation
-	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}}
-	_, err = testMgr.reconciler.Reconcile(t.Context(), req)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
-	}
+	// 6. Assertions with timeout:
+	// a. Pod endpoint attached to zonal NEG in fake GCP
+	// b. Pod readiness gate patched to True
+	// c. Gateway Programmed condition set to True
+	var (
+		attachedEps []*compute.NetworkEndpoint
+		updatedPod  corev1.Pod
+		updatedGW   gatewayv1.Gateway
+		foundGate   bool
+		foundProg   bool
+	)
 
-	// 6. Assertions:
-	// a. Pod endpoint is attached to zonal NEG in fake GCP!
-	eps, err := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
-	if err != nil {
-		t.Fatalf("ListNetworkEndpoints failed: %v", err)
-	}
-	if len(eps) != 1 || eps[0].IpAddress != "10.0.1.5" || eps[0].Instance != "gke-node-1" {
-		t.Errorf("expected pod endpoint attached to NEG, got %+v", eps)
-	}
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+		attachedEps, _ = fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
+		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: "dp-pod-1"}, &updatedPod)
+		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW)
 
-	// b. Pod readiness gate gcpgateway.gke-labs.io/load-balancer-ready is patched to True!
-	var updatedPod corev1.Pod
-	if err := fakeK8s.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: "dp-pod-1"}, &updatedPod); err != nil {
-		t.Fatalf("failed to get updated pod: %v", err)
-	}
-	foundGateTrue := false
-	for _, c := range updatedPod.Status.Conditions {
-		if c.Type == corev1.PodConditionType(LoadBalancerReadyGate) && c.Status == corev1.ConditionTrue {
-			foundGateTrue = true
+		foundGate = false
+		for _, c := range updatedPod.Status.Conditions {
+			if c.Type == corev1.PodConditionType(LoadBalancerReadyGate) && c.Status == corev1.ConditionTrue {
+				foundGate = true
+				break
+			}
+		}
+
+		foundProg = false
+		for _, c := range updatedGW.Status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) && c.Status == metav1.ConditionTrue {
+				foundProg = true
+				break
+			}
+		}
+
+		if len(attachedEps) > 0 && foundGate && foundProg {
 			break
 		}
 	}
-	if !foundGateTrue {
+
+	if len(attachedEps) != 1 || attachedEps[0].IpAddress != "10.0.1.5" || attachedEps[0].Instance != "gke-node-1" {
+		t.Errorf("expected pod endpoint attached to NEG, got %+v", attachedEps)
+	}
+
+	if !foundGate {
 		t.Errorf("expected pod readiness gate %s=True, conditions are: %+v", LoadBalancerReadyGate, updatedPod.Status.Conditions)
 	}
 
-	// c. Gateway condition Programmed is True!
-	var updatedGW gatewayv1.Gateway
-	if err := fakeK8s.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW); err != nil {
-		t.Fatalf("failed to get updated Gateway: %v", err)
-	}
-	foundProgrammedTrue := false
-	for _, c := range updatedGW.Status.Conditions {
-		if c.Type == string(gatewayv1.GatewayConditionProgrammed) && c.Status == metav1.ConditionTrue {
-			foundProgrammedTrue = true
-			break
-		}
-	}
-	if !foundProgrammedTrue {
+	if !foundProg {
 		t.Errorf("expected Gateway Programmed=True, conditions are: %+v", updatedGW.Status.Conditions)
 	}
 }
