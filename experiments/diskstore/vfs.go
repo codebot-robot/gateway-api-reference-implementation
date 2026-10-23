@@ -45,6 +45,7 @@ type FS interface {
 	Create(name string) (File, error)
 	Open(name string) (File, error)
 	Remove(name string) error
+	Rename(oldpath, newpath string) error
 	MkdirAll(path string, perm os.FileMode) error
 	ReadDir(dirname string) ([]os.DirEntry, error)
 	SyncDir(dirname string) error
@@ -112,6 +113,10 @@ func (o *OSFS) Open(name string) (File, error) {
 
 func (o *OSFS) Remove(name string) error {
 	return os.Remove(name)
+}
+
+func (o *OSFS) Rename(oldpath, newpath string) error {
+	return os.Rename(oldpath, newpath)
 }
 
 func (o *OSFS) MkdirAll(path string, perm os.FileMode) error {
@@ -291,6 +296,26 @@ func (m *MemFS) Remove(name string) error {
 		return os.ErrNotExist
 	}
 	delete(m.files, cleaned)
+	return nil
+}
+
+func (m *MemFS) Rename(oldpath, newpath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	oldClean := cleanPath(oldpath)
+	newClean := cleanPath(newpath)
+
+	data, exists := m.files[oldClean]
+	if !exists {
+		return os.ErrNotExist
+	}
+	newDir := filepath.Dir(newClean)
+	if newDir != "." && newDir != "/" && !m.directories[newDir] {
+		return fmt.Errorf("directory does not exist: %s", newDir)
+	}
+
+	m.files[newClean] = data
+	delete(m.files, oldClean)
 	return nil
 }
 

@@ -156,6 +156,18 @@ func (f *FaultFS) Remove(name string) error {
 	return f.underlying.Remove(name)
 }
 
+func (f *FaultFS) Rename(oldpath, newpath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	oldClean := cleanPath(oldpath)
+	newClean := cleanPath(newpath)
+	if ff, exists := f.files[oldClean]; exists {
+		f.files[newClean] = ff
+		delete(f.files, oldClean)
+	}
+	return f.underlying.Rename(oldpath, newpath)
+}
+
 func (f *FaultFS) MkdirAll(path string, perm os.FileMode) error {
 	return f.underlying.MkdirAll(path, perm)
 }
