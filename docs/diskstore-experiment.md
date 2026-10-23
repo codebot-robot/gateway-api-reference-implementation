@@ -282,6 +282,11 @@ Recompute Latency Comparison:
 4. **Crash Recovery Time:**
    - `DiskStore` scans and recovers 10,000 objects across a 160 MB heap file in **486 ms**, a 14x improvement achieved by reading disk blocks sequentially in physical order and eliminating buffer cache thrashing.
 
+5. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
+   - **Point-in-Time Consistency:** `DiskStore.List(bucketName)` acquires `s.writerMu.RLock()` for the duration of the broad bucket read and object decoding. This guarantees point-in-time snapshot consistency: no concurrent writes (`Put`) or deletions (`Delete`) can mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
+   - **Trade-off Analysis:** Holding the writer read-lock (`writerMu.RLock()`) blocks concurrent writer transactions for that bucket while all objects in the bucket are iterated and decoded into memory. An alternative architecture would provide lock-free concurrency via per-page versioning or multi-version concurrency control (MVCC); however, MVCC introduces substantial memory overhead, garbage collection complexity, and page table churn.
+   - **Alignment with Informer Access Patterns:** In production Kubernetes controllers and the Gateway API reference implementation, reconcilers never execute broad `List()` queries on populated cache buckets during normal operation. Controller reconcilers process discrete watch events and perform point lookups (`Get(key)`), which take fast per-key index reads outside the writer lock. Full-bucket `List()` calls occur almost exclusively during initial process cold startup, debug inspection, or rare relist events. Consequently, preserving point-in-time consistency via `writerMu.RLock()` offers the optimal balance of architectural simplicity, zero steady-state memory overhead, and data integrity without compromising typical controller throughput.
+
 ---
 
 ## Conclusion
