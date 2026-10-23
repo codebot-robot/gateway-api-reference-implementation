@@ -110,7 +110,7 @@ func runDataplane(ctx context.Context, args []string) error {
 	fs.StringVar(&allowedSourceCIDRsStr, "allowed-source-cidrs", "", "Allowed source CIDRs")
 	fs.StringVar(&opts.ProxyProtocol, "proxy-protocol", opts.ProxyProtocol, "Enable PROXY protocol")
 	fs.StringVar(&proxyProtocolTrustedCIDRsStr, "proxy-protocol-trusted-cidrs", "", "Trusted PROXY protocol CIDRs")
-	fs.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", opts.DrainSentinelPath, "Path to drain sentinel file")
+	fs.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", DefaultSentinelPath, "Path to drain sentinel file")
 	fs.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "Metrics bind address")
 	fs.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "Health probe bind address")
 	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "HTTP proxy bind address")
@@ -196,6 +196,7 @@ func runController(ctx context.Context, args []string) error {
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
 	opts.ProxyHTTP3Addr = ""
+	opts.DrainSentinelPath = DefaultSentinelPath
 
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").
@@ -211,17 +212,18 @@ func runController(ctx context.Context, args []string) error {
 		fmt.Sprintf("--drain-seconds=%d", drainSeconds),
 	}
 
+	gracePeriodSeconds := int64(drainSeconds + 25)
+	if gracePeriodSeconds < 60 {
+		gracePeriodSeconds = 60
+	}
+
 	opts.AddressProvider = singlepod.NewAddressProvider(
 		nil,
 		singlepod.WithDataplaneImage(dataplaneImg),
 		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
 		singlepod.WithPreStopCommand(preStopCmd...),
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
-		singlepod.WithDefaultListenerOptions(
-			[]string{"35.191.0.0/16", "130.211.0.0/22"},
-			"enabled",
-			[]string{"35.191.0.0/16", "130.211.0.0/22"},
-		),
+		singlepod.WithTerminationGracePeriodSeconds(gracePeriodSeconds),
 	)
 
 	klog.Infof("Starting gcpgateway controller (clusterID=%s, prefix=%s, project=%s, region=%s)", clusterID, negPrefix, project, region)
