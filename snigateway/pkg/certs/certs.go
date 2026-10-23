@@ -34,6 +34,22 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 )
 
+// Default certificate file names used across snigateway components and tests.
+const (
+	// CACertFileName is the standard filename for the CA certificate PEM file.
+	CACertFileName = "ca.crt"
+	// CAKeyFileName is the standard filename for the CA private key PEM file.
+	CAKeyFileName = "ca.key"
+	// ServerCertFileName is the standard filename for the server certificate PEM file.
+	ServerCertFileName = "server.crt"
+	// ServerKeyFileName is the standard filename for the server private key PEM file.
+	ServerKeyFileName = "server.key"
+	// ClientCertFileName is the standard filename for the client certificate PEM file.
+	ClientCertFileName = "client.crt"
+	// ClientKeyFileName is the standard filename for the client private key PEM file.
+	ClientKeyFileName = "client.key"
+)
+
 // CertificatePair holds PEM-encoded certificate and private key.
 type CertificatePair struct {
 	CertPEM []byte
@@ -205,12 +221,12 @@ func GenerateAndWriteCertificates(dir string, serverName string, clientCN string
 		data  []byte
 		perms os.FileMode
 	}{
-		{"ca.crt", certs.CA.CertPEM, 0644},
-		{"ca.key", certs.CA.KeyPEM, 0600},
-		{"server.crt", certs.Server.CertPEM, 0644},
-		{"server.key", certs.Server.KeyPEM, 0600},
-		{"client.crt", certs.Client.CertPEM, 0644},
-		{"client.key", certs.Client.KeyPEM, 0600},
+		{CACertFileName, certs.CA.CertPEM, 0644},
+		{CAKeyFileName, certs.CA.KeyPEM, 0600},
+		{ServerCertFileName, certs.Server.CertPEM, 0644},
+		{ServerKeyFileName, certs.Server.KeyPEM, 0600},
+		{ClientCertFileName, certs.Client.CertPEM, 0644},
+		{ClientKeyFileName, certs.Client.KeyPEM, 0600},
 	}
 
 	for _, f := range files {
