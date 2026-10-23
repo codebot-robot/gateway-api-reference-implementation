@@ -35,12 +35,12 @@ func TestGenerateAndWriteCertificates(t *testing.T) {
 	}
 
 	files := []string{
-		"ca.crt",
-		"ca.key",
-		"server.crt",
-		"server.key",
-		"client.crt",
-		"client.key",
+		CACertFileName,
+		CAKeyFileName,
+		ServerCertFileName,
+		ServerKeyFileName,
+		ClientCertFileName,
+		ClientKeyFileName,
 	}
 
 	for _, f := range files {
@@ -50,25 +50,25 @@ func TestGenerateAndWriteCertificates(t *testing.T) {
 		}
 	}
 
-	caCertPEM, err := os.ReadFile(filepath.Join(tempDir, "ca.crt"))
+	caCertPEM, err := os.ReadFile(filepath.Join(tempDir, CACertFileName))
 	if err != nil {
-		t.Fatalf("reading ca.crt: %v", err)
+		t.Fatalf("reading %s: %v", CACertFileName, err)
 	}
-	serverCertPEM, err := os.ReadFile(filepath.Join(tempDir, "server.crt"))
+	serverCertPEM, err := os.ReadFile(filepath.Join(tempDir, ServerCertFileName))
 	if err != nil {
-		t.Fatalf("reading server.crt: %v", err)
+		t.Fatalf("reading %s: %v", ServerCertFileName, err)
 	}
-	serverKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "server.key"))
+	serverKeyPEM, err := os.ReadFile(filepath.Join(tempDir, ServerKeyFileName))
 	if err != nil {
-		t.Fatalf("reading server.key: %v", err)
+		t.Fatalf("reading %s: %v", ServerKeyFileName, err)
 	}
-	clientCertPEM, err := os.ReadFile(filepath.Join(tempDir, "client.crt"))
+	clientCertPEM, err := os.ReadFile(filepath.Join(tempDir, ClientCertFileName))
 	if err != nil {
-		t.Fatalf("reading client.crt: %v", err)
+		t.Fatalf("reading %s: %v", ClientCertFileName, err)
 	}
-	clientKeyPEM, err := os.ReadFile(filepath.Join(tempDir, "client.key"))
+	clientKeyPEM, err := os.ReadFile(filepath.Join(tempDir, ClientKeyFileName))
 	if err != nil {
-		t.Fatalf("reading client.key: %v", err)
+		t.Fatalf("reading %s: %v", ClientKeyFileName, err)
 	}
 
 	serverTLS, err := NewServerTLSConfig(caCertPEM, serverCertPEM, serverKeyPEM)

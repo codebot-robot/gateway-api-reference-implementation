@@ -133,6 +133,9 @@ func Ptr[T any](t T) *T {
 	return &t
 }
 
+// ConfigMapCACertKey is the data key holding the PEM-encoded CA certificate in ConfigMaps referenced by BackendTLSPolicy.
+const ConfigMapCACertKey = "ca.crt"
+
 // ExtractCACertFromConfigMap extracts and validates PEM-encoded CA certificate data from a ConfigMap's "ca.crt" key.
 // Returns the raw PEM bytes if valid, or an error if missing, empty, or not a valid PEM certificate.
 func ExtractCACertFromConfigMap(cm *corev1.ConfigMap) ([]byte, error) {
@@ -140,17 +143,17 @@ func ExtractCACertFromConfigMap(cm *corev1.ConfigMap) ([]byte, error) {
 		return nil, fmt.Errorf("ConfigMap is nil")
 	}
 	var data []byte
-	if d, ok := cm.Data["ca.crt"]; ok {
+	if d, ok := cm.Data[ConfigMapCACertKey]; ok {
 		data = []byte(d)
-	} else if d, ok := cm.BinaryData["ca.crt"]; ok {
+	} else if d, ok := cm.BinaryData[ConfigMapCACertKey]; ok {
 		data = d
 	}
 	if len(data) == 0 {
-		return nil, fmt.Errorf("ConfigMap %s/%s does not contain 'ca.crt' key or it is empty", cm.Namespace, cm.Name)
+		return nil, fmt.Errorf("ConfigMap %s/%s does not contain %q key or it is empty", cm.Namespace, cm.Name, ConfigMapCACertKey)
 	}
 	block, _ := pem.Decode(data)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("ConfigMap %s/%s 'ca.crt' does not contain valid PEM-encoded certificate", cm.Namespace, cm.Name)
+		return nil, fmt.Errorf("ConfigMap %s/%s %q does not contain valid PEM-encoded certificate", cm.Namespace, cm.Name, ConfigMapCACertKey)
 	}
 	return data, nil
 }

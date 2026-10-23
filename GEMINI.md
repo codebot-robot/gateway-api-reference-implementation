@@ -42,3 +42,13 @@ The project uses the `ap` tool for various tasks. Since `ap` is a custom tool, i
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest lint`: For deeper static analysis.
 
 **Reminder**: Coding agents MUST run at least `ap generate` before sending PRs, and MUST run `ap e2e` locally to verify that all conformance and end-to-end tests pass before submitting changes! Running `ap e2e` locally before pushing is a strict requirement to prevent test regressions in CI.
+
+## Testing
+
+Follow these rules when writing or updating tests:
+
+- **Build inputs from the real producer.** If component B consumes objects created by component A, construct test inputs with component A's code: constructors, templates, and exported constants. Do not hand-write fixtures that copy component A's labels, annotation keys, ports, or names as string literals.
+- **Test through public entry points.** Drive behaviour through the package's public API, or through the controller with a real or `envtest` API server, rather than by mutating internal fields to simulate a condition. If a fault has to be injected, inject it at the boundary: the filesystem, the network, or a fake cloud API.
+- **Every review-found bug gets an end-to-end regression test** that reproduces the reported scenario, not just the narrow fix.
+- **Prefer shared constants.** Shared label keys and values, annotation keys, secret data keys, and ports should be exported once and imported by both production code and tests.
+

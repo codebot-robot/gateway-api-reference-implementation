@@ -504,7 +504,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca-cert-cm"},
 		Data: map[string]string{
-			"ca.crt": validCertPEM,
+			ConfigMapCACertKey: validCertPEM,
 		},
 	}
 
@@ -556,7 +556,7 @@ func TestState_ConfigMapChangeBackendTLSPolicyDependencyWithoutMapping(t *testin
 	cmInvalid := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca-cert-cm"},
 		Data: map[string]string{
-			"ca.crt": "invalid cert data",
+			ConfigMapCACertKey: "invalid cert data",
 		},
 	}
 	st.UpsertConfigMap(cmInvalid)

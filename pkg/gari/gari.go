@@ -227,10 +227,10 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		ControllerName:         controller.DefaultControllerName,
-		MetricsAddr:            ":8999",
-		HealthProbeBindAddress: ":8999",
-		ProxyAddr:              ":8080",
-		ProxyHTTPSAddr:         ":8443",
+		MetricsAddr:            fmt.Sprintf(":%d", state.DataPlaneHealthProbePort),
+		HealthProbeBindAddress: fmt.Sprintf(":%d", state.DataPlaneHealthProbePort),
+		ProxyAddr:              fmt.Sprintf(":%d", state.DataPlaneHTTPPort),
+		ProxyHTTPSAddr:         fmt.Sprintf(":%d", state.DataPlaneHTTPSPort),
 		LeaderElectionID:       "gateway-api-reference-implementation",
 		UDPIdleTimeout:         proxy.DefaultUDPIdleTimeout,
 		UDPMaxSessions:         proxy.DefaultUDPMaxSessions,

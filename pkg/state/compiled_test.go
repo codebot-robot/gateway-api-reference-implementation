@@ -2441,7 +2441,7 @@ func TestComputeDesiredBackendTLSPolicyStatus_ConditionsAndReasons(t *testing.T)
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 		{Namespace: "default", Name: "malformed-empty"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "malformed-empty"},
@@ -2449,7 +2449,7 @@ func TestComputeDesiredBackendTLSPolicyStatus_ConditionsAndReasons(t *testing.T)
 		},
 		{Namespace: "default", Name: "malformed-pem"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "malformed-pem"},
-			Data:       map[string]string{"ca.crt": "invalid-pem-bytes"},
+			Data:       map[string]string{ConfigMapCACertKey: "invalid-pem-bytes"},
 		},
 	}
 
@@ -2626,7 +2626,7 @@ func TestComputeOutputs_InvalidBackendTLSPolicy_CompiledBackendFails(t *testing.
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "malformed"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "malformed"},
-			Data:       map[string]string{"ca.crt": "invalid"},
+			Data:       map[string]string{ConfigMapCACertKey: "invalid"},
 		},
 	}
 
@@ -2780,7 +2780,7 @@ func TestComputeOutputs_BackendTLSPolicy_ObservedGenerationBump(t *testing.T) {
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 	}
 	services := map[types.NamespacedName]*corev1.Service{
@@ -2902,7 +2902,7 @@ func TestComputeOutputs_BackendTLSPolicy_SectionNameMatching(t *testing.T) {
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 	}
 	services := map[types.NamespacedName]*corev1.Service{
@@ -3242,7 +3242,7 @@ func TestComputeDesiredBackendTLSPolicyStatus_SectionConflictResolution(t *testi
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 	}
 
@@ -3438,7 +3438,7 @@ func TestBackendTLSPolicy_SectionAndServiceWide_NoConflict(t *testing.T) {
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 	}
 
@@ -3602,7 +3602,7 @@ func TestBackendTLSPolicy_CompiledInternalTLSConfig_CarriesSubjectAltNames(t *te
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 	}
 
@@ -4032,7 +4032,7 @@ func TestGatewayBackendClientCertificate_DataplaneWiring(t *testing.T) {
 	caConfigMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "backend-ca"},
 		Data: map[string]string{
-			"ca.crt": string(caCertPEM),
+			ConfigMapCACertKey: string(caCertPEM),
 		},
 	}
 
@@ -4139,11 +4139,11 @@ func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "default-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "default-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEMDefault)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEMDefault)},
 		},
 		{Namespace: "default", Name: "port-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "port-ca"},
-			Data:       map[string]string{"ca.crt": string(certPEMPort)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEMPort)},
 		},
 	}
 
@@ -4289,7 +4289,7 @@ func TestFrontendClientCertValidation_PerPortHTTPIgnored(t *testing.T) {
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "ca-cm"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca-cm"},
-			Data:       map[string]string{"ca.crt": string(certPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(certPEM)},
 		},
 	}
 
@@ -4443,7 +4443,7 @@ func TestFrontendClientCertValidation_InvalidReasons(t *testing.T) {
 			configMaps: map[types.NamespacedName]*corev1.ConfigMap{
 				{Namespace: "other-ns", Name: "remote-ca"}: {
 					ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "remote-ca"},
-					Data:       map[string]string{"ca.crt": string(caCertPEM)},
+					Data:       map[string]string{ConfigMapCACertKey: string(caCertPEM)},
 				},
 			},
 			useGrant:           false,
@@ -4465,7 +4465,7 @@ func TestFrontendClientCertValidation_InvalidReasons(t *testing.T) {
 			configMaps: map[types.NamespacedName]*corev1.ConfigMap{
 				{Namespace: "other-ns", Name: "remote-ca"}: {
 					ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "remote-ca"},
-					Data:       map[string]string{"ca.crt": string(caCertPEM)},
+					Data:       map[string]string{ConfigMapCACertKey: string(caCertPEM)},
 				},
 			},
 			useGrant:           true,
@@ -4588,7 +4588,7 @@ func TestFrontendClientCertValidation_AllowInsecureFallback_ProgrammedAndServed(
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(caCertPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(caCertPEM)},
 		},
 	}
 
@@ -4690,7 +4690,7 @@ func TestGatewayCondition_InsecureFrontendValidationMode(t *testing.T) {
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ca"},
-			Data:       map[string]string{"ca.crt": string(caCertPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(caCertPEM)},
 		},
 	}
 
@@ -4997,7 +4997,7 @@ func TestFrontendClientCertValidation_AllowValidOnly_ProgrammedAndServed(t *test
 	configMaps := map[types.NamespacedName]*corev1.ConfigMap{
 		{Namespace: "default", Name: "valid-ca"}: {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "valid-ca"},
-			Data:       map[string]string{"ca.crt": string(caCertPEM)},
+			Data:       map[string]string{ConfigMapCACertKey: string(caCertPEM)},
 		},
 	}
 

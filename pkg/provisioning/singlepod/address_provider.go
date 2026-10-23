@@ -70,6 +70,15 @@ const (
 
 	// DataplaneSecretDataKey is the key in the per-Gateway Secret holding the serialized DataplaneConfig.
 	DataplaneSecretDataKey = "config.json"
+
+	// DataPlaneHTTPPort is the default container port for HTTP traffic.
+	DataPlaneHTTPPort = state.DataPlaneHTTPPort
+
+	// DataPlaneHTTPSPort is the default container port for HTTPS/TLS traffic.
+	DataPlaneHTTPSPort = state.DataPlaneHTTPSPort
+
+	// DataPlaneHealthProbePort is the container port for health probes and metrics.
+	DataPlaneHealthProbePort = state.DataPlaneHealthProbePort
 )
 
 // ResourceNameForGateway computes the resource name for a Gateway within its namespace.
@@ -467,15 +476,15 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	containerPorts := []*corev1ac.ContainerPortApplyConfiguration{
 		corev1ac.ContainerPort().
 			WithName("http").
-			WithContainerPort(8080).
+			WithContainerPort(DataPlaneHTTPPort).
 			WithProtocol(corev1.ProtocolTCP),
 		corev1ac.ContainerPort().
 			WithName("https").
-			WithContainerPort(8443).
+			WithContainerPort(DataPlaneHTTPSPort).
 			WithProtocol(corev1.ProtocolTCP),
 		corev1ac.ContainerPort().
 			WithName("http3").
-			WithContainerPort(8443).
+			WithContainerPort(DataPlaneHTTPSPort).
 			WithProtocol(corev1.ProtocolUDP),
 	}
 	for _, portInt := range tcpPorts {
@@ -514,7 +523,7 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 				WithReadinessProbe(corev1ac.Probe().
 					WithHTTPGet(corev1ac.HTTPGetAction().
 						WithPath("/readyz").
-						WithPort(intstr.FromInt32(8999)),
+						WithPort(intstr.FromInt32(DataPlaneHealthProbePort)),
 					).
 					WithInitialDelaySeconds(1).
 					WithPeriodSeconds(2),
