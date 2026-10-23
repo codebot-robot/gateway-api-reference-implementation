@@ -16,6 +16,7 @@ package engine
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"strings"
@@ -72,6 +73,7 @@ func TestDiskStore_OversizeObject(t *testing.T) {
 	// 3 MiB payload (> MaxPayloadCapacity ~2 MiB)
 	oversizePayload := make([]byte, 3*1024*1024)
 	copy(oversizePayload, []byte("large-payload-prefix-data"))
+	_, _ = rand.Read(oversizePayload[len("large-payload-prefix-data"):])
 
 	// Write must NOT fail
 	if err := store.Put("ConfigMap", "default/large-cm", oversizePayload, "1002"); err != nil {
@@ -414,7 +416,9 @@ func TestRegression_Round2_Item2_OversizeToSmallUpdateThenReopen(t *testing.T) {
 
 	initialCount := OversizeCount()
 
-	oversizeVal := bytes.Repeat([]byte("large-payload-block"), 120000) // ~2.28 MiB
+	oversizeVal := make([]byte, 2300000) // ~2.2 MiB
+	copy(oversizeVal, []byte("large-payload-block"))
+	_, _ = rand.Read(oversizeVal[len("large-payload-block"):])
 	if err := store.Put("ConfigMap", "cm-transition", oversizeVal, "1"); err != nil {
 		t.Fatalf("Put oversize failed: %v", err)
 	}

@@ -71,6 +71,13 @@ type Options struct {
 	NumFrames  int
 	AutoDelete bool
 	Clock      Clock
+
+	CompressionCodec     CompressionCodec
+	CompressionThreshold int
+	MaxObjectSize        int
+
+	compressionCodecSet     bool
+	compressionThresholdSet bool
 }
 
 // Option is a functional option for configuring an Engine.
@@ -80,6 +87,29 @@ type Option func(*Options)
 func WithClock(clock Clock) Option {
 	return func(o *Options) {
 		o.Clock = clock
+	}
+}
+
+// WithCompressionCodec sets the compression algorithm to use (CodecNone, CodecZstd, CodecS2).
+func WithCompressionCodec(codec CompressionCodec) Option {
+	return func(o *Options) {
+		o.CompressionCodec = codec
+		o.compressionCodecSet = true
+	}
+}
+
+// WithCompressionThreshold sets the byte size threshold above which values are compressed.
+func WithCompressionThreshold(threshold int) Option {
+	return func(o *Options) {
+		o.CompressionThreshold = threshold
+		o.compressionThresholdSet = true
+	}
+}
+
+// WithMaxObjectSize sets the maximum uncompressed object size accepted during decompression.
+func WithMaxObjectSize(size int) Option {
+	return func(o *Options) {
+		o.MaxObjectSize = size
 	}
 }
 
@@ -138,7 +168,10 @@ type Engine struct {
 	isTemp     bool
 	autoDelete bool
 
-	cipher Cipher
+	cipher               Cipher
+	compressionCodec     CompressionCodec
+	compressionThreshold int
+	maxObjectSize        int
 
 	heapFile File
 	wal      *WAL
@@ -235,13 +268,25 @@ func wipeStoreFiles(fs FS, dir string) error {
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
-		FS:         NewOSFS(),
-		Cipher:     NoopCipher{},
-		NumFrames:  DefaultBufferPoolFrames,
-		AutoDelete: false,
+		FS:                   NewOSFS(),
+		Cipher:               NoopCipher{},
+		NumFrames:            DefaultBufferPoolFrames,
+		AutoDelete:           false,
+		CompressionCodec:     CodecZstd,
+		CompressionThreshold: DefaultCompressionThreshold,
+		MaxObjectSize:        DefaultMaxObjectSize,
 	}
 	for _, opt := range opts {
 		opt(&options)
+	}
+	if !options.compressionCodecSet && options.CompressionCodec == 0 {
+		options.CompressionCodec = CodecZstd
+	}
+	if !options.compressionThresholdSet && options.CompressionThreshold == 0 {
+		options.CompressionThreshold = DefaultCompressionThreshold
+	}
+	if options.MaxObjectSize <= 0 {
+		options.MaxObjectSize = DefaultMaxObjectSize
 	}
 
 	dir := options.Dir
@@ -399,6 +444,9 @@ func Open(opts ...Option) (*Engine, error) {
 		isTemp:                     isTemp,
 		autoDelete:                 options.AutoDelete,
 		cipher:                     options.Cipher,
+		compressionCodec:           options.CompressionCodec,
+		compressionThreshold:       options.CompressionThreshold,
+		maxObjectSize:              options.MaxObjectSize,
 		heapFile:                   heapFile,
 		keyIndex:                   make(map[string]KeyIndexEntry),
 		oversizeObjects:            make(map[string][]byte),
@@ -816,6 +864,29 @@ func (s *Engine) DirectIOFallbackCount() int64 {
 	return GlobalMetrics.DirectIOFallbackCount.Load()
 }
 
+// CompressionCodec returns the engine's configured compression algorithm.
+func (s *Engine) CompressionCodec() CompressionCodec {
+	return s.compressionCodec
+}
+
+// CompressionThreshold returns the size threshold above which values attempt compression.
+func (s *Engine) CompressionThreshold() int {
+	return s.compressionThreshold
+}
+
+// MaxObjectSize returns the maximum uncompressed object size accepted during decompression.
+func (s *Engine) MaxObjectSize() int {
+	return s.maxObjectSize
+}
+
+func (s *Engine) compress(payload []byte) ([]byte, error) {
+	return compressValue(payload, s.compressionCodec, s.compressionThreshold)
+}
+
+func (s *Engine) decompress(data []byte) ([]byte, error) {
+	return decompressValue(data, s.maxObjectSize)
+}
+
 // Put writes an object to the engine, encrypting if a cipher is configured.
 func (s *Engine) Put(bucketName, key string, payload []byte, token string) error {
 	if s.isFailed() {
@@ -827,11 +898,18 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 
 	qKey := qualifyKey(bucketName, key)
 
+	// Compress payload
+	compressed, err := s.compress(payload)
+	if err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+
 	// Encrypt payload if cipher is configured
-	toStore := payload
+	toStore := compressed
 	if s.cipher != nil {
 		ad := AdditionalData(bucketName, key)
-		encrypted, err := s.cipher.Encrypt(payload, ad)
+		encrypted, err := s.cipher.Encrypt(compressed, ad)
 		if err != nil {
 			s.setFailed(err)
 			return s.failErr()
@@ -1173,7 +1251,12 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 				}
 				res = decrypted
 			}
-			return res, true, nil
+			decompressed, err := s.decompress(res)
+			if err != nil {
+				s.setFailed(err)
+				return nil, false, s.failErr()
+			}
+			return decompressed, true, nil
 		}
 
 		handle, err := s.bp.PinPage(entry.LogicalPage)
@@ -1238,7 +1321,13 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 			recPayload = decrypted
 		}
 
-		return recPayload, true, nil
+		decompressed, err := s.decompress(recPayload)
+		if err != nil {
+			s.setFailed(err)
+			return nil, false, s.failErr()
+		}
+
+		return decompressed, true, nil
 	}
 
 	return nil, false, errors.New("read conflict retry limit reached")

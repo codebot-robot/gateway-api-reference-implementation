@@ -17,6 +17,7 @@ package kubecache
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -238,19 +239,41 @@ func TestIndexer_WithEncryption(t *testing.T) {
 	_ = indexer.Close()
 	_ = store.Close()
 
-	// Verify on-disk bytes without cipher do not contain the plaintext token
+	// Verify reading through store without cipher fails to decompress ciphertext
 	storeNoCipher, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
 	if err != nil {
 		t.Fatalf("Open without cipher failed: %v", err)
 	}
 	defer storeNoCipher.Close()
 
-	rawCiphertext, exists, err := storeNoCipher.Get(fmt.Sprintf("%T", secret), "kube-system/sensitive-secret")
-	if err != nil || !exists {
-		t.Fatalf("raw store get failed: %v", err)
+	_, _, err = storeNoCipher.Get(fmt.Sprintf("%T", secret), "kube-system/sensitive-secret")
+	if err == nil {
+		t.Fatalf("expected Get without cipher to fail on ciphertext, but succeeded")
 	}
-	if bytes.Contains(rawCiphertext, []byte("super-secret-token-12345")) {
-		t.Fatalf("secret token was found in plaintext in raw store bytes!")
+
+	// Verify on-disk files do not contain the plaintext token
+	for _, sub := range []string{"", "wal"} {
+		dir := filepath.Join("idx_crypto_store", sub)
+		entries, err := memFS.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			f, err := memFS.Open(filepath.Join(dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			sz, _ := f.Size()
+			buf := make([]byte, sz)
+			_, _ = f.ReadAt(buf, 0)
+			_ = f.Close()
+			if bytes.Contains(buf, []byte("super-secret-token-12345")) {
+				t.Fatalf("secret token was found in plaintext in file %s!", filepath.Join(dir, e.Name()))
+			}
+		}
 	}
 }
 

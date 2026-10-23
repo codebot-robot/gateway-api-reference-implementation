@@ -197,71 +197,117 @@ func TestDiskStore_Versus_BBolt_MeasurementSuite(t *testing.T) {
 	runtime.GC()
 
 	// =============================================================
-	// 3. DiskStore (WAL + BufferPool Heap File)
+	// 3. DiskStore (WAL + BufferPool Heap File) with Codecs
 	// =============================================================
-	t.Log("Measuring DiskStore (WAL + BufferPool)...")
 	cipherDisk, err := engine.NewEphemeralAESGCMCipher()
 	if err != nil {
 		t.Fatalf("cipher creation failed: %v", err)
 	}
 
-	diskDir := t.TempDir()
-	diskStore, err := engine.Open(
-		engine.WithDir(diskDir),
-		engine.WithCipher(cipherDisk),
-		engine.WithNumFrames(2048), // 8 MiB buffer pool
-	)
-	if err != nil {
-		t.Fatalf("diskstore creation failed: %v", err)
+	codecsToBenchmark := []struct {
+		name  string
+		codec engine.CompressionCodec
+	}{
+		{"DiskStore (None)", engine.CodecNone},
+		{"DiskStore (zstd)", engine.CodecZstd},
+		{"DiskStore (S2)", engine.CodecS2},
 	}
 
-	diskIndexer, err := New(diskStore, &corev1.ConfigMap{}, DefaultOnFatal,
-		WithBucketName("ConfigMap"),
-		WithIndexerCodec(NewHybridCodec()),
-	)
-	if err != nil {
-		t.Fatalf("diskindexer creation failed: %v", err)
+	type diskStoreBenchResult struct {
+		name             string
+		heapDeltaMB      float64
+		rssDeltaMB       float64
+		diskSizeMB       float64
+		writeDuration    time.Duration
+		throughput       float64
+		recoveryDuration time.Duration
+		lat0Cold         time.Duration
+		lat0Warm         time.Duration
+		lat10Cold        time.Duration
+		lat10Warm        time.Duration
+		lat1000Cold      time.Duration
+		lat1000Warm      time.Duration
 	}
 
-	t0 = time.Now()
-	for i := 0; i < objectCount; i++ {
-		cm := generateBenchmarkConfigMap(i)
-		_ = diskIndexer.Add(cm)
-		if (i+1)%2500 == 0 {
-			// Periodic checkpoint every 2,500 writes
-			_, _ = diskStore.Checkpoint()
+	var diskResults []diskStoreBenchResult
+
+	for _, bc := range codecsToBenchmark {
+		t.Logf("Measuring %s...", bc.name)
+		diskDir := t.TempDir()
+		diskStore, err := engine.Open(
+			engine.WithDir(diskDir),
+			engine.WithCipher(cipherDisk),
+			engine.WithNumFrames(2048), // 8 MiB buffer pool
+			engine.WithCompressionCodec(bc.codec),
+		)
+		if err != nil {
+			t.Fatalf("diskstore creation failed (%s): %v", bc.name, err)
 		}
+
+		diskIndexer, err := New(diskStore, &corev1.ConfigMap{}, DefaultOnFatal,
+			WithBucketName("ConfigMap"),
+			WithIndexerCodec(NewHybridCodec()),
+		)
+		if err != nil {
+			t.Fatalf("diskindexer creation failed (%s): %v", bc.name, err)
+		}
+
+		t0 = time.Now()
+		for i := 0; i < objectCount; i++ {
+			cm := generateBenchmarkConfigMap(i)
+			_ = diskIndexer.Add(cm)
+			if (i+1)%2500 == 0 {
+				_, _ = diskStore.Checkpoint()
+			}
+		}
+		_, _ = diskStore.Checkpoint()
+		writeDur := time.Since(t0)
+
+		memAfter := readMemStats()
+		heapDelta := memAfter.HeapInUseMB - baseMem.HeapInUseMB
+		rssDelta := memAfter.RSSMB - baseMem.RSSMB
+
+		diskSizeMB, _ := getDirSize(diskDir)
+
+		l0Cold, l0Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 0)
+		l10Cold, l10Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 10)
+		l1000Cold, l1000Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 1000)
+
+		_ = diskStore.Close()
+
+		// Measure recovery
+		t0 = time.Now()
+		recoveredStore, err := engine.Open(
+			engine.WithDir(diskDir),
+			engine.WithCipher(cipherDisk),
+			engine.WithNumFrames(2048),
+			engine.WithCompressionCodec(bc.codec),
+		)
+		if err != nil {
+			t.Fatalf("reopening store for recovery failed (%s): %v", bc.name, err)
+		}
+		recDur := time.Since(t0)
+		_ = recoveredStore.Close()
+
+		diskResults = append(diskResults, diskStoreBenchResult{
+			name:             bc.name,
+			heapDeltaMB:      heapDelta,
+			rssDeltaMB:       rssDelta,
+			diskSizeMB:       diskSizeMB,
+			writeDuration:    writeDur,
+			throughput:       float64(objectCount) / writeDur.Seconds(),
+			recoveryDuration: recDur,
+			lat0Cold:         l0Cold,
+			lat0Warm:         l0Warm,
+			lat10Cold:        l10Cold,
+			lat10Warm:        l10Warm,
+			lat1000Cold:      l1000Cold,
+			lat1000Warm:      l1000Warm,
+		})
+
+		runtime.GC()
+		runtime.GC()
 	}
-	_, _ = diskStore.Checkpoint()
-	diskWriteDuration := time.Since(t0)
-
-	memAfterDisk := readMemStats()
-	heapDeltaDisk := memAfterDisk.HeapInUseMB - baseMem.HeapInUseMB
-	rssDeltaDisk := memAfterDisk.RSSMB - baseMem.RSSMB
-
-	diskSizeMB, _ := getDirSize(diskDir)
-
-	latDisk0Cold, latDisk0Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 0)
-	latDisk10Cold, latDisk10Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 10)
-	latDisk1000Cold, latDisk1000Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 1000)
-
-	_ = diskStore.Close()
-
-	// =============================================================
-	// 4. Recovery Time Measurement
-	// =============================================================
-	t.Log("Measuring DiskStore Recovery Time...")
-	t0 = time.Now()
-	recoveredStore, err := engine.Open(
-		engine.WithDir(diskDir),
-		engine.WithCipher(cipherDisk),
-		engine.WithNumFrames(2048),
-	)
-	if err != nil {
-		t.Fatalf("reopening store for recovery failed: %v", err)
-	}
-	recoveryDuration := time.Since(t0)
-	_ = recoveredStore.Close()
 
 	// =============================================================
 	// Output Comparative Results
@@ -278,20 +324,24 @@ func TestDiskStore_Versus_BBolt_MeasurementSuite(t *testing.T) {
 		"In-Memory Informer", heapDeltaMem, rssDeltaMem, "0 MB (RAM)", memWriteDuration.Seconds(), float64(objectCount)/memWriteDuration.Seconds(), "-")
 	fmt.Printf("%-30s | %10.2f MB | %10.2f MB | %10.2f MB | %10.2f s | %10.0f op/s | %12s\n",
 		"BBolt (mmap + NoSync)", heapDeltaBBolt, rssDeltaBBolt, bboltDiskSizeMB, bboltWriteDuration.Seconds(), float64(objectCount)/bboltWriteDuration.Seconds(), "12.4 ms")
-	fmt.Printf("%-30s | %10.2f MB | %10.2f MB | %10.2f MB | %10.2f s | %10.0f op/s | %10.2f ms\n",
-		"DiskStore (WAL + BufferPool)", heapDeltaDisk, rssDeltaDisk, diskSizeMB, diskWriteDuration.Seconds(), float64(objectCount)/diskWriteDuration.Seconds(), float64(recoveryDuration.Milliseconds()))
+	for _, res := range diskResults {
+		fmt.Printf("%-30s | %10.2f MB | %10.2f MB | %10.2f MB | %10.2f s | %10.0f op/s | %10.2f ms\n",
+			res.name, res.heapDeltaMB, res.rssDeltaMB, res.diskSizeMB, res.writeDuration.Seconds(), res.throughput, float64(res.recoveryDuration.Milliseconds()))
+	}
 	fmt.Println("------------------------------------------------------------------------------------------------------------------------------------------------")
 	fmt.Println("\nRecompute Latency Comparison:")
-	fmt.Printf("  In-Memory Informer:   0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
+	fmt.Printf("  In-Memory Informer:     0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
 		float64(latMem0.Microseconds()), float64(latMem10.Microseconds()), float64(latMem1000.Microseconds()))
-	fmt.Printf("  BBolt Store (Cold):   0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
+	fmt.Printf("  BBolt Store (Cold):     0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
 		float64(latBBolt0Cold.Microseconds()), float64(latBBolt10Cold.Microseconds()), float64(latBBolt1000Cold.Microseconds()))
-	fmt.Printf("  BBolt Store (Warm):   0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
+	fmt.Printf("  BBolt Store (Warm):     0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
 		float64(latBBolt0Warm.Microseconds()), float64(latBBolt10Warm.Microseconds()), float64(latBBolt1000Warm.Microseconds()))
-	fmt.Printf("  DiskStore   (Cold):   0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-		float64(latDisk0Cold.Microseconds()), float64(latDisk10Cold.Microseconds()), float64(latDisk1000Cold.Microseconds()))
-	fmt.Printf("  DiskStore   (Warm):   0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-		float64(latDisk0Warm.Microseconds()), float64(latDisk10Warm.Microseconds()), float64(latDisk1000Warm.Microseconds()))
+	for _, res := range diskResults {
+		fmt.Printf("  %-23s (Cold): 0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
+			res.name, float64(res.lat0Cold.Microseconds()), float64(res.lat10Cold.Microseconds()), float64(res.lat1000Cold.Microseconds()))
+		fmt.Printf("  %-23s (Warm): 0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
+			res.name, float64(res.lat0Warm.Microseconds()), float64(res.lat10Warm.Microseconds()), float64(res.lat1000Warm.Microseconds()))
+	}
 	fmt.Println("================================================================================================================================================")
 }
 

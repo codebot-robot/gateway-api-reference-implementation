@@ -20,13 +20,17 @@ The new `DiskStore` architecture introduces:
 
 | Architecture | Heap In-Use | Process RSS | Disk Size | Write Throughput | Recovery Time | Warm Recompute (10 refs) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **In-Memory Informer** (Status Quo) | 147.70 MB | 170.17 MB | 0 MB (RAM) | 66,706 op/s | N/A | 9 µs |
-| **BBolt Store** (`mmap` + `NoSync`) | 2.05 MB | 138.25 MB | 144.25 MB | 9,133 op/s | 12.4 ms | 6 µs |
-| **DiskStore** (WAL + BufferPool) | **13.30 MB** | **31.76 MB** | 160.73 MB | 2,094 op/s | 486.0 ms | **88 µs** |
+| **In-Memory Informer** (Status Quo) | 147.65 MB | 171.09 MB | 0 MB (RAM) | 64,566 op/s | N/A | 10 µs |
+| **BBolt Store** (`mmap` + `NoSync`) | 1.98 MB | 139.52 MB | 144.25 MB | 8,679 op/s | 12.4 ms | 5 µs |
+| **DiskStore (Uncompressed)** | 14.35 MB | 34.91 MB | 160.73 MB | 2,810 op/s | 459.0 ms | 95 µs |
+| **DiskStore (zstd)** | **24.77 MB** | **52.75 MB** | **6.13 MB** | **29,561 op/s** | **71.0 ms** | **106 µs** |
+| **DiskStore (S2)** | 35.41 MB | 73.00 MB | 6.50 MB | 39,578 op/s | 67.0 ms | 167 µs |
 
-- **RSS Reduction:** `DiskStore` consumes **31.76 MB Process RSS**, achieving a **77.0% reduction compared to BBolt** (138.25 MB) and an **81.3% reduction compared to In-Memory** (170.17 MB).
+- **Disk Footprint Reduction:** With zstd compression enabled by default, `DiskStore` consumes **6.13 MB on disk**, a 96.2% reduction compared to uncompressed storage (160.73 MB) and a 95.8% reduction compared to BBolt (144.25 MB).
+- **RSS Reduction:** `DiskStore (zstd)` consumes **52.75 MB Process RSS**, achieving a **62.2% reduction compared to BBolt** (139.52 MB) and a **69.2% reduction compared to In-Memory** (171.09 MB).
+- **Write Throughput Acceleration:** Compressing values before writing to the WAL and heap reduces I/O transfer volume, accelerating write throughput from 2,810 op/s to **29,561 op/s**.
 - **Zero Mmap Overhead:** Because direct I/O bypasses the operating system page cache and buffer pool memory is bounded to a fixed arena, container memory accounting remains flat and predictable under load.
-- **Fast Startup & Recovery:** The sequential scan in physical block order reconstructs the store state across 160 MB of heap data in under **500 ms**.
+- **Fast Startup & Recovery:** The sequential scan in physical block order reconstructs the store state across the compressed heap file in **71 ms**.
 
 ---
 
@@ -166,7 +170,29 @@ Large objects span power-of-two contiguous physical blocks:
 
 ---
 
-### 3. Out-Of-Place Writes and Buddy Allocation
+### 3. Value Compression and Page Class Selection
+
+To conserve disk space and reduce multi-block power-of-two page allocation overhead, the engine compresses values that exceed the single-block slotted page payload threshold:
+
+- **Compression Scope:** Only object values are compressed. Object keys, WAL record headers, and physical 4 KiB block headers remain uncompressed.
+- **Supported Codecs:**
+  - `CodecNone (0x00)`: Value stored raw without compression.
+  - `CodecZstd (0x01)`: Value compressed using pure Go `zstd` at its fastest level (`zstd.SpeedFastest`). zstd is the default codec.
+  - `CodecS2 (0x02)`: Value compressed using pure Go `s2` block format.
+- **On-Disk Value Record Format:**
+  - Stored raw (`CodecNone`): `[Codec (1B)][Raw Payload Bytes...]`
+  - Stored compressed (`CodecZstd` or `CodecS2`): `[Codec (1B)][Uncompressed Length uint32 Big-Endian (4B)][Compressed Stream Bytes...]`
+- **Configurable Threshold:** Defaults to `DefaultCompressionThreshold = BlockUsableSize - 64` (4000 bytes, the 1-block slotted page capacity). Objects smaller than or equal to the threshold are stored raw. Callers configure this threshold via `WithCompressionThreshold(bytes)`.
+- **10% Savings Rule:** If an object exceeds the threshold but its compressed size is not at least about 10% smaller than the raw payload (`compressedLen * 10 <= rawLen * 9`), the value is stored raw with `CodecNone` to avoid compression overhead for incompressible data.
+- **Page Class Selection from Compressed Size:** The page class (1-block slotted page vs. power-of-two multi-block page) is selected using the compressed payload length. An object that is 10 KB uncompressed drops from a 4-block page (16 KiB) to a 1-block slotted page (4 KiB) after compression.
+- **Compress Once, Write Same Bytes Twice:** Both the WAL record and heap page store the compressed (and optionally encrypted) payload. This cuts log segment volume in half for large objects and avoids decompressing during WAL redo replay.
+- **Ordering with Encryption:** Compression runs before authenticated symmetric encryption (`compress -> encrypt -> toStore`). Ciphertext does not compress; decrypting before decompressing ensures confidentiality.
+- **Bound Decompression & Corruption Resistance:** Every compressed record records its 32-bit uncompressed length. The engine rejects any record whose recorded length exceeds `MaxObjectSize` (default 64 MiB) prior to memory allocation or decompressor invocation. After decompression, the engine verifies that the output length matches the recorded length. Length mismatches, truncated byte streams, and unknown codec bytes are treated as corruption, transitioning the engine into the permanent failed state without panicking or allocating large buffers.
+- **Pooled Encoders and Decoders:** zstd encoders and decoders are expensive to allocate and are reused via `sync.Pool`. Decoders configure `zstd.WithDecodeAllCapLimit(true)` to enforce bounded memory allocation even on malformed inputs.
+
+---
+
+### 4. Out-Of-Place Writes and Buddy Allocation
 
 #### Storage Invariants
 1. **Reuse Rule:** The disk location holding a page's newest *durable* (fsynced) copy must never be overwritten. Older copies become free for reuse only after a newer copy has been fsynced to disk. Blocks written since the last fsync are tracked in memory and may be freed immediately if superseded.
@@ -179,7 +205,7 @@ Large objects span power-of-two contiguous physical blocks:
 
 ---
 
-### 4. Buffer Pool and Direct I/O Engine
+### 5. Buffer Pool and Direct I/O Engine
 
 - **Fixed-Size Arena:** A single contiguous `[]byte` slice aligned to 4096 bytes without using `mmap`. Because Go slices of primitive types contain no pointers, the Go runtime garbage collector skips scanning the arena.
 - **Direct I/O:**
@@ -299,44 +325,57 @@ Recovery never trusts bytes that object payloads control:
 ================================================================================================================================================
 COMPARATIVE BENCHMARK: 10000 ConfigMaps with 10 KB Payloads (~100 MB data)
 ================================================================================================================================================
-Baseline Clean Process: HeapInUse=2.20 MB, Process RSS=14.65 MB
+Baseline Clean Process: HeapInUse=2.20 MB, Process RSS=14.77 MB
 ------------------------------------------------------------------------------------------------------------------------------------------------
 Storage Engine                 | Heap In-Use  | Process RSS  | Disk Size    | Write Time   | Write Thruput  | Recovery    
 ------------------------------------------------------------------------------------------------------------------------------------------------
-In-Memory Informer             |    147.70 MB |    170.17 MB |   0 MB (RAM) |       0.15 s |    66706 op/s  |            -
-BBolt (mmap + NoSync)          |      2.05 MB |    138.25 MB |    144.25 MB |       1.09 s |     9133 op/s  |      12.4 ms
-DiskStore (WAL + BufferPool)   |     13.30 MB |     31.76 MB |    160.73 MB |       4.77 s |     2094 op/s  |     486.00 ms
+In-Memory Informer             |    147.65 MB |    171.09 MB |   0 MB (RAM) |       0.15 s |    64566 op/s  |            -
+BBolt (mmap + NoSync)          |      1.98 MB |    139.52 MB |    144.25 MB |       1.15 s |     8679 op/s  |      12.4 ms
+DiskStore (None)               |     14.35 MB |     34.91 MB |    160.73 MB |       3.56 s |     2810 op/s  |     459.00 ms
+DiskStore (zstd)               |     24.77 MB |     52.75 MB |      6.13 MB |       0.34 s |    29561 op/s  |      71.00 ms
+DiskStore (S2)                 |     35.41 MB |     73.00 MB |      6.50 MB |       0.25 s |    39578 op/s  |      67.00 ms
 ------------------------------------------------------------------------------------------------------------------------------------------------
 
 Recompute Latency Comparison:
-  In-Memory Informer:   0 refs =   0.00 µs |   10 refs =   9.00 µs | 1000 refs =   271.00 µs
-  BBolt Store (Cold):   0 refs =   3.00 µs |   10 refs = 134.00 µs | 1000 refs = 18447.00 µs
-  BBolt Store (Warm):   0 refs =   0.00 µs |   10 refs =   6.00 µs | 1000 refs =   531.00 µs
-  DiskStore   (Cold):   0 refs =   0.00 µs |   10 refs = 4110.00 µs | 1000 refs = 353555.00 µs
-  DiskStore   (Warm):   0 refs =   0.00 µs |   10 refs =  88.00 µs | 1000 refs = 349889.00 µs
+  In-Memory Informer:     0 refs =   0.00 µs |   10 refs =  10.00 µs | 1000 refs =   322.00 µs
+  BBolt Store (Cold):     0 refs =   3.00 µs |   10 refs = 141.00 µs | 1000 refs = 17633.00 µs
+  BBolt Store (Warm):     0 refs =   0.00 µs |   10 refs =   5.00 µs | 1000 refs =   516.00 µs
+  DiskStore (None) (Cold):0 refs =   0.00 µs |   10 refs = 4543.00 µs | 1000 refs = 351777.00 µs
+  DiskStore (None) (Warm):0 refs =   0.00 µs |   10 refs =  95.00 µs | 1000 refs = 345492.00 µs
+  DiskStore (zstd) (Cold):0 refs =   0.00 µs |   10 refs = 155.00 µs | 1000 refs = 15408.00 µs
+  DiskStore (zstd) (Warm):0 refs =   0.00 µs |   10 refs = 106.00 µs | 1000 refs = 12950.00 µs
+  DiskStore (S2)   (Cold):0 refs =   0.00 µs |   10 refs = 220.00 µs | 1000 refs = 12045.00 µs
+  DiskStore (S2)   (Warm):0 refs =   0.00 µs |   10 refs = 167.00 µs | 1000 refs = 16562.00 µs
 ================================================================================================================================================
 ```
 
 ### Analysis of Trade-offs
 
-1. **Process RSS & Container Memory Limits:**
-   - `BBolt` achieves low Go heap in-use (2.05 MB), but its resident set size (138.25 MB) is heavily inflated by the kernel page cache holding mmap pages in the container's cgroup. In production Kubernetes pods with tight memory limits (e.g. 100–150 MiB), `bbolt` causes OOM kills.
-   - `DiskStore` caps Process RSS at **31.76 MB** by using direct I/O and a fixed 8 MiB buffer pool arena. This predictable memory footprint makes it safe for resource-constrained environments.
+1. **Compression Algorithm Selection: zstd as Default vs. S2:**
+   - **Compression Ratio:** `zstd` produces the smallest on-disk footprint (**6.13 MB** vs. **6.50 MB** for S2 and **160.73 MB** uncompressed). By moving 10 KB objects from 4-block pages into 1-block slotted pages, disk usage drops by **96.2%**.
+   - **Memory Footprint:** `zstd` uses significantly less heap (**24.77 MB** vs. **35.41 MB**) and lower Process RSS (**52.75 MB** vs. **73.00 MB**) than S2. zstd encoders and decoders are pooled, avoiding per-call buffer allocations.
+   - **Throughput:** While S2 achieves higher raw write throughput (39,578 op/s vs. 29,561 op/s), both codecs dramatically outperform uncompressed writes (2,810 op/s) and easily exceed peak informer ingestion rates.
+   - **Read Latency:** On warm recomputations (1,000 refs), `zstd` achieves lower latency than S2 (**12.95 ms** vs. **16.56 ms**).
+   - **Verdict:** `zstd` is selected as the default codec because it provides a superior compression ratio, lower memory footprint, and lower warm read latency.
 
-2. **Read Latency:**
-   - On warm recompute, `DiskStore` achieves **88 µs** for 10 references and low overhead for cache hits, because pinned descriptors avoid deep pointer chains and interface conversions.
-   - On cold reads (requiring direct I/O disk fetch), `DiskStore` reads direct from NVMe storage outside the pool mutex.
+2. **Process RSS & Container Memory Limits:**
+   - `BBolt` achieves low Go heap in-use (1.98 MB), but its resident set size (139.52 MB) is heavily inflated by the kernel page cache holding mmap pages in the container's cgroup. In production Kubernetes pods with tight memory limits (e.g. 100–150 MiB), `bbolt` causes OOM kills.
+   - `DiskStore (zstd)` caps Process RSS at **52.75 MB** by using direct I/O and a fixed 8 MiB buffer pool arena. This predictable memory footprint makes it safe for resource-constrained environments.
 
-3. **Write Throughput & Cache Database Durability Model:**
+3. **Read Latency:**
+   - On warm recompute, `DiskStore (zstd)` achieves **106 µs** for 10 references and low overhead for cache hits, because pinned descriptors avoid deep pointer chains and interface conversions.
+   - On cold reads (requiring direct I/O disk fetch), `DiskStore (zstd)` completes 1,000 object references in **15.4 ms**, outperforming BBolt's cold read time (**17.6 ms**) because compressed pages require fewer disk reads and less buffer frame thrashing.
+
+4. **Write Throughput & Cache Database Durability Model:**
    - `DiskStore` acts as a crash-consistent cache database: commits update buffer pool frames and append records to the WAL without requiring synchronous fsync on every individual commit. Durability guarantees ensure that on failure or process crash, the store always recovers to a strictly consistent state up to the last periodic WAL/heap fsync or checkpoint.
-   - **Why BBolt's NoSync Mode Is Deceptively Fast:** bbolt achieves ~9,000 op/s only by running with `NoSync: true`, completely bypassing fsync and relying on asynchronous OS dirty-page writeback via `mmap`. However, `mmap` writeback is inherently unsafe: if the operating system encounters a write error while flushing dirty pages in the background, Linux *silently drops* the dirty pages (the historical cause of PostgreSQL's fdatasync corruption bugs). Running bbolt safely (`NoSync: false`) drops its write throughput to under 50 op/s.
-   - **Why DiskStore Maintains Bounded Memory Without Mmap Corruption:** `DiskStore` avoids double-buffering and uncontrolled page cache dirty writeback by using direct I/O (`O_DIRECT` / `F_NOCACHE`). By decoupling in-memory WAL append from background 4 KiB block writing, `DiskStore` reaches over **2,000 op/s** write throughput while strictly maintaining crash consistency.
-   - **Slotted Page Stream Packing:** For standard Kubernetes informers streaming smaller objects (1–3 KB) during initial `LIST` and `WATCH` syncs, `DiskStore` packs multiple objects into active slotted pages (up to 20–30 objects per 4 KiB block), drastically reducing page allocations and direct I/O write operations.
+   - **Why BBolt's NoSync Mode Is Deceptively Fast:** bbolt achieves ~8,700 op/s only by running with `NoSync: true`, completely bypassing fsync and relying on asynchronous OS dirty-page writeback via `mmap`. However, `mmap` writeback is inherently unsafe: if the operating system encounters a write error while flushing dirty pages in the background, Linux *silently drops* the dirty pages (the historical cause of PostgreSQL's fdatasync corruption bugs). Running bbolt safely (`NoSync: false`) drops its write throughput to under 50 op/s.
+   - **Why Compression Accelerates Write Throughput:** Compressing values before writing to the WAL and buffer pool reduces physical I/O transfer volume. This elevates write throughput from **2,810 op/s** uncompressed to **29,561 op/s** with `zstd` and **39,578 op/s** with `S2`.
+   - **Slotted Page Stream Packing:** For standard Kubernetes informers streaming objects during initial `LIST` and `WATCH` syncs, compression allows 10 KB objects to fit within single 4 KiB slotted pages, drastically reducing page allocations and direct I/O write operations.
 
-4. **Crash Recovery Time:**
-   - `DiskStore` scans and recovers 10,000 objects across a 160 MB heap file in **486 ms**, a 14x improvement achieved by reading disk blocks sequentially in physical order and eliminating buffer cache thrashing.
+5. **Crash Recovery Time:**
+   - `DiskStore (zstd)` scans and recovers 10,000 objects across the compressed heap file in **71 ms**, compared to **459 ms** uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, minimizing recovery latency.
 
-5. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
+6. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
    - **Point-in-Time Consistency:** `DiskStore.List(bucketName)` acquires `s.writerMu.RLock()` for the duration of the broad bucket read and object decoding. This provides point-in-time consistency across the bucket: concurrent writes (`Put`) or deletions (`Delete`) cannot mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
    - **Scope and Trade-off Analysis:** Because `writerMu` is store-wide, holding `writerMu.RLock()` stalls writes to every bucket for the duration of a `List` while all objects in the bucket are iterated and decoded into memory. An alternative architecture would provide non-blocking concurrency via per-page versioning or multi-version concurrency control (MVCC); however, MVCC introduces additional memory overhead, garbage collection complexity, and page table churn. The trade-off is that writes stall for the duration of a `List`, in exchange for a consistent view without per-page versioning.
    - **Alignment with Informer Access Patterns:** GARI consumes these caches through informer event handlers and doesn't call `List` on them, so broad reads mostly happen at startup and relist. Other controllers may differ in their access patterns, so workloads that frequently invoke `List` concurrently with active write streams would experience write stalls under this locking model.
@@ -345,8 +384,10 @@ Recompute Latency Comparison:
 
 ## Conclusion
 
-The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file and fixed-size direct I/O buffer pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
-- **77.0% lower memory footprint (RSS)** than bbolt.
+The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file, value compression, and fixed-size direct I/O buffer pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
+- **96.2% lower disk usage** with zstd value compression.
+- **62.2% lower memory footprint (RSS)** than bbolt.
+- **10x higher write throughput** with compressed WAL logging and page class reduction.
 - **Strict crash consistency** with out-of-place writes and the Reuse Rule.
-- **Resilience against untrusted payload forgery**.
+- **Resilience against untrusted payload forgery and corrupt decompression inputs**.
 - **Full `cache.Indexer` conformance**.
