@@ -18,6 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"sort"
+	"strings"
 )
 
 // KeyIndexEntry maps an object key to its location in a logical page.
@@ -31,14 +34,15 @@ type KeyIndexEntry struct {
 
 // RecoveryResult contains the state reconstructed after a crash scan and log replay.
 type RecoveryResult struct {
-	DBID                [16]byte
-	PageDescs           map[uint64]*PageDesc
-	Buddy               *BuddyAllocator
-	KeyIndex            map[string]KeyIndexEntry
-	EmptyLogicalPages   []uint64
-	LastResourceVersion string
-	MaxLSN              uint64
-	NextLogicalPage     uint64
+	DBID                        [16]byte
+	PageDescs                   map[uint64]*PageDesc
+	Buddy                       *BuddyAllocator
+	KeyIndex                    map[string]KeyIndexEntry
+	EmptyLogicalPages           []uint64
+	LastResourceVersion         string
+	LastResourceVersionByBucket map[string]string
+	MaxLSN                      uint64
+	NextLogicalPage             uint64
 }
 
 type candidatePageCopy struct {
@@ -104,7 +108,29 @@ func (r *chunkBlockReader) ReadBlock(b uint64) ([]byte, error) {
 // Recover scans the heap file, filters out foreign and torn copies, replays the WAL from
 // the last checkpoint's redo start, and rebuilds the in-memory indexes and allocator state.
 func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResult, error) {
-	// Item 6: Fsync heap file and every WAL segment before trusting them
+	// Item 10: Fsync every existing WAL segment and walDir before trusting them
+	entries, err := fs.ReadDir(walDir)
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".wal") {
+				segPath := filepath.Join(walDir, entry.Name())
+				f, openErr := fs.Open(segPath)
+				if openErr != nil {
+					return nil, fmt.Errorf("failed to open WAL segment %s for fsync: %w", entry.Name(), openErr)
+				}
+				syncErr := f.Sync()
+				closeErr := f.Close()
+				if err := errors.Join(syncErr, closeErr); err != nil {
+					return nil, fmt.Errorf("failed to fsync WAL segment %s: %w", entry.Name(), err)
+				}
+			}
+		}
+		if err := fs.SyncDir(walDir); err != nil {
+			return nil, fmt.Errorf("failed to fsync WAL directory: %w", err)
+		}
+	}
+
+	// Fsync heap file before recovery
 	if err := heapFile.Sync(); err != nil {
 		return nil, fmt.Errorf("failed to fsync heap file before recovery: %w", err)
 	}
@@ -206,10 +232,12 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 		}
 
 		desc := &PageDesc{
-			LogicalPage:   logicalPage,
-			NumBlocks:     cand.numBlocks,
-			PhysicalBlock: cand.startBlock,
-			DurableLoc:    cand.startBlock,
+			LogicalPage:       logicalPage,
+			NumBlocks:         cand.numBlocks,
+			PhysicalBlock:     cand.startBlock,
+			FlushedLoc:        NoBlock,
+			FlushedBeforeSync: NoBlock,
+			DurableLoc:        cand.startBlock,
 		}
 		desc.PageLSN.Store(cand.lsn)
 		pageDescs[logicalPage] = desc
@@ -221,10 +249,20 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 
 	// Step 3: Scan recovered pages to rebuild key index and empty page list
 	// Item 4: Always keep the copy with the highest LSN when a key appears multiple times.
+	// Sort winning candidates by physical block so chunkBlockReader scans disk sequentially.
 	keyIndex := make(map[string]KeyIndexEntry)
 	var emptyPages []uint64
 
-	for logicalPage, cand := range bestCandidates {
+	var sortedCandidates []candidatePageCopy
+	for _, cand := range bestCandidates {
+		sortedCandidates = append(sortedCandidates, cand)
+	}
+	sort.Slice(sortedCandidates, func(i, j int) bool {
+		return sortedCandidates[i].startBlock < sortedCandidates[j].startBlock
+	})
+
+	for _, cand := range sortedCandidates {
+		logicalPage := cand.logicalPage
 		blocks := make([][]byte, cand.numBlocks)
 		for i := 0; i < cand.numBlocks; i++ {
 			bBytes, err := reader.ReadBlock(cand.startBlock + uint64(i))
@@ -287,6 +325,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	var redoStartLSN uint64 = 1
 	var lastResourceVersion string
 	var maxWAL_LSN uint64
+	lastRVByBucket := make(map[string]string)
 
 	walScanIt, err := NewWALIterator(fs, walDir, dbID, 1)
 	if err == nil {
@@ -303,6 +342,13 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			}
 			if rec.ResourceVersion != "" {
 				lastResourceVersion = rec.ResourceVersion
+				bucket, _ := unqualifyKey(rec.Key)
+				if bucket != "" {
+					lastRVByBucket[bucket] = rec.ResourceVersion
+				}
+			}
+			if rec.Type == RecordTypeBookmark {
+				continue
 			}
 			if rec.Type == RecordTypeCheckpoint && rec.RedoStartLSN > 0 {
 				redoStartLSN = rec.RedoStartLSN
@@ -334,14 +380,21 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			}
 			if rec.ResourceVersion != "" {
 				lastResourceVersion = rec.ResourceVersion
+				bucket, _ := unqualifyKey(rec.Key)
+				if bucket != "" {
+					lastRVByBucket[bucket] = rec.ResourceVersion
+				}
+			}
+			if rec.Type == RecordTypeBookmark {
+				continue
 			}
 
 			// Apply Put
 			if rec.Type == RecordTypePut {
 				existing, inIndex := keyIndex[rec.Key]
-				if inIndex {
+				if inIndex && !existing.IsOversize {
 					desc, inPages := pageDescs[existing.LogicalPage]
-					if inPages && desc.PageLSN.Load() >= rec.LSN {
+					if inPages && desc != nil && desc.PageLSN.Load() >= rec.LSN {
 						continue // Target page already reflects this or newer write
 					}
 				}
@@ -361,7 +414,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				if len(rec.Payload) < BlockUsableSize-64 {
 					// 1-block slotted page
 					var targetPage uint64
-					if inIndex && pageDescs[existing.LogicalPage].NumBlocks == 1 {
+					if inIndex && !existing.IsOversize && pageDescs[existing.LogicalPage] != nil && pageDescs[existing.LogicalPage].NumBlocks == 1 {
 						targetPage = existing.LogicalPage
 					} else if len(emptyPages) > 0 {
 						targetPage = emptyPages[len(emptyPages)-1]
@@ -375,12 +428,12 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 					if buf, ok := redoPages[targetPage]; ok {
 						pageBuf = buf
 					} else if desc, ok := pageDescs[targetPage]; ok && desc.PhysicalBlock != NoBlock {
-						pageBuf = make([]byte, BlockSize)
+						pageBuf = AllocateAlignedBlock(BlockSize)
 						if _, err := heapFile.ReadAt(pageBuf, int64(desc.PhysicalBlock*BlockSize)); err != nil {
 							return nil, fmt.Errorf("failed to read page %d for redo: %w", targetPage, err)
 						}
 					} else {
-						pageBuf = make([]byte, BlockSize)
+						pageBuf = AllocateAlignedBlock(BlockSize)
 						hdr := BlockHeader{
 							LogicalPage: targetPage,
 							LSN:         rec.LSN,
@@ -393,7 +446,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 					if wrapErr != nil {
 						return nil, fmt.Errorf("failed to wrap page for redo: %w", wrapErr)
 					}
-					if inIndex && targetPage == existing.LogicalPage {
+					if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage {
 						if delErr := slotted.Delete(existing.Slot, rec.LSN); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
 							return nil, fmt.Errorf("failed to delete slot for redo: %w", delErr)
 						}
@@ -403,7 +456,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						// Page full during redo: allocate next page
 						maxRecoveredLogicalPage++
 						targetPage = maxRecoveredLogicalPage
-						pageBuf = make([]byte, BlockSize)
+						pageBuf = AllocateAlignedBlock(BlockSize)
 						hdr := BlockHeader{LogicalPage: targetPage, LSN: rec.LSN, NumBlocks: 1}
 						EncodeBlockHeader(hdr, pageBuf)
 						slotted, wrapErr = WrapSlottedPage(pageBuf)
@@ -432,9 +485,12 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						desc.NumBlocks = 1
 					} else {
 						d := &PageDesc{
-							LogicalPage:   targetPage,
-							NumBlocks:     1,
-							PhysicalBlock: NoBlock,
+							LogicalPage:       targetPage,
+							NumBlocks:         1,
+							PhysicalBlock:     NoBlock,
+							FlushedLoc:        NoBlock,
+							FlushedBeforeSync: NoBlock,
+							DurableLoc:        NoBlock,
 						}
 						d.PageLSN.Store(rec.LSN)
 						pageDescs[targetPage] = d
@@ -472,9 +528,12 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 						desc.NumBlocks = len(mb.Blocks)
 					} else {
 						d := &PageDesc{
-							LogicalPage:   targetPage,
-							NumBlocks:     len(mb.Blocks),
-							PhysicalBlock: NoBlock,
+							LogicalPage:       targetPage,
+							NumBlocks:         len(mb.Blocks),
+							PhysicalBlock:     NoBlock,
+							FlushedLoc:        NoBlock,
+							FlushedBeforeSync: NoBlock,
+							DurableLoc:        NoBlock,
 						}
 						d.PageLSN.Store(rec.LSN)
 						pageDescs[targetPage] = d
@@ -486,14 +545,18 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 			if rec.Type == RecordTypeDelete {
 				existing, inIndex := keyIndex[rec.Key]
 				if inIndex {
+					if existing.IsOversize {
+						delete(keyIndex, rec.Key)
+						continue
+					}
 					desc, inPages := pageDescs[existing.LogicalPage]
-					if !inPages || desc.PageLSN.Load() < rec.LSN {
+					if inPages && desc != nil && desc.PageLSN.Load() < rec.LSN {
 						if desc.NumBlocks == 1 {
 							var pageBuf []byte
 							if buf, ok := redoPages[existing.LogicalPage]; ok {
 								pageBuf = buf
 							} else if desc.PhysicalBlock != NoBlock {
-								pageBuf = make([]byte, BlockSize)
+								pageBuf = AllocateAlignedBlock(BlockSize)
 								if _, err := heapFile.ReadAt(pageBuf, int64(desc.PhysicalBlock*BlockSize)); err != nil {
 									return nil, fmt.Errorf("failed to read page %d for delete redo: %w", existing.LogicalPage, err)
 								}
@@ -516,7 +579,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 							}
 						} else {
 							// Multi-block page: write empty tombstone page
-							tombstone := make([]byte, BlockSize)
+							tombstone := AllocateAlignedBlock(BlockSize)
 							hdr := BlockHeader{LogicalPage: existing.LogicalPage, LSN: rec.LSN, NumBlocks: 1}
 							EncodeBlockHeader(hdr, tombstone)
 							FinalizeBlockCRC(tombstone)
@@ -527,8 +590,8 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 							desc.NumBlocks = 1
 							emptyPages = append(emptyPages, existing.LogicalPage)
 						}
-						delete(keyIndex, rec.Key)
 					}
+					delete(keyIndex, rec.Key)
 				}
 			}
 		}
@@ -540,6 +603,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	// Step 6: Flush any pages modified by redo replay to heapFile and fsync
 	for pID := range dirtyLogicalPages {
 		desc := pageDescs[pID]
+		oldLoc := desc.PhysicalBlock
 		order := 0
 		for (1 << order) < desc.NumBlocks {
 			order++
@@ -547,6 +611,11 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 		newLoc, err := buddy.Allocate(order)
 		if err != nil {
 			return nil, fmt.Errorf("failed to allocate heap block for redone page %d: %w", pID, err)
+		}
+		if oldLoc != NoBlock {
+			if err := buddy.Free(oldLoc); err != nil {
+				return nil, fmt.Errorf("failed to free superseded block %d during redo: %w", oldLoc, err)
+			}
 		}
 		desc.PhysicalBlock = newLoc
 		desc.DurableLoc = newLoc
@@ -574,13 +643,14 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 	}
 
 	return &RecoveryResult{
-		DBID:                dbID,
-		PageDescs:           pageDescs,
-		Buddy:               buddy,
-		KeyIndex:            keyIndex,
-		EmptyLogicalPages:   emptyPages,
-		LastResourceVersion: lastResourceVersion,
-		MaxLSN:              maxWAL_LSN,
-		NextLogicalPage:     maxRecoveredLogicalPage + 1,
+		DBID:                        dbID,
+		PageDescs:                   pageDescs,
+		Buddy:                       buddy,
+		KeyIndex:                    keyIndex,
+		EmptyLogicalPages:           emptyPages,
+		LastResourceVersion:         lastResourceVersion,
+		LastResourceVersionByBucket: lastRVByBucket,
+		MaxLSN:                      maxWAL_LSN,
+		NextLogicalPage:             maxRecoveredLogicalPage + 1,
 	}, nil
 }

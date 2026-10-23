@@ -82,18 +82,13 @@ func (c *Checkpointer) Checkpoint() (uint64, error) {
 		return 0, fmt.Errorf("checkpoint failed to promote flushed pages: %w", err)
 	}
 
-	chkLSN := c.wal.NextLSN()
-	if redoStartLSN == 0 {
-		redoStartLSN = chkLSN
-	}
-
-	// 6. Append checkpoint record to WAL
+	// 6. Append checkpoint record to WAL, assigning LSN under WAL lock
 	chkRec := Record{
 		Type:         RecordTypeCheckpoint,
-		LSN:          chkLSN,
 		RedoStartLSN: redoStartLSN,
 	}
-	if err := c.wal.Append(chkRec); err != nil {
+	chkLSN, err := c.wal.AppendRecord(&chkRec)
+	if err != nil {
 		return 0, fmt.Errorf("checkpoint failed to write WAL record: %w", err)
 	}
 
