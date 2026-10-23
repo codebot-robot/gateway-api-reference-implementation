@@ -454,12 +454,18 @@ func TestProxy_UDPCapEnforced(t *testing.T) {
 
 	// Open 3 clients (up to cap)
 	clients := make([]net.Conn, 3)
+	defer func() {
+		for _, c := range clients {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
 	for i := 0; i < 3; i++ {
 		c, err := net.Dial("udp", proxyAddr)
 		if err != nil {
 			t.Fatalf("client %d dial failed: %v", i, err)
 		}
-		defer c.Close()
 		clients[i] = c
 
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
@@ -584,12 +590,18 @@ func TestProxy_UDPCapBackToBack(t *testing.T) {
 
 	// Send datagrams from 3 clients back-to-back without waiting for replies.
 	clients := make([]net.Conn, 3)
+	defer func() {
+		for _, c := range clients {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
 	for i := 0; i < 3; i++ {
 		c, err := net.Dial("udp", proxyAddr)
 		if err != nil {
 			t.Fatalf("client %d dial failed: %v", i, err)
 		}
-		defer c.Close()
 		clients[i] = c
 
 		if _, err := c.Write([]byte(fmt.Sprintf("client-%d", i))); err != nil {
