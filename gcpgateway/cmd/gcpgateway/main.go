@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
@@ -149,16 +150,22 @@ func runDataplane(ctx context.Context, args []string) error {
 	return gari.Run(ctx, opts)
 }
 
-func runController(ctx context.Context, args []string) error {
+// SetupController parses args and builds the gari.Options for controller mode.
+// If computeClient is nil:
+//   - if --fake-compute is set, gcp.NewFakeComputeClient() is used.
+//   - otherwise compute.NewService(ctx) is called, returning an error on failure.
+func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
 	var (
 		clusterID      string
 		negPrefix      string
 		project        string
 		region         string
+		zonesStr       string
 		controllerName string
 		dataplaneImg   string
 		drainSeconds   int
 		leaderElect    bool
+		fakeCompute    bool
 	)
 
 	defaultClusterID := os.Getenv("CLUSTER_ID")
@@ -181,13 +188,28 @@ func runController(ctx context.Context, args []string) error {
 	fs.StringVar(&negPrefix, "neg-prefix", defaultNegPrefix, "Prefix for zonal NEG names")
 	fs.StringVar(&project, "project", defaultProject, "GCP Project ID")
 	fs.StringVar(&region, "region", defaultRegion, "GCP Region")
+	fs.StringVar(&zonesStr, "zones", "", "Comma-separated list of GCP zones")
 	fs.StringVar(&controllerName, "controller-name", DefaultControllerName, "GatewayClass controller name")
 	fs.StringVar(&dataplaneImg, "dataplane-image", defaultImg, "Data-plane container image")
 	fs.IntVar(&drainSeconds, "drain-seconds", DefaultDrainSeconds, "Seconds to drain connections during rolling updates")
 	fs.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election")
+	fs.BoolVar(&fakeCompute, "fake-compute", false, "Use in-memory fake Compute client for testing/offline mode")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		return gari.Options{}, err
+	}
+
+	gcpClient := computeClient
+	if gcpClient == nil {
+		if fakeCompute {
+			gcpClient = gcp.NewFakeComputeClient()
+		} else {
+			computeSvc, err := compute.NewService(ctx)
+			if err != nil {
+				return gari.Options{}, fmt.Errorf("initializing Google Cloud Compute API client: %w", err)
+			}
+			gcpClient = gcp.NewGCEComputeClient(computeSvc)
+		}
 	}
 
 	opts := gari.DefaultOptions()
@@ -226,22 +248,46 @@ func runController(ctx context.Context, args []string) error {
 		singlepod.WithTerminationGracePeriodSeconds(gracePeriodSeconds),
 	)
 
-	klog.Infof("Starting gcpgateway controller (clusterID=%s, prefix=%s, project=%s, region=%s)", clusterID, negPrefix, project, region)
-	var gcpClient gcp.ComputeClient
-	computeSvc, err := compute.NewService(ctx)
-	if err == nil {
-		gcpClient = gcp.NewGCEComputeClient(computeSvc)
-	} else {
-		klog.Warningf("Unable to initialize Compute client (running in offline/mock mode): %v", err)
-		gcpClient = gcp.NewFakeComputeClient()
+	var zoneList []string
+	if zonesStr != "" {
+		for _, z := range strings.Split(zonesStr, ",") {
+			if trimmed := strings.TrimSpace(z); trimmed != "" {
+				zoneList = append(zoneList, trimmed)
+			}
+		}
 	}
 
-	reg := registrar.NewRegistrar(nil, gcpClient, registrar.Config{
-		ClusterID: clusterID,
-		NegPrefix: negPrefix,
-		Project:   project,
-	})
-	_ = reg
+	opts.SetupWithManager = func(mgr ctrl.Manager) error {
+		reg := registrar.NewRegistrar(mgr.GetClient(), gcpClient, registrar.Config{
+			ClusterID: clusterID,
+			NegPrefix: negPrefix,
+			Project:   project,
+			Zones:     zoneList,
+		})
+
+		rec := controller.NewGatewayReconciler(
+			mgr.GetClient(),
+			mgr.GetScheme(),
+			gcpClient,
+			reg,
+			clusterID,
+			negPrefix,
+			project,
+		)
+		rec.ControllerName = controllerName
+		rec.Zones = zoneList
+
+		return rec.SetupWithManager(mgr)
+	}
+
+	return opts, nil
+}
+
+func runController(ctx context.Context, args []string) error {
+	opts, err := SetupController(ctx, args, nil)
+	if err != nil {
+		return err
+	}
 	return gari.Run(ctx, opts)
 }
 
