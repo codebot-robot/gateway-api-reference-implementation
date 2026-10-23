@@ -18,7 +18,8 @@ import "sync/atomic"
 
 // Metrics tracks runtime counters for diskstore operations.
 type Metrics struct {
-	OversizeObjectsCount atomic.Int64
+	OversizeObjectsCount  atomic.Int64
+	DirectIOFallbackCount atomic.Int64
 }
 
 // GlobalMetrics holds the shared store metrics instance.
@@ -27,4 +28,9 @@ var GlobalMetrics = &Metrics{}
 // OversizeCount returns the current count of active oversize objects kept in memory.
 func OversizeCount() int64 {
 	return GlobalMetrics.OversizeObjectsCount.Load()
+}
+
+// DirectIOFallbackCount returns the number of times direct I/O fell back to buffered I/O.
+func DirectIOFallbackCount() int64 {
+	return GlobalMetrics.DirectIOFallbackCount.Load()
 }

@@ -17,11 +17,12 @@ package diskstore
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -125,7 +126,7 @@ type DiskStore struct {
 	bp       *BufferPool
 	cp       *Checkpointer
 
-	writerMu sync.Mutex // Single writer: serializes Put, Delete, and Checkpoint
+	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time List
 
 	keyMu           sync.RWMutex
 	keyIndex        map[string]KeyIndexEntry // bucketQualifiedKey -> KeyIndexEntry
@@ -139,8 +140,9 @@ type DiskStore struct {
 	failedErr error
 	failMu    sync.RWMutex
 
-	lastRecoveredRV string
-	closed          atomic.Bool
+	lastRecoveredRV         string
+	lastRecoveredRVByBucket map[string]string
+	closed                  atomic.Bool
 }
 
 // OpenStore opens or initializes a DiskStore in dir.
@@ -227,6 +229,10 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 	openFlags := os.O_RDWR | os.O_CREATE | DirectIOOpenFlag()
 	heapFile, err := options.FS.OpenFile(heapPath, openFlags, 0644)
 	if err != nil {
+		if DirectIOOpenFlag() != 0 {
+			klog.Warningf("diskstore: heap file failed to open with direct I/O: %v, falling back to buffered I/O", err)
+			GlobalMetrics.DirectIOFallbackCount.Add(1)
+		}
 		// Fallback without O_DIRECT if filesystem doesn't support it (e.g. tmpfs)
 		heapFile, err = options.FS.OpenFile(heapPath, os.O_RDWR|os.O_CREATE, 0644)
 		if err != nil {
@@ -250,22 +256,23 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 	}
 
 	s := &DiskStore{
-		fs:                options.FS,
-		dir:               dir,
-		dbID:              dbID,
-		isTemp:            isTemp,
-		autoDelete:        options.AutoDelete,
-		cipher:            options.Cipher,
-		codec:             options.Codec,
-		heapFile:          heapFile,
-		keyIndex:          make(map[string]KeyIndexEntry),
-		oversizeObjects:   make(map[string][]byte),
-		emptyLogicalPages: make([]uint64, 0),
-		nextLogicalPage:   1,
+		fs:                      options.FS,
+		dir:                     dir,
+		dbID:                    dbID,
+		isTemp:                  isTemp,
+		autoDelete:              options.AutoDelete,
+		cipher:                  options.Cipher,
+		codec:                   options.Codec,
+		heapFile:                heapFile,
+		keyIndex:                make(map[string]KeyIndexEntry),
+		oversizeObjects:         make(map[string][]byte),
+		emptyLogicalPages:       make([]uint64, 0),
+		lastRecoveredRVByBucket: make(map[string]string),
+		nextLogicalPage:         1,
 	}
 
 	if isNewStore {
-		wal, err := OpenWAL(options.FS, walDir, dbID, 0)
+		wal, err := OpenWAL(options.FS, walDir, dbID, 0, WALOptions{OnFailure: s.setFailed})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
@@ -290,13 +297,16 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 		s.keyIndex = recoveryRes.KeyIndex
 		s.emptyLogicalPages = recoveryRes.EmptyLogicalPages
 		s.lastRecoveredRV = recoveryRes.LastResourceVersion
+		if recoveryRes.LastResourceVersionByBucket != nil {
+			s.lastRecoveredRVByBucket = recoveryRes.LastResourceVersionByBucket
+		}
 		s.nextLogicalPage = recoveryRes.NextLogicalPage
 		if s.nextLogicalPage == 0 {
 			s.nextLogicalPage = 1
 		}
 
 		// Item 1: LSNs continue from recovered maximum, new segment starts at maxLSN + 1
-		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN)
+		wal, err := OpenWAL(options.FS, walDir, dbID, recoveryRes.MaxLSN, WALOptions{OnFailure: s.setFailed})
 		if err != nil {
 			closeErr := heapFile.Close()
 			return nil, errors.Join(fmt.Errorf("failed to open WAL: %w", err), closeErr)
@@ -312,56 +322,200 @@ func OpenStore(opts ...StoreOption) (*DiskStore, error) {
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 
 		// Item 17: Load persisted oversize objects
-		s.loadOversizeObjects()
+		if err := s.loadOversizeObjects(); err != nil {
+			closeErr := heapFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to load oversize objects: %w", err), closeErr)
+		}
 	}
 
 	return s, nil
 }
 
-func (s *DiskStore) oversizeFilePath(qKey string) string {
-	escaped := url.QueryEscape(qKey)
-	return filepath.Join(s.dir, "oversize", escaped)
+const (
+	// OversizeMagic identifies valid oversize object files ("OVRS").
+	OversizeMagic uint32 = 0x4F565253
+
+	// OversizeVersion is 1.
+	OversizeVersion uint32 = 1
+
+	// OversizeHeaderSize is 32 bytes.
+	OversizeHeaderSize = 32
+)
+
+func oversizeFileName(qKey string) string {
+	h := sha256.Sum256([]byte(qKey))
+	return fmt.Sprintf("%x.obj", h)
 }
 
-func (s *DiskStore) loadOversizeObjects() {
+func (s *DiskStore) oversizeFilePath(qKey string) string {
+	return filepath.Join(s.dir, "oversize", oversizeFileName(qKey))
+}
+
+func (s *DiskStore) removeOversizeFile(qKey string) error {
+	p := s.oversizeFilePath(qKey)
+	if err := s.fs.Remove(p); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove oversize file %s: %w", p, err)
+	}
+	if err := s.fs.SyncDir(filepath.Join(s.dir, "oversize")); err != nil {
+		return fmt.Errorf("failed to sync oversize dir: %w", err)
+	}
+	return nil
+}
+
+func encodeOversizeFile(qKey string, lsn uint64, payload []byte) []byte {
+	keyBytes := []byte(qKey)
+	totalLen := OversizeHeaderSize + len(keyBytes) + len(payload)
+	buf := make([]byte, totalLen)
+
+	binary.BigEndian.PutUint32(buf[0:4], OversizeMagic)
+	binary.BigEndian.PutUint32(buf[4:8], OversizeVersion)
+	binary.BigEndian.PutUint64(buf[8:16], lsn)
+	// bytes 16..20 zeroed for CRC
+	binary.BigEndian.PutUint32(buf[20:24], uint32(len(keyBytes)))
+	binary.BigEndian.PutUint32(buf[24:28], uint32(len(payload)))
+
+	copy(buf[OversizeHeaderSize:], keyBytes)
+	copy(buf[OversizeHeaderSize+len(keyBytes):], payload)
+
+	crc := crc32.Checksum(buf, castagnoliTable)
+	binary.BigEndian.PutUint32(buf[16:20], crc)
+	return buf
+}
+
+func decodeOversizeFile(data []byte) (string, uint64, []byte, error) {
+	if len(data) < OversizeHeaderSize {
+		return "", 0, nil, errors.New("oversize file too small")
+	}
+	magic := binary.BigEndian.Uint32(data[0:4])
+	ver := binary.BigEndian.Uint32(data[4:8])
+	if magic != OversizeMagic || ver != OversizeVersion {
+		return "", 0, nil, fmt.Errorf("invalid oversize magic or version: magic 0x%08x, ver %d", magic, ver)
+	}
+	lsn := binary.BigEndian.Uint64(data[8:16])
+	storedCRC := binary.BigEndian.Uint32(data[16:20])
+	keyLen := binary.BigEndian.Uint32(data[20:24])
+	payloadLen := binary.BigEndian.Uint32(data[24:28])
+
+	if int(OversizeHeaderSize)+int(keyLen)+int(payloadLen) != len(data) {
+		return "", 0, nil, fmt.Errorf("oversize file size mismatch: header specifies %d bytes, file is %d bytes", int(OversizeHeaderSize)+int(keyLen)+int(payloadLen), len(data))
+	}
+
+	// Verify CRC over bytes with CRC zeroed
+	var zeroCRC [4]byte
+	crc := crc32.Update(0, castagnoliTable, data[:16])
+	crc = crc32.Update(crc, castagnoliTable, zeroCRC[:])
+	actualCRC := crc32.Update(crc, castagnoliTable, data[20:])
+	if storedCRC != actualCRC {
+		return "", 0, nil, ErrBlockCRCMismatch
+	}
+
+	qKey := string(data[OversizeHeaderSize : OversizeHeaderSize+keyLen])
+	payload := data[OversizeHeaderSize+keyLen:]
+	return qKey, lsn, payload, nil
+}
+
+func (s *DiskStore) writeOversizeFile(qKey string, lsn uint64, payload []byte) error {
+	oversizeDir := filepath.Join(s.dir, "oversize")
+	finalPath := s.oversizeFilePath(qKey)
+	tmpName := fmt.Sprintf(".tmp-%d-%s", lsn, oversizeFileName(qKey))
+	tmpPath := filepath.Join(oversizeDir, tmpName)
+
+	fileData := encodeOversizeFile(qKey, lsn, payload)
+
+	of, err := s.fs.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to create temp oversize file: %w", err)
+	}
+
+	if _, err := of.WriteAt(fileData, 0); err != nil {
+		closeErr := of.Close()
+		remErr := s.fs.Remove(tmpPath)
+		return errors.Join(fmt.Errorf("failed to write temp oversize file: %w", err), closeErr, remErr)
+	}
+
+	if err := of.Sync(); err != nil {
+		closeErr := of.Close()
+		remErr := s.fs.Remove(tmpPath)
+		return errors.Join(fmt.Errorf("failed to sync temp oversize file: %w", err), closeErr, remErr)
+	}
+
+	if err := of.Close(); err != nil {
+		remErr := s.fs.Remove(tmpPath)
+		return errors.Join(fmt.Errorf("failed to close temp oversize file: %w", err), remErr)
+	}
+
+	if err := s.fs.Rename(tmpPath, finalPath); err != nil {
+		remErr := s.fs.Remove(tmpPath)
+		return errors.Join(fmt.Errorf("failed to rename temp oversize file: %w", err), remErr)
+	}
+
+	if err := s.fs.SyncDir(oversizeDir); err != nil {
+		return fmt.Errorf("failed to sync oversize dir: %w", err)
+	}
+	return nil
+}
+
+func (s *DiskStore) loadOversizeObjects() error {
 	oversizeDir := filepath.Join(s.dir, "oversize")
 	entries, err := s.fs.ReadDir(oversizeDir)
 	if err != nil {
-		return
+		return err
 	}
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		qKey, err := url.QueryUnescape(entry.Name())
-		if err != nil {
-			continue
-		}
-		filePath := filepath.Join(oversizeDir, entry.Name())
-		f, err := s.fs.Open(filePath)
-		if err != nil {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || info.Size() < 8 {
-			if closeErr := f.Close(); closeErr != nil {
-				klog.V(4).ErrorS(closeErr, "failed to close invalid oversize file", "file", filePath)
+		name := entry.Name()
+		filePath := filepath.Join(oversizeDir, name)
+
+		if strings.HasPrefix(name, ".tmp-") {
+			// Clean up abandoned temporary files from previous crashes
+			if remErr := s.fs.Remove(filePath); remErr != nil {
+				klog.V(4).ErrorS(remErr, "failed to remove abandoned temp oversize file", "file", filePath)
 			}
 			continue
+		}
+
+		f, err := s.fs.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to open oversize file %s: %w", name, err)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				klog.V(4).ErrorS(closeErr, "failed to close oversize file", "file", filePath)
+			}
+			return fmt.Errorf("failed to stat oversize file %s: %w", name, err)
 		}
 		data := make([]byte, info.Size())
 		if _, rErr := f.ReadAt(data, 0); rErr != nil {
 			if closeErr := f.Close(); closeErr != nil {
 				klog.V(4).ErrorS(closeErr, "failed to close unreadable oversize file", "file", filePath)
 			}
-			continue
+			return fmt.Errorf("failed to read oversize file %s: %w", name, rErr)
 		}
 		if cErr := f.Close(); cErr != nil {
-			continue
+			return fmt.Errorf("failed to close oversize file %s: %w", name, cErr)
 		}
 
-		lsn := binary.BigEndian.Uint64(data[0:8])
-		payload := data[8:]
+		qKey, lsn, payload, err := decodeOversizeFile(data)
+		if err != nil {
+			return fmt.Errorf("corrupt oversize file %s: %w", name, err)
+		}
+
+		// Item 2: Loading must respect LSNs
+		if existing, ok := s.keyIndex[qKey]; ok {
+			if !existing.IsOversize || existing.LSN > lsn {
+				// Object was updated to a normal-sized object or newer version; file is stale
+				if remErr := s.fs.Remove(filePath); remErr != nil {
+					return fmt.Errorf("failed to remove stale oversize file %s: %w", filePath, remErr)
+				}
+				if syncErr := s.fs.SyncDir(oversizeDir); syncErr != nil {
+					return fmt.Errorf("failed to sync oversize dir: %w", syncErr)
+				}
+				continue
+			}
+		}
 
 		s.oversizeObjects[qKey] = payload
 		s.keyIndex[qKey] = KeyIndexEntry{
@@ -372,6 +526,7 @@ func (s *DiskStore) loadOversizeObjects() {
 		}
 		GlobalMetrics.OversizeObjectsCount.Add(1)
 	}
+	return nil
 }
 
 // setFailed transitions the store into the permanent failed state (Item 18).
@@ -401,8 +556,38 @@ func (s *DiskStore) failErr() error {
 }
 
 // LastRecoveredResourceVersion returns the resourceVersion of the last record processed during recovery.
-func (s *DiskStore) LastRecoveredResourceVersion() string {
+// If bucketName is specified, it returns the recovered resourceVersion for that bucket.
+func (s *DiskStore) LastRecoveredResourceVersion(bucketName ...string) string {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	if len(bucketName) > 0 && bucketName[0] != "" {
+		if rv, ok := s.lastRecoveredRVByBucket[bucketName[0]]; ok && rv != "" {
+			return rv
+		}
+	}
 	return s.lastRecoveredRV
+}
+
+// RecordBookmark records a watch bookmark in the WAL without creating a key/value object.
+func (s *DiskStore) RecordBookmark(bucketName, rv string) error {
+	if s.isFailed() {
+		return s.failErr()
+	}
+
+	rec := Record{
+		Type:            RecordTypeBookmark,
+		Key:             qualifyKey(bucketName, ""),
+		ResourceVersion: rv,
+	}
+	if _, err := s.wal.AppendRecord(&rec); err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+
+	s.keyMu.Lock()
+	s.lastRecoveredRVByBucket[bucketName] = rv
+	s.keyMu.Unlock()
+	return nil
 }
 
 // DBID returns the store's unique database ID.
@@ -435,38 +620,44 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 	defer s.writerMu.Unlock()
 
 	qKey := qualifyKey(bucketName, key)
-	lsn := s.wal.NextLSN()
+
+	s.keyMu.RLock()
+	existing, inIndex := s.keyIndex[qKey]
+	s.keyMu.RUnlock()
+
+	// Append record to WAL, assigning LSN under WAL lock
+	rec := Record{
+		Type:            RecordTypePut,
+		Key:             qKey,
+		Payload:         payload,
+		ResourceVersion: rv,
+	}
+	lsn, err := s.wal.AppendRecord(&rec)
+	if err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
 
 	// Handle oversize object (> 2 MiB): persist to disk under oversize directory (Item 17)
 	if len(payload) > MaxPayloadCapacity {
-		GlobalMetrics.OversizeObjectsCount.Add(1)
+		if inIndex {
+			if !existing.IsOversize {
+				if existing.NumBlocks == 1 {
+					if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+						s.setFailed(err)
+						return s.failErr()
+					}
+				} else {
+					if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
+						s.setFailed(err)
+						return s.failErr()
+					}
+				}
+			}
+		}
 
-		// Persist oversize file
-		filePath := s.oversizeFilePath(qKey)
-		fileData := make([]byte, 8+len(payload))
-		binary.BigEndian.PutUint64(fileData[0:8], lsn)
-		copy(fileData[8:], payload)
-
-		of, err := s.fs.Create(filePath)
-		if err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-		if _, err := of.WriteAt(fileData, 0); err != nil {
-			closeErr := of.Close()
-			s.setFailed(errors.Join(err, closeErr))
-			return s.failErr()
-		}
-		if err := of.Sync(); err != nil {
-			closeErr := of.Close()
-			s.setFailed(errors.Join(err, closeErr))
-			return s.failErr()
-		}
-		if err := of.Close(); err != nil {
-			s.setFailed(err)
-			return s.failErr()
-		}
-		if err := s.fs.SyncDir(filepath.Join(s.dir, "oversize")); err != nil {
+		// Persist oversize file atomically
+		if err := s.writeOversizeFile(qKey, lsn, payload); err != nil {
 			s.setFailed(err)
 			return s.failErr()
 		}
@@ -481,42 +672,28 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 		}
 		s.keyMu.Unlock()
 
-		// Append to WAL
-		rec := Record{
-			Type:            RecordTypePut,
-			LSN:             lsn,
-			Key:             qKey,
-			Payload:         payload,
-			ResourceVersion: rv,
-		}
-		if err := s.wal.Append(rec); err != nil {
-			s.setFailed(err)
-			return s.failErr()
+		if !inIndex || !existing.IsOversize {
+			GlobalMetrics.OversizeObjectsCount.Add(1)
 		}
 		return nil
 	}
 
-	// Append record to WAL
-	rec := Record{
-		Type:            RecordTypePut,
-		LSN:             lsn,
-		Key:             qKey,
-		Payload:         payload,
-		ResourceVersion: rv,
-	}
-	if err := s.wal.Append(rec); err != nil {
-		s.setFailed(err)
-		return s.failErr()
+	// If transitioning from oversize to normal-sized object (Item 2)
+	if inIndex && existing.IsOversize {
+		if err := s.removeOversizeFile(qKey); err != nil {
+			s.setFailed(err)
+			return s.failErr()
+		}
+		s.keyMu.Lock()
+		delete(s.oversizeObjects, qKey)
+		s.keyMu.Unlock()
+		GlobalMetrics.OversizeObjectsCount.Add(-1)
 	}
 
 	// Check if this object fits in a 1-block slotted page
 	if len(payload) < BlockUsableSize-64 {
 		// Use or allocate a slotted page
 		var targetPage uint64
-		s.keyMu.RLock()
-		existing, inIndex := s.keyIndex[qKey]
-		s.keyMu.RUnlock()
-
 		if inIndex && !existing.IsOversize && existing.NumBlocks == 1 {
 			targetPage = existing.LogicalPage
 		} else if s.activeSlottedPage != 0 {
@@ -560,7 +737,7 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 			}
 			s.keyMu.Unlock()
 
-			if inIndex && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
+			if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
 				if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
 					handle.Desc.Mu.Unlock()
 					handle.Unpin()
@@ -575,9 +752,15 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 
 			// If old record was on another page, delete it from old page
 			if inIndex && !existing.IsOversize && existing.NumBlocks == 1 {
-				s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn)
-			} else if inIndex && existing.NumBlocks > 1 {
-				s.clearLogicalPageLocked(existing.LogicalPage, lsn)
+				if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+					s.setFailed(err)
+					return s.failErr()
+				}
+			} else if inIndex && !existing.IsOversize && existing.NumBlocks > 1 {
+				if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
+					s.setFailed(err)
+					return s.failErr()
+				}
 			}
 
 			if len(s.emptyLogicalPages) > 0 {
@@ -631,16 +814,18 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 			return s.failErr()
 		}
 
-		s.keyMu.RLock()
-		existing, inIndex := s.keyIndex[qKey]
-		s.keyMu.RUnlock()
-
 		// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
 		if inIndex {
 			if !existing.IsOversize && existing.NumBlocks == 1 {
-				s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn)
-			} else if existing.NumBlocks > 1 {
-				s.clearLogicalPageLocked(existing.LogicalPage, lsn)
+				if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+					s.setFailed(err)
+					return s.failErr()
+				}
+			} else if !existing.IsOversize && existing.NumBlocks > 1 {
+				if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
+					s.setFailed(err)
+					return s.failErr()
+				}
 			}
 		}
 
@@ -687,38 +872,41 @@ func (s *DiskStore) Put(bucketName, key string, payload []byte, rv string) error
 	return nil
 }
 
-func (s *DiskStore) deleteSlotFromPageLocked(pageID uint64, slotIdx uint32, lsn uint64) {
+func (s *DiskStore) deleteSlotFromPageLocked(pageID uint64, slotIdx uint32, lsn uint64) error {
 	handle, err := s.bp.PinPage(pageID)
 	if err != nil {
-		return
+		return fmt.Errorf("failed to pin page %d for slot deletion: %w", pageID, err)
 	}
 	handle.Desc.Mu.Lock()
 	slotted, wrapErr := WrapSlottedPage(handle.Block(0))
 	if wrapErr != nil {
 		handle.Desc.Mu.Unlock()
 		handle.Unpin()
-		return
+		return fmt.Errorf("failed to wrap page %d: %w", pageID, wrapErr)
 	}
-	if delErr := slotted.Delete(slotIdx, lsn); delErr == nil || errors.Is(delErr, ErrSlotNotFound) {
-		slotted.Finalize()
-		if slotted.ActiveSlotsCount() == 0 {
-			s.emptyLogicalPages = append(s.emptyLogicalPages, pageID)
-			if s.activeSlottedPage == pageID {
-				s.activeSlottedPage = 0
-			}
+	if delErr := slotted.Delete(slotIdx, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
+		handle.Desc.Mu.Unlock()
+		handle.Unpin()
+		return fmt.Errorf("failed to delete slot %d from page %d: %w", slotIdx, pageID, delErr)
+	}
+	slotted.Finalize()
+	if slotted.ActiveSlotsCount() == 0 {
+		s.emptyLogicalPages = append(s.emptyLogicalPages, pageID)
+		if s.activeSlottedPage == pageID {
+			s.activeSlottedPage = 0
 		}
 	}
 	handle.Desc.Mu.Unlock()
 	s.bp.MarkDirty(pageID, lsn)
 	handle.Unpin()
+	return nil
 }
 
 // clearLogicalPageLocked writes a tombstone to clear a superseded or deleted multi-block page (Items 15, 16).
-func (s *DiskStore) clearLogicalPageLocked(logicalPage uint64, lsn uint64) {
+func (s *DiskStore) clearLogicalPageLocked(logicalPage uint64, lsn uint64) error {
 	handle, err := s.bp.PinPage(logicalPage)
 	if err != nil {
-		s.emptyLogicalPages = append(s.emptyLogicalPages, logicalPage)
-		return
+		return fmt.Errorf("failed to pin multi-block page %d for clearing: %w", logicalPage, err)
 	}
 	handle.Desc.Mu.Lock()
 	tombstone := make([]byte, BlockSize)
@@ -730,6 +918,7 @@ func (s *DiskStore) clearLogicalPageLocked(logicalPage uint64, lsn uint64) {
 	s.bp.MarkDirty(logicalPage, lsn)
 	handle.Unpin()
 	s.emptyLogicalPages = append(s.emptyLogicalPages, logicalPage)
+	return nil
 }
 
 // Get retrieves an object by key, validating expected key and LSN.
@@ -840,32 +1029,36 @@ func (s *DiskStore) Delete(bucketName, key string) error {
 	if entry.IsOversize {
 		delete(s.oversizeObjects, qKey)
 		GlobalMetrics.OversizeObjectsCount.Add(-1)
-		if remErr := s.fs.Remove(s.oversizeFilePath(qKey)); remErr != nil && !os.IsNotExist(remErr) {
-			klog.V(4).ErrorS(remErr, "failed to remove oversize file", "key", qKey)
-		}
-		if syncErr := s.fs.SyncDir(filepath.Join(s.dir, "oversize")); syncErr != nil {
-			klog.V(4).ErrorS(syncErr, "failed to sync oversize dir")
-		}
 	}
 	s.keyMu.Unlock()
 
-	lsn := s.wal.NextLSN()
 	rec := Record{
 		Type: RecordTypeDelete,
-		LSN:  lsn,
 		Key:  qKey,
 	}
-	if err := s.wal.Append(rec); err != nil {
+	lsn, err := s.wal.AppendRecord(&rec)
+	if err != nil {
 		s.setFailed(err)
 		return s.failErr()
 	}
 
-	if !entry.IsOversize {
+	if entry.IsOversize {
+		if err := s.removeOversizeFile(qKey); err != nil {
+			s.setFailed(err)
+			return s.failErr()
+		}
+	} else {
 		if entry.NumBlocks == 1 {
-			s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn)
+			if err := s.deleteSlotFromPageLocked(entry.LogicalPage, entry.Slot, lsn); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
 		} else {
 			// Item 16: When deleting a multi-block object, write an empty tombstone page
-			s.clearLogicalPageLocked(entry.LogicalPage, lsn)
+			if err := s.clearLogicalPageLocked(entry.LogicalPage, lsn); err != nil {
+				s.setFailed(err)
+				return s.failErr()
+			}
 		}
 	}
 
@@ -895,13 +1088,17 @@ type RecordItem struct {
 	Payload []byte
 }
 
-// List returns a point-in-time consistent view of all objects in the bucket (Item 10, 19).
+// List returns a point-in-time consistent view of all objects in the bucket (Item 9, 10, 19).
 func (s *DiskStore) List(bucketName string) ([]RecordItem, error) {
 	if s.isFailed() {
 		return nil, s.failErr()
 	}
 
-	// Capture snapshot of keys and index entries belonging to bucketName under read lock
+	// Hold writerMu read lock to ensure point-in-time consistency: no writes/deletes can mutate
+	// pages or index underneath this read (Item 9)
+	s.writerMu.RLock()
+	defer s.writerMu.RUnlock()
+
 	s.keyMu.RLock()
 	prefix := bucketName + "\x00"
 	snapshot := make(map[string]KeyIndexEntry)
@@ -926,14 +1123,35 @@ func (s *DiskStore) List(bucketName string) ([]RecordItem, error) {
 	return items, nil
 }
 
-// Checkpoint performs a checkpoint under writer lock (Item 13, 18).
+// Sync ensures that all appended WAL records are flushed to disk and fsynced.
+func (s *DiskStore) Sync() error {
+	if s.isFailed() {
+		return s.failErr()
+	}
+	if err := s.wal.Sync(); err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+	return nil
+}
+
+// Flush flushes all buffered WAL records to disk and fsynced.
+func (s *DiskStore) Flush() error {
+	if s.isFailed() {
+		return s.failErr()
+	}
+	if err := s.wal.Flush(); err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+	return nil
+}
+
+// Checkpoint performs a non-blocking checkpoint (Item 7).
 func (s *DiskStore) Checkpoint() (uint64, error) {
 	if s.isFailed() {
 		return 0, s.failErr()
 	}
-
-	s.writerMu.Lock()
-	defer s.writerMu.Unlock()
 
 	chkLSN, err := s.cp.Checkpoint()
 	if err != nil {
@@ -950,6 +1168,13 @@ func (s *DiskStore) Close() error {
 	}
 
 	var errs []error
+	// If not failed, checkpoint on close to truncate WAL and speed up reopen
+	if !s.isFailed() && s.cp != nil {
+		if _, err := s.cp.Checkpoint(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if s.bp != nil {
 		if err := s.bp.Close(); err != nil {
 			errs = append(errs, err)

@@ -159,11 +159,11 @@ func NewDiskIndexer(store *DiskStore, example k8sruntime.Object, opts ...Indexer
 		ad := AdditionalData(indexer.bucketName, raw.Key)
 		decrypted, err := indexer.cipher.Decrypt(raw.Payload, ad)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("failed to decrypt %s on reopen: %w", raw.Key, err)
 		}
 		target := indexer.example.DeepCopyObject()
 		if err := indexer.codec.Decode(decrypted, target); err != nil {
-			continue
+			return nil, fmt.Errorf("failed to decode %s on reopen: %w", raw.Key, err)
 		}
 		indexer.updateIndicesLocked(raw.Key, target)
 	}
@@ -413,7 +413,7 @@ func (d *DiskIndexer) LastStoreSyncResourceVersion() string {
 	if d.lastSyncRV != "" {
 		return d.lastSyncRV
 	}
-	return d.store.LastRecoveredResourceVersion()
+	return d.store.LastRecoveredResourceVersion(d.bucketName)
 }
 
 // Bookmark records the resourceVersion from a watch bookmark (Item 21).
@@ -422,8 +422,8 @@ func (d *DiskIndexer) Bookmark(rv string) {
 	d.lastSyncRV = rv
 	d.mu.Unlock()
 
-	// Persist bookmark to WAL
-	if err := d.store.Put(d.bucketName, ".bookmark", nil, rv); err != nil {
+	// Persist bookmark to WAL without creating fake object in bucket
+	if err := d.store.RecordBookmark(d.bucketName, rv); err != nil {
 		klog.V(4).ErrorS(err, "failed to record bookmark in store", "bucket", d.bucketName, "rv", rv)
 	}
 }
