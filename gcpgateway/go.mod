@@ -3,7 +3,7 @@ module github.com/gke-labs/gateway-api-reference-implementation/gcpgateway
 go 1.27.2
 
 require (
-	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261023111709-39c5d83366b3
+	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
 	google.golang.org/api v0.308.0
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
