@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -36,6 +37,9 @@ const (
 
 	// CodecS2 compresses values using S2 block format.
 	CodecS2 CompressionCodec = 2
+
+	// CodecSnappy compresses values using Snappy block format.
+	CodecSnappy CompressionCodec = 3
 )
 
 func (c CompressionCodec) String() string {
@@ -46,6 +50,8 @@ func (c CompressionCodec) String() string {
 		return "zstd"
 	case CodecS2:
 		return "s2"
+	case CodecSnappy:
+		return "snappy"
 	default:
 		return fmt.Sprintf("unknown(%d)", c)
 	}
@@ -115,6 +121,8 @@ func compressValue(payload []byte, codec CompressionCodec, threshold int) ([]byt
 		zstdEncoderPool.Put(enc)
 	case CodecS2:
 		compressed = s2.Encode(nil, payload)
+	case CodecSnappy:
+		compressed = snappy.Encode(nil, payload)
 	default:
 		return nil, fmt.Errorf("%w: unsupported codec %d", ErrCorruptCompression, codec)
 	}
@@ -183,6 +191,31 @@ func decompressValue(data []byte, maxObjectSize int) ([]byte, error) {
 		decompressed, err := s2.Decode(dst, data[compressionHeaderSize:])
 		if err != nil {
 			return nil, fmt.Errorf("%w: s2 decode failed: %v", ErrCorruptCompression, err)
+		}
+		if len(decompressed) != int(uncompressedLen) {
+			return nil, fmt.Errorf("%w: decompressed length %d does not match recorded length %d", ErrCorruptCompression, len(decompressed), uncompressedLen)
+		}
+		return decompressed, nil
+
+	case CodecSnappy:
+		if len(data) < compressionHeaderSize {
+			return nil, fmt.Errorf("%w: truncated compressed record (%d bytes)", ErrCorruptCompression, len(data))
+		}
+		uncompressedLen := binary.BigEndian.Uint32(data[1:5])
+		if uncompressedLen > uint32(maxObjectSize) {
+			return nil, fmt.Errorf("%w: recorded length %d exceeds limit %d", ErrObjectTooLarge, uncompressedLen, maxObjectSize)
+		}
+		expectedLen, err := snappy.DecodedLen(data[compressionHeaderSize:])
+		if err != nil {
+			return nil, fmt.Errorf("%w: snappy decode length check failed: %v", ErrCorruptCompression, err)
+		}
+		if expectedLen != int(uncompressedLen) {
+			return nil, fmt.Errorf("%w: snappy decoded length %d does not match recorded length %d", ErrCorruptCompression, expectedLen, uncompressedLen)
+		}
+		dst := make([]byte, 0, uncompressedLen)
+		decompressed, err := snappy.Decode(dst, data[compressionHeaderSize:])
+		if err != nil {
+			return nil, fmt.Errorf("%w: snappy decode failed: %v", ErrCorruptCompression, err)
 		}
 		if len(decompressed) != int(uncompressedLen) {
 			return nil, fmt.Errorf("%w: decompressed length %d does not match recorded length %d", ErrCorruptCompression, len(decompressed), uncompressedLen)

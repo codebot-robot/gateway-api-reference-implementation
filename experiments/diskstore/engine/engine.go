@@ -197,6 +197,7 @@ type Engine struct {
 	lastRecoveredTokenByBucket map[string]string
 	lastRecoveredToken         string
 	closed                     atomic.Bool
+	closedCh                   chan struct{}
 }
 
 func removeDirRecursive(fs FS, dir string) error {
@@ -453,6 +454,7 @@ func Open(opts ...Option) (*Engine, error) {
 		emptyLogicalPages:          make([]uint64, 0),
 		lastRecoveredTokenByBucket: make(map[string]string),
 		failedCh:                   make(chan struct{}),
+		closedCh:                   make(chan struct{}),
 		wiped:                      wiped,
 		nextLogicalPage:            1,
 	}
@@ -790,6 +792,11 @@ func (s *Engine) failErr() error {
 // Failed returns a channel that is closed when the engine enters the failed state.
 func (s *Engine) Failed() <-chan struct{} {
 	return s.failedCh
+}
+
+// Closed returns a channel that is closed when the engine is closed.
+func (s *Engine) Closed() <-chan struct{} {
+	return s.closedCh
 }
 
 // Err returns the sticky failure error, or nil if the engine is healthy.
@@ -1527,6 +1534,7 @@ func (s *Engine) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	close(s.closedCh)
 
 	var errs []error
 	// If not failed, checkpoint on close to truncate WAL and speed up reopen

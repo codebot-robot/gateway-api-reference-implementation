@@ -18,8 +18,10 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine"
 	corev1 "k8s.io/api/core/v1"
@@ -518,5 +520,54 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 	// Secret must recover secret-rv-600
 	if secretIndexer2.LastStoreSyncResourceVersion() != "secret-rv-600" {
 		t.Fatalf("Secret recovered wrong RV: got %q, want %q", secretIndexer2.LastStoreSyncResourceVersion(), "secret-rv-600")
+	}
+}
+
+// TestIndexer_NoGoroutineLeakOnEngineClose verifies that closing the underlying engine alone
+// terminates the adapter's failure-watch goroutine without leaking goroutines.
+func TestIndexer_NoGoroutineLeakOnEngineClose(t *testing.T) {
+	// Let existing background goroutines settle
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	baseline := runtime.NumGoroutine()
+
+	memFS := engine.NewMemFS()
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_leak_store"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	_ = indexer
+
+	// Verify goroutine was spawned
+	if runtime.NumGoroutine() <= baseline {
+		t.Fatalf("expected goroutine count to exceed baseline %d, got %d", baseline, runtime.NumGoroutine())
+	}
+
+	// Close ONLY the engine without calling indexer.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close failed: %v", err)
+	}
+
+	// Verify the goroutine count returns to baseline
+	var current int
+	returnedToBaseline := false
+	for attempt := 0; attempt < 50; attempt++ {
+		time.Sleep(10 * time.Millisecond)
+		runtime.GC()
+		current = runtime.NumGoroutine()
+		if current <= baseline {
+			returnedToBaseline = true
+			break
+		}
+	}
+	if !returnedToBaseline {
+		t.Fatalf("goroutine leak: expected goroutine count to return to baseline %d, got %d", baseline, current)
 	}
 }

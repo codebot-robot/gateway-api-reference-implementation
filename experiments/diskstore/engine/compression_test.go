@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -164,6 +165,7 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 		{"none", CodecNone},
 		{"zstd", CodecZstd},
 		{"s2", CodecS2},
+		{"snappy", CodecSnappy},
 	}
 
 	// Test boundary sizes:
@@ -368,6 +370,17 @@ func TestCompression_Rejection_Direct(t *testing.T) {
 	_, err = decompressValue(s2MismatchBuf, maxObjSize)
 	if !errors.Is(err, ErrCorruptCompression) {
 		t.Fatalf("expected ErrCorruptCompression for S2 length mismatch, got %v", err)
+	}
+
+	// Snappy length mismatch check
+	snappyCompressed10 := snappy.Encode(nil, []byte("0123456789"))
+	snappyMismatchBuf := make([]byte, 5+len(snappyCompressed10))
+	snappyMismatchBuf[0] = byte(CodecSnappy)
+	binary.BigEndian.PutUint32(snappyMismatchBuf[1:5], 20)
+	copy(snappyMismatchBuf[5:], snappyCompressed10)
+	_, err = decompressValue(snappyMismatchBuf, maxObjSize)
+	if !errors.Is(err, ErrCorruptCompression) {
+		t.Fatalf("expected ErrCorruptCompression for Snappy length mismatch, got %v", err)
 	}
 
 	// 3. Truncated data

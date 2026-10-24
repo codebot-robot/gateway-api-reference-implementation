@@ -16,21 +16,28 @@ The new `DiskStore` architecture introduces:
 - **Non-blocking checkpoints** with ARIES dirty page tracking and WAL segment truncation.
 - Full compatibility with `k8s.io/client-go/tools/cache.Indexer`.
 
-### Key Empirical Results (10,000 ConfigMaps, 10 KB Payloads)
+### Key Empirical Results (Mixed Realistic Corpus: 10,000 Objects, 10 KB Payloads)
+
+*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-frame) buffer pool.*
 
 | Architecture | Heap In-Use | Process RSS | Disk Size | Write Throughput | Recovery Time | Warm Recompute (10 refs) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **In-Memory Informer** (Status Quo) | 147.65 MB | 171.09 MB | 0 MB (RAM) | 64,566 op/s | N/A | 10 µs |
-| **BBolt Store** (`mmap` + `NoSync`) | 1.98 MB | 139.52 MB | 144.25 MB | 8,679 op/s | 12.4 ms | 5 µs |
-| **DiskStore (Uncompressed)** | 14.35 MB | 34.91 MB | 160.73 MB | 2,810 op/s | 459.0 ms | 95 µs |
-| **DiskStore (zstd)** | **24.77 MB** | **52.75 MB** | **6.13 MB** | **29,561 op/s** | **71.0 ms** | **106 µs** |
-| **DiskStore (S2)** | 35.41 MB | 73.00 MB | 6.50 MB | 39,578 op/s | 67.0 ms | 167 µs |
+| **In-Memory Informer** (Status Quo) | 115.94 MB | 103.48 MB | 0 MB (RAM) | 1,831,254 op/s | N/A | 11 µs |
+| **BBolt Store** (`mmap` + `NoSync`) | 115.33 MB | 301.85 MB | 144.25 MB | 13,767 op/s | 12.0 ms | 9 µs |
+| **DiskStore (Uncompressed)** | 114.76 MB | 187.31 MB | 159.90 MB | 2,586 op/s | 555.0 ms | 36 µs |
+| **DiskStore (zstd)** | **114.77 MB** | **197.62 MB** | **92.71 MB** | **3,026 op/s** | **350.0 ms** | **62 µs** |
+| **DiskStore (S2)** | 114.77 MB | 183.43 MB | 82.73 MB | 3,244 op/s | 296.0 ms | 48 µs |
+| **DiskStore (Snappy)** | 114.78 MB | 181.45 MB | 82.61 MB | 3,194 op/s | 310.0 ms | 27 µs |
 
-- **Disk Footprint Reduction:** With zstd compression enabled by default, `DiskStore` consumes **6.13 MB on disk**, a 96.2% reduction compared to uncompressed storage (160.73 MB) and a 95.8% reduction compared to BBolt (144.25 MB).
-- **RSS Reduction:** `DiskStore (zstd)` consumes **52.75 MB Process RSS**, achieving a **62.2% reduction compared to BBolt** (139.52 MB) and a **69.2% reduction compared to In-Memory** (171.09 MB).
-- **Write Throughput Acceleration:** Compressing values before writing to the WAL and heap reduces I/O transfer volume, accelerating write throughput from 2,810 op/s to **29,561 op/s**.
+- **Disk Footprint Reduction by Data Type:**
+  - **Configuration text (JSON):** `zstd` reduces on-disk storage by **82.3%** (8.51 MB vs. 47.95 MB uncompressed) and triples write throughput (11,056 op/s vs. 3,631 op/s).
+  - **TLS material (x509 PEM):** `zstd` reduces on-disk storage by **66.3%** (16.20 MB vs. 48.01 MB uncompressed).
+  - **Random bytes:** Incompressible data triggers the 10% threshold rule and stores raw without compression expansion (47.96 MB across all codecs).
+  - **Mixed realistic corpus:** `zstd` achieves a **42.0% disk reduction** (92.71 MB vs. 159.90 MB uncompressed) across a corpus containing one-third incompressible data.
+- **RSS Reduction:** `DiskStore (zstd)` consumes **197.62 MB Process RSS**, achieving a **34.5% reduction compared to BBolt** (301.85 MB) by avoiding kernel page-cache amplification from `mmap`.
+- **Write Throughput Acceleration:** Compressing values allows objects to fit within single-block slotted pages or smaller multi-block allocations, reducing buffer pool frame eviction churn and issuing fewer write system calls during WAL logging and page flushes.
 - **Zero Mmap Overhead:** Because direct I/O bypasses the operating system page cache and buffer pool memory is bounded to a fixed arena, container memory accounting remains flat and predictable under load.
-- **Fast Startup & Recovery:** The sequential scan in physical block order reconstructs the store state across the compressed heap file in **71 ms**.
+- **Fast Startup & Recovery:** The sequential scan in physical block order reconstructs the store state across the mixed corpus in **350 ms**.
 
 ---
 
@@ -179,9 +186,10 @@ To conserve disk space and reduce multi-block power-of-two page allocation overh
   - `CodecNone (0x00)`: Value stored raw without compression.
   - `CodecZstd (0x01)`: Value compressed using pure Go `zstd` at its fastest level (`zstd.SpeedFastest`). zstd is the default codec.
   - `CodecS2 (0x02)`: Value compressed using pure Go `s2` block format.
+  - `CodecSnappy (0x03)`: Value compressed using pure Go `snappy` block format (`github.com/klauspost/compress/snappy`).
 - **On-Disk Value Record Format:**
   - Stored raw (`CodecNone`): `[Codec (1B)][Raw Payload Bytes...]`
-  - Stored compressed (`CodecZstd` or `CodecS2`): `[Codec (1B)][Uncompressed Length uint32 Big-Endian (4B)][Compressed Stream Bytes...]`
+  - Stored compressed (`CodecZstd`, `CodecS2`, or `CodecSnappy`): `[Codec (1B)][Uncompressed Length uint32 Big-Endian (4B)][Compressed Stream Bytes...]`
 - **Configurable Threshold:** Defaults to `DefaultCompressionThreshold = BlockUsableSize - 64` (4000 bytes, the 1-block slotted page capacity). Objects smaller than or equal to the threshold are stored raw. Callers configure this threshold via `WithCompressionThreshold(bytes)`.
 - **10% Savings Rule:** If an object exceeds the threshold but its compressed size is not at least about 10% smaller than the raw payload (`compressedLen * 10 <= rawLen * 9`), the value is stored raw with `CodecNone` to avoid compression overhead for incompressible data.
 - **Page Class Selection from Compressed Size:** The page class (1-block slotted page vs. power-of-two multi-block page) is selected using the compressed payload length. An object that is 10 KB uncompressed drops from a 4-block page (16 KiB) to a 1-block slotted page (4 KiB) after compression.
@@ -319,61 +327,154 @@ Recovery never trusts bytes that object payloads control:
 
 ## Comparison with BBolt and In-Memory Informer
 
-### Detailed Benchmark Results (10,000 ConfigMaps, 10 KB Payloads)
+### Detailed Benchmark Results Across Realistic Workloads
+
+*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-frame) buffer pool.*
+
+#### 1. Configuration Text (JSON) (2,500 objects, ~10 KB each)
 
 ```
 ================================================================================================================================================
-COMPARATIVE BENCHMARK: 10000 ConfigMaps with 10 KB Payloads (~100 MB data)
+COMPARATIVE BENCHMARK: Configuration Text (JSON) (2500 objects, ~10 KB each)
 ================================================================================================================================================
-Baseline Clean Process: HeapInUse=2.20 MB, Process RSS=14.77 MB
-------------------------------------------------------------------------------------------------------------------------------------------------
 Storage Engine                 | Heap In-Use  | Process RSS  | Disk Size    | Write Time   | Write Thruput  | Recovery    
 ------------------------------------------------------------------------------------------------------------------------------------------------
-In-Memory Informer             |    147.65 MB |    171.09 MB |   0 MB (RAM) |       0.15 s |    64566 op/s  |            -
-BBolt (mmap + NoSync)          |      1.98 MB |    139.52 MB |    144.25 MB |       1.15 s |     8679 op/s  |      12.4 ms
-DiskStore (None)               |     14.35 MB |     34.91 MB |    160.73 MB |       3.56 s |     2810 op/s  |     459.00 ms
-DiskStore (zstd)               |     24.77 MB |     52.75 MB |      6.13 MB |       0.34 s |    29561 op/s  |      71.00 ms
-DiskStore (S2)                 |     35.41 MB |     73.00 MB |      6.50 MB |       0.25 s |    39578 op/s  |      67.00 ms
+In-Memory Informer             |      28.83 MB |      45.77 MB |   0 MB (RAM) |       0.00 s |    2339028 op/s |            -
+BBolt (mmap + NoSync)          |      28.80 MB |      82.41 MB |     48.09 MB |       0.20 s |      12699 op/s |     12.00 ms
+DiskStore (None)               |      28.66 MB |      79.41 MB |     47.95 MB |       0.69 s |       3631 op/s |    162.00 ms
+DiskStore (zstd)               |      28.69 MB |      76.14 MB |      8.51 MB |       0.23 s |      11056 op/s |     44.00 ms
+DiskStore (S2)                 |      28.69 MB |      82.27 MB |     16.23 MB |       0.43 s |       5798 op/s |    139.00 ms
+DiskStore (Snappy)             |      28.70 MB |      77.47 MB |     15.62 MB |       0.40 s |       6196 op/s |     71.00 ms
 ------------------------------------------------------------------------------------------------------------------------------------------------
-
 Recompute Latency Comparison:
-  In-Memory Informer:     0 refs =   0.00 µs |   10 refs =  10.00 µs | 1000 refs =   322.00 µs
-  BBolt Store (Cold):     0 refs =   3.00 µs |   10 refs = 141.00 µs | 1000 refs = 17633.00 µs
-  BBolt Store (Warm):     0 refs =   0.00 µs |   10 refs =   5.00 µs | 1000 refs =   516.00 µs
-  DiskStore (None) (Cold):0 refs =   0.00 µs |   10 refs = 4543.00 µs | 1000 refs = 351777.00 µs
-  DiskStore (None) (Warm):0 refs =   0.00 µs |   10 refs =  95.00 µs | 1000 refs = 345492.00 µs
-  DiskStore (zstd) (Cold):0 refs =   0.00 µs |   10 refs = 155.00 µs | 1000 refs = 15408.00 µs
-  DiskStore (zstd) (Warm):0 refs =   0.00 µs |   10 refs = 106.00 µs | 1000 refs = 12950.00 µs
-  DiskStore (S2)   (Cold):0 refs =   0.00 µs |   10 refs = 220.00 µs | 1000 refs = 12045.00 µs
-  DiskStore (S2)   (Warm):0 refs =   0.00 µs |   10 refs = 167.00 µs | 1000 refs = 16562.00 µs
+  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  12.00 µs | 1000 refs =   416.00 µs
+  BBolt (mmap + NoSync)   (Cold): 0 refs =   5.00 µs |   10 refs = 181.00 µs | 1000 refs = 20842.00 µs
+  BBolt (mmap + NoSync)   (Warm): 0 refs =   0.00 µs |   10 refs =   9.00 µs | 1000 refs =  1149.00 µs
+  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs = 3644.00 µs | 1000 refs = 267040.00 µs
+  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs =  93.00 µs | 1000 refs = 264492.00 µs
+  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs = 206.00 µs | 1000 refs = 15318.00 µs
+  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs = 130.00 µs | 1000 refs = 19964.00 µs
+  DiskStore (S2)          (Cold): 0 refs =   0.00 µs |   10 refs = 1803.00 µs | 1000 refs = 180449.00 µs
+  DiskStore (S2)          (Warm): 0 refs =   0.00 µs |   10 refs =  78.00 µs | 1000 refs =  9933.00 µs
+  DiskStore (Snappy)      (Cold): 0 refs =   0.00 µs |   10 refs = 1793.00 µs | 1000 refs = 162689.00 µs
+  DiskStore (Snappy)      (Warm): 0 refs =   0.00 µs |   10 refs =  65.00 µs | 1000 refs =  9616.00 µs
+================================================================================================================================================
+```
+
+#### 2. TLS Material (x509 PEM) (2,500 objects, ~10 KB each)
+
+```
+================================================================================================================================================
+COMPARATIVE BENCHMARK: TLS Material (x509 PEM) (2500 objects, ~10 KB each)
+================================================================================================================================================
+Storage Engine                 | Heap In-Use  | Process RSS  | Disk Size    | Write Time   | Write Thruput  | Recovery    
+------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer             |      30.24 MB |      -2.69 MB |   0 MB (RAM) |       0.00 s |    1906796 op/s |            -
+BBolt (mmap + NoSync)          |      30.13 MB |      44.77 MB |     48.09 MB |       0.19 s |      13278 op/s |     12.00 ms
+DiskStore (None)               |      29.96 MB |      30.23 MB |     48.01 MB |       0.64 s |       3882 op/s |    156.00 ms
+DiskStore (zstd)               |      29.96 MB |      31.79 MB |     16.20 MB |       0.43 s |       5755 op/s |     62.00 ms
+DiskStore (S2)                 |      29.96 MB |      30.46 MB |     17.85 MB |       0.48 s |       5256 op/s |     63.00 ms
+DiskStore (Snappy)             |      29.97 MB |      42.64 MB |     18.39 MB |       0.47 s |       5358 op/s |     73.00 ms
+------------------------------------------------------------------------------------------------------------------------------------------------
+Recompute Latency Comparison:
+  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  11.00 µs | 1000 refs =   196.00 µs
+  BBolt (mmap + NoSync)   (Cold): 0 refs =   5.00 µs |   10 refs =  49.00 µs | 1000 refs =  1218.00 µs
+  BBolt (mmap + NoSync)   (Warm): 0 refs =   0.00 µs |   10 refs =  22.00 µs | 1000 refs =   702.00 µs
+  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs =  12.00 µs | 1000 refs =   283.00 µs
+  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   223.00 µs
+  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs =  12.00 µs | 1000 refs =   273.00 µs
+  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   240.00 µs
+  DiskStore (S2)          (Cold): 0 refs =   0.00 µs |   10 refs =  52.00 µs | 1000 refs =   434.00 µs
+  DiskStore (S2)          (Warm): 0 refs =   0.00 µs |   10 refs =   3.00 µs | 1000 refs =   384.00 µs
+  DiskStore (Snappy)      (Cold): 0 refs =   0.00 µs |   10 refs =  11.00 µs | 1000 refs =   278.00 µs
+  DiskStore (Snappy)      (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   236.00 µs
+================================================================================================================================================
+```
+
+#### 3. Random Incompressible Bytes (2,500 objects, ~10 KB each)
+
+```
+================================================================================================================================================
+COMPARATIVE BENCHMARK: Random Incompressible Bytes (2500 objects, ~10 KB each)
+================================================================================================================================================
+Storage Engine                 | Heap In-Use  | Process RSS  | Disk Size    | Write Time   | Write Thruput  | Recovery    
+------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer             |      27.69 MB |     -20.23 MB |   0 MB (RAM) |       0.00 s |    2389144 op/s |            -
+BBolt (mmap + NoSync)          |      27.60 MB |      41.75 MB |     48.07 MB |       0.19 s |      13390 op/s |     12.00 ms
+DiskStore (None)               |      27.38 MB |      25.95 MB |     47.96 MB |       0.69 s |       3622 op/s |    158.00 ms
+DiskStore (zstd)               |      27.38 MB |      27.96 MB |     47.96 MB |       0.64 s |       3889 op/s |    147.00 ms
+DiskStore (S2)                 |      27.38 MB |      22.90 MB |     47.96 MB |       0.65 s |       3836 op/s |    148.00 ms
+DiskStore (Snappy)             |      27.40 MB |      25.26 MB |     47.96 MB |       0.64 s |       3899 op/s |    152.00 ms
+------------------------------------------------------------------------------------------------------------------------------------------------
+Recompute Latency Comparison:
+  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  18.00 µs | 1000 refs =   344.00 µs
+  BBolt (mmap + NoSync)   (Cold): 0 refs =   3.00 µs |   10 refs =  36.00 µs | 1000 refs =  1090.00 µs
+  BBolt (mmap + NoSync)   (Warm): 0 refs =   1.00 µs |   10 refs =  13.00 µs | 1000 refs =   841.00 µs
+  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs =  14.00 µs | 1000 refs =   279.00 µs
+  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   226.00 µs
+  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs =  15.00 µs | 1000 refs =   351.00 µs
+  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   215.00 µs
+  DiskStore (S2)          (Cold): 0 refs =   0.00 µs |   10 refs =  14.00 µs | 1000 refs =   286.00 µs
+  DiskStore (S2)          (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   217.00 µs
+  DiskStore (Snappy)      (Cold): 0 refs =   0.00 µs |   10 refs =  20.00 µs | 1000 refs =   293.00 µs
+  DiskStore (Snappy)      (Warm): 0 refs =   0.00 µs |   10 refs =   2.00 µs | 1000 refs =   258.00 µs
+================================================================================================================================================
+```
+
+#### 4. Mixed Realistic Corpus (10,000 objects, ~100 MB data)
+
+```
+================================================================================================================================================
+COMPARATIVE BENCHMARK: Mixed Realistic Corpus (10000 objects, ~10 KB each)
+================================================================================================================================================
+Storage Engine                 | Heap In-Use  | Process RSS  | Disk Size    | Write Time   | Write Thruput  | Recovery    
+------------------------------------------------------------------------------------------------------------------------------------------------
+In-Memory Informer             |     115.94 MB |     103.48 MB |   0 MB (RAM) |       0.01 s |    1831254 op/s |            -
+BBolt (mmap + NoSync)          |     115.33 MB |     301.85 MB |    144.25 MB |       0.73 s |      13767 op/s |     12.00 ms
+DiskStore (None)               |     114.76 MB |     187.31 MB |    159.90 MB |       3.87 s |       2586 op/s |    555.00 ms
+DiskStore (zstd)               |     114.77 MB |     197.62 MB |     92.71 MB |       3.30 s |       3026 op/s |    350.00 ms
+DiskStore (S2)                 |     114.77 MB |     183.43 MB |     82.73 MB |       3.08 s |       3244 op/s |    296.00 ms
+DiskStore (Snappy)             |     114.78 MB |     181.45 MB |     82.61 MB |       3.13 s |       3194 op/s |    310.00 ms
+------------------------------------------------------------------------------------------------------------------------------------------------
+Recompute Latency Comparison:
+  In-Memory Informer     :         0 refs =   0.00 µs |   10 refs =  11.00 µs | 1000 refs =   338.00 µs
+  BBolt (mmap + NoSync)   (Cold): 0 refs =   5.00 µs |   10 refs =  85.00 µs | 1000 refs =  3869.00 µs
+  BBolt (mmap + NoSync)   (Warm): 0 refs =   1.00 µs |   10 refs =   9.00 µs | 1000 refs =   714.00 µs
+  DiskStore (None)        (Cold): 0 refs =   0.00 µs |   10 refs = 1515.00 µs | 1000 refs = 120400.00 µs
+  DiskStore (None)        (Warm): 0 refs =   0.00 µs |   10 refs =  36.00 µs | 1000 refs =  3353.00 µs
+  DiskStore (zstd)        (Cold): 0 refs =   0.00 µs |   10 refs = 1188.00 µs | 1000 refs = 77373.00 µs
+  DiskStore (zstd)        (Warm): 0 refs =   0.00 µs |   10 refs =  62.00 µs | 1000 refs =  5088.00 µs
+  DiskStore (S2)          (Cold): 0 refs =   0.00 µs |   10 refs = 1148.00 µs | 1000 refs = 80150.00 µs
+  DiskStore (S2)          (Warm): 0 refs =   0.00 µs |   10 refs =  48.00 µs | 1000 refs =  2774.00 µs
+  DiskStore (Snappy)      (Cold): 0 refs =   0.00 µs |   10 refs = 1263.00 µs | 1000 refs = 70304.00 µs
+  DiskStore (Snappy)      (Warm): 0 refs =   0.00 µs |   10 refs =  27.00 µs | 1000 refs =  2659.00 µs
 ================================================================================================================================================
 ```
 
 ### Analysis of Trade-offs
 
-1. **Compression Algorithm Selection: zstd as Default vs. S2:**
-   - **Compression Ratio:** `zstd` produces the smallest on-disk footprint (**6.13 MB** vs. **6.50 MB** for S2 and **160.73 MB** uncompressed). By moving 10 KB objects from 4-block pages into 1-block slotted pages, disk usage drops by **96.2%**.
-   - **Memory Footprint:** `zstd` uses significantly less heap (**24.77 MB** vs. **35.41 MB**) and lower Process RSS (**52.75 MB** vs. **73.00 MB**) than S2. zstd encoders and decoders are pooled, avoiding per-call buffer allocations.
-   - **Throughput:** While S2 achieves higher raw write throughput (39,578 op/s vs. 29,561 op/s), both codecs dramatically outperform uncompressed writes (2,810 op/s) and easily exceed peak informer ingestion rates.
-   - **Read Latency:** On warm recomputations (1,000 refs), `zstd` achieves lower latency than S2 (**12.95 ms** vs. **16.56 ms**).
-   - **Verdict:** `zstd` is selected as the default codec because it provides a superior compression ratio, lower memory footprint, and lower warm read latency.
+1. **Why Compression Accelerates Write Throughput:**
+   - Uncompressed storage writes 4 physical blocks for every 10 KB object. For 10,000 objects, that totals 40,000 blocks written through an 8 MiB (2,048-frame) buffer pool. The buffer pool experiences continuous frame eviction and dirty page writeback.
+   - The engine issues one write call per WAL block, and one write call per page during flushes.
+   - When values compress, objects fit within single-block slotted pages or smaller multi-block allocations (e.g. 1 or 2 blocks). The reduced working set fits within the buffer pool without continuous eviction churn. Fewer pages and fewer blocks reduce the number of write system calls, which accelerates write throughput.
+   - Batched writes would raise the uncompressed baseline; that architectural enhancement is tracked separately.
 
-2. **Process RSS & Container Memory Limits:**
-   - `BBolt` achieves low Go heap in-use (1.98 MB), but its resident set size (139.52 MB) is heavily inflated by the kernel page cache holding mmap pages in the container's cgroup. In production Kubernetes pods with tight memory limits (e.g. 100–150 MiB), `bbolt` causes OOM kills.
-   - `DiskStore (zstd)` caps Process RSS at **52.75 MB** by using direct I/O and a fixed 8 MiB buffer pool arena. This predictable memory footprint makes it safe for resource-constrained environments.
+2. **Heap Usage and Goroutine Lifecycle:**
+   - Heap in-use remains flat and consistent across all storage engines and compression codecs (~28.7 MB for 2,500 objects; ~114.8 MB for 10,000 objects).
+   - Closing the engine signals its `Closed()` channel, which terminates the adapter's failure-watch goroutine. This releases references to the engine and its buffer-pool arena, preventing memory retention across engine lifecycles.
 
-3. **Read Latency:**
-   - On warm recompute, `DiskStore (zstd)` achieves **106 µs** for 10 references and low overhead for cache hits, because pinned descriptors avoid deep pointer chains and interface conversions.
-   - On cold reads (requiring direct I/O disk fetch), `DiskStore (zstd)` completes 1,000 object references in **15.4 ms**, outperforming BBolt's cold read time (**17.6 ms**) because compressed pages require fewer disk reads and less buffer frame thrashing.
+3. **Codec Trade-offs (zstd vs. S2 vs. Snappy):**
+   - **Configuration Text (JSON):** `zstd` produces the smallest disk footprint (**8.51 MB**, an 82.3% reduction), outperforming S2 (**16.23 MB**) and Snappy (**15.62 MB**) by almost a factor of two. Because the data compresses into fewer pages, `zstd` achieves the highest write throughput (**11,056 op/s** vs. **5,798 op/s** for S2 and **6,196 op/s** for Snappy) and fastest recovery (**44 ms** vs. **139 ms** / **71 ms**).
+   - **TLS Material (x509 PEM):** `zstd` achieves the highest compression ratio (**16.20 MB**, a 66.3% reduction) compared to S2 (**17.85 MB**) and Snappy (**18.39 MB**).
+   - **Incompressible Random Bytes:** All three codecs detect that compressed output fails the 10% savings threshold and fall back to raw storage (`CodecNone`), consuming identical disk space (**47.96 MB**) with identical write throughput (~3,800 op/s).
+   - **Verdict:** `zstd` is selected as the default codec because it delivers the highest compression ratio and highest throughput on compressible Kubernetes configuration data.
 
-4. **Write Throughput & Cache Database Durability Model:**
-   - `DiskStore` acts as a crash-consistent cache database: commits update buffer pool frames and append records to the WAL without requiring synchronous fsync on every individual commit. Durability guarantees ensure that on failure or process crash, the store always recovers to a strictly consistent state up to the last periodic WAL/heap fsync or checkpoint.
-   - **Why BBolt's NoSync Mode Is Deceptively Fast:** bbolt achieves ~8,700 op/s only by running with `NoSync: true`, completely bypassing fsync and relying on asynchronous OS dirty-page writeback via `mmap`. However, `mmap` writeback is inherently unsafe: if the operating system encounters a write error while flushing dirty pages in the background, Linux *silently drops* the dirty pages (the historical cause of PostgreSQL's fdatasync corruption bugs). Running bbolt safely (`NoSync: false`) drops its write throughput to under 50 op/s.
-   - **Why Compression Accelerates Write Throughput:** Compressing values before writing to the WAL and buffer pool reduces physical I/O transfer volume. This elevates write throughput from **2,810 op/s** uncompressed to **29,561 op/s** with `zstd` and **39,578 op/s** with `S2`.
-   - **Slotted Page Stream Packing:** For standard Kubernetes informers streaming objects during initial `LIST` and `WATCH` syncs, compression allows 10 KB objects to fit within single 4 KiB slotted pages, drastically reducing page allocations and direct I/O write operations.
+4. **Process RSS & Container Memory Limits:**
+   - `BBolt` resident set size balloons to **301.85 MB** on the 10,000 mixed object workload because operating system page caching retains mmap pages in the container cgroup.
+   - `DiskStore` caps Process RSS at **181–197 MB** across all codecs by using direct I/O and a fixed 8 MiB buffer pool arena, avoiding kernel page-cache amplification.
 
 5. **Crash Recovery Time:**
-   - `DiskStore (zstd)` scans and recovers 10,000 objects across the compressed heap file in **71 ms**, compared to **459 ms** uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, minimizing recovery latency.
+   - On compressible configuration text, `DiskStore (zstd)` recovers in **44 ms**, compared to **162 ms** uncompressed. On the 10,000 mixed corpus, recovery completes in **350 ms**, compared to **555 ms** uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, minimizing recovery latency.
 
 6. **Broad Read Isolation and Locking Trade-offs (`List` vs Concurrent Writers):**
    - **Point-in-Time Consistency:** `DiskStore.List(bucketName)` acquires `s.writerMu.RLock()` for the duration of the broad bucket read and object decoding. This provides point-in-time consistency across the bucket: concurrent writes (`Put`) or deletions (`Delete`) cannot mutate page contents, renumber slots during compaction, or modify the key index while objects are being retrieved and decoded.
@@ -385,9 +486,9 @@ Recompute Latency Comparison:
 ## Conclusion
 
 The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file, value compression, and fixed-size direct I/O buffer pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
-- **96.2% lower disk usage** with zstd value compression.
-- **62.2% lower memory footprint (RSS)** than bbolt.
-- **10x higher write throughput** with compressed WAL logging and page class reduction.
+- **82.3% lower disk usage** on configuration text (JSON) and **66.3% lower disk usage** on TLS material with zstd value compression.
+- **34.5% lower memory footprint (RSS)** than bbolt on mixed realistic workloads.
+- **3x higher write throughput** on configuration text through reduced buffer pool eviction churn.
 - **Strict crash consistency** with out-of-place writes and the Reuse Rule.
 - **Resilience against untrusted payload forgery and corrupt decompression inputs**.
 - **Full `cache.Indexer` conformance**.

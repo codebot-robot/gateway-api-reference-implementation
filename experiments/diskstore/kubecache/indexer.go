@@ -147,11 +147,13 @@ func New(eng *engine.Engine, example k8sruntime.Object, onFatal func(error), opt
 		return nil, err
 	}
 
-	// Listen for asynchronous background engine failures
+	// Listen for asynchronous background engine failures or engine closure
 	go func() {
 		select {
 		case <-eng.Failed():
 			d.fatal(eng.Err())
+		case <-eng.Closed():
+			return
 		case <-d.closed:
 			return
 		}
