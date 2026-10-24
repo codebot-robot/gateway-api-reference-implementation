@@ -71,6 +71,13 @@ type Options struct {
 	NumFrames  int
 	AutoDelete bool
 	Clock      Clock
+
+	CompressionCodec     CompressionCodec
+	CompressionThreshold int
+	MaxObjectSize        int
+
+	compressionCodecSet     bool
+	compressionThresholdSet bool
 }
 
 // Option is a functional option for configuring an Engine.
@@ -80,6 +87,29 @@ type Option func(*Options)
 func WithClock(clock Clock) Option {
 	return func(o *Options) {
 		o.Clock = clock
+	}
+}
+
+// WithCompressionCodec sets the compression algorithm to use (CodecNone, CodecZstd).
+func WithCompressionCodec(codec CompressionCodec) Option {
+	return func(o *Options) {
+		o.CompressionCodec = codec
+		o.compressionCodecSet = true
+	}
+}
+
+// WithCompressionThreshold sets the byte size threshold above which values are compressed.
+func WithCompressionThreshold(threshold int) Option {
+	return func(o *Options) {
+		o.CompressionThreshold = threshold
+		o.compressionThresholdSet = true
+	}
+}
+
+// WithMaxObjectSize sets the maximum uncompressed object size accepted during decompression.
+func WithMaxObjectSize(size int) Option {
+	return func(o *Options) {
+		o.MaxObjectSize = size
 	}
 }
 
@@ -138,7 +168,10 @@ type Engine struct {
 	isTemp     bool
 	autoDelete bool
 
-	cipher Cipher
+	cipher               Cipher
+	compressionCodec     CompressionCodec
+	compressionThreshold int
+	maxObjectSize        int
 
 	heapFile File
 	wal      *WAL
@@ -164,6 +197,7 @@ type Engine struct {
 	lastRecoveredTokenByBucket map[string]string
 	lastRecoveredToken         string
 	closed                     atomic.Bool
+	closedCh                   chan struct{}
 }
 
 func removeDirRecursive(fs FS, dir string) error {
@@ -232,16 +266,38 @@ func wipeStoreFiles(fs FS, dir string) error {
 	return nil
 }
 
+const (
+	// StoreFormatVersion is the format version recorded in meta.db.
+	// Version 1 did not record a version and stored uncompressed values without a codec byte.
+	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
+	StoreFormatVersion uint32 = 2
+
+	// metaFileSize is 16 bytes DB ID + 4 bytes StoreFormatVersion.
+	metaFileSize = 20
+)
+
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
-		FS:         NewOSFS(),
-		Cipher:     NoopCipher{},
-		NumFrames:  DefaultBufferPoolFrames,
-		AutoDelete: false,
+		FS:                   NewOSFS(),
+		Cipher:               NoopCipher{},
+		NumFrames:            DefaultBufferPoolFrames,
+		AutoDelete:           false,
+		CompressionCodec:     CodecZstd,
+		CompressionThreshold: DefaultCompressionThreshold,
+		MaxObjectSize:        DefaultMaxObjectSize,
 	}
 	for _, opt := range opts {
 		opt(&options)
+	}
+	if !options.compressionCodecSet && options.CompressionCodec == 0 {
+		options.CompressionCodec = CodecZstd
+	}
+	if !options.compressionThresholdSet && options.CompressionThreshold == 0 {
+		options.CompressionThreshold = DefaultCompressionThreshold
+	}
+	if options.MaxObjectSize <= 0 {
+		options.MaxObjectSize = DefaultMaxObjectSize
 	}
 
 	dir := options.Dir
@@ -291,7 +347,7 @@ func Open(opts ...Option) (*Engine, error) {
 	var dbID [16]byte
 	isNewStore := false
 
-	// Read or generate database ID
+	// Read or generate database ID and verify store format version
 	metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, 0644)
 	if err != nil {
 		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
@@ -332,32 +388,59 @@ func Open(opts ...Option) (*Engine, error) {
 			}
 
 			isNewStore = true
-			if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
-				return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
-			}
-			metaFile, err = options.FS.Create(metaPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create meta file: %w", err)
-			}
-			if _, wErr := metaFile.WriteAt(dbID[:], 0); wErr != nil {
-				closeErr := metaFile.Close()
-				return nil, errors.Join(wErr, closeErr)
-			}
-			if err := metaFile.Sync(); err != nil {
-				closeErr := metaFile.Close()
-				return nil, errors.Join(fmt.Errorf("failed to sync meta file: %w", err), closeErr)
-			}
 		} else {
 			return nil, err
 		}
 	} else {
-		if _, rErr := metaFile.ReadAt(dbID[:], 0); rErr != nil {
-			closeErr := metaFile.Close()
-			return nil, errors.Join(fmt.Errorf("failed to read DB ID from meta: %w", rErr), closeErr)
+		// meta.db exists. Read dbID and store format version.
+		metaBuf := make([]byte, metaFileSize)
+		n, rErr := metaFile.ReadAt(metaBuf, 0)
+		if cErr := metaFile.Close(); cErr != nil {
+			return nil, fmt.Errorf("failed to close meta file: %w", cErr)
+		}
+
+		validVersion := false
+		if (rErr == nil || errors.Is(rErr, io.EOF)) && n >= metaFileSize {
+			version := binary.BigEndian.Uint32(metaBuf[16:20])
+			if version == StoreFormatVersion {
+				validVersion = true
+				copy(dbID[:], metaBuf[:16])
+			}
+		}
+
+		if !validVersion {
+			// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
+			// wipe the store and initialize a fresh database.
+			if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
+				return nil, fmt.Errorf("failed to wipe outdated store: %w", wipeErr)
+			}
+			wiped = true
+			isNewStore = true
 		}
 	}
-	if err := metaFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close meta file: %w", err)
+
+	if isNewStore {
+		if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
+			return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
+		}
+		metaFile, err = options.FS.Create(metaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create meta file: %w", err)
+		}
+		metaBuf := make([]byte, metaFileSize)
+		copy(metaBuf[:16], dbID[:])
+		binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion)
+		if _, wErr := metaFile.WriteAt(metaBuf, 0); wErr != nil {
+			closeErr := metaFile.Close()
+			return nil, errors.Join(wErr, closeErr)
+		}
+		if err := metaFile.Sync(); err != nil {
+			closeErr := metaFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to sync meta file: %w", err), closeErr)
+		}
+		if err := metaFile.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close meta file: %w", err)
+		}
 	}
 	if err := options.FS.SyncDir(dir); err != nil {
 		return nil, fmt.Errorf("failed to sync directory after meta file creation: %w", err)
@@ -399,12 +482,16 @@ func Open(opts ...Option) (*Engine, error) {
 		isTemp:                     isTemp,
 		autoDelete:                 options.AutoDelete,
 		cipher:                     options.Cipher,
+		compressionCodec:           options.CompressionCodec,
+		compressionThreshold:       options.CompressionThreshold,
+		maxObjectSize:              options.MaxObjectSize,
 		heapFile:                   heapFile,
 		keyIndex:                   make(map[string]KeyIndexEntry),
 		oversizeObjects:            make(map[string][]byte),
 		emptyLogicalPages:          make([]uint64, 0),
 		lastRecoveredTokenByBucket: make(map[string]string),
 		failedCh:                   make(chan struct{}),
+		closedCh:                   make(chan struct{}),
 		wiped:                      wiped,
 		nextLogicalPage:            1,
 	}
@@ -744,6 +831,11 @@ func (s *Engine) Failed() <-chan struct{} {
 	return s.failedCh
 }
 
+// Closed returns a channel that is closed when the engine is closed.
+func (s *Engine) Closed() <-chan struct{} {
+	return s.closedCh
+}
+
 // Err returns the sticky failure error, or nil if the engine is healthy.
 func (s *Engine) Err() error {
 	s.failMu.RLock()
@@ -816,6 +908,29 @@ func (s *Engine) DirectIOFallbackCount() int64 {
 	return GlobalMetrics.DirectIOFallbackCount.Load()
 }
 
+// CompressionCodec returns the engine's configured compression algorithm.
+func (s *Engine) CompressionCodec() CompressionCodec {
+	return s.compressionCodec
+}
+
+// CompressionThreshold returns the size threshold above which values attempt compression.
+func (s *Engine) CompressionThreshold() int {
+	return s.compressionThreshold
+}
+
+// MaxObjectSize returns the maximum uncompressed object size accepted during decompression.
+func (s *Engine) MaxObjectSize() int {
+	return s.maxObjectSize
+}
+
+func (s *Engine) compress(payload []byte) ([]byte, error) {
+	return compressValue(payload, s.compressionCodec, s.compressionThreshold, s.maxObjectSize)
+}
+
+func (s *Engine) decompress(data []byte) ([]byte, error) {
+	return decompressValue(data, s.maxObjectSize)
+}
+
 // Put writes an object to the engine, encrypting if a cipher is configured.
 func (s *Engine) Put(bucketName, key string, payload []byte, token string) error {
 	if s.isFailed() {
@@ -827,11 +942,18 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 
 	qKey := qualifyKey(bucketName, key)
 
+	// Compress payload
+	compressed, err := s.compress(payload)
+	if err != nil {
+		s.setFailed(err)
+		return s.failErr()
+	}
+
 	// Encrypt payload if cipher is configured
-	toStore := payload
+	toStore := compressed
 	if s.cipher != nil {
 		ad := AdditionalData(bucketName, key)
-		encrypted, err := s.cipher.Encrypt(payload, ad)
+		encrypted, err := s.cipher.Encrypt(compressed, ad)
 		if err != nil {
 			s.setFailed(err)
 			return s.failErr()
@@ -1173,7 +1295,12 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 				}
 				res = decrypted
 			}
-			return res, true, nil
+			decompressed, err := s.decompress(res)
+			if err != nil {
+				s.setFailed(err)
+				return nil, false, s.failErr()
+			}
+			return decompressed, true, nil
 		}
 
 		handle, err := s.bp.PinPage(entry.LogicalPage)
@@ -1238,7 +1365,13 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 			recPayload = decrypted
 		}
 
-		return recPayload, true, nil
+		decompressed, err := s.decompress(recPayload)
+		if err != nil {
+			s.setFailed(err)
+			return nil, false, s.failErr()
+		}
+
+		return decompressed, true, nil
 	}
 
 	return nil, false, errors.New("read conflict retry limit reached")
@@ -1438,6 +1571,7 @@ func (s *Engine) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	close(s.closedCh)
 
 	var errs []error
 	// If not failed, checkpoint on close to truncate WAL and speed up reopen

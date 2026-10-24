@@ -17,8 +17,11 @@ package kubecache
 import (
 	"bytes"
 	"fmt"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/experiments/diskstore/engine"
 	corev1 "k8s.io/api/core/v1"
@@ -238,19 +241,41 @@ func TestIndexer_WithEncryption(t *testing.T) {
 	_ = indexer.Close()
 	_ = store.Close()
 
-	// Verify on-disk bytes without cipher do not contain the plaintext token
+	// Verify reading through store without cipher fails to decompress ciphertext
 	storeNoCipher, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crypto_store"))
 	if err != nil {
 		t.Fatalf("Open without cipher failed: %v", err)
 	}
 	defer storeNoCipher.Close()
 
-	rawCiphertext, exists, err := storeNoCipher.Get(fmt.Sprintf("%T", secret), "kube-system/sensitive-secret")
-	if err != nil || !exists {
-		t.Fatalf("raw store get failed: %v", err)
+	_, _, err = storeNoCipher.Get(fmt.Sprintf("%T", secret), "kube-system/sensitive-secret")
+	if err == nil {
+		t.Fatalf("expected Get without cipher to fail on ciphertext, but succeeded")
 	}
-	if bytes.Contains(rawCiphertext, []byte("super-secret-token-12345")) {
-		t.Fatalf("secret token was found in plaintext in raw store bytes!")
+
+	// Verify on-disk files do not contain the plaintext token
+	for _, sub := range []string{"", "wal"} {
+		dir := filepath.Join("idx_crypto_store", sub)
+		entries, err := memFS.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			f, err := memFS.Open(filepath.Join(dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			sz, _ := f.Size()
+			buf := make([]byte, sz)
+			_, _ = f.ReadAt(buf, 0)
+			_ = f.Close()
+			if bytes.Contains(buf, []byte("super-secret-token-12345")) {
+				t.Fatalf("secret token was found in plaintext in file %s!", filepath.Join(dir, e.Name()))
+			}
+		}
 	}
 }
 
@@ -495,5 +520,54 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 	// Secret must recover secret-rv-600
 	if secretIndexer2.LastStoreSyncResourceVersion() != "secret-rv-600" {
 		t.Fatalf("Secret recovered wrong RV: got %q, want %q", secretIndexer2.LastStoreSyncResourceVersion(), "secret-rv-600")
+	}
+}
+
+// TestIndexer_NoGoroutineLeakOnEngineClose verifies that closing the underlying engine alone
+// terminates the adapter's failure-watch goroutine without leaking goroutines.
+func TestIndexer_NoGoroutineLeakOnEngineClose(t *testing.T) {
+	// Let existing background goroutines settle
+	for i := 0; i < 5; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	baseline := runtime.NumGoroutine()
+
+	memFS := engine.NewMemFS()
+	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_leak_store"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	_ = indexer
+
+	// Verify goroutine was spawned
+	if runtime.NumGoroutine() <= baseline {
+		t.Fatalf("expected goroutine count to exceed baseline %d, got %d", baseline, runtime.NumGoroutine())
+	}
+
+	// Close ONLY the engine without calling indexer.Close()
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close failed: %v", err)
+	}
+
+	// Verify the goroutine count returns to baseline
+	var current int
+	returnedToBaseline := false
+	for attempt := 0; attempt < 50; attempt++ {
+		time.Sleep(10 * time.Millisecond)
+		runtime.GC()
+		current = runtime.NumGoroutine()
+		if current <= baseline {
+			returnedToBaseline = true
+			break
+		}
+	}
+	if !returnedToBaseline {
+		t.Fatalf("goroutine leak: expected goroutine count to return to baseline %d, got %d", baseline, current)
 	}
 }
