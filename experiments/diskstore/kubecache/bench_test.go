@@ -25,8 +25,10 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -310,6 +312,40 @@ func generateMixedObject(i int) *corev1.ConfigMap {
 	}
 }
 
+func getCorpusObject(corpus string, i int) *corev1.ConfigMap {
+	switch corpus {
+	case "config-text":
+		return generateConfigTextObject(i)
+	case "tls-material":
+		return generateTLSObject(i)
+	case "random-bytes":
+		return generateRandomBytesObject(i)
+	default: // mixed
+		return generateMixedObject(i)
+	}
+}
+
+func getObjectKey(corpus string, i int) types.NamespacedName {
+	ns := fmt.Sprintf("ns-%02d", i%20)
+	switch corpus {
+	case "config-text":
+		return types.NamespacedName{Namespace: ns, Name: fmt.Sprintf("cm-%05d", i)}
+	case "tls-material":
+		return types.NamespacedName{Namespace: ns, Name: fmt.Sprintf("tls-%05d", i)}
+	case "random-bytes":
+		return types.NamespacedName{Namespace: ns, Name: fmt.Sprintf("rand-%05d", i)}
+	default: // mixed
+		switch i % 3 {
+		case 0:
+			return types.NamespacedName{Namespace: ns, Name: fmt.Sprintf("cm-%05d", i)}
+		case 1:
+			return types.NamespacedName{Namespace: ns, Name: fmt.Sprintf("tls-%05d", i)}
+		default:
+			return types.NamespacedName{Namespace: ns, Name: fmt.Sprintf("rand-%05d", i)}
+		}
+	}
+}
+
 type MemorySnapshot struct {
 	HeapAllocMB float64
 	HeapInUseMB float64
@@ -336,38 +372,53 @@ func readMemStats() MemorySnapshot {
 	return snap
 }
 
-func getDirSize(path string) (float64, error) {
-	var total int64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+func getDiskBreakdown(dir string) (heapMB float64, walMB float64, totalMB float64, err error) {
+	heapFi, err := os.Stat(filepath.Join(dir, "heap.db"))
+	if err == nil {
+		heapMB = float64(heapFi.Size()) / (1024 * 1024)
+	}
+	walEntries, _ := os.ReadDir(filepath.Join(dir, "wal"))
+	var walTotal int64
+	for _, e := range walEntries {
+		if !e.IsDir() {
+			fi, err := e.Info()
+			if err == nil {
+				walTotal += fi.Size()
+			}
 		}
-		if !info.IsDir() {
-			total += info.Size()
-		}
-		return nil
-	})
-	return float64(total) / (1024 * 1024), err
+	}
+	walMB = float64(walTotal) / (1024 * 1024)
+	totalMB = heapMB + walMB
+	return heapMB, walMB, totalMB, nil
 }
 
-func measureRecomputeMem(indexer toolscache.Indexer, stateKeys map[types.NamespacedName]string, refs int) time.Duration {
+func measureRecomputeMem(t *testing.T, indexer toolscache.Indexer, corpus string, refs int) time.Duration {
 	start := time.Now()
 	for i := 0; i < refs; i++ {
-		key := types.NamespacedName{Namespace: fmt.Sprintf("ns-%02d", i%20), Name: fmt.Sprintf("cm-%05d", i)}
-		_, _, _ = indexer.GetByKey(key.String())
+		key := getObjectKey(corpus, i)
+		item, exists, err := indexer.GetByKey(key.String())
+		if err != nil || !exists || item == nil {
+			t.Fatalf("In-Memory lookup failed for key %s (corpus %s): exists=%v, err=%v", key, corpus, exists, err)
+		}
 	}
 	return time.Since(start)
 }
 
-func measureRecomputeBBolt(store *bboltcache.Store, resolver *bboltcache.LazyResolver, stateKeys map[types.NamespacedName]string, refs int) (cold time.Duration, warm time.Duration) {
+func measureRecomputeBBolt(t *testing.T, store *bboltcache.Store, resolver *bboltcache.LazyResolver, corpus string, refs int) (cold time.Duration, warm time.Duration) {
 	resolver.Clear()
 	startCold := time.Now()
 	resolver.StartRecompute()
-	snapCold, _ := store.NewSnapshot()
+	snapCold, err := store.NewSnapshot()
+	if err != nil {
+		t.Fatalf("BBolt NewSnapshot failed: %v", err)
+	}
 	for i := 0; i < refs; i++ {
-		key := types.NamespacedName{Namespace: fmt.Sprintf("ns-%02d", i%20), Name: fmt.Sprintf("cm-%05d", i)}
-		rv := stateKeys[key]
-		_, _, _ = resolver.ResolveConfigMap(snapCold, key, rv)
+		key := getObjectKey(corpus, i)
+		rv := fmt.Sprintf("%d", 1000+i)
+		obj, exists, err := resolver.ResolveConfigMap(snapCold, key, rv)
+		if err != nil || !exists || obj == nil {
+			t.Fatalf("BBolt cold lookup failed for key %s (corpus %s): exists=%v, err=%v", key, corpus, exists, err)
+		}
 	}
 	_ = snapCold.Close()
 	resolver.FinishRecompute()
@@ -375,11 +426,17 @@ func measureRecomputeBBolt(store *bboltcache.Store, resolver *bboltcache.LazyRes
 
 	startWarm := time.Now()
 	resolver.StartRecompute()
-	snapWarm, _ := store.NewSnapshot()
+	snapWarm, err := store.NewSnapshot()
+	if err != nil {
+		t.Fatalf("BBolt NewSnapshot warm failed: %v", err)
+	}
 	for i := 0; i < refs; i++ {
-		key := types.NamespacedName{Namespace: fmt.Sprintf("ns-%02d", i%20), Name: fmt.Sprintf("cm-%05d", i)}
-		rv := stateKeys[key]
-		_, _, _ = resolver.ResolveConfigMap(snapWarm, key, rv)
+		key := getObjectKey(corpus, i)
+		rv := fmt.Sprintf("%d", 1000+i)
+		obj, exists, err := resolver.ResolveConfigMap(snapWarm, key, rv)
+		if err != nil || !exists || obj == nil {
+			t.Fatalf("BBolt warm lookup failed for key %s (corpus %s): exists=%v, err=%v", key, corpus, exists, err)
+		}
 	}
 	_ = snapWarm.Close()
 	resolver.FinishRecompute()
@@ -388,96 +445,104 @@ func measureRecomputeBBolt(store *bboltcache.Store, resolver *bboltcache.LazyRes
 	return cold, warm
 }
 
-func measureRecomputeDiskStore(indexer *Indexer, stateKeys map[types.NamespacedName]string, refs int) (cold time.Duration, warm time.Duration) {
+func measureRecomputeDiskStore(t *testing.T, indexer *Indexer, corpus string, refs int) (cold time.Duration, warm time.Duration) {
 	startCold := time.Now()
 	for i := 0; i < refs; i++ {
-		key := types.NamespacedName{Namespace: fmt.Sprintf("ns-%02d", i%20), Name: fmt.Sprintf("cm-%05d", i)}
-		_, _, _ = indexer.GetByKey(key.String())
+		key := getObjectKey(corpus, i)
+		item, exists, err := indexer.GetByKey(key.String())
+		if err != nil || !exists || item == nil {
+			t.Fatalf("DiskStore cold lookup failed for key %s (corpus %s): exists=%v, err=%v", key, corpus, exists, err)
+		}
 	}
 	cold = time.Since(startCold)
 
 	startWarm := time.Now()
 	for i := 0; i < refs; i++ {
-		key := types.NamespacedName{Namespace: fmt.Sprintf("ns-%02d", i%20), Name: fmt.Sprintf("cm-%05d", i)}
-		_, _, _ = indexer.GetByKey(key.String())
+		key := getObjectKey(corpus, i)
+		item, exists, err := indexer.GetByKey(key.String())
+		if err != nil || !exists || item == nil {
+			t.Fatalf("DiskStore warm lookup failed for key %s (corpus %s): exists=%v, err=%v", key, corpus, exists, err)
+		}
 	}
 	warm = time.Since(startWarm)
 
 	return cold, warm
 }
 
-type corpusBenchmarkResult struct {
-	Name             string
-	HeapDeltaMB      float64
-	RSSDeltaMB       float64
-	DiskSizeMB       float64
-	WriteDuration    time.Duration
-	Throughput       float64
-	RecoveryDuration time.Duration
-	Lat0Cold         time.Duration
-	Lat0Warm         time.Duration
-	Lat10Cold        time.Duration
-	Lat10Warm        time.Duration
-	Lat1000Cold      time.Duration
-	Lat1000Warm      time.Duration
+type WorkerResult struct {
+	Name             string  `json:"name"`
+	HeapInUseMB      float64 `json:"heap_in_use_mb"`
+	ProcessRSSMB     float64 `json:"process_rss_mb"`
+	DeltaRSSMB       float64 `json:"delta_rss_mb"`
+	HeapFileMB       float64 `json:"heap_file_mb"`
+	WalSizeMB        float64 `json:"wal_size_mb"`
+	TotalDiskMB      float64 `json:"total_disk_mb"`
+	WriteDurationSec float64 `json:"write_duration_sec"`
+	Throughput       float64 `json:"throughput"`
+	RecoveryMs       float64 `json:"recovery_ms"`
+	Lat0ColdUs       float64 `json:"lat_0_cold_us"`
+	Lat0WarmUs       float64 `json:"lat_0_warm_us"`
+	Lat10ColdUs      float64 `json:"lat_10_cold_us"`
+	Lat10WarmUs      float64 `json:"lat_10_warm_us"`
+	Lat1000ColdUs    float64 `json:"lat_1000_cold_us"`
+	Lat1000WarmUs    float64 `json:"lat_1000_warm_us"`
 }
 
-func runCorpusBenchmark(t *testing.T, corpusName string, objectCount int, getObj func(int) *corev1.ConfigMap) {
-	t.Logf("Running comparative benchmark for [%s] with %d objects (~%.1f MB data)...",
-		corpusName, objectCount, float64(objectCount)*10.0/1024.0)
-
-	baseMem := readMemStats()
-	var results []corpusBenchmarkResult
-
-	// Pre-create objects to exclude generation time from write measurements
-	objects := make([]*corev1.ConfigMap, objectCount)
-	stateKeys := make(map[types.NamespacedName]string, objectCount)
-	for i := 0; i < objectCount; i++ {
-		cm := getObj(i)
-		objects[i] = cm
-		stateKeys[types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}] = cm.ResourceVersion
+// TestDiskStore_Benchmark_Worker executes a single benchmark engine in an isolated OS process.
+func TestDiskStore_Benchmark_Worker(t *testing.T) {
+	if os.Getenv("BENCHMARK_WORKER") != "1" {
+		return
 	}
 
-	// 1. In-Memory Informer Baseline
-	{
-		runtime.GC()
+	corpus := os.Getenv("BENCHMARK_CORPUS")
+	engineType := os.Getenv("BENCHMARK_ENGINE")
+	count, _ := strconv.Atoi(os.Getenv("BENCHMARK_OBJECT_COUNT"))
+	if count <= 0 {
+		count = 2500
+	}
+
+	baseMem := readMemStats()
+
+	var res WorkerResult
+
+	switch engineType {
+	case "in-memory":
 		memIndexer := toolscache.NewIndexer(toolscache.DeletionHandlingMetaNamespaceKeyFunc, toolscache.Indexers{
 			toolscache.NamespaceIndex: toolscache.MetaNamespaceIndexFunc,
 		})
 
 		t0 := time.Now()
-		for _, cm := range objects {
+		for i := 0; i < count; i++ {
+			cm := getCorpusObject(corpus, i)
 			_ = memIndexer.Add(cm)
 		}
 		writeDur := time.Since(t0)
 
 		memAfter := readMemStats()
-		l0 := measureRecomputeMem(memIndexer, stateKeys, 0)
-		l10 := measureRecomputeMem(memIndexer, stateKeys, 10)
-		l1000 := measureRecomputeMem(memIndexer, stateKeys, 1000)
+		l0 := measureRecomputeMem(t, memIndexer, corpus, 0)
+		l10 := measureRecomputeMem(t, memIndexer, corpus, 10)
+		l1000 := measureRecomputeMem(t, memIndexer, corpus, 1000)
 
-		results = append(results, corpusBenchmarkResult{
-			Name:          "In-Memory Informer",
-			HeapDeltaMB:   memAfter.HeapInUseMB - baseMem.HeapInUseMB,
-			RSSDeltaMB:    memAfter.RSSMB - baseMem.RSSMB,
-			DiskSizeMB:    0,
-			WriteDuration: writeDur,
-			Throughput:    float64(objectCount) / writeDur.Seconds(),
-			Lat0Cold:      l0,
-			Lat0Warm:      l0,
-			Lat10Cold:     l10,
-			Lat10Warm:     l10,
-			Lat1000Cold:   l1000,
-			Lat1000Warm:   l1000,
-		})
+		res = WorkerResult{
+			Name:             "In-Memory Informer",
+			HeapInUseMB:      memAfter.HeapInUseMB - baseMem.HeapInUseMB,
+			ProcessRSSMB:     memAfter.RSSMB,
+			DeltaRSSMB:       memAfter.RSSMB - baseMem.RSSMB,
+			HeapFileMB:       0,
+			WalSizeMB:        0,
+			TotalDiskMB:      0,
+			WriteDurationSec: writeDur.Seconds(),
+			Throughput:       float64(count) / writeDur.Seconds(),
+			RecoveryMs:       0,
+			Lat0ColdUs:       float64(l0.Microseconds()),
+			Lat0WarmUs:       float64(l0.Microseconds()),
+			Lat10ColdUs:      float64(l10.Microseconds()),
+			Lat10WarmUs:      float64(l10.Microseconds()),
+			Lat1000ColdUs:    float64(l1000.Microseconds()),
+			Lat1000WarmUs:    float64(l1000.Microseconds()),
+		}
 
-		memIndexer = nil
-		runtime.GC()
-		runtime.GC()
-	}
-
-	// 2. BBolt Disk Store
-	{
+	case "bbolt":
 		cipherBbolt, err := bboltcache.NewEphemeralAESGCMCipher()
 		if err != nil {
 			t.Fatalf("cipher creation failed: %v", err)
@@ -498,7 +563,8 @@ func runCorpusBenchmark(t *testing.T, corpusName string, objectCount int, getObj
 		}
 
 		t0 := time.Now()
-		for _, cm := range objects {
+		for i := 0; i < count; i++ {
+			cm := getCorpusObject(corpus, i)
 			_ = bboltIndexer.Add(cm)
 		}
 		writeDur := time.Since(t0)
@@ -508,58 +574,63 @@ func runCorpusBenchmark(t *testing.T, corpusName string, objectCount int, getObj
 		diskSizeMB := float64(fiBBolt.Size()) / (1024 * 1024)
 
 		bboltResolver := bboltcache.NewLazyResolver("ConfigMap", "Secret", cipherBbolt)
-		l0Cold, l0Warm := measureRecomputeBBolt(bboltStore, bboltResolver, stateKeys, 0)
-		l10Cold, l10Warm := measureRecomputeBBolt(bboltStore, bboltResolver, stateKeys, 10)
-		l1000Cold, l1000Warm := measureRecomputeBBolt(bboltStore, bboltResolver, stateKeys, 1000)
+		l0Cold, l0Warm := measureRecomputeBBolt(t, bboltStore, bboltResolver, corpus, 0)
+		l10Cold, l10Warm := measureRecomputeBBolt(t, bboltStore, bboltResolver, corpus, 10)
+		l1000Cold, l1000Warm := measureRecomputeBBolt(t, bboltStore, bboltResolver, corpus, 1000)
 
 		_ = bboltStore.Close()
-		runtime.GC()
-		runtime.GC()
 
-		results = append(results, corpusBenchmarkResult{
+		res = WorkerResult{
 			Name:             "BBolt (mmap + NoSync)",
-			HeapDeltaMB:      memAfter.HeapInUseMB - baseMem.HeapInUseMB,
-			RSSDeltaMB:       memAfter.RSSMB - baseMem.RSSMB,
-			DiskSizeMB:       diskSizeMB,
-			WriteDuration:    writeDur,
-			Throughput:       float64(objectCount) / writeDur.Seconds(),
-			RecoveryDuration: 12 * time.Millisecond,
-			Lat0Cold:         l0Cold,
-			Lat0Warm:         l0Warm,
-			Lat10Cold:        l10Cold,
-			Lat10Warm:        l10Warm,
-			Lat1000Cold:      l1000Cold,
-			Lat1000Warm:      l1000Warm,
-		})
-	}
+			HeapInUseMB:      memAfter.HeapInUseMB - baseMem.HeapInUseMB,
+			ProcessRSSMB:     memAfter.RSSMB,
+			DeltaRSSMB:       memAfter.RSSMB - baseMem.RSSMB,
+			HeapFileMB:       diskSizeMB,
+			WalSizeMB:        0,
+			TotalDiskMB:      diskSizeMB,
+			WriteDurationSec: writeDur.Seconds(),
+			Throughput:       float64(count) / writeDur.Seconds(),
+			RecoveryMs:       12.0,
+			Lat0ColdUs:       float64(l0Cold.Microseconds()),
+			Lat0WarmUs:       float64(l0Warm.Microseconds()),
+			Lat10ColdUs:      float64(l10Cold.Microseconds()),
+			Lat10WarmUs:      float64(l10Warm.Microseconds()),
+			Lat1000ColdUs:    float64(l1000Cold.Microseconds()),
+			Lat1000WarmUs:    float64(l1000Warm.Microseconds()),
+		}
 
-	// 3. DiskStore Codecs: None, zstd, S2, Snappy
-	cipherDisk, err := engine.NewEphemeralAESGCMCipher()
-	if err != nil {
-		t.Fatalf("cipher creation failed: %v", err)
-	}
+	case "disk-none", "disk-zstd", "disk-s2", "disk-snappy":
+		var codec engine.CompressionCodec
+		var displayName string
+		switch engineType {
+		case "disk-none":
+			codec = engine.CodecNone
+			displayName = "DiskStore (None)"
+		case "disk-zstd":
+			codec = engine.CodecZstd
+			displayName = "DiskStore (zstd)"
+		case "disk-s2":
+			codec = engine.CodecS2
+			displayName = "DiskStore (S2)"
+		case "disk-snappy":
+			codec = engine.CodecSnappy
+			displayName = "DiskStore (Snappy)"
+		}
 
-	codecsToBenchmark := []struct {
-		name  string
-		codec engine.CompressionCodec
-	}{
-		{"DiskStore (None)", engine.CodecNone},
-		{"DiskStore (zstd)", engine.CodecZstd},
-		{"DiskStore (S2)", engine.CodecS2},
-		{"DiskStore (Snappy)", engine.CodecSnappy},
-	}
+		cipherDisk, err := engine.NewEphemeralAESGCMCipher()
+		if err != nil {
+			t.Fatalf("cipher creation failed: %v", err)
+		}
 
-	for _, bc := range codecsToBenchmark {
-		t.Logf("[%s] Measuring %s...", corpusName, bc.name)
 		diskDir := t.TempDir()
 		diskStore, err := engine.Open(
 			engine.WithDir(diskDir),
 			engine.WithCipher(cipherDisk),
 			engine.WithNumFrames(2048), // 8 MiB buffer pool
-			engine.WithCompressionCodec(bc.codec),
+			engine.WithCompressionCodec(codec),
 		)
 		if err != nil {
-			t.Fatalf("diskstore creation failed (%s): %v", bc.name, err)
+			t.Fatalf("diskstore creation failed: %v", err)
 		}
 
 		diskIndexer, err := New(diskStore, &corev1.ConfigMap{}, DefaultOnFatal,
@@ -567,11 +638,12 @@ func runCorpusBenchmark(t *testing.T, corpusName string, objectCount int, getObj
 			WithIndexerCodec(NewHybridCodec()),
 		)
 		if err != nil {
-			t.Fatalf("diskindexer creation failed (%s): %v", bc.name, err)
+			t.Fatalf("diskindexer creation failed: %v", err)
 		}
 
 		t0 := time.Now()
-		for i, cm := range objects {
+		for i := 0; i < count; i++ {
+			cm := getCorpusObject(corpus, i)
 			_ = diskIndexer.Add(cm)
 			if (i+1)%2500 == 0 {
 				_, _ = diskStore.Checkpoint()
@@ -580,84 +652,140 @@ func runCorpusBenchmark(t *testing.T, corpusName string, objectCount int, getObj
 		_, _ = diskStore.Checkpoint()
 		writeDur := time.Since(t0)
 
-		l0Cold, l0Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 0)
-		l10Cold, l10Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 10)
-		l1000Cold, l1000Warm := measureRecomputeDiskStore(diskIndexer, stateKeys, 1000)
+		memAfter := readMemStats()
 
-		// Close indexer before closing store to avoid background watcher goroutine leak
+		l0Cold, l0Warm := measureRecomputeDiskStore(t, diskIndexer, corpus, 0)
+		l10Cold, l10Warm := measureRecomputeDiskStore(t, diskIndexer, corpus, 10)
+		l1000Cold, l1000Warm := measureRecomputeDiskStore(t, diskIndexer, corpus, 1000)
+
 		_ = diskIndexer.Close()
 		_ = diskStore.Close()
 
-		memAfter := readMemStats()
-		diskSizeMB, _ := getDirSize(diskDir)
+		heapMB, walMB, totalMB, _ := getDiskBreakdown(diskDir)
 
-		// Measure recovery
 		t0 = time.Now()
 		recoveredStore, err := engine.Open(
 			engine.WithDir(diskDir),
 			engine.WithCipher(cipherDisk),
 			engine.WithNumFrames(2048),
-			engine.WithCompressionCodec(bc.codec),
+			engine.WithCompressionCodec(codec),
 		)
 		if err != nil {
-			t.Fatalf("reopening store for recovery failed (%s): %v", bc.name, err)
+			t.Fatalf("reopening store for recovery failed: %v", err)
 		}
 		recDur := time.Since(t0)
 		_ = recoveredStore.Close()
 
-		results = append(results, corpusBenchmarkResult{
-			Name:             bc.name,
-			HeapDeltaMB:      memAfter.HeapInUseMB - baseMem.HeapInUseMB,
-			RSSDeltaMB:       memAfter.RSSMB - baseMem.RSSMB,
-			DiskSizeMB:       diskSizeMB,
-			WriteDuration:    writeDur,
-			Throughput:       float64(objectCount) / writeDur.Seconds(),
-			RecoveryDuration: recDur,
-			Lat0Cold:         l0Cold,
-			Lat0Warm:         l0Warm,
-			Lat10Cold:        l10Cold,
-			Lat10Warm:        l10Warm,
-			Lat1000Cold:      l1000Cold,
-			Lat1000Warm:      l1000Warm,
-		})
+		res = WorkerResult{
+			Name:             displayName,
+			HeapInUseMB:      memAfter.HeapInUseMB - baseMem.HeapInUseMB,
+			ProcessRSSMB:     memAfter.RSSMB,
+			DeltaRSSMB:       memAfter.RSSMB - baseMem.RSSMB,
+			HeapFileMB:       heapMB,
+			WalSizeMB:        walMB,
+			TotalDiskMB:      totalMB,
+			WriteDurationSec: writeDur.Seconds(),
+			Throughput:       float64(count) / writeDur.Seconds(),
+			RecoveryMs:       float64(recDur.Milliseconds()),
+			Lat0ColdUs:       float64(l0Cold.Microseconds()),
+			Lat0WarmUs:       float64(l0Warm.Microseconds()),
+			Lat10ColdUs:      float64(l10Cold.Microseconds()),
+			Lat10WarmUs:      float64(l10Warm.Microseconds()),
+			Lat1000ColdUs:    float64(l1000Cold.Microseconds()),
+			Lat1000WarmUs:    float64(l1000Warm.Microseconds()),
+		}
+	}
 
-		runtime.GC()
-		runtime.GC()
+	payload, _ := json.Marshal(res)
+	fmt.Printf("RESULT_JSON:%s\n", string(payload))
+}
+
+func runSubprocessBenchmark(t *testing.T, corpus string, engineName string, count int) WorkerResult {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDiskStore_Benchmark_Worker$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"BENCHMARK_WORKER=1",
+		"BENCHMARK_CORPUS="+corpus,
+		"BENCHMARK_ENGINE="+engineName,
+		fmt.Sprintf("BENCHMARK_OBJECT_COUNT=%d", count),
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worker failed (%s, %s): %v\nOutput:\n%s", corpus, engineName, err, string(out))
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "RESULT_JSON:") {
+			jsonStr := strings.TrimPrefix(line, "RESULT_JSON:")
+			var res WorkerResult
+			if err := json.Unmarshal([]byte(jsonStr), &res); err != nil {
+				t.Fatalf("failed to unmarshal worker result: %v", err)
+			}
+			return res
+		}
+	}
+	t.Fatalf("no RESULT_JSON found in worker output for %s %s:\n%s", corpus, engineName, string(out))
+	return WorkerResult{}
+}
+
+func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, objectCount int) {
+	t.Logf("Running comparative benchmark for [%s] with %d objects (~%.1f MB data)...",
+		corpusName, objectCount, float64(objectCount)*10.0/1024.0)
+
+	engines := []struct {
+		id   string
+		name string
+	}{
+		{"in-memory", "In-Memory Informer"},
+		{"bbolt", "BBolt (mmap + NoSync)"},
+		{"disk-none", "DiskStore (None)"},
+		{"disk-zstd", "DiskStore (zstd)"},
+		{"disk-s2", "DiskStore (S2)"},
+		{"disk-snappy", "DiskStore (Snappy)"},
+	}
+
+	var results []WorkerResult
+	for _, eng := range engines {
+		t.Logf("[%s] Running isolated worker for %s...", corpusName, eng.name)
+		res := runSubprocessBenchmark(t, corpusID, eng.id, objectCount)
+		results = append(results, res)
 	}
 
 	// Output Results Table for Corpus
-	fmt.Println("\n================================================================================================================================================")
+	fmt.Println("\n====================================================================================================================================================================")
 	fmt.Printf("COMPARATIVE BENCHMARK: %s (%d objects, ~10 KB each)\n", corpusName, objectCount)
-	fmt.Println("================================================================================================================================================")
-	fmt.Printf("%-30s | %-12s | %-12s | %-12s | %-12s | %-14s | %-12s\n",
-		"Storage Engine", "Heap In-Use", "Process RSS", "Disk Size", "Write Time", "Write Thruput", "Recovery")
-	fmt.Println("------------------------------------------------------------------------------------------------------------------------------------------------")
+	fmt.Println("====================================================================================================================================================================")
+	fmt.Printf("%-24s | %-12s | %-12s | %-12s | %-10s | %-12s | %-12s | %-14s | %-10s\n",
+		"Storage Engine", "Heap In-Use", "Process RSS", "Heap File", "WAL Size", "Total Disk", "Write Time", "Write Thruput", "Recovery")
+	fmt.Println("--------------------------------------------------------------------------------------------------------------------------------------------------------------------")
 	for _, res := range results {
-		recStr := fmt.Sprintf("%.2f ms", float64(res.RecoveryDuration.Milliseconds()))
+		recStr := fmt.Sprintf("%.2f ms", res.RecoveryMs)
 		if res.Name == "In-Memory Informer" {
 			recStr = "-"
 		}
-		diskStr := fmt.Sprintf("%.2f MB", res.DiskSizeMB)
+		heapFileStr := fmt.Sprintf("%.2f MB", res.HeapFileMB)
+		walStr := fmt.Sprintf("%.2f MB", res.WalSizeMB)
+		diskStr := fmt.Sprintf("%.2f MB", res.TotalDiskMB)
 		if res.Name == "In-Memory Informer" {
+			heapFileStr = "-"
+			walStr = "-"
 			diskStr = "0 MB (RAM)"
 		}
-		fmt.Printf("%-30s | %10.2f MB | %10.2f MB | %12s | %10.2f s | %10.0f op/s | %12s\n",
-			res.Name, res.HeapDeltaMB, res.RSSDeltaMB, diskStr, res.WriteDuration.Seconds(), res.Throughput, recStr)
+		fmt.Printf("%-24s | %10.2f MB | %10.2f MB | %10s | %8s | %10s | %10.2f s | %10.0f op/s | %10s\n",
+			res.Name, res.HeapInUseMB, res.ProcessRSSMB, heapFileStr, walStr, diskStr, res.WriteDurationSec, res.Throughput, recStr)
 	}
-	fmt.Println("------------------------------------------------------------------------------------------------------------------------------------------------")
+	fmt.Println("--------------------------------------------------------------------------------------------------------------------------------------------------------------------")
 	fmt.Println("Recompute Latency Comparison:")
 	for _, res := range results {
 		if res.Name == "In-Memory Informer" {
 			fmt.Printf("  %-23s:         0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-				res.Name, float64(res.Lat0Cold.Microseconds()), float64(res.Lat10Cold.Microseconds()), float64(res.Lat1000Cold.Microseconds()))
+				res.Name, res.Lat0ColdUs, res.Lat10ColdUs, res.Lat1000ColdUs)
 		} else {
 			fmt.Printf("  %-23s (Cold): 0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-				res.Name, float64(res.Lat0Cold.Microseconds()), float64(res.Lat10Cold.Microseconds()), float64(res.Lat1000Cold.Microseconds()))
+				res.Name, res.Lat0ColdUs, res.Lat10ColdUs, res.Lat1000ColdUs)
 			fmt.Printf("  %-23s (Warm): 0 refs = %6.2f µs |   10 refs = %6.2f µs | 1000 refs = %8.2f µs\n",
-				res.Name, float64(res.Lat0Warm.Microseconds()), float64(res.Lat10Warm.Microseconds()), float64(res.Lat1000Warm.Microseconds()))
+				res.Name, res.Lat0WarmUs, res.Lat10WarmUs, res.Lat1000WarmUs)
 		}
 	}
-	fmt.Println("================================================================================================================================================")
+	fmt.Println("====================================================================================================================================================================")
 }
 
 func TestDiskStore_Versus_BBolt_MeasurementSuite(t *testing.T) {
@@ -666,8 +794,8 @@ func TestDiskStore_Versus_BBolt_MeasurementSuite(t *testing.T) {
 	}
 
 	// Run realistic benchmarks for each individual corpus type and the comprehensive mixed corpus
-	runCorpusBenchmark(t, "Configuration Text (JSON)", 2500, generateConfigTextObject)
-	runCorpusBenchmark(t, "TLS Material (x509 PEM)", 2500, generateTLSObject)
-	runCorpusBenchmark(t, "Random Incompressible Bytes", 2500, generateRandomBytesObject)
-	runCorpusBenchmark(t, "Mixed Realistic Corpus", 10000, generateMixedObject)
+	runCorpusBenchmark(t, "Configuration Text (JSON)", "config-text", 2500)
+	runCorpusBenchmark(t, "TLS Material (x509 PEM)", "tls-material", 2500)
+	runCorpusBenchmark(t, "Random Incompressible Bytes", "random-bytes", 2500)
+	runCorpusBenchmark(t, "Mixed Realistic Corpus", "mixed", 10000)
 }
