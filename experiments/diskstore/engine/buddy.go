@@ -178,17 +178,7 @@ func (b *BuddyAllocator) allocateLocked(order int) (uint64, error) {
 	return block, nil
 }
 
-// Free releases previously allocated blocks starting at block and merges buddies.
-func (b *BuddyAllocator) Free(block uint64) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	order, exists := b.allocated[block]
-	if !exists {
-		return fmt.Errorf("block %d not allocated", block)
-	}
-	delete(b.allocated, block)
-
+func (b *BuddyAllocator) insertAndCoalesceFreeLocked(order int, block uint64) {
 	currBlock := block
 	currOrder := order
 	for currOrder < MaxOrder {
@@ -206,7 +196,125 @@ func (b *BuddyAllocator) Free(block uint64) error {
 	}
 
 	b.insertFree(currOrder, currBlock)
+}
+
+func (b *BuddyAllocator) returnFreeRangeLocked(start, count uint64) {
+	curr := start
+	end := start + count
+	for curr < end {
+		order := 0
+		for order < MaxOrder {
+			nextOrder := order + 1
+			blockSize := uint64(1 << nextOrder)
+			if curr+blockSize <= end && curr%blockSize == 0 {
+				order = nextOrder
+			} else {
+				break
+			}
+		}
+		b.insertAndCoalesceFreeLocked(order, curr)
+		curr += uint64(1 << order)
+	}
+}
+
+// Free releases previously allocated blocks starting at block and merges buddies.
+func (b *BuddyAllocator) Free(block uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	order, exists := b.allocated[block]
+	if !exists {
+		return fmt.Errorf("block %d not allocated", block)
+	}
+	delete(b.allocated, block)
+
+	b.insertAndCoalesceFreeLocked(order, block)
 	return nil
+}
+
+// AllocateBatch reserves a contiguous extent of physical blocks for a batch of pages,
+// recording each individual page allocation in the allocator.
+// It sorts orders internally (largest first) so all pages are naturally aligned,
+// and returns the allocated starting block for each page in the caller's original input order.
+func (b *BuddyAllocator) AllocateBatch(orders []int) ([]uint64, error) {
+	if len(orders) == 0 {
+		return nil, nil
+	}
+	totalBlocks := 0
+	for _, o := range orders {
+		if o < MinOrder || o > MaxOrder {
+			return nil, fmt.Errorf("invalid order %d in batch", o)
+		}
+		totalBlocks += 1 << o
+	}
+	if totalBlocks > (1 << MaxOrder) {
+		return nil, fmt.Errorf("batch total blocks %d exceeds maximum extent size %d", totalBlocks, 1<<MaxOrder)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.allocateBatchLocked(orders, totalBlocks)
+}
+
+func (b *BuddyAllocator) allocateBatchLocked(orders []int, totalBlocks int) ([]uint64, error) {
+	minOrder := 0
+	for (1 << minOrder) < totalBlocks {
+		minOrder++
+	}
+
+	targetOrder := -1
+	var lowestBlock uint64 = ^uint64(0)
+	for o := minOrder; o <= MaxOrder; o++ {
+		if len(b.freeLists[o]) > 0 {
+			blk := b.freeLists[o][0]
+			if blk < lowestBlock {
+				lowestBlock = blk
+				targetOrder = o
+			}
+		}
+	}
+
+	if targetOrder == -1 {
+		b.growLocked(DefaultGrowBlocks)
+		for o := minOrder; o <= MaxOrder; o++ {
+			if len(b.freeLists[o]) > 0 {
+				blk := b.freeLists[o][0]
+				if blk < lowestBlock {
+					lowestBlock = blk
+					targetOrder = o
+				}
+			}
+		}
+	}
+
+	startBlock := b.freeLists[targetOrder][0]
+	b.removeFree(targetOrder, startBlock)
+	extentSize := uint64(1 << targetOrder)
+	if rem := extentSize - uint64(totalBlocks); rem > 0 {
+		b.returnFreeRangeLocked(startBlock+uint64(totalBlocks), rem)
+	}
+
+	type batchItem struct {
+		origIdx int
+		order   int
+	}
+	items := make([]batchItem, len(orders))
+	for i, o := range orders {
+		items[i] = batchItem{origIdx: i, order: o}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].order > items[j].order
+	})
+
+	locs := make([]uint64, len(orders))
+	curr := startBlock
+	for _, it := range items {
+		locs[it.origIdx] = curr
+		b.allocated[curr] = it.order
+		curr += uint64(1 << it.order)
+	}
+	return locs, nil
 }
 
 // MarkAllocated marks specific blocks as allocated during crash recovery.

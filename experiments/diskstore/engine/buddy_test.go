@@ -114,3 +114,129 @@ func TestBuddyAllocator_TailTruncation(t *testing.T) {
 	_ = alloc.Free(b0)
 	_ = alloc.Free(b1)
 }
+
+func TestBuddyAllocator_AllocateBatch(t *testing.T) {
+	alloc := NewBuddyAllocator(512)
+
+	// Test 1: Batch of 16 single-block pages (order 0)
+	orders := make([]int, 16)
+	locs, err := alloc.AllocateBatch(orders)
+	if err != nil {
+		t.Fatalf("AllocateBatch failed: %v", err)
+	}
+	if len(locs) != 16 {
+		t.Fatalf("expected 16 locations, got %d", len(locs))
+	}
+	// Verify contiguous layout
+	for i := 1; i < 16; i++ {
+		if locs[i] != locs[i-1]+1 {
+			t.Fatalf("locs not contiguous: locs[%d]=%d, locs[%d]=%d", i-1, locs[i-1], i, locs[i])
+		}
+	}
+
+	// Free all 16 blocks; they should coalesce back to order 4
+	for _, blk := range locs {
+		if err := alloc.Free(blk); err != nil {
+			t.Fatalf("Free failed on block %d: %v", blk, err)
+		}
+	}
+
+	// Should be able to allocate order 4 at the original start block
+	order4Blk, err := alloc.Allocate(4)
+	if err != nil || order4Blk != locs[0] {
+		t.Fatalf("expected coalesced order 4 block %d, got %d, err=%v", locs[0], order4Blk, err)
+	}
+	_ = alloc.Free(order4Blk)
+
+	// Test 2: Mixed orders sorted descending (order 2, order 1, order 0, order 0)
+	// Total = 4 + 2 + 1 + 1 = 8 blocks
+	mixedOrders := []int{2, 1, 0, 0}
+	mixedLocs, err := alloc.AllocateBatch(mixedOrders)
+	if err != nil {
+		t.Fatalf("AllocateBatch mixed failed: %v", err)
+	}
+	// Verify contiguous
+	expectedOffsets := []uint64{0, 4, 6, 7}
+	for i, off := range expectedOffsets {
+		if mixedLocs[i] != mixedLocs[0]+off {
+			t.Fatalf("mixedLocs[%d] mismatch: expected %d, got %d", i, mixedLocs[0]+off, mixedLocs[i])
+		}
+	}
+	// Verify alignment
+	if mixedLocs[0]%4 != 0 {
+		t.Fatalf("order 2 block not 4-aligned: %d", mixedLocs[0])
+	}
+	if mixedLocs[1]%2 != 0 {
+		t.Fatalf("order 1 block not 2-aligned: %d", mixedLocs[1])
+	}
+
+	// Free all mixed blocks
+	for _, blk := range mixedLocs {
+		if err := alloc.Free(blk); err != nil {
+			t.Fatalf("Free mixed block %d failed: %v", blk, err)
+		}
+	}
+
+	// Test 3: Unsorted orders [0, 2, 1] must be naturally aligned and returned in caller's order
+	unsortedOrders := []int{0, 2, 1}
+	unsortedLocs, err := alloc.AllocateBatch(unsortedOrders)
+	if err != nil {
+		t.Fatalf("AllocateBatch unsorted failed: %v", err)
+	}
+	if len(unsortedLocs) != 3 {
+		t.Fatalf("expected 3 locs, got %d", len(unsortedLocs))
+	}
+	// Verify each location is naturally aligned to its order
+	for i, o := range unsortedOrders {
+		align := uint64(1 << o)
+		if unsortedLocs[i]%align != 0 {
+			t.Fatalf("unsortedLocs[%d] (order %d) block %d not %d-aligned", i, o, unsortedLocs[i], align)
+		}
+	}
+	// The largest order (order 2) is at index 1 -> offset 0
+	// The next largest (order 1) is at index 2 -> offset 4
+	// The order 0 is at index 0 -> offset 6
+	base := unsortedLocs[1]
+	if unsortedLocs[2] != base+4 {
+		t.Fatalf("expected order 1 at base+4, got %d (base %d)", unsortedLocs[2], base)
+	}
+	if unsortedLocs[0] != base+6 {
+		t.Fatalf("expected order 0 at base+6, got %d (base %d)", unsortedLocs[0], base)
+	}
+
+	// Free all blocks in arbitrary order; must coalesce cleanly back to order 3
+	_ = alloc.Free(unsortedLocs[0])
+	_ = alloc.Free(unsortedLocs[2])
+	_ = alloc.Free(unsortedLocs[1])
+
+	order3Blk, err := alloc.Allocate(3)
+	if err != nil || order3Blk != base {
+		t.Fatalf("expected coalesced order 3 block %d, got %d, err=%v", base, order3Blk, err)
+	}
+	_ = alloc.Free(order3Blk)
+
+	// Test 4: Maximum extent batch (512 single-block pages = 1 << MaxOrder)
+	maxBatchOrders := make([]int, 512)
+	maxLocs, err := alloc.AllocateBatch(maxBatchOrders)
+	if err != nil {
+		t.Fatalf("AllocateBatch 512 failed: %v", err)
+	}
+	if len(maxLocs) != 512 {
+		t.Fatalf("expected 512 locs, got %d", len(maxLocs))
+	}
+	for i := 1; i < 512; i++ {
+		if maxLocs[i] != maxLocs[i-1]+1 {
+			t.Fatalf("maxLocs not contiguous at %d: %d vs %d", i, maxLocs[i-1], maxLocs[i])
+		}
+	}
+	for _, blk := range maxLocs {
+		_ = alloc.Free(blk)
+	}
+
+	// Test 5: Batch exceeding MaxOrder (513 single-block pages) must be rejected
+	oversizeOrders := make([]int, 513)
+	_, err = alloc.AllocateBatch(oversizeOrders)
+	if err == nil {
+		t.Fatalf("expected error for batch exceeding MaxOrder extent, got nil")
+	}
+}
