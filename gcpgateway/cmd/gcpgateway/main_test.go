@@ -16,14 +16,18 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
@@ -32,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -108,6 +113,77 @@ func TestSetupController_FakeComputeFlag(t *testing.T) {
 	}
 	if opts.SetupWithManager == nil {
 		t.Errorf("expected SetupWithManager to be set")
+	}
+}
+
+func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expectedDrainSeconds int, expectedGracePeriod int64) {
+	t.Helper()
+
+	// 1. TerminationGracePeriodSeconds derived from --drain-seconds
+	if deploy.Spec.Template.Spec.TerminationGracePeriodSeconds == nil {
+		t.Errorf("expected TerminationGracePeriodSeconds to be set, got nil")
+	} else if *deploy.Spec.Template.Spec.TerminationGracePeriodSeconds != expectedGracePeriod {
+		t.Errorf("expected TerminationGracePeriodSeconds=%d, got %d", expectedGracePeriod, *deploy.Spec.Template.Spec.TerminationGracePeriodSeconds)
+	}
+
+	// 2. Pre-stop command
+	if len(deploy.Spec.Template.Spec.Containers) == 0 {
+		t.Fatalf("expected at least 1 container in Deployment template, got 0")
+	}
+	c := deploy.Spec.Template.Spec.Containers[0]
+	if c.Lifecycle == nil || c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil {
+		t.Fatalf("expected Lifecycle.PreStop.Exec to be configured on container")
+	}
+	expectedPreStop := []string{
+		"/gcpgateway",
+		"hook",
+		"pre-stop",
+		fmt.Sprintf("--drain-seconds=%d", expectedDrainSeconds),
+	}
+	if !slices.Equal(c.Lifecycle.PreStop.Exec.Command, expectedPreStop) {
+		t.Errorf("expected pre-stop command %v, got %v", expectedPreStop, c.Lifecycle.PreStop.Exec.Command)
+	}
+
+	// 3. Drain volume (memory-backed EmptyDir)
+	var foundVol bool
+	for _, v := range deploy.Spec.Template.Spec.Volumes {
+		if v.Name == "drain-volume" {
+			foundVol = true
+			if v.EmptyDir == nil || v.EmptyDir.Medium != corev1.StorageMediumMemory {
+				t.Errorf("expected drain-volume to have memory-backed EmptyDir, got %+v", v.EmptyDir)
+			}
+			break
+		}
+	}
+	if !foundVol {
+		t.Errorf("expected 'drain-volume' in Deployment template volumes")
+	}
+
+	// 4. Drain volume mount (/var/run/gcpgateway)
+	var foundMount bool
+	for _, m := range c.VolumeMounts {
+		if m.Name == "drain-volume" {
+			foundMount = true
+			if m.MountPath != "/var/run/gcpgateway" {
+				t.Errorf("expected drain-volume mount path '/var/run/gcpgateway', got %q", m.MountPath)
+			}
+			break
+		}
+	}
+	if !foundMount {
+		t.Errorf("expected 'drain-volume' mount in container volumeMounts")
+	}
+
+	// 5. Readiness gate
+	var foundGate bool
+	for _, g := range deploy.Spec.Template.Spec.ReadinessGates {
+		if g.ConditionType == corev1.PodConditionType(LoadBalancerReadyGate) {
+			foundGate = true
+			break
+		}
+	}
+	if !foundGate {
+		t.Errorf("expected readiness gate %s in Deployment template, got %+v", LoadBalancerReadyGate, deploy.Spec.Template.Spec.ReadinessGates)
 	}
 }
 
@@ -208,28 +284,58 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		t.Fatalf("SetupController failed: %v", err)
 	}
 
-	// 2. Provision data plane Deployment via AddressProvider
-	ap := singlepod.NewAddressProvider(
-		env.Client,
-		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
-		singlepod.WithTerminationGracePeriodSeconds(60),
-	)
-
-	_, _, err = ap.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	trueVal := true
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:                 env.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		Controller: config.Controller{
+			SkipNameValidation: &trueVal,
+		},
+	})
 	if err != nil {
-		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+		t.Fatalf("failed to create manager: %v", err)
 	}
+	opts.Manager = mgr
+
+	server, err := gari.New(opts)
+	if err != nil {
+		t.Fatalf("gari.New failed: %v", err)
+	}
+
+	// 2. Start GARI manager in background; GARI supplies the client,
+	// executes opts.SetupWithManager, and provisions the Deployment.
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	defer cancelMgr()
+	mgrErrCh := make(chan error, 1)
+	go func() {
+		if err := server.Manager().Start(mgrCtx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("manager exited with error: %v", err)
+			mgrErrCh <- err
+		}
+	}()
+	t.Cleanup(func() {
+		cancelMgr()
+		select {
+		case err := <-mgrErrCh:
+			t.Errorf("manager error reported during cleanup: %v", err)
+		default:
+		}
+	})
 
 	resName := singlepod.ResourceNameForGateway(gw.Name)
 	var deploy appsv1.Deployment
-	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
-		t.Fatalf("failed to get created Deployment: %v", err)
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {
+			break
+		}
+	}
+	if deploy.Name == "" {
+		t.Fatalf("timed out waiting for Deployment %s to be created by GARI", resName)
 	}
 
-	// Verify terminationGracePeriodSeconds on real Deployment template
-	if deploy.Spec.Template.Spec.TerminationGracePeriodSeconds == nil || *deploy.Spec.Template.Spec.TerminationGracePeriodSeconds != 60 {
-		t.Errorf("expected TerminationGracePeriodSeconds=60, got %v", deploy.Spec.Template.Spec.TerminationGracePeriodSeconds)
-	}
+	// Assert production-derived properties on real Deployment template (drain-seconds=35 -> grace period 60)
+	assertProductionDeployment(t, &deploy, 35, 60)
 
 	// 3. Create real data-plane Pod matching the Deployment template via testenv.BuildPodFromDeployment
 	pod := testenv.BuildPodFromDeployment(
@@ -257,28 +363,7 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 		t.Fatalf("updating pod status: %v", err)
 	}
 
-	// 4. Initialize real controller-runtime Manager and execute opts.SetupWithManager
-	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
-		Scheme:                 env.Scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
-		HealthProbeBindAddress: "0",
-	})
-	if err != nil {
-		t.Fatalf("failed to create manager: %v", err)
-	}
-
-	if err := opts.SetupWithManager(mgr); err != nil {
-		t.Fatalf("SetupWithManager failed: %v", err)
-	}
-
-	// 5. Start manager in background
-	mgrCtx, cancelMgr := context.WithCancel(t.Context())
-	defer cancelMgr()
-	go func() {
-		_ = mgr.Start(mgrCtx)
-	}()
-
-	// 6. Assertions with timeout:
+	// 4. Assertions with timeout:
 	// a. Pod endpoint attached to zonal NEG in fake GCP
 	// b. Pod readiness gate patched to True
 	// c. Gateway Programmed condition set to True
@@ -327,4 +412,115 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 	if !foundProg {
 		t.Errorf("expected Gateway Programmed=True, conditions are: %+v", updatedGW.Status.Conditions)
 	}
+}
+
+// TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds verifies that GARI
+// provisions a data-plane Deployment deriving the non-default grace period (45 + 25 = 70)
+// and pre-stop command (--drain-seconds=45) from SetupController.
+func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) {
+	env := testenv.Start(t)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gcpgateway",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+	if err := env.Client.Create(t.Context(), gc); err != nil {
+		t.Fatalf("creating GatewayClass: %v", err)
+	}
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw-drain45",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  &ipAddrType,
+					Value: "34.120.254.20",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(t.Context(), gw); err != nil {
+		t.Fatalf("creating Gateway: %v", err)
+	}
+
+	fakeGCP := gcp.NewFakeComputeClient()
+
+	opts, err := SetupController(t.Context(), []string{
+		"--cluster-id=cluster-1",
+		"--neg-prefix=gcpgw",
+		"--project=my-project",
+		"--zones=us-central1-a",
+		"--drain-seconds=45",
+		"--fake-compute",
+	}, fakeGCP)
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+
+	trueVal := true
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:                 env.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		Controller: config.Controller{
+			SkipNameValidation: &trueVal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating manager: %v", err)
+	}
+	opts.Manager = mgr
+
+	server, err := gari.New(opts)
+	if err != nil {
+		t.Fatalf("gari.New failed: %v", err)
+	}
+
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	defer cancelMgr()
+	mgrErrCh := make(chan error, 1)
+	go func() {
+		if err := server.Manager().Start(mgrCtx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("manager exited with error: %v", err)
+			mgrErrCh <- err
+		}
+	}()
+	t.Cleanup(func() {
+		cancelMgr()
+		select {
+		case err := <-mgrErrCh:
+			t.Errorf("manager error reported during cleanup: %v", err)
+		default:
+		}
+	})
+
+	resName := singlepod.ResourceNameForGateway(gw.Name)
+	var deploy appsv1.Deployment
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {
+			break
+		}
+	}
+	if deploy.Name == "" {
+		t.Fatalf("timed out waiting for Deployment %s to be created by GARI", resName)
+	}
+
+	// drain-seconds=45 -> 45 + 25 = 70 (strictly greater than the 60s minimum clamp)
+	assertProductionDeployment(t, &deploy, 45, 70)
 }
