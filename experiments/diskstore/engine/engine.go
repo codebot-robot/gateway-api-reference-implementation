@@ -90,7 +90,7 @@ func WithClock(clock Clock) Option {
 	}
 }
 
-// WithCompressionCodec sets the compression algorithm to use (CodecNone, CodecZstd, CodecS2).
+// WithCompressionCodec sets the compression algorithm to use (CodecNone, CodecZstd).
 func WithCompressionCodec(codec CompressionCodec) Option {
 	return func(o *Options) {
 		o.CompressionCodec = codec
@@ -266,6 +266,16 @@ func wipeStoreFiles(fs FS, dir string) error {
 	return nil
 }
 
+const (
+	// StoreFormatVersion is the format version recorded in meta.db.
+	// Version 1 did not record a version and stored uncompressed values without a codec byte.
+	// Version 2 records this version in meta.db and prefixes each stored value with a codec byte.
+	StoreFormatVersion uint32 = 2
+
+	// metaFileSize is 16 bytes DB ID + 4 bytes StoreFormatVersion.
+	metaFileSize = 20
+)
+
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
@@ -337,7 +347,7 @@ func Open(opts ...Option) (*Engine, error) {
 	var dbID [16]byte
 	isNewStore := false
 
-	// Read or generate database ID
+	// Read or generate database ID and verify store format version
 	metaFile, err := options.FS.OpenFile(metaPath, os.O_RDWR, 0644)
 	if err != nil {
 		if os.IsNotExist(err) || errors.Is(err, os.ErrNotExist) {
@@ -378,32 +388,59 @@ func Open(opts ...Option) (*Engine, error) {
 			}
 
 			isNewStore = true
-			if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
-				return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
-			}
-			metaFile, err = options.FS.Create(metaPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create meta file: %w", err)
-			}
-			if _, wErr := metaFile.WriteAt(dbID[:], 0); wErr != nil {
-				closeErr := metaFile.Close()
-				return nil, errors.Join(wErr, closeErr)
-			}
-			if err := metaFile.Sync(); err != nil {
-				closeErr := metaFile.Close()
-				return nil, errors.Join(fmt.Errorf("failed to sync meta file: %w", err), closeErr)
-			}
 		} else {
 			return nil, err
 		}
 	} else {
-		if _, rErr := metaFile.ReadAt(dbID[:], 0); rErr != nil {
-			closeErr := metaFile.Close()
-			return nil, errors.Join(fmt.Errorf("failed to read DB ID from meta: %w", rErr), closeErr)
+		// meta.db exists. Read dbID and store format version.
+		metaBuf := make([]byte, metaFileSize)
+		n, rErr := metaFile.ReadAt(metaBuf, 0)
+		if cErr := metaFile.Close(); cErr != nil {
+			return nil, fmt.Errorf("failed to close meta file: %w", cErr)
+		}
+
+		validVersion := false
+		if (rErr == nil || errors.Is(rErr, io.EOF)) && n >= metaFileSize {
+			version := binary.BigEndian.Uint32(metaBuf[16:20])
+			if version == StoreFormatVersion {
+				validVersion = true
+				copy(dbID[:], metaBuf[:16])
+			}
+		}
+
+		if !validVersion {
+			// Missing format version (e.g. 16-byte version 1 meta.db) or version mismatch:
+			// wipe the store and initialize a fresh database.
+			if wipeErr := wipeStoreFiles(options.FS, dir); wipeErr != nil {
+				return nil, fmt.Errorf("failed to wipe outdated store: %w", wipeErr)
+			}
+			wiped = true
+			isNewStore = true
 		}
 	}
-	if err := metaFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close meta file: %w", err)
+
+	if isNewStore {
+		if _, randErr := io.ReadFull(rand.Reader, dbID[:]); randErr != nil {
+			return nil, fmt.Errorf("failed to generate DB ID: %w", randErr)
+		}
+		metaFile, err = options.FS.Create(metaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create meta file: %w", err)
+		}
+		metaBuf := make([]byte, metaFileSize)
+		copy(metaBuf[:16], dbID[:])
+		binary.BigEndian.PutUint32(metaBuf[16:20], StoreFormatVersion)
+		if _, wErr := metaFile.WriteAt(metaBuf, 0); wErr != nil {
+			closeErr := metaFile.Close()
+			return nil, errors.Join(wErr, closeErr)
+		}
+		if err := metaFile.Sync(); err != nil {
+			closeErr := metaFile.Close()
+			return nil, errors.Join(fmt.Errorf("failed to sync meta file: %w", err), closeErr)
+		}
+		if err := metaFile.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close meta file: %w", err)
+		}
 	}
 	if err := options.FS.SyncDir(dir); err != nil {
 		return nil, fmt.Errorf("failed to sync directory after meta file creation: %w", err)
@@ -887,7 +924,7 @@ func (s *Engine) MaxObjectSize() int {
 }
 
 func (s *Engine) compress(payload []byte) ([]byte, error) {
-	return compressValue(payload, s.compressionCodec, s.compressionThreshold)
+	return compressValue(payload, s.compressionCodec, s.compressionThreshold, s.maxObjectSize)
 }
 
 func (s *Engine) decompress(data []byte) ([]byte, error) {

@@ -599,7 +599,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			Lat1000WarmUs:    float64(l1000Warm.Microseconds()),
 		}
 
-	case "disk-none", "disk-zstd", "disk-s2", "disk-snappy":
+	case "disk-none", "disk-zstd":
 		var codec engine.CompressionCodec
 		var displayName string
 		switch engineType {
@@ -609,12 +609,6 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		case "disk-zstd":
 			codec = engine.CodecZstd
 			displayName = "DiskStore (zstd)"
-		case "disk-s2":
-			codec = engine.CodecS2
-			displayName = "DiskStore (S2)"
-		case "disk-snappy":
-			codec = engine.CodecSnappy
-			displayName = "DiskStore (Snappy)"
 		}
 
 		cipherDisk, err := engine.NewEphemeralAESGCMCipher()
@@ -738,8 +732,6 @@ func runCorpusBenchmark(t *testing.T, corpusName string, corpusID string, object
 		{"bbolt", "BBolt (mmap + NoSync)"},
 		{"disk-none", "DiskStore (None)"},
 		{"disk-zstd", "DiskStore (zstd)"},
-		{"disk-s2", "DiskStore (S2)"},
-		{"disk-snappy", "DiskStore (Snappy)"},
 	}
 
 	var results []WorkerResult

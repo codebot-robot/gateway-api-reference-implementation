@@ -20,10 +20,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 
-	"github.com/klauspost/compress/s2"
-	"github.com/klauspost/compress/snappy"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -155,7 +154,7 @@ func TestCompression_ThresholdAndRawFallback(t *testing.T) {
 	}
 }
 
-// TestCompression_RoundTripAllCodecs tests round-trips for CodecNone, CodecZstd, and CodecS2
+// TestCompression_RoundTripAllCodecs tests round-trips for CodecNone and CodecZstd
 // at sizes on both sides of the threshold and of every page-class boundary.
 func TestCompression_RoundTripAllCodecs(t *testing.T) {
 	codecs := []struct {
@@ -164,22 +163,8 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 	}{
 		{"none", CodecNone},
 		{"zstd", CodecZstd},
-		{"s2", CodecS2},
-		{"snappy", CodecSnappy},
 	}
 
-	// Test boundary sizes:
-	// Below threshold: 500, 3990
-	// At/above threshold: 4000, 4010
-	// 2-block vs 4-block boundary (8050 bytes): 8040, 8060
-	// 4-block vs 8-block boundary (16178 bytes): 16170, 16190
-	// 8-block vs 16-block boundary (32434 bytes): 32420, 32450
-	// 16-block vs 32-block (64946 bytes): 64940, 64960
-	// 32-block vs 64-block (129970 bytes): 129960, 129980
-	// 64-block vs 128-block (260018 bytes): 260000, 260030
-	// 128-block vs 256-block (520114 bytes): 520100, 520130
-	// 256-block vs 512-block (1040306 bytes): 1040300, 1040320
-	// 512-block vs oversize (2080704 bytes): 2080000, 2100000
 	testSizes := []int{
 		500, 3990, 4000, 4010,
 		8040, 8060,
@@ -229,6 +214,140 @@ func TestCompression_RoundTripAllCodecs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCompression_PayloadExceedingMaxObjectSize_StoredRawAndReadable asserts that payloads exceeding
+// MaxObjectSize are stored uncompressed with CodecNone rather than rejected or failing on read.
+func TestCompression_PayloadExceedingMaxObjectSize_StoredRawAndReadable(t *testing.T) {
+	memFS := NewMemFS()
+	const customMaxObjSize = 5000
+	store, err := Open(
+		WithFS(memFS),
+		WithDir("test_max_object_size_fallback"),
+		WithCompressionCodec(CodecZstd),
+		WithMaxObjectSize(customMaxObjSize),
+	)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	// 7,000 bytes is compressible, above the threshold (4000), but exceeds MaxObjectSize (5000).
+	// compressValue must store it uncompressed with CodecNone rather than compressing it,
+	// so that Get on read back will never reject it.
+	largePayload := makeRepetitivePayload(7000)
+	if err := store.Put("ConfigMap", "large-cm", largePayload, "1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	entry := store.keyIndex[qualifyKey("ConfigMap", "large-cm")]
+	h, err := store.bp.PinPage(entry.LogicalPage)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	var stored []byte
+	if entry.NumBlocks == 1 {
+		sp, _ := WrapSlottedPage(h.Block(0))
+		_, stored, _, _ = sp.Get(entry.Slot)
+	} else {
+		_, stored, _, _ = DecodeMultiBlockPage(h.Blocks())
+	}
+	h.Unpin()
+
+	if stored[0] != byte(CodecNone) {
+		t.Fatalf("expected CodecNone for payload exceeding MaxObjectSize, got %d", stored[0])
+	}
+	if !bytes.Equal(stored[1:], largePayload) {
+		t.Fatalf("stored payload mismatch")
+	}
+
+	// Read must succeed without error
+	got, exists, err := store.Get("ConfigMap", "large-cm")
+	if err != nil || !exists {
+		t.Fatalf("Get failed: exists=%v, err=%v", exists, err)
+	}
+	if !bytes.Equal(got, largePayload) {
+		t.Fatalf("retrieved payload does not match original")
+	}
+}
+
+// TestEngine_OldFormatVersion_WipedOnOpen verifies that opening a store written before format versioning
+// (or with an incompatible version) wipes the store and reports Wiped().
+func TestEngine_OldFormatVersion_WipedOnOpen(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_old_format_store"
+
+	// 1. Simulate an old store written in version 1 (where meta.db only contained a 16-byte DB ID)
+	_ = memFS.MkdirAll(dir, 0755)
+	metaPath := filepath.Join(dir, "meta.db")
+	f, err := memFS.Create(metaPath)
+	if err != nil {
+		t.Fatalf("Create meta.db failed: %v", err)
+	}
+	oldDBID := make([]byte, 16)
+	_, _ = rand.Read(oldDBID)
+	_, _ = f.WriteAt(oldDBID, 0)
+	_ = f.Close()
+
+	// Add dummy heap file to simulate existing old data
+	hf, err := memFS.Create(filepath.Join(dir, "heap.db"))
+	if err != nil {
+		t.Fatalf("Create heap.db failed: %v", err)
+	}
+	_, _ = hf.WriteAt([]byte("dummy old heap content"), 0)
+	_ = hf.Close()
+
+	// 2. Open store: Open must detect missing format version, wipe the store, and report Wiped()
+	store, err := Open(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	if !store.Wiped() {
+		t.Fatalf("expected Wiped() == true for store with old 16-byte meta.db format")
+	}
+
+	// Verify meta.db has been rewritten with 20 bytes containing StoreFormatVersion
+	metaF, err := memFS.Open(metaPath)
+	if err != nil {
+		t.Fatalf("Open meta.db failed: %v", err)
+	}
+	sz, _ := metaF.Size()
+	if sz != int64(metaFileSize) {
+		t.Fatalf("expected meta.db size %d after wipe, got %d", metaFileSize, sz)
+	}
+	buf := make([]byte, metaFileSize)
+	_, _ = metaF.ReadAt(buf, 0)
+	_ = metaF.Close()
+	ver := binary.BigEndian.Uint32(buf[16:20])
+	if ver != StoreFormatVersion {
+		t.Fatalf("expected StoreFormatVersion %d, got %d", StoreFormatVersion, ver)
+	}
+
+	// Verify fresh store can write and read normally
+	if err := store.Put("ConfigMap", "fresh-key", []byte("fresh-val"), "1"); err != nil {
+		t.Fatalf("Put on wiped store failed: %v", err)
+	}
+	val, exists, err := store.Get("ConfigMap", "fresh-key")
+	if err != nil || !exists || !bytes.Equal(val, []byte("fresh-val")) {
+		t.Fatalf("Get on wiped store failed")
+	}
+
+	// 3. Reopening the version 2 store must NOT wipe it
+	_ = store.Close()
+	store2, err := Open(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer store2.Close()
+	if store2.Wiped() {
+		t.Fatalf("expected Wiped() == false on reopening version 2 store")
+	}
+	val2, exists2, err := store2.Get("ConfigMap", "fresh-key")
+	if err != nil || !exists2 || !bytes.Equal(val2, []byte("fresh-val")) {
+		t.Fatalf("Get after reopen failed")
 	}
 }
 
@@ -298,7 +417,6 @@ func TestCompression_RecoveryWALReplay(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	// Put several compressed records
 	p1 := makeRepetitivePayload(8000)
 	p2 := makeRepetitivePayload(16000)
 	p3 := makeRepetitivePayload(2000)
@@ -347,7 +465,6 @@ func TestCompression_Rejection_Direct(t *testing.T) {
 	}
 
 	// 2. Mismatch between recorded and actual length
-	// Valid zstd frame that decompresses to 10 bytes, but recorded length claims 20 bytes
 	enc := zstdEncoderPool.Get().(*zstd.Encoder)
 	compressed10 := enc.EncodeAll([]byte("0123456789"), nil)
 	zstdEncoderPool.Put(enc)
@@ -359,28 +476,6 @@ func TestCompression_Rejection_Direct(t *testing.T) {
 	_, err = decompressValue(mismatchBuf, maxObjSize)
 	if !errors.Is(err, ErrCorruptCompression) {
 		t.Fatalf("expected ErrCorruptCompression for length mismatch, got %v", err)
-	}
-
-	// S2 length mismatch check
-	s2Compressed10 := s2.Encode(nil, []byte("0123456789"))
-	s2MismatchBuf := make([]byte, 5+len(s2Compressed10))
-	s2MismatchBuf[0] = byte(CodecS2)
-	binary.BigEndian.PutUint32(s2MismatchBuf[1:5], 20)
-	copy(s2MismatchBuf[5:], s2Compressed10)
-	_, err = decompressValue(s2MismatchBuf, maxObjSize)
-	if !errors.Is(err, ErrCorruptCompression) {
-		t.Fatalf("expected ErrCorruptCompression for S2 length mismatch, got %v", err)
-	}
-
-	// Snappy length mismatch check
-	snappyCompressed10 := snappy.Encode(nil, []byte("0123456789"))
-	snappyMismatchBuf := make([]byte, 5+len(snappyCompressed10))
-	snappyMismatchBuf[0] = byte(CodecSnappy)
-	binary.BigEndian.PutUint32(snappyMismatchBuf[1:5], 20)
-	copy(snappyMismatchBuf[5:], snappyCompressed10)
-	_, err = decompressValue(snappyMismatchBuf, maxObjSize)
-	if !errors.Is(err, ErrCorruptCompression) {
-		t.Fatalf("expected ErrCorruptCompression for Snappy length mismatch, got %v", err)
 	}
 
 	// 3. Truncated data
@@ -404,11 +499,12 @@ func TestCompression_Rejection_Direct(t *testing.T) {
 		t.Fatalf("expected ErrCorruptCompression for truncated stream, got %v", err)
 	}
 
-	// 4. Unknown codec byte
-	unknownCodec := []byte{0x77, 0x01, 0x02}
-	_, err = decompressValue(unknownCodec, maxObjSize)
-	if !errors.Is(err, ErrCorruptCompression) {
-		t.Fatalf("expected ErrCorruptCompression for unknown codec, got %v", err)
+	// 4. Unknown codec byte (including reserved codec bytes 2 and 3)
+	for _, unknown := range [][]byte{{0x02, 0x01}, {0x03, 0x01}, {0x77, 0x01}} {
+		_, err = decompressValue(unknown, maxObjSize)
+		if !errors.Is(err, ErrCorruptCompression) {
+			t.Fatalf("expected ErrCorruptCompression for unknown codec 0x%02x, got %v", unknown[0], err)
+		}
 	}
 }
 
