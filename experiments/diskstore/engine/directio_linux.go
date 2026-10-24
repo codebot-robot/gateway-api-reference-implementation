@@ -30,6 +30,11 @@ func platformPwritev(fd uintptr, off int64, iov [][]byte) error {
 	return err
 }
 
+func platformPwrite(fd uintptr, off int64, buf []byte) error {
+	_, err := unix.Pwrite(int(fd), buf, off)
+	return err
+}
+
 // DirectIOOpenFlag returns unix.O_DIRECT on Linux.
 func DirectIOOpenFlag() int {
 	return unix.O_DIRECT

@@ -29,6 +29,10 @@ func platformPwritev(fd uintptr, off int64, iov [][]byte) error {
 	return fmt.Errorf("vectored direct I/O pwritev is not supported on this platform: %w", errors.ErrUnsupported)
 }
 
+func platformPwrite(fd uintptr, off int64, buf []byte) error {
+	return fmt.Errorf("direct I/O pwrite is not supported on this platform: %w", errors.ErrUnsupported)
+}
+
 func DirectIOOpenFlag() int {
 	return 0
 }

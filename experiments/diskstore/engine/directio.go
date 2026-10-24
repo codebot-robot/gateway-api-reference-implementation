@@ -21,10 +21,11 @@ import (
 	"syscall"
 )
 
-// DirectIO moves multi-block pages using direct, unbuffered vectored I/O.
+// DirectIO moves multi-block pages using direct, unbuffered I/O.
 type DirectIO interface {
 	Readv(file File, off int64, iov [][]byte) error
 	Writev(file File, off int64, iov [][]byte) error
+	Write(file File, off int64, buf []byte) error
 }
 
 type defaultDirectIO struct{}
@@ -92,6 +93,33 @@ func (d *defaultDirectIO) Writev(file File, off int64, iov [][]byte) error {
 			return fmt.Errorf("writev fallback failed at block %d: %w", i, wErr)
 		}
 		currOff += int64(n)
+	}
+	return nil
+}
+
+func (d *defaultDirectIO) Write(file File, off int64, buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+
+	// Check if file supports SyscallConn for raw pwrite syscall
+	conn, err := file.SyscallConn()
+	if err == nil && conn != nil {
+		if rawConn, ok := conn.(syscall.RawConn); ok {
+			var sysErr error
+			err = rawConn.Control(func(fd uintptr) {
+				sysErr = platformPwrite(fd, off, buf)
+			})
+			if err == nil && sysErr == nil {
+				return nil
+			}
+		}
+	}
+
+	// Fallback to WriteAt
+	_, wErr := file.WriteAt(buf, off)
+	if wErr != nil {
+		return fmt.Errorf("write fallback failed at offset %d: %w", off, wErr)
 	}
 	return nil
 }

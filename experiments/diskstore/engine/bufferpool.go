@@ -17,6 +17,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,9 @@ import (
 const (
 	// DefaultBufferPoolFrames is 1024 frames = 4 MiB.
 	DefaultBufferPoolFrames = 1024
+
+	// MaxBatchBlocks is the maximum number of blocks in a flush batch (512 blocks = 2 MiB = 1 << MaxOrder).
+	MaxBatchBlocks = 1 << MaxOrder
 
 	// NoBlock is a sentinel representing an unassigned block location.
 	NoBlock uint64 = ^uint64(0)
@@ -107,6 +111,9 @@ type BufferPool struct {
 	arena      []byte // Pointer-free byte arena aligned to 4096 bytes
 	freeFrames []int
 
+	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
+	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
+
 	pageTable map[uint64]*PageDesc // logicalPage -> PageDesc
 
 	bgStop chan struct{}
@@ -146,6 +153,8 @@ func NewBufferPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, op
 		freeFrames[i] = i
 	}
 
+	stagingBuf := AllocateAlignedBlock(MaxBatchBlocks * BlockSize)
+
 	bp := &BufferPool{
 		file:       file,
 		wal:        wal,
@@ -156,6 +165,7 @@ func NewBufferPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, op
 		numFrames:  numFrames,
 		arena:      arena,
 		freeFrames: freeFrames,
+		stagingBuf: stagingBuf,
 		pageTable:  make(map[uint64]*PageDesc),
 		onFailure:  onFailure,
 		bgStop:     make(chan struct{}),
@@ -210,13 +220,22 @@ func (bp *BufferPool) sweepIdleDirtyPages() {
 			}
 		}
 	}
+	if len(toFlush) == 0 {
+		bp.mu.Unlock()
+		return
+	}
+
+	var err error
+	if len(toFlush) == 1 {
+		err = bp.flushPageUnlocked(toFlush[0])
+	} else {
+		err = bp.flushBatchUnlocked(toFlush)
+	}
 	bp.mu.Unlock()
 
-	for _, desc := range toFlush {
-		if err := bp.FlushPage(desc.LogicalPage); err != nil {
-			bp.fail(fmt.Errorf("background idle sweep failed: %w", err))
-			return
-		}
+	if err != nil {
+		bp.fail(fmt.Errorf("background idle sweep failed: %w", err))
+		return
 	}
 }
 
@@ -437,21 +456,59 @@ func (bp *BufferPool) acquireFramesLocked(count int) ([]int, error) {
 			continue
 		}
 
-		// Pass 2: Flush unpinned dirty page by oldest LastAccess outside lock
-		var bestDirty *PageDesc
+		// Pass 2: Flush unpinned dirty pages in a batch outside lock (routine cleaning should batch)
+		lowWatermark := bp.numFrames / 5
+		targetFrames := count - len(bp.freeFrames)
+		if replenish := lowWatermark - len(bp.freeFrames); replenish > targetFrames {
+			targetFrames = replenish
+		}
+		if targetFrames > 64 {
+			targetFrames = 64
+		}
+		if targetFrames < 1 {
+			targetFrames = 1
+		}
+
+		var candidates []*PageDesc
 		for _, desc := range bp.pageTable {
 			if len(desc.FrameIDs) > 0 && desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
-				if bestDirty == nil || desc.LastAccess.Before(bestDirty.LastAccess) {
-					bestDirty = desc
-				}
+				candidates = append(candidates, desc)
 			}
 		}
-		if bestDirty == nil {
+		if len(candidates) == 0 {
 			return nil, ErrBufferPoolFull
 		}
 
-		if err := bp.flushPageUnlocked(bestDirty); err != nil {
-			return nil, err
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].LastAccess.Before(candidates[j].LastAccess)
+		})
+
+		batchFrames := 0
+		var toEvict []*PageDesc
+		for _, desc := range candidates {
+			toEvict = append(toEvict, desc)
+			batchFrames += len(desc.FrameIDs)
+			if batchFrames >= targetFrames {
+				break
+			}
+		}
+
+		var flushErr error
+		if len(toEvict) == 1 {
+			flushErr = bp.flushPageUnlocked(toEvict[0])
+		} else {
+			flushErr = bp.flushBatchUnlocked(toEvict)
+		}
+		if flushErr != nil {
+			return nil, flushErr
+		}
+
+		// Immediately evict frames of the newly cleaned pages
+		for _, desc := range toEvict {
+			if !desc.Dirty && desc.PinCount.Load() == 0 && !desc.InFlight && len(desc.FrameIDs) > 0 {
+				bp.freeFrames = append(bp.freeFrames, desc.FrameIDs...)
+				desc.FrameIDs = nil
+			}
 		}
 	}
 
@@ -500,75 +557,146 @@ func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
 	if !desc.Dirty || desc.InFlight || len(desc.FrameIDs) == 0 {
 		return nil
 	}
+	return bp.flushSingleExtentBatchUnlocked([]*PageDesc{desc})
+}
 
-	pageLSN := desc.PageLSN.Load()
-
-	// Allocate new location from buddy allocator under bp.mu
-	order := 0
-	for (1 << order) < desc.NumBlocks {
-		order++
-	}
-
-	newLoc, err := bp.buddy.Allocate(order)
-	if err != nil {
-		return fmt.Errorf("failed to allocate disk block for page %d: %w", desc.LogicalPage, err)
-	}
-
-	desc.InFlight = true
-	desc.PinCount.Add(1)
-
-	desc.Mu.Lock()
-	iov := make([][]byte, desc.NumBlocks)
-	for i, fID := range desc.FrameIDs {
-		start := fID * BlockSize
-		blk := bp.arena[start : start+BlockSize]
-		hdr := BlockHeader{
-			LogicalPage: desc.LogicalPage,
-			LSN:         pageLSN,
-			BlockIndex:  uint32(i),
-			NumBlocks:   uint32(desc.NumBlocks),
+// flushBatchUnlocked flushes a batch of pages to disk in contiguous extents with a single direct write per extent,
+// releasing bp.mu during direct I/O and WAL sync.
+// Must be called with bp.mu held; returns with bp.mu held.
+func (bp *BufferPool) flushBatchUnlocked(batch []*PageDesc) error {
+	var valid []*PageDesc
+	for _, desc := range batch {
+		if desc.Dirty && !desc.InFlight && len(desc.FrameIDs) > 0 {
+			valid = append(valid, desc)
 		}
-		EncodeBlockHeader(hdr, blk)
-		FinalizeBlockCRC(blk)
-
-		// Copy into aligned direct I/O buffer to prevent data races with concurrent writers
-		buf := AllocateAlignedBlock(BlockSize)
-		copy(buf, blk)
-		iov[i] = buf
 	}
-	desc.Mu.Unlock()
+	if len(valid) == 0 {
+		return nil
+	}
 
-	// Release pool mutex during I/O
+	// Chunk the batch so each extent is at most MaxBatchBlocks (512 blocks = 1 << MaxOrder)
+	for len(valid) > 0 {
+		chunkTotalBlocks := 0
+		chunkEnd := 0
+		for chunkEnd < len(valid) {
+			nextBlocks := valid[chunkEnd].NumBlocks
+			if chunkEnd > 0 && chunkTotalBlocks+nextBlocks > MaxBatchBlocks {
+				break
+			}
+			chunkTotalBlocks += nextBlocks
+			chunkEnd++
+		}
+
+		chunk := valid[:chunkEnd]
+		valid = valid[chunkEnd:]
+
+		if err := bp.flushSingleExtentBatchUnlocked(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
+	orders := make([]int, len(chunk))
+	pageLSNs := make([]uint64, len(chunk))
+	var maxLSN uint64
+	totalBlocks := 0
+
+	for i, desc := range chunk {
+		order := 0
+		for (1 << order) < desc.NumBlocks {
+			order++
+		}
+		orders[i] = order
+		lsn := desc.PageLSN.Load()
+		pageLSNs[i] = lsn
+		if lsn > maxLSN {
+			maxLSN = lsn
+		}
+		totalBlocks += 1 << order
+	}
+
+	// Allocate contiguous extent from buddy allocator under bp.mu
+	locs, err := bp.buddy.AllocateBatch(orders)
+	if err != nil {
+		return fmt.Errorf("failed to allocate contiguous disk blocks for batch of %d pages: %w", len(chunk), err)
+	}
+
+	startBlock := locs[0]
+	for _, l := range locs {
+		if l < startBlock {
+			startBlock = l
+		}
+	}
+
+	// Mark all pages in chunk as InFlight and pin them under bp.mu
+	for _, desc := range chunk {
+		desc.InFlight = true
+		desc.PinCount.Add(1)
+	}
+
+	// Release pool mutex so concurrent operations can access other pages in memory
 	bp.mu.Unlock()
 
-	var syncErr error
-	if bp.wal != nil {
-		syncErr = bp.wal.SyncThrough(pageLSN)
+	// Acquire flush mutex to copy into the shared aligned staging buffer and issue direct I/O write
+	bp.flushMu.Lock()
+
+	for i, desc := range chunk {
+		desc.Mu.Lock()
+		blockOffset := locs[i] - startBlock
+		for j, fID := range desc.FrameIDs {
+			srcStart := fID * BlockSize
+			blk := bp.arena[srcStart : srcStart+BlockSize]
+			hdr := BlockHeader{
+				LogicalPage: desc.LogicalPage,
+				LSN:         pageLSNs[i],
+				BlockIndex:  uint32(j),
+				NumBlocks:   uint32(desc.NumBlocks),
+			}
+			EncodeBlockHeader(hdr, blk)
+			FinalizeBlockCRC(blk)
+
+			destStart := int(blockOffset+uint64(j)) * BlockSize
+			copy(bp.stagingBuf[destStart:destStart+BlockSize], blk)
+		}
+		desc.Mu.Unlock()
 	}
 
+	// Sync WAL once per batch through maxLSN
+	var syncErr error
+	if bp.wal != nil && maxLSN > 0 {
+		syncErr = bp.wal.SyncThrough(maxLSN)
+	}
+
+	// Single direct I/O write for the entire contiguous extent
 	var writeErr error
 	if syncErr == nil {
-		writeErr = bp.directIO.Writev(bp.file, int64(newLoc*BlockSize), iov)
+		totalBytes := int64(totalBlocks * BlockSize)
+		writeErr = bp.directIO.Write(bp.file, int64(startBlock*BlockSize), bp.stagingBuf[:totalBytes])
 	}
+
+	bp.flushMu.Unlock()
 
 	// Re-acquire pool mutex
 	bp.mu.Lock()
-	desc.InFlight = false
-	desc.PinCount.Add(-1)
+
+	for _, desc := range chunk {
+		desc.InFlight = false
+		desc.PinCount.Add(-1)
+	}
 
 	flushErr := errors.Join(syncErr, writeErr)
 	if flushErr != nil {
-		// Attempt to reclaim the newly allocated block so it is not leaked in-memory.
-		// If Free fails, we do not panic because:
-		// 1. The primary failure (flushErr) is already propagated to the caller and
-		//    bp.onFailure transitions the store into a terminal failed state (ErrFailed),
-		//    terminating further mutating operations.
-		// 2. The BuddyAllocator is an in-memory structure that is never persisted directly.
-		//    On restart, the allocator is reconstructed from scratch by scanning valid pages
-		//    in the heap file (MarkAllocated). Since newLoc was never successfully flushed or
-		//    checkpointed, it will naturally be reclaimed as free space during recovery.
-		if freeErr := bp.buddy.Free(newLoc); freeErr != nil {
-			flushErr = errors.Join(flushErr, fmt.Errorf("failed to free allocated block %d on flush failure: %w", newLoc, freeErr))
+		// Reclaim allocated blocks on failure
+		var freeErrs []error
+		for _, loc := range locs {
+			if fErr := bp.buddy.Free(loc); fErr != nil {
+				freeErrs = append(freeErrs, fErr)
+			}
+		}
+		if len(freeErrs) > 0 {
+			flushErr = errors.Join(flushErr, fmt.Errorf("failed to free batch blocks on flush failure: %w", errors.Join(freeErrs...)))
 		}
 		if bp.onFailure != nil {
 			bp.onFailure(flushErr)
@@ -576,18 +704,23 @@ func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
 		return flushErr
 	}
 
-	oldFlushed := desc.FlushedLoc
-	desc.FlushedLoc = newLoc
-	desc.PhysicalBlock = newLoc
+	// Update page locations and free superseded flushed locations
+	for i, desc := range chunk {
+		newLoc := locs[i]
+		oldFlushed := desc.FlushedLoc
+		desc.FlushedLoc = newLoc
+		desc.PhysicalBlock = newLoc
 
-	if oldFlushed != NoBlock && oldFlushed != desc.DurableLoc && oldFlushed != desc.FlushedBeforeSync {
-		if err := bp.buddy.Free(oldFlushed); err != nil && bp.onFailure != nil {
-			bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free superseded flushed block %d: %w", oldFlushed, err))
+		if oldFlushed != NoBlock && oldFlushed != desc.DurableLoc && oldFlushed != desc.FlushedBeforeSync {
+			if err := bp.buddy.Free(oldFlushed); err != nil && bp.onFailure != nil {
+				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free superseded flushed block %d: %w", oldFlushed, err))
+			}
+		}
+		if desc.PageLSN.Load() == pageLSNs[i] {
+			desc.Dirty = false
 		}
 	}
-	if desc.PageLSN.Load() == pageLSN {
-		desc.Dirty = false
-	}
+
 	return nil
 }
 
@@ -598,17 +731,12 @@ func (bp *BufferPool) FlushAllDirty() error {
 
 	var toFlush []*PageDesc
 	for _, desc := range bp.pageTable {
-		if desc.Dirty && len(desc.FrameIDs) > 0 {
+		if desc.Dirty && len(desc.FrameIDs) > 0 && !desc.InFlight {
 			toFlush = append(toFlush, desc)
 		}
 	}
 
-	for _, desc := range toFlush {
-		if err := bp.flushPageUnlocked(desc); err != nil {
-			return err
-		}
-	}
-	return nil
+	return bp.flushBatchUnlocked(toFlush)
 }
 
 // SnapshotFlushedForSync records all currently flushed locations before a heap fsync starts.
