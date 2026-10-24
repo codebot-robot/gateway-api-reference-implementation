@@ -98,6 +98,7 @@ func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp
 // watching Gateways, data-plane Pods, and EndpointSlices.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		Named("gcpgateway").
 		For(&gatewayv1.Gateway{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.podToGateway)).
 		Watches(&discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(r.endpointSliceToGateway)).
