@@ -173,24 +173,23 @@ This rule prevents disk inconsistency across crashes. If a host loses power afte
 
 The block pool enforces this rule before flushing dirty pages. The flusher calculates the maximum LSN among all pages in the flush batch. It calls `wal.SyncThrough(maxLSN)` to flush and fsync the log before writing the block run to the heap file.
 
-### 2. The Reuse Rule and Page Location Tracking
+### 2. The Reuse Rule
 
 The disk location holding a page's newest durable (fsynced) copy must never be overwritten. Older locations become free for reuse only after a newer copy is confirmed durable by a heap file fsync.
 
-The engine tracks page locations on disk using four descriptor fields in `PageDesc`:
-- `PhysicalBlock`: The currently known disk block number of the page.
-- `FlushedLoc`: The disk block number where the page was written since the last heap fsync.
-- `FlushedBeforeSync`: The snapshot of `FlushedLoc` recorded immediately before an active heap fsync begins.
-- `DurableLoc`: The disk block number confirmed durable by a completed heap fsync.
+Because the engine writes pages out of place, each flush writes a modified page to a newly allocated block run on disk. The engine cannot immediately release the page's prior disk location to the allocator:
+- If a crash occurs before the heap file fsync completes, recovery relies on the older durable location. Overwriting or recycling that location prematurely risks data loss.
+- Only after the heap file fsync confirms that the new copy is durable does the engine release the superseded location back to the allocator for reuse.
 
-These fields operate as follows:
-1. When a dirty page flushes to disk, the buddy allocator reserves a new block run. The page writes to this new location. The engine sets `desc.FlushedLoc` and `desc.PhysicalBlock` to the new block number. If `desc.FlushedLoc` previously held an older block number, the engine frees that block number immediately only if it is neither `desc.DurableLoc` nor `desc.FlushedBeforeSync`. The `FlushedBeforeSync` exception keeps a copy alive while a heap fsync for it is in progress. The engine leaves `desc.DurableLoc` untouched.
-2. During a checkpoint or explicit sync:
-   - The engine calls `bp.SnapshotFlushedForSync()`. This copies `FlushedLoc` to `FlushedBeforeSync` only for pages without a flush in flight (`!desc.InFlight`). Skipping pages with a flush in flight is safe because their write may not be complete when the heap fsync starts; the engine leaves their `FlushedBeforeSync` as `NoBlock`, and a subsequent sync promotes their copy once it has flushed.
-   - The engine invokes `fsync` on the heap file.
-   - The engine calls `bp.PromoteFlushedToDurable()`. This promotes `FlushedBeforeSync` to `DurableLoc`. If an older `DurableLoc` existed, that older block number is now superseded. The engine frees the old block number to the buddy allocator.
-3. If new writes flush during the heap fsync, their new block numbers populate `FlushedLoc`. Those writes remain un-promoted until the subsequent fsync completes.
-4. If the system crashes before the heap fsync completes, `DurableLoc` still holds the valid previous copy. Recovery restores that copy.
+To coordinate concurrent flushes and fsyncs, the engine distinguishes three stages of a page's disk location:
+1. **Flushed:** Written to a new disk location, but not yet confirmed durable by a heap fsync.
+2. **Syncing:** Snapshotted at the start of an active heap fsync.
+3. **Durable:** Confirmed durable by a completed heap fsync.
+
+The engine applies the reuse rule through the following lifecycle:
+- **Flushing:** When a dirty page flushes, it writes to a new disk location. If the page previously wrote to an intermediate un-synced location, the engine frees that intermediate location immediately, unless that location is currently syncing. Keeping syncing locations allocated prevents newer flushes from releasing disk blocks that the ongoing fsync is making durable.
+- **Syncing and Promotion:** When syncing the heap file, the engine snapshots completed flushed locations for all pages that do not have a flush in flight. Skipping pages with an in-flight flush is safe because not promoting is always conservative: the page retains its older durable location on disk until a subsequent sync. Once the heap fsync completes, the engine promotes the snapshotted locations to durable and frees any superseded older locations to the allocator.
+- **Crash Recovery:** If the system crashes before a heap fsync completes, recovery restores the previous durable copy.
 
 ### 3. Natural Alignment of Block Runs
 
@@ -243,46 +242,26 @@ The engine recovers database state through the following steps in `recovery.go`:
 
 ## Concurrency
 
-The engine coordinates concurrent operations through the following locks:
+The engine coordinates concurrent operations through four design choices:
 
-- `writerMu` (`sync.RWMutex` on `Engine`):
-  - Exclusive lock (`Lock`) taken by mutating operations (`Put`, `Delete`) to serialize writes.
-  - Shared lock (`RLock`) taken by read scans (`Scan`, `List`) to provide a consistent point-in-time snapshot during traversal.
-- `keyMu` (`sync.RWMutex` on `Engine`):
-  - Protects the in-memory key index map and oversize object store.
-  - Acquired with `RLock` during point lookups (`Get`) and index iterations.
-  - Acquired with `Lock` when inserting, updating, or deleting key index entries.
-  - Acquired and released within the scope of `writerMu`. The engine never attempts to acquire `writerMu` while holding `keyMu`.
-- `BufferPool.mu` (`sync.Mutex` on `BufferPool`):
-  - Protects block pool metadata, the page table map, the free block list, and dirty page lists.
-  - The engine never acquires `BufferPool.mu` while holding a per-page latch (`desc.Mu`).
-- `PageDesc.Mu` (`sync.RWMutex` on `PageDesc`):
-  - The per-page latch protecting read and write access to the page's block memory in the pool arena.
-  - Callers pin the page under `BufferPool.mu`, release `BufferPool.mu`, and then acquire `PageDesc.Mu`.
-- `BufferPool.flushMu` (`sync.Mutex` on `BufferPool`):
-  - Serializes access to the direct I/O staging buffer and writes to the heap file.
-  - Acquired during page flushes after releasing `BufferPool.mu`.
-- `BuddyAllocator.mu` (`sync.Mutex` on `BuddyAllocator`):
-  - Protects buddy free lists and allocation mappings.
-  - Acquired during block allocation, batch allocation, and block deallocation.
-- `WAL.appendMu` (`sync.Mutex` on `WAL`):
-  - Serializes record appenders so records append without interleaving.
-- `WAL.mu` (`sync.Mutex` on `WAL`):
-  - Protects WAL double-buffers, file offsets, LSN tracking, and background flusher coordination.
-- `Checkpointer.mu` (`sync.Mutex` on `Checkpointer`):
-  - Serializes checkpoint operations so only one checkpoint executes at a time.
-  - Acquired without holding `writerMu`, which allows checkpoints to run concurrently with writes.
-- `failMu` (`sync.RWMutex` on `Engine`):
-  - Protects the sticky error state and failure channels.
+### Single-Writer Mutation
 
-### Lock Nesting and Acquisition
+The engine serializes mutating operations (`Put`, `Delete`). A single active writer simplifies transaction management, page allocation, and WAL ordering. It avoids the need for undo logs, distributed multi-page latching protocols, or multi-version concurrency control in the storage engine.
 
-The engine uses the following lock nestings:
-- `writerMu` → `keyMu`: Mutating operations (`Put`, `Delete`) acquire `writerMu`, and then acquire `keyMu` when inserting, updating, or deleting index entries. `keyMu` is always innermost and never held across I/O.
-- `BufferPool.mu` → `BuddyAllocator.mu`: The block pool acquires `BufferPool.mu` before invoking the buddy allocator to allocate block runs (`AllocateBatch`) or free superseded blocks (`Free`).
-- `WAL.appendMu` → `WAL.mu`: The WAL appender acquires `WAL.appendMu` to serialize incoming records, and then acquires `WAL.mu` to reserve buffer space and assign LSNs.
-- `Checkpointer.mu` → the pool and WAL locks: The checkpointer acquires `Checkpointer.mu` without holding `writerMu`. Under `Checkpointer.mu`, the checkpointer sequentially invokes operations that acquire `BufferPool.mu` (snapshotting dirty pages and flushed locations), `BufferPool.flushMu` (flushing dirty pages), and the WAL locks (`AppendRecord`, `Sync`, and `TruncateBefore`).
+### Concurrent Readers and Scans
 
-The following locks are taken only after `BufferPool.mu` is released:
-- `PageDesc.Mu`: Callers pin the page under `BufferPool.mu`, release `BufferPool.mu`, and only then acquire `PageDesc.Mu` (shared for reads, exclusive for writes or flushes). Callers never acquire `BufferPool.mu` while holding `PageDesc.Mu`.
-- `BufferPool.flushMu`: The flusher marks pages in-flight and unpins them under `BufferPool.mu`, releases `BufferPool.mu`, and only then acquires `BufferPool.flushMu` to serialize staging buffer usage and direct I/O writes to the heap file.
+- **Point lookups (`Get`):** Lookups run concurrently with write operations. A reader looks up the target record in the in-memory index, pins the referenced page in the block pool, and reads the record under a shared per-page latch.
+- **Range scans (`Scan`, `List`):** Iterations acquire a shared view of the engine, preventing concurrent writes from altering index state during traversal. This provides callers with a consistent point-in-time view of the data.
+
+### Non-Blocking Checkpointing
+
+The checkpointer runs concurrently with user writes. It does not serialize behind the engine writer lock. Instead, the checkpointer snapshots dirty page state and flushed locations under brief block pool synchronization, flushes dirty pages in the background, invokes heap fsync, and appends a checkpoint record to the WAL.
+
+### Synchronization Boundaries
+
+The engine separates synchronization across four distinct layers to prevent deadlocks and contention:
+
+1. **In-Memory Index:** The key index protects mappings from keys to page and slot locations. Index synchronization is strictly innermost. Callers never perform disk I/O, allocate blocks, or acquire page latches while holding index synchronization.
+2. **Block Pool vs. Page Data:** The block pool separates pool management from page content access. Callers acquire pool synchronization only to look up, pin, or unpin a page descriptor. Callers release pool synchronization before acquiring a per-page latch to read or modify page bytes. Callers never acquire pool synchronization while holding a per-page latch. This allows concurrent operations to access distinct pages in memory without contending on the pool.
+3. **Flushing and Direct I/O:** Page flushing marks descriptors in-flight and releases pool synchronization before copying data into the staging buffer and writing to disk. Direct I/O writes to the heap file proceed without blocking access to other resident pages in the pool.
+4. **WAL Appends and Syncing:** The WAL serializes incoming records to preserve strictly monotonic LSN assignment. Log buffer management and background flushes operate independently from page table latches.
