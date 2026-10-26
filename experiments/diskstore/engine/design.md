@@ -12,7 +12,7 @@ The engine uses the following terms:
 - **Page.** The logical unit, identified by a logical page number. It is either a slotted page (one block holding many small records, each in a record slot) or a multi-block page ($2^k$ blocks holding one large record). The engine writes pages out of place, so a logical page moves between block numbers over time.
 - **Block run.** A contiguous, aligned run of blocks allocated by the buddy allocator. A multi-block page always occupies one block run, and a flush batch writes several pages into one block run.
 - **WAL terms:**
-  - **Segment.** An immutable log file named by its starting 64-bit LSN, formatted as a 20-digit zero-padded decimal number with a `.wal` extension.
+  - **Segment.** An append-only log file named by its starting 64-bit LSN, formatted as a 20-digit zero-padded decimal number with a `.wal` extension. The engine appends records to the active segment. In accordance with invariant 4, once a 4 KiB block within a segment is fsynced to disk, the engine never rewrites that block.
   - **Record.** A single log entry recording an operation, such as a write, deletion, checkpoint, or progress token.
   - **LSN.** A 64-bit monotonically increasing Log Sequence Number.
   - **Durable LSN.** The highest LSN confirmed flushed and fsynced to disk.
@@ -102,16 +102,17 @@ When active payloads fragment space, the engine compacts the page. Compaction sl
 
 ### Multi-Block Page
 
-A multi-block page stores a single large record across a power-of-two block run ($2^k$ blocks, from 2 to 512 blocks, up to 2 MiB).
+A multi-block page stores a single large record across a power-of-two block run ($2^k$ blocks, from 1 to 512 blocks, up to 2 MiB, as produced by `CalculateMultiBlockCount`).
 
 The format distributes the record across the block run:
-- Every block in the run contains the 32-byte block header. Every block header carries the page's logical page number, LSN, total block count ($2^k$), and individual block index ($0$ through $2^k - 1$).
-- Block 0 stores the record header at byte 32:
+- Every block in the run begins with the 32-byte block header. Each block header carries the page's logical page number, LSN, total block count ($2^k$), and individual block index ($0$ through $2^k - 1$).
+- The record header, key, and payload are written as one continuous stream starting at byte 32 of block 0 and continuing through the usable section (bytes 32 to 4095) of each successive block in the run:
   - `KeyLen` (2 bytes): Length of the key string.
   - `PayloadLen` (4 bytes): Length of the value payload.
   - `LSN` (8 bytes): Modification LSN.
   - `Key`: Raw bytes of the key string.
-- The value payload streams across the usable payload section (bytes 32 to 4095) of blocks 0 through $2^k - 1$.
+  - `Payload`: Raw or compressed value bytes.
+  Because the engine writes this data as a single continuous stream, both the key and the payload can cross block boundaries.
 - The in-memory key index maps the record to its logical page number and record slot 0.
 
 ### WAL Segment Header
@@ -183,9 +184,9 @@ The engine tracks page locations on disk using four descriptor fields in `PageDe
 - `DurableLoc`: The disk block number confirmed durable by a completed heap fsync.
 
 These fields operate as follows:
-1. When a dirty page flushes to disk, the buddy allocator reserves a new block run. The page writes to this new location. The engine sets `desc.FlushedLoc` and `desc.PhysicalBlock` to the new block number. If `desc.FlushedLoc` previously held an intermediate un-synced block number, the engine frees that intermediate block number immediately. The engine leaves `desc.DurableLoc` untouched.
+1. When a dirty page flushes to disk, the buddy allocator reserves a new block run. The page writes to this new location. The engine sets `desc.FlushedLoc` and `desc.PhysicalBlock` to the new block number. If `desc.FlushedLoc` previously held an older block number, the engine frees that block number immediately only if it is neither `desc.DurableLoc` nor `desc.FlushedBeforeSync`. The `FlushedBeforeSync` exception keeps a copy alive while a heap fsync for it is in progress. The engine leaves `desc.DurableLoc` untouched.
 2. During a checkpoint or explicit sync:
-   - The engine calls `bp.SnapshotFlushedForSync()`. This copies `FlushedLoc` to `FlushedBeforeSync` for all pages.
+   - The engine calls `bp.SnapshotFlushedForSync()`. This copies `FlushedLoc` to `FlushedBeforeSync` only for pages without a flush in flight (`!desc.InFlight`). Skipping pages with a flush in flight is safe because their write may not be complete when the heap fsync starts; the engine leaves their `FlushedBeforeSync` as `NoBlock`, and a subsequent sync promotes their copy once it has flushed.
    - The engine invokes `fsync` on the heap file.
    - The engine calls `bp.PromoteFlushedToDurable()`. This promotes `FlushedBeforeSync` to `DurableLoc`. If an older `DurableLoc` existed, that older block number is now superseded. The engine frees the old block number to the buddy allocator.
 3. If new writes flush during the heap fsync, their new block numbers populate `FlushedLoc`. Those writes remain un-promoted until the subsequent fsync completes.
@@ -270,16 +271,18 @@ The engine coordinates concurrent operations through the following locks:
   - Protects WAL double-buffers, file offsets, LSN tracking, and background flusher coordination.
 - `Checkpointer.mu` (`sync.Mutex` on `Checkpointer`):
   - Serializes checkpoint operations so only one checkpoint executes at a time.
+  - Acquired without holding `writerMu`, which allows checkpoints to run concurrently with writes.
 - `failMu` (`sync.RWMutex` on `Engine`):
   - Protects the sticky error state and failure channels.
 
-### Lock Order
+### Lock Nesting and Acquisition
 
-Callers acquire locks according to this hierarchy:
-1. `writerMu`
-2. `Checkpointer.mu`
-3. `BufferPool.mu` -> `PageDesc.Mu` (never acquire `BufferPool.mu` while holding `PageDesc.Mu`)
-4. `BufferPool.flushMu` (acquired outside `BufferPool.mu`)
-5. `BuddyAllocator.mu` (acquired inside `BufferPool.mu` or independently during redo)
-6. `WAL.appendMu` -> `WAL.mu`
-7. `keyMu` (held only for brief in-memory index operations, never across I/O)
+The engine uses the following lock nestings:
+- `writerMu` → `keyMu`: Mutating operations (`Put`, `Delete`) acquire `writerMu`, and then acquire `keyMu` when inserting, updating, or deleting index entries. `keyMu` is always innermost and never held across I/O.
+- `BufferPool.mu` → `BuddyAllocator.mu`: The block pool acquires `BufferPool.mu` before invoking the buddy allocator to allocate block runs (`AllocateBatch`) or free superseded blocks (`Free`).
+- `WAL.appendMu` → `WAL.mu`: The WAL appender acquires `WAL.appendMu` to serialize incoming records, and then acquires `WAL.mu` to reserve buffer space and assign LSNs.
+- `Checkpointer.mu` → the pool and WAL locks: The checkpointer acquires `Checkpointer.mu` without holding `writerMu`. Under `Checkpointer.mu`, the checkpointer sequentially invokes operations that acquire `BufferPool.mu` (snapshotting dirty pages and flushed locations), `BufferPool.flushMu` (flushing dirty pages), and the WAL locks (`AppendRecord`, `Sync`, and `TruncateBefore`).
+
+The following locks are taken only after `BufferPool.mu` is released:
+- `PageDesc.Mu`: Callers pin the page under `BufferPool.mu`, release `BufferPool.mu`, and only then acquire `PageDesc.Mu` (shared for reads, exclusive for writes or flushes). Callers never acquire `BufferPool.mu` while holding `PageDesc.Mu`.
+- `BufferPool.flushMu`: The flusher marks pages in-flight and unpins them under `BufferPool.mu`, releases `BufferPool.mu`, and only then acquires `BufferPool.flushMu` to serialize staging buffer usage and direct I/O writes to the heap file.
