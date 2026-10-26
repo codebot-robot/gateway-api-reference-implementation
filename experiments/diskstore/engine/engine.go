@@ -72,12 +72,10 @@ type Options struct {
 	AutoDelete bool
 	Clock      Clock
 
-	CompressionCodec     CompressionCodec
-	CompressionThreshold int
-	MaxObjectSize        int
+	CompressionCodec CompressionCodec
+	MaxObjectSize    int
 
-	compressionCodecSet     bool
-	compressionThresholdSet bool
+	compressionCodecSet bool
 }
 
 // Option is a functional option for configuring an Engine.
@@ -95,14 +93,6 @@ func WithCompressionCodec(codec CompressionCodec) Option {
 	return func(o *Options) {
 		o.CompressionCodec = codec
 		o.compressionCodecSet = true
-	}
-}
-
-// WithCompressionThreshold sets the byte size threshold above which values are compressed.
-func WithCompressionThreshold(threshold int) Option {
-	return func(o *Options) {
-		o.CompressionThreshold = threshold
-		o.compressionThresholdSet = true
 	}
 }
 
@@ -168,10 +158,9 @@ type Engine struct {
 	isTemp     bool
 	autoDelete bool
 
-	cipher               Cipher
-	compressionCodec     CompressionCodec
-	compressionThreshold int
-	maxObjectSize        int
+	cipher           Cipher
+	compressionCodec CompressionCodec
+	maxObjectSize    int
 
 	heapFile File
 	wal      *WAL
@@ -279,22 +268,18 @@ const (
 // Open opens or initializes an Engine in dir.
 func Open(opts ...Option) (*Engine, error) {
 	options := Options{
-		FS:                   NewOSFS(),
-		Cipher:               NoopCipher{},
-		NumFrames:            DefaultBufferPoolFrames,
-		AutoDelete:           false,
-		CompressionCodec:     CodecZstd,
-		CompressionThreshold: DefaultCompressionThreshold,
-		MaxObjectSize:        DefaultMaxObjectSize,
+		FS:               NewOSFS(),
+		Cipher:           NoopCipher{},
+		NumFrames:        DefaultBufferPoolFrames,
+		AutoDelete:       false,
+		CompressionCodec: CodecZstd,
+		MaxObjectSize:    DefaultMaxObjectSize,
 	}
 	for _, opt := range opts {
 		opt(&options)
 	}
 	if !options.compressionCodecSet && options.CompressionCodec == 0 {
 		options.CompressionCodec = CodecZstd
-	}
-	if !options.compressionThresholdSet && options.CompressionThreshold == 0 {
-		options.CompressionThreshold = DefaultCompressionThreshold
 	}
 	if options.MaxObjectSize <= 0 {
 		options.MaxObjectSize = DefaultMaxObjectSize
@@ -483,7 +468,6 @@ func Open(opts ...Option) (*Engine, error) {
 		autoDelete:                 options.AutoDelete,
 		cipher:                     options.Cipher,
 		compressionCodec:           options.CompressionCodec,
-		compressionThreshold:       options.CompressionThreshold,
 		maxObjectSize:              options.MaxObjectSize,
 		heapFile:                   heapFile,
 		keyIndex:                   make(map[string]KeyIndexEntry),
@@ -913,18 +897,13 @@ func (s *Engine) CompressionCodec() CompressionCodec {
 	return s.compressionCodec
 }
 
-// CompressionThreshold returns the size threshold above which values attempt compression.
-func (s *Engine) CompressionThreshold() int {
-	return s.compressionThreshold
-}
-
 // MaxObjectSize returns the maximum uncompressed object size accepted during decompression.
 func (s *Engine) MaxObjectSize() int {
 	return s.maxObjectSize
 }
 
 func (s *Engine) compress(payload []byte) ([]byte, error) {
-	return compressValue(payload, s.compressionCodec, s.compressionThreshold, s.maxObjectSize)
+	return compressValue(payload, s.compressionCodec, s.maxObjectSize)
 }
 
 func (s *Engine) decompress(data []byte) ([]byte, error) {

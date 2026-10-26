@@ -49,10 +49,6 @@ func (c CompressionCodec) String() string {
 }
 
 const (
-	// DefaultCompressionThreshold is the slotted-page payload size limit (4000 bytes).
-	// Values above this threshold attempt compression.
-	DefaultCompressionThreshold = BlockUsableSize - 64
-
 	// DefaultMaxObjectSize is the maximum uncompressed object size accepted during decompression (64 MiB).
 	DefaultMaxObjectSize = MaxRecordFieldLength
 
@@ -96,10 +92,10 @@ var (
 	}
 )
 
-func compressValue(payload []byte, codec CompressionCodec, threshold int, maxObjectSize int) ([]byte, error) {
-	// If compression is disabled, payload is below the threshold, or payload exceeds MaxObjectSize,
+func compressValue(payload []byte, codec CompressionCodec, maxObjectSize int) ([]byte, error) {
+	// If compression is disabled or payload exceeds MaxObjectSize,
 	// store uncompressed with CodecNone. This ensures payloads accepted on write are never rejected on read.
-	if codec == CodecNone || len(payload) <= threshold || (maxObjectSize > 0 && len(payload) > maxObjectSize) {
+	if codec == CodecNone || (maxObjectSize > 0 && len(payload) > maxObjectSize) {
 		out := make([]byte, 1+len(payload))
 		out[0] = byte(CodecNone)
 		copy(out[1:], payload)

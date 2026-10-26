@@ -41,17 +41,18 @@ func makeRandomPayload(size int) []byte {
 	return b
 }
 
-// TestCompression_ThresholdAndRawFallback tests that values above threshold are stored compressed
-// with codec and uncompressed length recorded, while incompressible values or values below threshold are stored raw.
-func TestCompression_ThresholdAndRawFallback(t *testing.T) {
+// TestCompression_RawFallbackAndSavingsRule tests that compressible values are stored compressed
+// with codec and uncompressed length recorded, while incompressible values or values failing
+// the 10% savings rule are stored raw with CodecNone.
+func TestCompression_RawFallbackAndSavingsRule(t *testing.T) {
 	memFS := NewMemFS()
-	store, err := Open(WithFS(memFS), WithDir("test_compress_threshold"), WithCompressionCodec(CodecZstd))
+	store, err := Open(WithFS(memFS), WithDir("test_compress_raw_fallback"), WithCompressionCodec(CodecZstd))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 	defer store.Close()
 
-	// 1. Compressible value above threshold (8000 bytes > 4000)
+	// 1. Compressible value (8000 bytes)
 	compressibleVal := makeRepetitivePayload(8000)
 	if err := store.Put("ConfigMap", "cm-compressed", compressibleVal, "1"); err != nil {
 		t.Fatalf("Put compressible failed: %v", err)
@@ -91,7 +92,7 @@ func TestCompression_ThresholdAndRawFallback(t *testing.T) {
 		t.Fatalf("Get returned invalid payload")
 	}
 
-	// 2. Incompressible value above threshold (5000 random bytes)
+	// 2. Incompressible value (5000 random bytes)
 	incompressibleVal := makeRandomPayload(5000)
 	if err := store.Put("ConfigMap", "cm-raw-above-thresh", incompressibleVal, "2"); err != nil {
 		t.Fatalf("Put incompressible failed: %v", err)
@@ -124,7 +125,7 @@ func TestCompression_ThresholdAndRawFallback(t *testing.T) {
 		t.Fatalf("Get incompressible returned invalid payload")
 	}
 
-	// 3. Compressible value below threshold (2000 bytes <= 4000)
+	// 3. Compressible small value (2000 bytes) is now compressed
 	smallVal := makeRepetitivePayload(2000)
 	if err := store.Put("ConfigMap", "cm-small", smallVal, "3"); err != nil {
 		t.Fatalf("Put small failed: %v", err)
@@ -141,21 +142,50 @@ func TestCompression_ThresholdAndRawFallback(t *testing.T) {
 	_, storedSmallPayload, _, _ = spSmall.Get(entrySmall.Slot)
 	hSmall.Unpin()
 
-	if storedSmallPayload[0] != byte(CodecNone) {
-		t.Fatalf("expected codec byte %d (CodecNone) for small data, got %d", CodecNone, storedSmallPayload[0])
+	if storedSmallPayload[0] != byte(CodecZstd) {
+		t.Fatalf("expected codec byte %d (CodecZstd) for compressible small data, got %d", CodecZstd, storedSmallPayload[0])
 	}
-	if !bytes.Equal(storedSmallPayload[1:], smallVal) {
-		t.Fatalf("stored small payload mismatch")
+	if len(storedSmallPayload) >= 2000 {
+		t.Fatalf("expected compressed size to be smaller than 2000, got %d", len(storedSmallPayload))
 	}
 
 	gotSmall, exists, err := store.Get("ConfigMap", "cm-small")
 	if err != nil || !exists || !bytes.Equal(gotSmall, smallVal) {
 		t.Fatalf("Get small returned invalid payload")
 	}
+
+	// 4. Tiny compressible value (64 bytes) fails 10% savings rule and falls back to CodecNone
+	tinyVal := makeRepetitivePayload(64)
+	if err := store.Put("ConfigMap", "cm-tiny", tinyVal, "4"); err != nil {
+		t.Fatalf("Put tiny failed: %v", err)
+	}
+
+	qKeyTiny := qualifyKey("ConfigMap", "cm-tiny")
+	entryTiny := store.keyIndex[qKeyTiny]
+	hTiny, err := store.bp.PinPage(entryTiny.LogicalPage)
+	if err != nil {
+		t.Fatalf("PinPage failed: %v", err)
+	}
+	var storedTinyPayload []byte
+	spTiny, _ := WrapSlottedPage(hTiny.Block(0))
+	_, storedTinyPayload, _, _ = spTiny.Get(entryTiny.Slot)
+	hTiny.Unpin()
+
+	if storedTinyPayload[0] != byte(CodecNone) {
+		t.Fatalf("expected codec byte %d (CodecNone) for tiny data failing 10%% rule, got %d", CodecNone, storedTinyPayload[0])
+	}
+	if !bytes.Equal(storedTinyPayload[1:], tinyVal) {
+		t.Fatalf("stored tiny payload mismatch")
+	}
+
+	gotTiny, exists, err := store.Get("ConfigMap", "cm-tiny")
+	if err != nil || !exists || !bytes.Equal(gotTiny, tinyVal) {
+		t.Fatalf("Get tiny returned invalid payload")
+	}
 }
 
 // TestCompression_RoundTripAllCodecs tests round-trips for CodecNone and CodecZstd
-// at sizes on both sides of the threshold and of every page-class boundary.
+// at sizes across every page-class boundary.
 func TestCompression_RoundTripAllCodecs(t *testing.T) {
 	codecs := []struct {
 		name  string
@@ -233,7 +263,7 @@ func TestCompression_PayloadExceedingMaxObjectSize_StoredRawAndReadable(t *testi
 	}
 	defer store.Close()
 
-	// 7,000 bytes is compressible, above the threshold (4000), but exceeds MaxObjectSize (5000).
+	// 7,000 bytes is compressible, but exceeds MaxObjectSize (5000).
 	// compressValue must store it uncompressed with CodecNone rather than compressing it,
 	// so that Get on read back will never reject it.
 	largePayload := makeRepetitivePayload(7000)
@@ -614,39 +644,211 @@ func TestCompression_Rejection_StoreState(t *testing.T) {
 	}
 }
 
-// TestCompression_ConfigurableThreshold verifies that WithCompressionThreshold changes
-// the size boundary at which compression is attempted.
-func TestCompression_ConfigurableThreshold(t *testing.T) {
-	memFS := NewMemFS()
-	store, err := Open(
-		WithFS(memFS),
-		WithDir("test_custom_thresh"),
-		WithCompressionCodec(CodecZstd),
-		WithCompressionThreshold(100), // Low threshold: compress values > 100 bytes
-	)
+func getStoredPayload(t *testing.T, store *Engine, bucket, key string) []byte {
+	t.Helper()
+	qKey := qualifyKey(bucket, key)
+	store.keyMu.RLock()
+	entry, exists := store.keyIndex[qKey]
+	store.keyMu.RUnlock()
+	if !exists {
+		t.Fatalf("key %s not found in keyIndex", qKey)
+	}
+	if entry.IsOversize {
+		store.keyMu.RLock()
+		data := bytes.Clone(store.oversizeObjects[qKey])
+		store.keyMu.RUnlock()
+		return data
+	}
+	h, err := store.bp.PinPage(entry.LogicalPage)
 	if err != nil {
-		t.Fatalf("Open failed: %v", err)
+		t.Fatalf("PinPage failed: %v", err)
 	}
-	defer store.Close()
+	defer h.Unpin()
+	var stored []byte
+	if entry.NumBlocks == 1 {
+		sp, err := WrapSlottedPage(h.Block(0))
+		if err != nil {
+			t.Fatalf("WrapSlottedPage failed: %v", err)
+		}
+		_, stored, _, _ = sp.Get(entry.Slot)
+	} else {
+		_, stored, _, _ = DecodeMultiBlockPage(h.Blocks())
+	}
+	return stored
+}
 
-	// 500 bytes (> 100) should be compressed
-	payload500 := makeRepetitivePayload(500)
-	if err := store.Put("ConfigMap", "cm-500", payload500, "1"); err != nil {
-		t.Fatalf("Put failed: %v", err)
+// TestCompression_RoundTripSizesAndReopen tests round-trip Put/Get and close/reopen for value sizes
+// 0, 1, 64, 500, 1000, 4000, 4001, and 20000 bytes, with both compressible and incompressible content.
+// Compressible values of 500 bytes or more must be stored with CodecZstd, and incompressible values with CodecNone.
+func TestCompression_RoundTripSizesAndReopen(t *testing.T) {
+	sizes := []int{0, 1, 64, 500, 1000, 4000, 4001, 20000}
+
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("Compressible_%dB", size), func(t *testing.T) {
+			memFS := NewMemFS()
+			dir := fmt.Sprintf("test_rt_comp_%d", size)
+			store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+			if err != nil {
+				t.Fatalf("Open failed: %v", err)
+			}
+
+			payload := makeRepetitivePayload(size)
+			key := fmt.Sprintf("key-%d", size)
+			if err := store.Put("bucket", key, payload, "1"); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+
+			stored := getStoredPayload(t, store, "bucket", key)
+			if size >= 500 {
+				if stored[0] != byte(CodecZstd) {
+					t.Fatalf("expected CodecZstd (%d) for compressible size %d, got %d", CodecZstd, size, stored[0])
+				}
+			} else {
+				if stored[0] != byte(CodecNone) {
+					t.Fatalf("expected CodecNone (%d) for small compressible size %d (10%% rule), got %d", CodecNone, size, stored[0])
+				}
+			}
+
+			got, exists, err := store.Get("bucket", key)
+			if err != nil || !exists || !bytes.Equal(got, payload) {
+				t.Fatalf("Get returned invalid payload: exists=%v, err=%v", exists, err)
+			}
+
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+
+			// Reopen and verify
+			store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+			if err != nil {
+				t.Fatalf("Reopen failed: %v", err)
+			}
+			defer store2.Close()
+
+			got2, exists2, err := store2.Get("bucket", key)
+			if err != nil || !exists2 || !bytes.Equal(got2, payload) {
+				t.Fatalf("Get after reopen returned invalid payload: exists=%v, err=%v", exists2, err)
+			}
+		})
+
+		t.Run(fmt.Sprintf("Incompressible_%dB", size), func(t *testing.T) {
+			memFS := NewMemFS()
+			dir := fmt.Sprintf("test_rt_incomp_%d", size)
+			store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+			if err != nil {
+				t.Fatalf("Open failed: %v", err)
+			}
+
+			payload := makeRandomPayload(size)
+			key := fmt.Sprintf("key-%d", size)
+			if err := store.Put("bucket", key, payload, "1"); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+
+			stored := getStoredPayload(t, store, "bucket", key)
+			if stored[0] != byte(CodecNone) {
+				t.Fatalf("expected CodecNone (%d) for incompressible size %d, got %d", CodecNone, size, stored[0])
+			}
+
+			got, exists, err := store.Get("bucket", key)
+			if err != nil || !exists || !bytes.Equal(got, payload) {
+				t.Fatalf("Get returned invalid payload: exists=%v, err=%v", exists, err)
+			}
+
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+
+			// Reopen and verify
+			store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecZstd))
+			if err != nil {
+				t.Fatalf("Reopen failed: %v", err)
+			}
+			defer store2.Close()
+
+			got2, exists2, err := store2.Get("bucket", key)
+			if err != nil || !exists2 || !bytes.Equal(got2, payload) {
+				t.Fatalf("Get after reopen returned invalid payload: exists=%v, err=%v", exists2, err)
+			}
+		})
+	}
+}
+
+// TestCompression_ReopenUncompressedSmallValues verifies that stores written with uncompressed
+// small values remain fully readable when reopened by an engine configured with CodecZstd.
+func TestCompression_ReopenUncompressedSmallValues(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_uncompressed_small"
+
+	// 1. Write store with CodecNone (simulating legacy stores or uncompressed writes)
+	store1, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open with CodecNone failed: %v", err)
 	}
 
-	entry := store.keyIndex[qualifyKey("ConfigMap", "cm-500")]
-	h, _ := store.bp.PinPage(entry.LogicalPage)
-	sp, _ := WrapSlottedPage(h.Block(0))
-	_, stored, _, _ := sp.Get(entry.Slot)
-	h.Unpin()
-
-	if stored[0] != byte(CodecZstd) {
-		t.Fatalf("expected codec %d (CodecZstd) for payload > custom threshold 100, got %d", CodecZstd, stored[0])
+	testPayloads := map[string][]byte{
+		"small-0":    makeRepetitivePayload(0),
+		"small-1":    makeRepetitivePayload(1),
+		"small-64":   makeRepetitivePayload(64),
+		"small-500":  makeRepetitivePayload(500),
+		"small-1000": makeRepetitivePayload(1000),
+		"small-2000": makeRepetitivePayload(2000),
+		"small-4000": makeRepetitivePayload(4000),
 	}
 
-	got, exists, err := store.Get("ConfigMap", "cm-500")
-	if err != nil || !exists || !bytes.Equal(got, payload500) {
-		t.Fatalf("Get returned invalid payload")
+	for k, v := range testPayloads {
+		if err := store1.Put("bucket", k, v, "1"); err != nil {
+			t.Fatalf("Put %s failed: %v", k, err)
+		}
+		// Confirm it was written as CodecNone
+		stored := getStoredPayload(t, store1, "bucket", k)
+		if stored[0] != byte(CodecNone) {
+			t.Fatalf("expected stored codec CodecNone for %s, got %d", k, stored[0])
+		}
+	}
+
+	if err := store1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 2. Reopen with default options (which enables CodecZstd)
+	store2, err := Open(WithFS(memFS), WithDir(dir))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	if store2.CompressionCodec() != CodecZstd {
+		t.Fatalf("expected default compression codec CodecZstd, got %v", store2.CompressionCodec())
+	}
+
+	// 3. Read back all legacy uncompressed small values
+	for k, expected := range testPayloads {
+		got, exists, err := store2.Get("bucket", k)
+		if err != nil {
+			t.Fatalf("Get %s failed: %v", k, err)
+		}
+		if !exists {
+			t.Fatalf("key %s does not exist after reopen", k)
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatalf("payload mismatch for %s after reopen", k)
+		}
+	}
+
+	// 4. Verify new writes in the reopened store compress small compressible payloads
+	newPayload := makeRepetitivePayload(500)
+	if err := store2.Put("bucket", "new-small-500", newPayload, "2"); err != nil {
+		t.Fatalf("Put new small payload failed: %v", err)
+	}
+
+	storedNew := getStoredPayload(t, store2, "bucket", "new-small-500")
+	if storedNew[0] != byte(CodecZstd) {
+		t.Fatalf("expected CodecZstd for new write in reopened store, got %d", storedNew[0])
+	}
+
+	gotNew, exists, err := store2.Get("bucket", "new-small-500")
+	if err != nil || !exists || !bytes.Equal(gotNew, newPayload) {
+		t.Fatalf("Get new-small-500 failed: exists=%v, err=%v", exists, err)
 	}
 }
