@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -158,5 +159,85 @@ func TestMultiBlockPage_OversizeObject(t *testing.T) {
 	_, err := NewMultiBlockPage(1, 1, "oversize", oversize)
 	if !errors.Is(err, ErrObjectOversize) {
 		t.Fatalf("expected ErrObjectOversize, got %v", err)
+	}
+}
+
+func TestCalculateMultiBlockCount(t *testing.T) {
+	// Key len + payload len within 2 blocks
+	blocks, err := CalculateMultiBlockCount(10, 100)
+	if err != nil || blocks != 2 {
+		t.Fatalf("expected 2 blocks, got %d, err %v", blocks, err)
+	}
+
+	// Boundary around 2 blocks: capacity = 2 * 4064 = 8128. Overhead = 14.
+	// For keyLen = 300, max payload in 2 blocks is 8128 - 14 - 300 = 7814.
+	blocks, err = CalculateMultiBlockCount(300, 7814)
+	if err != nil || blocks != 2 {
+		t.Fatalf("expected 2 blocks for payload 7814, got %d, err %v", blocks, err)
+	}
+	// 7815 bytes exceeds 2 blocks, requires 4 blocks
+	blocks, err = CalculateMultiBlockCount(300, 7815)
+	if err != nil || blocks != 4 {
+		t.Fatalf("expected 4 blocks for payload 7815, got %d, err %v", blocks, err)
+	}
+
+	// Exceeds 512 blocks
+	maxPayload512 := MaxMultiBlockCount*BlockUsableSize - PageRecordHeaderSize - 300
+	blocks, err = CalculateMultiBlockCount(300, maxPayload512)
+	if err != nil || blocks != 512 {
+		t.Fatalf("expected 512 blocks for payload %d, got %d, err %v", maxPayload512, blocks, err)
+	}
+	_, err = CalculateMultiBlockCount(300, maxPayload512+1)
+	if !errors.Is(err, ErrObjectOversize) {
+		t.Fatalf("expected ErrObjectOversize, got %v", err)
+	}
+
+	// Key too large (> 65535)
+	_, err = CalculateMultiBlockCount(65536, 10)
+	if !errors.Is(err, ErrObjectOversize) {
+		t.Fatalf("expected ErrObjectOversize for key > 65535, got %v", err)
+	}
+}
+
+func TestNewMultiBlockPage_CantWritePastBlocks(t *testing.T) {
+	// 1. Symptom 2 case: 300-byte key with payload around 7.8-8.0 KiB (8050 bytes).
+	// Must not panic, must successfully encode with 4 blocks.
+	key300 := strings.Repeat("k", 300)
+	payload8K := bytes.Repeat([]byte("p"), 8050)
+	mbPage, err := NewMultiBlockPage(1, 100, key300, payload8K)
+	if err != nil {
+		t.Fatalf("NewMultiBlockPage failed: %v", err)
+	}
+	if len(mbPage.Blocks) != 4 {
+		t.Fatalf("expected 4 blocks, got %d", len(mbPage.Blocks))
+	}
+	decKey, decPayload, decLSN, err := DecodeMultiBlockPage(mbPage.Blocks)
+	if err != nil || decKey != key300 || decLSN != 100 || !bytes.Equal(decPayload, payload8K) {
+		t.Fatalf("decoded multi-block record mismatch: err=%v", err)
+	}
+
+	// 2. 65535-byte key with small payload: must encode and decode cleanly.
+	key65K := strings.Repeat("x", 65535)
+	mb65K, err := NewMultiBlockPage(2, 200, key65K, []byte("small-val"))
+	if err != nil {
+		t.Fatalf("NewMultiBlockPage with 65535-byte key failed: %v", err)
+	}
+	decKey65, decPayload65, decLSN65, err := DecodeMultiBlockPage(mb65K.Blocks)
+	if err != nil || decKey65 != key65K || decLSN65 != 200 || string(decPayload65) != "small-val" {
+		t.Fatalf("decoded 65535-byte key record mismatch: err=%v", err)
+	}
+
+	// 3. Key exceeding 65535 bytes: must return error, not panic.
+	key65536 := strings.Repeat("x", 65536)
+	_, err = NewMultiBlockPage(3, 300, key65536, []byte("val"))
+	if !errors.Is(err, ErrObjectOversize) {
+		t.Fatalf("expected ErrObjectOversize for 65536-byte key, got %v", err)
+	}
+
+	// 4. Record exceeding 512-block capacity: must return error, not panic.
+	hugePayload := make([]byte, MaxMultiBlockCount*BlockUsableSize)
+	_, err = NewMultiBlockPage(4, 400, "k", hugePayload)
+	if !errors.Is(err, ErrObjectOversize) {
+		t.Fatalf("expected ErrObjectOversize for record exceeding 512 blocks, got %v", err)
 	}
 }

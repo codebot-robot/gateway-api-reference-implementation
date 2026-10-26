@@ -26,6 +26,9 @@ const (
 	// SlotEntrySize is 4 bytes: Offset(2) + Length(2).
 	SlotEntrySize = 4
 
+	// PageRecordHeaderSize is 14 bytes: KeyLen(2) + PayloadLen(4) + LSN(8).
+	PageRecordHeaderSize = 14
+
 	// BlockLSNOffset is offset 16 in BlockHeader.
 	BlockLSNOffset = 16
 
@@ -34,7 +37,24 @@ const (
 
 	// MaxPayloadCapacity is the maximum size of an object payload that fits in 512 blocks.
 	MaxPayloadCapacity = (MaxMultiBlockCount * BlockUsableSize) - 32
+
+	// MaxSlottedRecordSize is the maximum record length (header + key + payload) that can fit in an empty slotted page.
+	// BlockSize (4096) - BlockHeaderSize (32) - SlottedPageMetaSize (8) - SlotEntrySize (4) = 4052 bytes.
+	MaxSlottedRecordSize = BlockSize - BlockHeaderSize - SlottedPageMetaSize - SlotEntrySize
 )
+
+// SlottedRecordSize returns the total record size in a slotted page for the given key and payload lengths.
+func SlottedRecordSize(keyLen, payloadLen int) int {
+	return PageRecordHeaderSize + keyLen + payloadLen
+}
+
+// CanFitInSlottedPage reports whether a record with keyLen and payloadLen can fit in an empty slotted page.
+func CanFitInSlottedPage(keyLen, payloadLen int) bool {
+	if keyLen < 0 || payloadLen < 0 || keyLen > 65535 {
+		return false
+	}
+	return SlottedRecordSize(keyLen, payloadLen) <= MaxSlottedRecordSize
+}
 
 var (
 	// ErrPageFull indicates the slotted page cannot accommodate the record.
@@ -152,7 +172,10 @@ func (p *SlottedPage) ActiveSlotsCount() int {
 // If space is fragmented, it compacts the page internally.
 func (p *SlottedPage) Put(key string, payload []byte, lsn uint64) (uint32, error) {
 	keyBytes := []byte(key)
-	recLen := 2 + 4 + 8 + len(keyBytes) + len(payload) // KeyLen(2) + ValLen(4) + LSN(8) + Key + Payload
+	if len(keyBytes) > 65535 {
+		return 0, ErrPageFull
+	}
+	recLen := PageRecordHeaderSize + len(keyBytes) + len(payload) // KeyLen(2) + ValLen(4) + LSN(8) + Key + Payload
 
 	numSlots := p.numSlots()
 
@@ -290,15 +313,23 @@ func (p *SlottedPage) Finalize() {
 	FinalizeBlockCRC(p.buf)
 }
 
-// CalculateMultiBlockCount determines the power-of-two number of blocks (1..512) needed for a payload.
-func CalculateMultiBlockCount(payloadLen int) (int, error) {
-	neededBytes := 2 + 4 + 8 + 64 + payloadLen // Key + Payload + overhead
-	if neededBytes > MaxPayloadCapacity {
+// CalculateMultiBlockCount determines the power-of-two number of blocks (2..512) needed for a key and payload.
+func CalculateMultiBlockCount(keyLen, payloadLen int) (int, error) {
+	if keyLen < 0 || payloadLen < 0 {
+		return 0, errors.New("invalid key or payload length")
+	}
+	if keyLen > 65535 {
+		return 0, ErrObjectOversize
+	}
+
+	neededBytes := PageRecordHeaderSize + keyLen + payloadLen
+	maxMultiBlockCapacity := MaxMultiBlockCount * BlockUsableSize
+	if neededBytes > maxMultiBlockCapacity {
 		return 0, ErrObjectOversize
 	}
 
 	neededBlocks := (neededBytes + BlockUsableSize - 1) / BlockUsableSize
-	pow2 := 1
+	pow2 := 2
 	for pow2 < neededBlocks {
 		pow2 *= 2
 	}
@@ -315,7 +346,12 @@ type MultiBlockPage struct {
 
 // NewMultiBlockPage creates and encodes a multi-block page holding a single large record at slot 0.
 func NewMultiBlockPage(logicalPage, lsn uint64, key string, payload []byte) (*MultiBlockPage, error) {
-	numBlocks, err := CalculateMultiBlockCount(len(payload))
+	keyBytes := []byte(key)
+	if len(keyBytes) > 65535 {
+		return nil, ErrObjectOversize
+	}
+
+	numBlocks, err := CalculateMultiBlockCount(len(keyBytes), len(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -334,20 +370,22 @@ func NewMultiBlockPage(logicalPage, lsn uint64, key string, payload []byte) (*Mu
 
 	// Serialize record across blocks:
 	// Record: KeyLen(2) + PayloadLen(4) + LSN(8) + Key + Payload
-	keyBytes := []byte(key)
-	recMeta := make([]byte, 2+4+8+len(keyBytes))
+	recMeta := make([]byte, PageRecordHeaderSize+len(keyBytes))
 	binary.BigEndian.PutUint16(recMeta[0:2], uint16(len(keyBytes)))
 	binary.BigEndian.PutUint32(recMeta[2:6], uint32(len(payload)))
 	binary.BigEndian.PutUint64(recMeta[6:14], lsn)
 	copy(recMeta[14:], keyBytes)
 
-	// Stream recMeta + payload into blocks[0..numBlocks-1][64:4096]
+	// Stream recMeta + payload into blocks[0..numBlocks-1][32:4096]
 	currBlock := 0
 	currOffset := BlockHeaderSize
 
-	writeBytes := func(data []byte) {
+	writeBytes := func(data []byte) error {
 		written := 0
 		for written < len(data) {
+			if currBlock >= len(blocks) {
+				return ErrObjectOversize
+			}
 			avail := BlockSize - currOffset
 			toWrite := len(data) - written
 			if toWrite > avail {
@@ -361,10 +399,15 @@ func NewMultiBlockPage(logicalPage, lsn uint64, key string, payload []byte) (*Mu
 				currOffset = BlockHeaderSize
 			}
 		}
+		return nil
 	}
 
-	writeBytes(recMeta)
-	writeBytes(payload)
+	if err := writeBytes(recMeta); err != nil {
+		return nil, err
+	}
+	if err := writeBytes(payload); err != nil {
+		return nil, err
+	}
 
 	// Finalize CRC for every block in the multi-block page
 	for _, b := range blocks {

@@ -411,7 +411,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 				}
 
 				// Apply mutation to page buffer
-				if len(rec.Payload) < BlockUsableSize-64 {
+				if CanFitInSlottedPage(len(rec.Key), len(rec.Payload)) {
 					// 1-block slotted page
 					var targetPage uint64
 					if inIndex && !existing.IsOversize && pageDescs[existing.LogicalPage] != nil && pageDescs[existing.LogicalPage].NumBlocks == 1 {

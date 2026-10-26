@@ -965,6 +965,13 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	existing, inIndex := s.keyIndex[qKey]
 	s.keyMu.RUnlock()
 
+	// Validate size before appending to WAL: return clear, non-sticky error if record cannot fit.
+	if len(toStore) <= MaxPayloadCapacity && !CanFitInSlottedPage(len(qKey), len(toStore)) {
+		if _, err := CalculateMultiBlockCount(len(qKey), len(toStore)); err != nil {
+			return err
+		}
+	}
+
 	// Append record to WAL, assigning LSN under WAL lock
 	rec := Record{
 		Type:    RecordTypePut,
@@ -1033,7 +1040,7 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	}
 
 	// Check if this object fits in a 1-block slotted page
-	if len(toStore) < BlockUsableSize-64 {
+	if CanFitInSlottedPage(len(qKey), len(toStore)) {
 		// Use or allocate a slotted page
 		var targetPage uint64
 		if inIndex && !existing.IsOversize && existing.NumBlocks == 1 {
@@ -1079,12 +1086,30 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 			}
 			s.keyMu.Unlock()
 
-			if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
-				if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
-					handle.Desc.Mu.Unlock()
-					handle.Unpin()
-					s.setFailed(delErr)
-					return s.failErr()
+			if inIndex && !existing.IsOversize {
+				if targetPage == existing.LogicalPage && slotIdx != existing.Slot {
+					if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
+						handle.Desc.Mu.Unlock()
+						handle.Unpin()
+						s.setFailed(delErr)
+						return s.failErr()
+					}
+				} else if targetPage != existing.LogicalPage {
+					if existing.NumBlocks == 1 {
+						if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
+							handle.Desc.Mu.Unlock()
+							handle.Unpin()
+							s.setFailed(err)
+							return s.failErr()
+						}
+					} else if existing.NumBlocks > 1 {
+						if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
+							handle.Desc.Mu.Unlock()
+							handle.Unpin()
+							s.setFailed(err)
+							return s.failErr()
+						}
+					}
 				}
 			}
 		} else {
@@ -1150,10 +1175,9 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 		s.keyMu.Unlock()
 	} else {
 		// Multi-block page
-		numBlocks, err := CalculateMultiBlockCount(len(toStore))
+		numBlocks, err := CalculateMultiBlockCount(len(qKey), len(toStore))
 		if err != nil {
-			s.setFailed(err)
-			return s.failErr()
+			return err
 		}
 
 		// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
