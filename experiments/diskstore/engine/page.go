@@ -56,6 +56,15 @@ func CanFitInSlottedPage(keyLen, payloadLen int) bool {
 	return SlottedRecordSize(keyLen, payloadLen) <= MaxSlottedRecordSize
 }
 
+// fitsInMultiBlockPage reports whether a record with keyLen and payloadLen can fit
+// within the maximum multi-block page capacity (512 blocks = 2,080,768 bytes).
+func fitsInMultiBlockPage(keyLen, payloadLen int) bool {
+	if keyLen < 0 || payloadLen < 0 || keyLen > 65535 {
+		return false
+	}
+	return PageRecordHeaderSize+keyLen+payloadLen <= MaxMultiBlockCount*BlockUsableSize
+}
+
 var (
 	// ErrPageFull indicates the slotted page cannot accommodate the record.
 	ErrPageFull = errors.New("slotted page is full")
@@ -314,20 +323,18 @@ func (p *SlottedPage) Finalize() {
 }
 
 // CalculateMultiBlockCount determines the power-of-two number of blocks (2..512) needed for a key and payload.
+//
+// Multi-block allocations start at 2 blocks (order 1) rather than 1 block (order 0)
+// because the engine and crash recovery treat NumBlocks == 1 as a slotted page (see recovery.go
+// cand.numBlocks == 1 branch, and engine.go Get). With the exact slotted record limit of 4052 bytes,
+// a record of 4053–4064 bytes would otherwise fit in 1 usable block (4064 bytes) and receive
+// NumBlocks == 1, causing recovery and Get to misread the multi-block page as a slotted page.
 func CalculateMultiBlockCount(keyLen, payloadLen int) (int, error) {
-	if keyLen < 0 || payloadLen < 0 {
-		return 0, errors.New("invalid key or payload length")
-	}
-	if keyLen > 65535 {
+	if !fitsInMultiBlockPage(keyLen, payloadLen) {
 		return 0, ErrObjectOversize
 	}
 
 	neededBytes := PageRecordHeaderSize + keyLen + payloadLen
-	maxMultiBlockCapacity := MaxMultiBlockCount * BlockUsableSize
-	if neededBytes > maxMultiBlockCapacity {
-		return 0, ErrObjectOversize
-	}
-
 	neededBlocks := (neededBytes + BlockUsableSize - 1) / BlockUsableSize
 	pow2 := 2
 	for pow2 < neededBlocks {

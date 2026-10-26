@@ -965,11 +965,9 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	existing, inIndex := s.keyIndex[qKey]
 	s.keyMu.RUnlock()
 
-	// Validate size before appending to WAL: return clear, non-sticky error if record cannot fit.
-	if len(toStore) <= MaxPayloadCapacity && !CanFitInSlottedPage(len(qKey), len(toStore)) {
-		if _, err := CalculateMultiBlockCount(len(qKey), len(toStore)); err != nil {
-			return err
-		}
+	// Validate key length: a key over 65535 bytes cannot fit in the 16-bit key length field.
+	if len(qKey) > 65535 {
+		return ErrObjectOversize
 	}
 
 	// Append record to WAL, assigning LSN under WAL lock
@@ -990,8 +988,8 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	s.lastRecoveredTokenByBucket[bucketName] = token
 	s.keyMu.Unlock()
 
-	// Handle oversize object (> 2 MiB): persist to disk under oversize directory (Item 17)
-	if len(toStore) > MaxPayloadCapacity {
+	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
+	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
 		if inIndex {
 			if !existing.IsOversize {
 				if existing.NumBlocks == 1 {
@@ -1086,30 +1084,12 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 			}
 			s.keyMu.Unlock()
 
-			if inIndex && !existing.IsOversize {
-				if targetPage == existing.LogicalPage && slotIdx != existing.Slot {
-					if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
-						handle.Desc.Mu.Unlock()
-						handle.Unpin()
-						s.setFailed(delErr)
-						return s.failErr()
-					}
-				} else if targetPage != existing.LogicalPage {
-					if existing.NumBlocks == 1 {
-						if err := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); err != nil {
-							handle.Desc.Mu.Unlock()
-							handle.Unpin()
-							s.setFailed(err)
-							return s.failErr()
-						}
-					} else if existing.NumBlocks > 1 {
-						if err := s.clearLogicalPageLocked(existing.LogicalPage, lsn); err != nil {
-							handle.Desc.Mu.Unlock()
-							handle.Unpin()
-							s.setFailed(err)
-							return s.failErr()
-						}
-					}
+			if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
+				if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
+					handle.Desc.Mu.Unlock()
+					handle.Unpin()
+					s.setFailed(delErr)
+					return s.failErr()
 				}
 			}
 		} else {

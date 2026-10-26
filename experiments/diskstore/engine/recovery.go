@@ -399,7 +399,7 @@ func Recover(fs FS, heapFile File, walDir string, dbID [16]byte) (*RecoveryResul
 					}
 				}
 
-				if len(rec.Payload) > MaxPayloadCapacity {
+				if !fitsInMultiBlockPage(len(rec.Key), len(rec.Payload)) {
 					// Oversize object: lives in oversize directory, not heap blocks
 					keyIndex[rec.Key] = KeyIndexEntry{
 						LogicalPage: 0,
