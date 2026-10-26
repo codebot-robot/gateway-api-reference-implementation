@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -593,6 +594,288 @@ func TestEngine_TokenPerBucket(t *testing.T) {
 	// Secret must recover secret-rv-600
 	if store2.Token("Secret") != "secret-rv-600" {
 		t.Fatalf("Secret recovered wrong RV: got %q, want %q", store2.Token("Secret"), "secret-rv-600")
+	}
+}
+
+func TestKeyBoundaries_TableTest(t *testing.T) {
+	keys := []struct {
+		name string
+		key  string
+	}{
+		{"Key1B", strings.Repeat("a", 1)},
+		{"Key64B", strings.Repeat("b", 64)},
+		{"Key65B", strings.Repeat("c", 65)},
+		{"Key300B", strings.Repeat("d", 300)},
+		{"Key65535B", strings.Repeat("e", 65535)},
+	}
+
+	bucket := "b"
+
+	for _, tc := range keys {
+		t.Run(tc.name, func(t *testing.T) {
+			qKey := qualifyKey(bucket, tc.key)
+			qKeyLen := len(qKey)
+
+			// Collect boundary payload sizes
+			payloadSizes := make(map[int]bool)
+
+			// 1. Slotted limit (±1 byte)
+			slottedLimit := MaxSlottedRecordSize - PageRecordHeaderSize - qKeyLen
+			for _, delta := range []int{-1, 0, 1} {
+				sz := slottedLimit + delta
+				if sz >= 0 {
+					payloadSizes[sz] = true
+				}
+			}
+
+			// 2. Each power-of-two multi-block limit (±1 byte)
+			for numBlocks := 1; numBlocks <= MaxMultiBlockCount; numBlocks *= 2 {
+				mbLimit := (numBlocks * BlockUsableSize) - PageRecordHeaderSize - qKeyLen
+				for _, delta := range []int{-1, 0, 1} {
+					sz := mbLimit + delta
+					if sz >= 0 {
+						payloadSizes[sz] = true
+					}
+				}
+			}
+
+			// Sort payload sizes
+			sortedSizes := make([]int, 0, len(payloadSizes))
+			for sz := range payloadSizes {
+				sortedSizes = append(sortedSizes, sz)
+			}
+			sort.Ints(sortedSizes)
+
+			for _, pLen := range sortedSizes {
+				pLen := pLen
+				t.Run(fmt.Sprintf("Payload_%d", pLen), func(t *testing.T) {
+					memFS := NewMemFS()
+					dir := "test_boundary_store"
+
+					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+					if err != nil {
+						t.Fatalf("Open failed: %v", err)
+					}
+					defer func() {
+						if !store.closed.Load() {
+							_ = store.Close()
+						}
+					}()
+
+					payload := make([]byte, pLen)
+					for i := range payload {
+						payload[i] = byte((i*37 + 11) % 256)
+					}
+
+					putErr := store.Put(bucket, tc.key, payload, "rv-1")
+					if putErr != nil {
+						// Must be a non-sticky "too large" error
+						if !errors.Is(putErr, ErrObjectOversize) {
+							t.Fatalf("expected ErrObjectOversize, got %v", putErr)
+						}
+						if store.isFailed() {
+							t.Fatalf("store unexpectedly entered failed state: %v", store.failErr())
+						}
+
+						// Subsequent operations must succeed
+						probeVal := []byte("probe-value")
+						if err := store.Put(bucket, "probe", probeVal, "rv-probe"); err != nil {
+							t.Fatalf("Put after non-sticky error failed: %v", err)
+						}
+						got, exists, err := store.Get(bucket, "probe")
+						if err != nil || !exists || !bytes.Equal(got, probeVal) {
+							t.Fatalf("Get after non-sticky error failed: exists=%v, err=%v", exists, err)
+						}
+
+						// Reopen must succeed
+						_ = store.Close()
+						store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+						if err != nil {
+							t.Fatalf("reopen after non-sticky error failed: %v", err)
+						}
+						_ = store2.Close()
+					} else {
+						// Must round-trip through Get
+						got, exists, err := store.Get(bucket, tc.key)
+						if err != nil || !exists {
+							t.Fatalf("Get failed: exists=%v, err=%v", exists, err)
+						}
+						if !bytes.Equal(got, payload) {
+							t.Fatalf("payload mismatch: len(got)=%d, len(want)=%d", len(got), len(payload))
+						}
+
+						// Must round-trip through close and reopen
+						if err := store.Close(); err != nil {
+							t.Fatalf("Close failed: %v", err)
+						}
+						store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+						if err != nil {
+							t.Fatalf("reopen failed: %v", err)
+						}
+						defer store2.Close()
+
+						got2, exists2, err := store2.Get(bucket, tc.key)
+						if err != nil || !exists2 {
+							t.Fatalf("Get after reopen failed: exists=%v, err=%v", exists2, err)
+						}
+						if !bytes.Equal(got2, payload) {
+							t.Fatalf("payload mismatch after reopen: len(got)=%d, len(want)=%d", len(got2), len(payload))
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestSlottedPage_KeyOver64BytesNearBoundary(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_slotted_boundary"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	key100 := strings.Repeat("k", 100)
+	for _, sz := range []int{3928, 3938, 3939, 3950, 3999} {
+		payload := make([]byte, sz)
+		for i := range payload {
+			payload[i] = byte(i % 251)
+		}
+		if err := store.Put("ConfigMap", key100, payload, fmt.Sprintf("%d", sz)); err != nil {
+			t.Fatalf("Put for size %d failed: %v", sz, err)
+		}
+		got, exists, err := store.Get("ConfigMap", key100)
+		if err != nil || !exists || !bytes.Equal(got, payload) {
+			t.Fatalf("Get for size %d failed: exists=%v, err=%v", sz, exists, err)
+		}
+	}
+
+	_ = store.Close()
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	lastPayload := make([]byte, 3999)
+	for i := range lastPayload {
+		lastPayload[i] = byte(i % 251)
+	}
+	got2, exists2, err := store2.Get("ConfigMap", key100)
+	if err != nil || !exists2 || !bytes.Equal(got2, lastPayload) {
+		t.Fatalf("Get after reopen failed: exists=%v, err=%v", exists2, err)
+	}
+}
+
+func TestMultiBlockPage_KeyOver64BytesNearBoundary(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_multiblock_boundary"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	key300 := strings.Repeat("m", 300)
+	for _, sz := range []int{7800, 7814, 7815, 7900, 8000, 8050} {
+		payload := make([]byte, sz)
+		for i := range payload {
+			payload[i] = byte((i * 13) % 256)
+		}
+		if err := store.Put("ConfigMap", key300, payload, fmt.Sprintf("%d", sz)); err != nil {
+			t.Fatalf("Put for size %d failed: %v", sz, err)
+		}
+		got, exists, err := store.Get("ConfigMap", key300)
+		if err != nil || !exists || !bytes.Equal(got, payload) {
+			t.Fatalf("Get for size %d failed: exists=%v, err=%v", sz, exists, err)
+		}
+	}
+
+	_ = store.Close()
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	lastPayload := make([]byte, 8050)
+	for i := range lastPayload {
+		lastPayload[i] = byte((i * 13) % 256)
+	}
+	got2, exists2, err := store2.Get("ConfigMap", key300)
+	if err != nil || !exists2 || !bytes.Equal(got2, lastPayload) {
+		t.Fatalf("Get after reopen failed: exists=%v, err=%v", exists2, err)
+	}
+}
+
+func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_multiblock_transition_store"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	bucket := "b"
+	key := "k"
+	qKey := qualifyKey(bucket, key)
+	overhead := PageRecordHeaderSize + len(qKey) // 14 + 3 = 17 bytes
+
+	// Record sizes 4053 and 4064 fall between the max slotted record limit (4052)
+	// and the 1-block usable capacity (4064). They must allocate 2 blocks (order 1)
+	// so crash recovery and Get (which assume NumBlocks == 1 is slotted) decode them as multi-block.
+	recordSizes := []int{4053, 4064}
+	payloads := make(map[int][]byte)
+
+	for _, recSize := range recordSizes {
+		pLen := recSize - overhead
+		payload := make([]byte, pLen)
+		for i := range payload {
+			payload[i] = byte((i*41 + 7) % 256)
+		}
+		payloads[recSize] = payload
+
+		k := fmt.Sprintf("k-%d", recSize)
+		if err := store.Put(bucket, k, payload, fmt.Sprintf("%d", recSize)); err != nil {
+			t.Fatalf("Put for record size %d failed: %v", recSize, err)
+		}
+
+		// Verify keyIndex entry has NumBlocks == 2
+		store.keyMu.RLock()
+		entry, ok := store.keyIndex[qualifyKey(bucket, k)]
+		store.keyMu.RUnlock()
+		if !ok || entry.NumBlocks != 2 {
+			t.Fatalf("expected NumBlocks == 2 for record size %d, got ok=%v, numBlocks=%d", recSize, ok, entry.NumBlocks)
+		}
+
+		got, exists, err := store.Get(bucket, k)
+		if err != nil || !exists || !bytes.Equal(got, payload) {
+			t.Fatalf("Get for record size %d failed: exists=%v, err=%v", recSize, exists, err)
+		}
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen and verify crash recovery decodes both records correctly
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	for _, recSize := range recordSizes {
+		k := fmt.Sprintf("k-%d", recSize)
+		got, exists, err := store2.Get(bucket, k)
+		if err != nil || !exists || !bytes.Equal(got, payloads[recSize]) {
+			t.Fatalf("Get after reopen for record size %d failed: exists=%v, err=%v", recSize, exists, err)
+		}
 	}
 }
 

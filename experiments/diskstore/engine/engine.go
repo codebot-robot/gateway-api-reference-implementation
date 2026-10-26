@@ -965,6 +965,11 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	existing, inIndex := s.keyIndex[qKey]
 	s.keyMu.RUnlock()
 
+	// Validate key length: a key over 65535 bytes cannot fit in the 16-bit key length field.
+	if len(qKey) > 65535 {
+		return ErrObjectOversize
+	}
+
 	// Append record to WAL, assigning LSN under WAL lock
 	rec := Record{
 		Type:    RecordTypePut,
@@ -983,8 +988,8 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	s.lastRecoveredTokenByBucket[bucketName] = token
 	s.keyMu.Unlock()
 
-	// Handle oversize object (> 2 MiB): persist to disk under oversize directory (Item 17)
-	if len(toStore) > MaxPayloadCapacity {
+	// Handle oversize object: records exceeding 512-block multi-block capacity persist to disk under oversize directory
+	if !fitsInMultiBlockPage(len(qKey), len(toStore)) {
 		if inIndex {
 			if !existing.IsOversize {
 				if existing.NumBlocks == 1 {
@@ -1033,7 +1038,7 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 	}
 
 	// Check if this object fits in a 1-block slotted page
-	if len(toStore) < BlockUsableSize-64 {
+	if CanFitInSlottedPage(len(qKey), len(toStore)) {
 		// Use or allocate a slotted page
 		var targetPage uint64
 		if inIndex && !existing.IsOversize && existing.NumBlocks == 1 {
@@ -1150,10 +1155,9 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 		s.keyMu.Unlock()
 	} else {
 		// Multi-block page
-		numBlocks, err := CalculateMultiBlockCount(len(toStore))
+		numBlocks, err := CalculateMultiBlockCount(len(qKey), len(toStore))
 		if err != nil {
-			s.setFailed(err)
-			return s.failErr()
+			return err
 		}
 
 		// If replacing an existing slotted or multi-block record, clean up old location (Item 15)
