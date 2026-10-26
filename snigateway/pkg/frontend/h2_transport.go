@@ -274,9 +274,38 @@ func (h *H2Transport) drainConn(c *h2Conn) {
 }
 
 // GetConn opens an HTTP/2 CONNECT stream for the specified sessionID.
+//
+// HTTP/2 CONNECT streams return as soon as the request HEADERS frame is
+// written to the wire, providing 0-RTT pipelining. If the chosen connection
+// suffers a transport-level failure (such as a closed socket or network drop)
+// before any body bytes have been queued, the stream transparently reopens on
+// another pooled connection during the first Write or Read.
+//
+// A non-200 CONNECT response indicates a backend decision rather than a
+// connection failure; it returns to the caller without reopening or draining
+// the connection. Once body bytes have been queued, failover is not attempted
+// and errors surface to the caller as usual.
 func (h *H2Transport) GetConn(ctx context.Context, sessionID string) (net.Conn, error) {
 	conn, _, err := h.GetConnForSessions(ctx, []string{sessionID})
 	return conn, err
+}
+
+func (h *H2Transport) makeReopenFunc(sessionIDs []string, connToDrain *h2Conn) func(ctx context.Context) (*h2StreamConn, error) {
+	sids := slices.Clone(sessionIDs)
+	return func(reopenCtx context.Context) (*h2StreamConn, error) {
+		h.drainConn(connToDrain)
+		h.broadcast()
+
+		newConn, _, err := h.GetConnForSessions(reopenCtx, sids)
+		if err != nil {
+			return nil, err
+		}
+		h2sc, ok := newConn.(*h2StreamConn)
+		if !ok {
+			return nil, fmt.Errorf("unexpected connection type: %T", newConn)
+		}
+		return h2sc, nil
+	}
 }
 
 // TryGetConn attempts to open an HTTP/2 CONNECT stream on sessionID without blocking.
@@ -316,18 +345,25 @@ func (h *H2Transport) TryGetConn(ctx context.Context, sessionID string) (net.Con
 
 	streamConn, err := h.openConnectStream(ctx, bestConn)
 	if err != nil {
-		if ctx.Err() == nil {
+		var statusErr *connectStatusError
+		if !errors.As(err, &statusErr) && ctx.Err() == nil {
 			h.drainConn(bestConn)
 		}
 		h.broadcast()
 		return nil, err
 	}
+
+	streamConn.reopen = h.makeReopenFunc([]string{sessionID}, bestConn)
 	return streamConn, nil
 }
 
 // GetConnForSessions searches candidate sessions in order and opens an HTTP/2 CONNECT stream
 // on the least-loaded connection that has capacity. If all pooled connections are at their
-// MaxConcurrentStreams limit, it queues/waits until capacity becomes available or ctx is done.
+// MaxConcurrentStreams limit, it waits until capacity becomes available or ctx is done.
+//
+// Streams return as soon as request HEADERS are written. If the chosen connection suffers
+// a transport failure before any body bytes have been queued, the stream reopens on another
+// candidate connection during its first Write or Read.
 func (h *H2Transport) GetConnForSessions(ctx context.Context, sessionIDs []string) (net.Conn, string, error) {
 	for {
 		h.mu.Lock()
@@ -374,6 +410,10 @@ func (h *H2Transport) GetConnForSessions(ctx context.Context, sessionIDs []strin
 				if ctx.Err() != nil {
 					return nil, "", ctx.Err()
 				}
+				var statusErr *connectStatusError
+				if errors.As(err, &statusErr) {
+					return nil, "", err
+				}
 
 				// Connection-level error opening stream; drain connection and failover to next candidate
 				h.drainConn(bestConn)
@@ -381,6 +421,7 @@ func (h *H2Transport) GetConnForSessions(ctx context.Context, sessionIDs []strin
 				continue
 			}
 
+			streamConn.reopen = h.makeReopenFunc(sessionIDs, bestConn)
 			return streamConn, bestSID, nil
 		}
 
@@ -402,7 +443,32 @@ type rtResult struct {
 	err error
 }
 
-func (h *H2Transport) openConnectStream(ctx context.Context, hc *h2Conn) (net.Conn, error) {
+type connectStatusError struct {
+	status string
+}
+
+func (e *connectStatusError) Error() string {
+	return fmt.Sprintf("unexpected CONNECT response status: %s", e.status)
+}
+
+// openConnectStream initiates an HTTP/2 CONNECT tunnel on hc.
+//
+// To minimize connection setup latency on healthy connections, openConnectStream
+// returns the stream as soon as the request HEADERS frame is written (the
+// httptrace.ClientTrace WroteHeaders event), before waiting 1 RTT for the HTTP
+// 200 OK response.
+//
+// If a pooled connection closes concurrently around the time GetConn selects it,
+// WroteHeaders can fire before the read error is detected. To avoid a 1-RTT
+// penalty on healthy connections, the stream preserves 0-RTT and provides
+// transparent failover before the first byte: if the connection suffers a
+// transport failure before any body bytes have been queued, the stream
+// reopens on another pooled connection during the first Write or Read.
+//
+// Non-200 responses return directly to the caller without draining the
+// connection. Once body bytes have been queued, failover is not attempted and
+// errors surface to the caller as usual.
+func (h *H2Transport) openConnectStream(ctx context.Context, hc *h2Conn) (*h2StreamConn, error) {
 	queue := api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound)
 
 	streamCtx, streamCancel := context.WithCancel(context.Background())
@@ -422,37 +488,47 @@ func (h *H2Transport) openConnectStream(ctx context.Context, hc *h2Conn) (net.Co
 	req.Host = h.targetHost
 	req.URL = &url.URL{Host: req.Host}
 
-	respCh := make(chan rtResult, 1)
+	streamConn := newH2StreamConn(queue, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast, hc)
+	att := streamConn.attempt.Load()
+
 	go func() {
 		res, err := hc.cc.RoundTrip(req)
-		respCh <- rtResult{res: res, err: err}
+		att.mu.Lock()
+		if err != nil {
+			att.result = &rtResult{err: err}
+		} else if res.StatusCode != http.StatusOK {
+			closeCloser(res.Body)
+			att.result = &rtResult{res: res, err: &connectStatusError{status: res.Status}}
+		} else {
+			att.result = &rtResult{res: res}
+			att.resBody = res.Body
+		}
+		att.mu.Unlock()
+		close(att.done)
 	}()
 
-	// 0-RTT pipelining: hand stream back immediately as soon as request HEADERS are out!
 	select {
 	case <-ctx.Done():
 		streamCancel()
 		queue.Abort(ctx.Err())
 		return nil, ctx.Err()
-	case r := <-respCh:
-		// RoundTrip failed or responded before headersSent was selected
-		if r.err != nil {
+	case <-att.done:
+		if att.result.err != nil {
 			streamCancel()
-			queue.Abort(r.err)
-			return nil, r.err
+			queue.Abort(att.result.err)
+			return nil, att.result.err
 		}
-		if r.res.StatusCode != http.StatusOK {
-			streamCancel()
-			queue.Abort(net.ErrClosed)
-			closeCloser(r.res.Body)
-			return nil, fmt.Errorf("unexpected CONNECT response status: %s", r.res.Status)
-		}
-		streamConn := newH2StreamConn(queue, respCh, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast)
-		streamConn.resBody = r.res.Body
 		return streamConn, nil
 	case <-headersSent:
-		// Request HEADERS frame is out on the wire! Return stream immediately for 0-RTT body writes.
-		streamConn := newH2StreamConn(queue, respCh, streamCancel, hc.rawConn.LocalAddr(), hc.rawConn.RemoteAddr(), h.broadcast)
+		select {
+		case <-att.done:
+			if att.result.err != nil {
+				streamCancel()
+				queue.Abort(att.result.err)
+				return nil, att.result.err
+			}
+		default:
+		}
 		return streamConn, nil
 	}
 }
@@ -480,19 +556,78 @@ func (h *H2Transport) Close() error {
 	return nil
 }
 
-// h2StreamConn implements net.Conn over an HTTP/2 CONNECT stream.
-// Writes are queued into req.Body and reads are received from res.Body.
-type h2StreamConn struct {
+type streamAttempt struct {
 	queue        *api.H2ChunkQueue
-	respCh       chan rtResult
 	streamCancel context.CancelFunc
 	localAddr    net.Addr
 	remoteAddr   net.Addr
-	onClose      func()
+	hc           *h2Conn
+
+	done chan struct{}
+
+	mu      sync.Mutex
+	result  *rtResult
+	resBody io.ReadCloser
+}
+
+func (a *streamAttempt) pollResult() (io.ReadCloser, error, bool) {
+	select {
+	case <-a.done:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.resBody, a.result.err, true
+	default:
+		if a.hc != nil && (a.hc.closed.Load() || a.hc.cc.State().Closed) {
+			return nil, net.ErrClosed, true
+		}
+		return nil, nil, false
+	}
+}
+
+func (a *streamAttempt) awaitResult(closeCh chan struct{}, deadline time.Time) (io.ReadCloser, error) {
+	if rb, err, done := a.pollResult(); done {
+		return rb, err
+	}
+
+	var deadlineCh <-chan time.Time
+	if !deadline.IsZero() {
+		dur := time.Until(deadline)
+		if dur <= 0 {
+			return nil, os.ErrDeadlineExceeded
+		}
+		t := time.NewTimer(dur)
+		defer t.Stop()
+		deadlineCh = t.C
+	}
+
+	select {
+	case <-a.done:
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.resBody, a.result.err
+	case <-closeCh:
+		return nil, net.ErrClosed
+	case <-deadlineCh:
+		return nil, os.ErrDeadlineExceeded
+	}
+}
+
+// h2StreamConn implements net.Conn over an HTTP/2 CONNECT stream.
+// Writes are queued into req.Body and reads are received from res.Body.
+type h2StreamConn struct {
+	attempt atomic.Pointer[streamAttempt]
+
+	onClose func()
+	closeCh chan struct{}
+
+	reopen    func(ctx context.Context) (*h2StreamConn, error)
+	reopening chan struct{}
 
 	mu            sync.Mutex
-	resBody       io.ReadCloser
 	closed        bool
+	bodyQueued    bool
+	firstWriting  chan struct{}
+	reopenErr     error
 	readDeadline  time.Time
 	writeDeadline time.Time
 	readTimer     *time.Timer
@@ -500,15 +635,203 @@ type h2StreamConn struct {
 	closeOnce     sync.Once
 }
 
-func newH2StreamConn(queue *api.H2ChunkQueue, respCh chan rtResult, streamCancel context.CancelFunc, localAddr, remoteAddr net.Addr, onClose func()) *h2StreamConn {
-	return &h2StreamConn{
+func newH2StreamConn(queue *api.H2ChunkQueue, streamCancel context.CancelFunc, localAddr, remoteAddr net.Addr, onClose func(), hc *h2Conn) *h2StreamConn {
+	att := &streamAttempt{
 		queue:        queue,
-		respCh:       respCh,
 		streamCancel: streamCancel,
 		localAddr:    localAddr,
 		remoteAddr:   remoteAddr,
-		onClose:      onClose,
+		hc:           hc,
+		done:         make(chan struct{}),
 	}
+	sc := &h2StreamConn{
+		onClose: onClose,
+		closeCh: make(chan struct{}),
+	}
+	sc.attempt.Store(att)
+	return sc
+}
+
+func (c *h2StreamConn) waitFirstWrite(waitCh chan struct{}, deadline time.Time) error {
+	var deadlineCh <-chan time.Time
+	if !deadline.IsZero() {
+		dur := time.Until(deadline)
+		if dur <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		t := time.NewTimer(dur)
+		defer t.Stop()
+		deadlineCh = t.C
+	}
+
+	select {
+	case <-waitCh:
+		return nil
+	case <-c.closeCh:
+		return net.ErrClosed
+	case <-deadlineCh:
+		return os.ErrDeadlineExceeded
+	}
+}
+
+func (c *h2StreamConn) finishReopen(reopeningCh chan struct{}, origErr, reopenErr error, nextConn *h2StreamConn) {
+	c.mu.Lock()
+	c.finishReopenLocked(reopeningCh, origErr, reopenErr, nextConn)
+	c.mu.Unlock()
+}
+
+func (c *h2StreamConn) finishReopenLocked(reopeningCh chan struct{}, origErr, reopenErr error, nextConn *h2StreamConn) {
+	c.reopenErr = errors.Join(origErr, reopenErr)
+	c.reopening = nil
+	close(reopeningCh)
+	if nextConn != nil {
+		closeCloser(nextConn)
+	}
+}
+
+func (c *h2StreamConn) waitReopening(waitCh chan struct{}, deadline time.Time) error {
+	var deadlineCh <-chan time.Time
+	if !deadline.IsZero() {
+		dur := time.Until(deadline)
+		if dur <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		t := time.NewTimer(dur)
+		defer t.Stop()
+		deadlineCh = t.C
+	}
+
+	select {
+	case <-waitCh:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.closed {
+			return net.ErrClosed
+		}
+		if c.reopenErr != nil {
+			return c.reopenErr
+		}
+		return nil
+	case <-c.closeCh:
+		return net.ErrClosed
+	case <-deadlineCh:
+		return os.ErrDeadlineExceeded
+	}
+}
+
+func (c *h2StreamConn) transparentReopen(deadline time.Time, origErr error, failedAtt *streamAttempt) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	if c.reopenErr != nil {
+		err := c.reopenErr
+		c.mu.Unlock()
+		return err
+	}
+
+	// If another goroutine already completed a reopen from failedAtt, use the new attempt.
+	if failedAtt != nil && c.attempt.Load() != failedAtt {
+		c.mu.Unlock()
+		return nil
+	}
+
+	for c.reopening != nil {
+		waitCh := c.reopening
+		c.mu.Unlock()
+		if err := c.waitReopening(waitCh, deadline); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return net.ErrClosed
+		}
+		if c.reopenErr != nil {
+			err := c.reopenErr
+			c.mu.Unlock()
+			return err
+		}
+		if failedAtt != nil && c.attempt.Load() != failedAtt {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+
+	if failedAtt != nil && c.attempt.Load() != failedAtt {
+		c.mu.Unlock()
+		return nil
+	}
+
+	if c.reopen == nil {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+
+	reopenFn := c.reopen
+	c.reopen = nil
+	reopeningCh := make(chan struct{})
+	c.reopening = reopeningCh
+	c.mu.Unlock()
+
+	var reopenCtx context.Context
+	var cancel context.CancelFunc
+	if !deadline.IsZero() {
+		if time.Now().After(deadline) {
+			c.finishReopen(reopeningCh, origErr, os.ErrDeadlineExceeded, nil)
+			return os.ErrDeadlineExceeded
+		}
+		reopenCtx, cancel = context.WithDeadline(context.Background(), deadline)
+	} else {
+		reopenCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	}
+	defer cancel()
+
+	nextConn, err := reopenFn(reopenCtx)
+	if err != nil {
+		c.finishReopen(reopeningCh, origErr, err, nil)
+		return err
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.finishReopenLocked(reopeningCh, origErr, net.ErrClosed, nextConn)
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+
+	oldAtt := c.attempt.Load()
+	nextAtt := nextConn.attempt.Load()
+
+	c.attempt.Store(nextAtt)
+	c.reopen = nextConn.reopen
+
+	if !c.writeDeadline.IsZero() && nextAtt.queue != nil {
+		nextAtt.queue.SetWriteDeadline(c.writeDeadline)
+	}
+	if !c.readDeadline.IsZero() && nextAtt.queue != nil {
+		nextAtt.queue.SetReadDeadline(c.readDeadline)
+	}
+	c.reopening = nil
+	close(reopeningCh)
+	c.mu.Unlock()
+
+	if oldAtt != nil {
+		if oldAtt.streamCancel != nil {
+			oldAtt.streamCancel()
+		}
+		if oldAtt.queue != nil {
+			oldAtt.queue.Abort(net.ErrClosed)
+		}
+		oldAtt.mu.Lock()
+		if oldAtt.resBody != nil {
+			closeCloser(oldAtt.resBody)
+		}
+		oldAtt.mu.Unlock()
+	}
+
+	return nil
 }
 
 func (c *h2StreamConn) awaitResponse() (io.ReadCloser, error) {
@@ -517,38 +840,70 @@ func (c *h2StreamConn) awaitResponse() (io.ReadCloser, error) {
 		c.mu.Unlock()
 		return nil, net.ErrClosed
 	}
-	if c.resBody != nil {
-		rb := c.resBody
+	if c.reopenErr != nil {
+		err := c.reopenErr
 		c.mu.Unlock()
-		return rb, nil
+		return nil, err
 	}
+	att := c.attempt.Load()
+	deadline := c.readDeadline
+	closeCh := c.closeCh
 	c.mu.Unlock()
 
-	r, ok := <-c.respCh
-	if !ok {
-		return nil, net.ErrClosed
+	rb, err := att.awaitResult(closeCh, deadline)
+	if err == nil {
+		return rb, nil
 	}
-	if r.err != nil {
+
+	var statusErr *connectStatusError
+	if errors.As(err, &statusErr) {
 		closeCloser(c)
-		return nil, r.err
-	}
-	if r.res.StatusCode != http.StatusOK {
-		closeCloser(c)
-		closeCloser(r.res.Body)
-		return nil, fmt.Errorf("unexpected CONNECT response status: %s", r.res.Status)
+		return nil, err
 	}
 
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		closeCloser(r.res.Body)
 		return nil, net.ErrClosed
 	}
-	c.resBody = r.res.Body
-	rb := c.resBody
+	if c.reopenErr != nil {
+		err := c.reopenErr
+		c.mu.Unlock()
+		return nil, err
+	}
+
+	// If a first write is in progress, awaitResponse must not reopen until that write resolves.
+	for c.firstWriting != nil {
+		waitCh := c.firstWriting
+		c.mu.Unlock()
+		if werr := c.waitFirstWrite(waitCh, deadline); werr != nil {
+			return nil, werr
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		if c.reopenErr != nil {
+			err := c.reopenErr
+			c.mu.Unlock()
+			return nil, err
+		}
+	}
+
+	canReopen := !c.bodyQueued && !c.closed
 	c.mu.Unlock()
 
-	return rb, nil
+	if canReopen {
+		if rerr := c.transparentReopen(deadline, err, att); rerr != nil {
+			closeCloser(c)
+			return nil, errors.Join(err, rerr)
+		}
+		return c.awaitResponse()
+	}
+
+	closeCloser(c)
+	return nil, err
 }
 
 var h2SpliceBufPool = sync.Pool{
@@ -698,18 +1053,99 @@ func (c *h2StreamConn) Read(b []byte) (int, error) {
 }
 
 func (c *h2StreamConn) Write(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return 0, net.ErrClosed
 	}
+	if c.reopenErr != nil {
+		err := c.reopenErr
+		c.mu.Unlock()
+		return 0, err
+	}
 	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
 		c.mu.Unlock()
 		return 0, os.ErrDeadlineExceeded
 	}
-	c.mu.Unlock()
 
-	return c.queue.Write(b)
+	deadline := c.writeDeadline
+
+	// If another first write is in progress, wait for it to resolve.
+	for c.firstWriting != nil {
+		waitCh := c.firstWriting
+		c.mu.Unlock()
+		if err := c.waitFirstWrite(waitCh, deadline); err != nil {
+			return 0, err
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return 0, net.ErrClosed
+		}
+		if c.reopenErr != nil {
+			err := c.reopenErr
+			c.mu.Unlock()
+			return 0, err
+		}
+	}
+
+	att := c.attempt.Load()
+	alreadyQueued := c.bodyQueued
+
+	if !alreadyQueued {
+		if _, err, done := att.pollResult(); done && err != nil {
+			var statusErr *connectStatusError
+			if errors.As(err, &statusErr) {
+				c.mu.Unlock()
+				closeCloser(c)
+				return 0, err
+			}
+			c.mu.Unlock()
+			if rerr := c.transparentReopen(deadline, err, att); rerr != nil {
+				return 0, errors.Join(err, rerr)
+			}
+			return c.Write(b)
+		}
+
+		// Mark first write as in progress before calling queue.Write
+		firstWriteCh := make(chan struct{})
+		c.firstWriting = firstWriteCh
+		c.mu.Unlock()
+
+		var n int
+		var err error
+		func() {
+			defer func() {
+				c.mu.Lock()
+				c.firstWriting = nil
+				if n > 0 {
+					c.bodyQueued = true
+				}
+				close(firstWriteCh)
+				c.mu.Unlock()
+			}()
+			n, err = att.queue.Write(b)
+		}()
+
+		if n > 0 {
+			return n, err
+		}
+
+		// Zero bytes accepted into the queue (n == 0 && err != nil).
+		// Treat as not yet queued and attempt transparent reopen.
+		if rerr := c.transparentReopen(deadline, err, att); rerr == nil {
+			return c.Write(b)
+		} else {
+			return 0, errors.Join(err, rerr)
+		}
+	}
+
+	c.mu.Unlock()
+	return att.queue.Write(b)
 }
 
 func (c *h2StreamConn) SetReadDeadline(t time.Time) error {
@@ -722,12 +1158,17 @@ func (c *h2StreamConn) SetReadDeadline(t time.Time) error {
 	}
 	if !t.IsZero() && time.Until(t) > 0 {
 		c.readTimer = time.AfterFunc(time.Until(t), func() {
-			c.streamCancel()
-			c.mu.Lock()
-			rb := c.resBody
-			c.mu.Unlock()
-			if rb != nil {
-				closeCloser(rb)
+			att := c.attempt.Load()
+			if att != nil {
+				if att.streamCancel != nil {
+					att.streamCancel()
+				}
+				att.mu.Lock()
+				rb := att.resBody
+				att.mu.Unlock()
+				if rb != nil {
+					closeCloser(rb)
+				}
 			}
 		})
 	}
@@ -738,14 +1179,20 @@ func (c *h2StreamConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.writeDeadline = t
-	c.queue.SetWriteDeadline(t)
+	att := c.attempt.Load()
+	if att != nil && att.queue != nil {
+		att.queue.SetWriteDeadline(t)
+	}
 	if c.writeTimer != nil {
 		c.writeTimer.Stop()
 		c.writeTimer = nil
 	}
 	if !t.IsZero() && time.Until(t) > 0 {
 		c.writeTimer = time.AfterFunc(time.Until(t), func() {
-			c.queue.Wake()
+			a := c.attempt.Load()
+			if a != nil && a.queue != nil {
+				a.queue.Wake()
+			}
 		})
 	}
 	return nil
@@ -762,19 +1209,26 @@ func (c *h2StreamConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
+		close(c.closeCh)
 		if c.readTimer != nil {
 			c.readTimer.Stop()
 		}
 		if c.writeTimer != nil {
 			c.writeTimer.Stop()
 		}
-		rb := c.resBody
+		att := c.attempt.Load()
 		c.mu.Unlock()
 
-		c.streamCancel()
-		closeCloser(c.queue)
-		if rb != nil {
-			closeCloser(rb)
+		if att != nil {
+			if att.streamCancel != nil {
+				att.streamCancel()
+			}
+			closeCloser(att.queue)
+			att.mu.Lock()
+			if att.resBody != nil {
+				closeCloser(att.resBody)
+			}
+			att.mu.Unlock()
 		}
 		if c.onClose != nil {
 			c.onClose()
@@ -784,9 +1238,17 @@ func (c *h2StreamConn) Close() error {
 }
 
 func (c *h2StreamConn) LocalAddr() net.Addr {
-	return c.localAddr
+	att := c.attempt.Load()
+	if att != nil {
+		return att.localAddr
+	}
+	return nil
 }
 
 func (c *h2StreamConn) RemoteAddr() net.Addr {
-	return c.remoteAddr
+	att := c.attempt.Load()
+	if att != nil {
+		return att.remoteAddr
+	}
+	return nil
 }
