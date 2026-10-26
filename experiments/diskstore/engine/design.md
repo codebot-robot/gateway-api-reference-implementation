@@ -171,7 +171,7 @@ Before the engine writes any page with LSN $L$ to the heap file, the WAL must be
 
 This rule prevents disk inconsistency across crashes. If a host loses power after the heap file receives a page write, the WAL on disk will contain all log records up to that page's state. Crash recovery will never encounter heap data that outruns durable log history.
 
-The block pool enforces this rule before flushing dirty pages. The flusher calculates the maximum LSN among all pages in the flush batch. It calls `wal.SyncThrough(maxLSN)` to flush and fsync the log before writing the block run to the heap file.
+A page write waits until the WAL is durable through that page's LSN. When flushing a batch of pages, the engine waits once, for the highest LSN in the batch.
 
 ### 2. The Reuse Rule
 
@@ -195,50 +195,42 @@ The engine applies the reuse rule through the following lifecycle:
 
 Every block run of order $k$ ($2^k$ blocks) allocated by the buddy allocator begins at a block number that is a multiple of $2^k$.
 
-When the block pool flushes a batch of pages together, `AllocateBatch` sorts page requests from largest order to smallest order. This descending order packs pages into a single block run while preserving natural alignment for each page.
-
-Crash recovery depends on natural alignment for three reasons:
-1. **Candidate rejection:** When the recovery scanner checks block 0 of a candidate page with block count $N = 2^k$, it checks whether `blockNumber % N == 0`. It rejects unaligned blocks immediately. This prevents leftover blocks, inner blocks of larger runs, and payload bytes from masquerading as page starts.
-2. **Run verification:** Natural alignment ensures that candidate runs do not cross allocation boundaries.
-3. **Buddy allocator reconstruction:** The buddy allocator uses binary address calculations (`block ^ (1 << order)`) to split and coalesce blocks. These calculations require natural alignment. Recovery rebuilds the allocator free lists by marking winning candidates with `buddy.MarkAllocated`. Unaligned block numbers would corrupt the buddy tree structure.
+The engine maintains natural alignment for two reasons:
+1. **Identifying page starts:** The recovery scanner can tell where a page starts only from alignment. Because every block in a multi-block page carries a self-describing header, inner blocks of a larger run or leftover payload bytes could otherwise masquerade as the start of a smaller page. Enforcing natural alignment rejects misidentified starts immediately and ensures candidate runs do not cross allocation boundaries.
+2. **Buddy allocator operations:** The buddy allocator requires natural alignment to split larger blocks and merge adjacent buddies. Allocator reconstruction during recovery marks winning runs as allocated, and unaligned block numbers would corrupt the allocator's tree structure.
 
 ### 4. Immutability of Fsynced WAL Blocks
 
 The engine never rewrites a WAL block once it has been fsynced to disk.
 
-When the engine syncs the active WAL segment (`Sync` or `SyncThrough`), the write cursor may not align with a 4 KiB block boundary (`appendOff % 4096 != 0`). In this case, the engine pads the remainder of the 4 KiB block with zeros in memory. It advances `appendOff` to the start of the next 4 KiB block.
+When syncing the active WAL segment to disk, the write cursor may not align with a 4 KiB block boundary. The engine pads the remainder of the block with zeros and writes it to disk. Subsequent appends begin at the next 4 KiB block boundary, and the engine never writes to the padded block again.
 
-The engine writes and fsyncs the padded block to disk. Subsequent appends write to the next block boundary. The engine never modifies the padded block again.
-
-Rewriting a fsynced block would risk torn writes during a power failure. An interrupted write could corrupt durable records that earlier callers already confirmed. Zero-padding ensures that fsynced blocks remain immutable on disk. During recovery, the WAL iterator recognizes trailing zeros in a block as padding and advances to the next 4 KiB block boundary.
+This rule protects acknowledged records against torn writes during crashes. If the engine rewrote partially filled blocks on subsequent syncs, a power failure during a later write could corrupt records that earlier callers already confirmed as durable. Padding to the next block boundary ensures that fsynced blocks remain immutable on disk. During recovery, the WAL iterator recognizes trailing zeros in a block as padding and advances to the next 4 KiB block boundary.
 
 ### 5. Retention of Logical Page Numbers
 
-The engine never releases or destroys logical page numbers.
+The engine never discards a logical page number when its contents are deleted.
 
-The engine assigns logical page numbers as positive 64-bit integers from a monotonic counter (`nextLogicalPage++`). When all records in a slotted page or multi-block page are deleted, the engine does not discard the logical page number. The engine adds the empty page number to an empty logical page list.
+Because the engine writes pages out of place, older copies of a page remain on disk at their former physical block locations until the allocator reuses and overwrites those blocks. If the engine discarded a logical page number upon deletion without writing an empty page to disk, those older copies would still reside in the heap file. During crash recovery, the scan would discover the older copy, observe that it carries the highest known LSN for that abandoned page number, and resurrect the deleted records.
 
-When a write needs a new page, the engine takes an empty logical page number from the list before incrementing `nextLogicalPage`. Recovery discovers empty pages on disk and populates the empty page list. Logical page numbers never shrink, and their identities remain stable.
+To prevent resurrection, deleting all records from a page writes an empty page carrying the deletion's newer LSN. Recovery then finds the empty page, recognizes that its LSN supersedes all earlier copies, and ignores the stale data. The engine retains empty page numbers and reuses them for future allocations, ensuring that every logical page maintains an unbroken, monotonically increasing LSN history on disk.
 
 ## Recovery
 
-The engine recovers database state through the following steps in `recovery.go`:
+Recovery reconstructs database state after a restart or crash by scanning the self-describing heap file and replaying recent WAL records:
 
-1. **Directory and file fsync:** The engine fsyncs all existing WAL segments, the WAL directory, and the heap file. This ensures that earlier operating system writeback completes before recovery scans the files.
-2. **Physical heap block scan:** The engine reads the heap file sequentially in 256 KiB chunks (64 blocks). For each 4 KiB block:
-   - The engine validates the magic byte (`0x47`), format version (`1`), and CRC32C.
-   - For block index 0, the engine verifies natural alignment (`blockNumber % numBlocks == 0`).
-   - The engine verifies that subsequent blocks in the run contain matching logical page numbers, LSNs, and sequential block indices.
-   - The engine discards candidate runs with missing, corrupt, or torn blocks.
-   - For each logical page number, the engine keeps the candidate run with the highest LSN.
-3. **Buddy allocator reconstruction:** The engine marks all winning block runs as allocated in the buddy allocator (`buddy.MarkAllocated`).
-4. **Index and empty page reconstruction:** The engine reads the winning pages in physical block order:
-   - For slotted pages, the engine scans active record slots and populates the in-memory key index with `(logicalPage, slot, LSN)` entries. If a slotted page contains zero active records, the engine adds the logical page number to the empty page list.
-   - For multi-block pages, the engine reads record metadata from block 0. It registers active records in the key index at record slot 0. It registers tombstones in the empty page list.
-5. **WAL checkpoint scan:** The engine scans WAL records to find the most recent checkpoint record and extract its `RedoStartLSN`. The engine also reconstructs the highest progress token for each bucket.
-6. **WAL redo replay:** The engine replays WAL records from `RedoStartLSN` forward. If a record's LSN is greater than the target page's recovered LSN, the engine applies the mutation directly to an in-memory page buffer and marks the page dirty.
-7. **Redo flush:** The engine flushes all dirty pages modified during redo replay to new heap locations allocated from the buddy allocator. It frees their superseded locations and fsyncs the heap file.
-8. **Runtime state initialization:** The engine returns the recovered page table, buddy allocator, key index, empty logical pages, progress tokens, and next logical page number.
+- **Self-describing block scan:** Because every heap block header carries its logical page number, block index, total block count, LSN, and CRC checksum, recovery does not depend on a central catalog or page table on disk. Recovery scans the heap file sequentially to discover all valid block runs.
+- **Newest valid copy wins:** When out-of-place writes or power failures leave multiple copies of a logical page on disk, recovery checks block integrity and checksums across the entire run. Any torn, partial, or corrupt writes are discarded. For each logical page number, the valid candidate run with the highest LSN wins. Stale and torn copies are harmless because the reuse rule ensures the previous durable copy remains intact on disk until a newer write has completed and fsynced.
+- **Allocator and index reconstruction:** Once the winning block runs are selected, the engine reconstructs the buddy allocator state by marking all winning blocks as allocated. All remaining blocks in the file become free for new allocations. The engine then populates the in-memory key index from the active records in the winning pages and restores empty logical page numbers to the empty list.
+- **Idempotent WAL redo replay:** Recovery locates the most recent checkpoint in the WAL to determine the redo starting LSN. Redo replays log records forward from that point. For each record, recovery compares the record's LSN against the recovered page's LSN. If the page already reflects an LSN equal to or greater than the log record, the engine skips the record. This per-page LSN check makes redo idempotent, safely handling crashes that occurred mid-checkpoint or mid-flush.
+- **Flush before serving:** Any pages modified during WAL redo replay are marked dirty and flushed to newly allocated heap locations. The heap file is fsynced to make those pages durable, and superseded locations are freed before the engine begins serving client traffic.
+
+Recovery relies on the core invariants to guarantee consistency:
+- The **write-ahead rule** ensures that redo history in the WAL always covers any page modifications found on disk.
+- The **reuse rule** guarantees that an incomplete or torn flush never destroys the valid prior copy of a page.
+- **Natural alignment** enables the scan to identify page boundaries and rebuild allocator free lists without metadata corruption.
+- **Immutability of fsynced WAL blocks** ensures that acknowledged log records remain intact across crashes.
+- **Retention of logical page numbers** ensures that empty page records supersede older on-disk copies and prevent deleted records from resurrecting.
 
 ## Concurrency
 
