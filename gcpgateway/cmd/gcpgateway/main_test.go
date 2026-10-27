@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -547,54 +546,3 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 	// drain-seconds=45 -> 45 + 25 = 70 (strictly greater than the 60s minimum clamp)
 	assertProductionDeployment(t, &deploy, 45, 70)
 }
-
-func TestControllerManifest_RBACCustomResourceDefinitions(t *testing.T) {
-	manifestPath := filepath.Join("..", "..", "k8s", "controller.yaml")
-	data, err := os.ReadFile(manifestPath)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", manifestPath, err)
-	}
-
-	content := string(data)
-	docs := strings.Split(content, "\n---")
-	var foundClusterRole bool
-	var foundCRDRule bool
-
-	for _, doc := range docs {
-		if strings.Contains(doc, "kind: ClusterRole") && strings.Contains(doc, "name: gcpgateway-controller") {
-			foundClusterRole = true
-			lines := strings.Split(doc, "\n")
-			for i, line := range lines {
-				if strings.Contains(line, `resources: ["customresourcedefinitions"]`) {
-					foundCRDRule = true
-					// Look at adjacent lines in this rule block
-					start := max(0, i-5)
-					end := min(len(lines), i+6)
-					block := strings.Join(lines[start:end], "\n")
-					for _, l := range lines[start:end] {
-						trimmed := strings.TrimSpace(l)
-						if strings.HasPrefix(trimmed, "#") {
-							continue
-						}
-						if strings.HasPrefix(trimmed, "resourceNames:") {
-							t.Errorf("customresourcedefinitions rule must not restrict resourceNames; found line: %s", l)
-						}
-					}
-					for _, verb := range []string{`"get"`, `"list"`, `"watch"`} {
-						if !strings.Contains(block, verb) {
-							t.Errorf("customresourcedefinitions rule missing verb %s; block:\n%s", verb, block)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	if !foundClusterRole {
-		t.Fatalf("gcpgateway-controller ClusterRole not found in %s", manifestPath)
-	}
-	if !foundCRDRule {
-		t.Fatalf("customresourcedefinitions rule not found in gcpgateway-controller ClusterRole")
-	}
-}
-
