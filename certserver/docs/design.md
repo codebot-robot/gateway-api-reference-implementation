@@ -10,7 +10,7 @@ certserver operates on a core principle:
 
 certserver acts as an Automated Certificate Management Environment (ACME) client toward public certificate authorities such as Google Public CA and Let's Encrypt. certserver uses the HTTP-01 challenge type exclusively. It holds no DNS credentials and does not edit DNS records.
 
-GARI data planes participate directly in challenge verification. Each data plane forwards HTTP requests for `/.well-known/acme-challenge/<token>` to certserver over TLS. The data plane attaches its projected Kubernetes service-account token to each forwarded request. This design routes the certificate authority's validation traffic through the real network path: public DNS, the Gateway's public IP address, the GARI data plane, and certserver.
+GARI data planes participate directly in challenge verification. Challenge forwarding is opt-in per Gateway. For Gateways that opt in, each data plane forwards HTTP requests for `/.well-known/acme-challenge/<token>` to certserver over TLS. The data plane attaches its projected Kubernetes service-account token to each forwarded request. This design routes the certificate authority's validation traffic through the real network path: public DNS, the Gateway's public IP address, the GARI data plane, and certserver. When certserver returns an HTTP 404 response or does not answer in time, the data plane falls through to normal HTTPRoute routing. This fall-through allows users' own HTTP-01 solvers to keep working.
 
 certserver binds every completed challenge to the identity of the forwarding data plane. certserver releases a certificate only when the validation request arrives through a data plane that belongs to the requesting Gateway or to an authorized shared-front-end group.
 
@@ -27,7 +27,7 @@ This design separates key custody from TLS termination. GARI selects certificate
 
 ## Goals
 
-1. **Keep private keys and DNS credentials out of Kubernetes clusters.** GARI clusters run no ACME clients and store no DNS update credentials.
+1. **Keep private keys and DNS credentials out of Kubernetes clusters (end-state goal).** GARI clusters run no ACME clients and store no DNS update credentials. Phase 1 provides an exception for key delivery: the controller receives keys from certserver and writes them to GARI's per-Gateway config Secret, which stores them in etcd. In the end state, certserver keeps keys out of etcd by releasing them directly to data-plane memory or by retaining them on certserver for keyless signing.
 2. **Centralize issuance and renewal.** certserver caches certificates by normalized hostname set. Multiple Gateways and clusters that serve the same hostnames share one certificate, which avoids duplicate orders and conserves certificate authority rate limits.
 3. **Derive authorization from the real network path.** certserver validates domain control by routing HTTP-01 challenges through public DNS and the data plane. It requires no secondary policy language to grant certificates for public hostnames.
 4. **Prevent cross-Gateway certificate hijacking.** certserver binds each challenge to the forwarding data-plane identity. A Gateway cannot obtain certificates for hostnames that route to a different Gateway.
@@ -95,20 +95,20 @@ certserver runs on a dedicated, hardened machine outside the Kubernetes clusters
 
 The GARI controller runs inside each Kubernetes cluster. It reconciles `Gateway` resources and their listeners:
 
-- The controller identifies listeners that request certserver certificates.
+- The controller identifies `Terminate` listeners that configure certserver through `tls.options` with `gateway.gke-labs.io/certificate-source: certserver`. The Gateway API specification permits `tls.options` in place of `certificateRefs` on `Terminate` listeners.
 - The controller obtains a projected Kubernetes service-account token with the audience `certserver`.
-- The controller calls `GetCertificate` on certserver. The request contains the normalized hostnames, the Gateway namespace and name, and the service account of the data plane that serves the Gateway.
-- When certserver returns a certificate and private key, the controller configures the data plane.
+- The controller calls `GetCertificate` on certserver over gRPC. The request contains the normalized hostnames, the Gateway namespace and name, and the service account of the data plane that serves the Gateway.
+- When certserver returns a certificate and private key in phase 1, the controller writes them into GARI's per-Gateway data-plane config Secret. The data plane reads the certificate and key from this Secret.
 
 ### GARI Data Plane
 
 The GARI data plane runs in pods inside the Kubernetes cluster:
 
 - The data plane listens for incoming HTTP traffic on port 80 and HTTPS traffic on port 443.
-- When an incoming HTTP request matches the path `/.well-known/acme-challenge/<token>`, the data plane intercepts the request.
+- Challenge forwarding is opt-in per Gateway. For Gateways that opt in, the data plane intercepts incoming plain-HTTP requests matching the path `/.well-known/acme-challenge/<token>` on port 80.
 - The data plane forwards the request to certserver over TLS. The data plane attaches its projected service-account token in the HTTP `Authorization` header.
-- When certserver returns an HTTP 200 response, the data plane relays the response body to the certificate authority.
-- When certserver returns an HTTP 404 response, the data plane passes the request to normal HTTPRoute evaluation.
+- When certserver returns an HTTP 200 response, the data plane relays the key authorization body to the certificate authority.
+- When certserver returns an HTTP 404 response or does not answer in time, the data plane falls through to normal HTTPRoute routing. This fall-through allows users' own HTTP-01 solvers behind HTTPRoutes to keep working.
 - The data plane terminates client TLS connections on port 443 using certificates that certserver provides.
 
 ### Upstream Certificate Authority
@@ -273,22 +273,22 @@ The following sequence diagram illustrates the complete issuance process using H
 
 The flow proceeds through these steps:
 
-1. **Controller Request:** The GARI controller reconciles a Gateway. It extracts the listener hostnames, sorts and deduplicates them, and sends a `GetCertificate` gRPC request to certserver. The request contains the hostnames, the Gateway namespace and name, and the data plane's service account.
+1. **Controller Request:** The GARI controller reconciles a Gateway. It identifies listeners configured with `gateway.gke-labs.io/certificate-source: certserver` under `tls.options`. It extracts the listener hostnames, sorts and deduplicates them, and sends a `GetCertificate` gRPC request to certserver. The request contains the hostnames, the Gateway namespace and name, and the data plane's service account.
 2. **Policy Evaluation and Binding Registration:** certserver verifies the controller's identity and checks the requested hostnames against the cluster's allow and deny lists. certserver stores an active binding record that maps the pending order to the attested Gateway and data-plane service account.
 3. **ACME Order Creation:** certserver checks its local cache. If no valid certificate exists, certserver creates an ACME order with the upstream certificate authority. The certificate authority returns HTTP-01 challenge tokens. certserver stores these tokens in its shared challenge store.
 4. **Retry Response:** certserver returns a retryable status code to the GARI controller. The controller requeues the Gateway for reconciliation after a short delay.
 5. **Validation Trigger:** certserver notifies the certificate authority that challenges are ready for validation.
 6. **DNS Resolution:** The certificate authority resolves the domain name through public DNS. Public DNS returns the Gateway's public IP address.
 7. **Validation Request:** The certificate authority sends an HTTP GET request to `http://<hostname>/.well-known/acme-challenge/<token>` on port 80.
-8. **In-Path Challenge Forwarding:** The GARI data plane receives the request on port 80. The data plane reads its projected service-account token from disk and forwards the challenge request to certserver over TLS, including the original `Host` header and the bearer token.
+8. **In-Path Challenge Forwarding:** The Gateway opts in to challenge forwarding. The GARI data plane receives the request on port 80 and intercepts the challenge path. The data plane reads its projected service-account token from disk and forwards the challenge request to certserver over TLS, including the original `Host` header and the bearer token. If certserver returns an HTTP 404 response or does not answer in time, the data plane falls through to normal HTTPRoute routing.
 9. **Challenge Binding Verification:** certserver validates the service-account token against the cluster's JWKS. certserver verifies that the token corresponds to the data-plane service account registered for this order in step 2. certserver also confirms that the token matches a pending challenge for the requested `Host`.
 10. **Key Authorization Delivery:** certserver returns the ACME key authorization string to the data plane in an HTTP 200 response.
 11. **Relaying Response:** The data plane relays the key authorization string back to the certificate authority with a `Content-Type: application/octet-stream` header.
 12. **Order Finalization:** The certificate authority confirms validation and updates the order status to valid. certserver generates a Certificate Signing Request (CSR), sends it to the certificate authority, and downloads the signed certificate chain.
 13. **Cache Storage:** certserver writes the certificate chain and private key to its encrypted local disk cache.
 14. **Controller Requeue:** The GARI controller retries the `GetCertificate` RPC.
-15. **Certificate Release:** certserver detects the cached certificate, verifies that the requesting Gateway passed authorization, and returns the certificate chain and private key.
-16. **Data Plane Configuration:** The GARI controller delivers the certificate and key to the data plane. The data plane begins terminating TLS on port 443.
+15. **Certificate Release:** certserver detects the cached certificate, verifies that the requesting Gateway passed authorization, and returns the certificate chain and private key to the controller.
+16. **Data Plane Configuration:** In phase 1, the GARI controller writes the certificate and private key into GARI's per-Gateway data-plane config Secret. The data plane reads its configuration from this Secret and begins terminating TLS on port 443.
 
 ### Automated Renewal Flow
 
@@ -337,9 +337,20 @@ certserver supports three operational modes across three design phases:
 
 ### Phase 1: Release Mode
 
-In phase 1, certserver operates in release mode. certserver acts as the ACME client, generates private keys, completes HTTP-01 challenges, stores certificates and keys in its local cache, and releases both certificate chains and private keys to authorized GARI data planes.
+In phase 1, certserver operates in release mode. certserver acts as the ACME client, generates private keys, completes HTTP-01 challenges, and stores certificates and keys in its local cache.
 
-Release mode eliminates in-cluster ACME clients and removes all DNS credentials from Kubernetes clusters.
+certserver releases both certificate chains and private keys to the GARI controller over gRPC. The controller writes them into GARI's per-Gateway data-plane config Secret (`CertificateData.PrivateKey`). The data plane reads its configuration and private keys from this Secret.
+
+Phase 1 accepts storing private keys in etcd through this Secret to reuse GARI's existing configuration distribution pipeline. This phase eliminates in-cluster ACME clients and removes all DNS credentials from Kubernetes clusters.
+
+### Key Delivery Architecture
+
+Key delivery follows a phased progression:
+
+- **Phase 1 Decision:** The GARI controller receives private keys from certserver and delivers them to the data plane through the per-Gateway config Secret. This decision accepts private keys in etcd during phase 1. It avoids adding direct network dependencies or token exchange logic between data planes and certserver in the initial release.
+- **End-State Target:** In the end state, certserver keeps private keys out of etcd. certserver achieves this through one of two mechanisms:
+  1. **Direct Data-Plane Retrieval:** Data planes fetch certificates and private keys directly from certserver at startup using their own projected service-account tokens. The data plane holds keys in process memory only and never writes them to Secrets or disk. Challenge binding already binds the data plane's service account to the Gateway.
+  2. **Keyless Signing (Phase 2):** certserver retains private keys in secure host storage, and data planes delegate handshake signatures to certserver over RPC.
 
 ### Phase 2: Keyless Sign Mode
 
@@ -364,35 +375,11 @@ The initial release of certserver deliberately defers several capabilities:
 - **TLS-ALPN-01 Validation:** The ACME TLS-ALPN-01 challenge validates domain ownership over TLS on port 443 using a custom ALPN protocol (`acme-tls/1`). This protocol allows issuance when port 80 is unavailable. TLS-ALPN-01 requires dynamic TLS certificate presentation in the data plane and remains deferred to a future phase.
 - **Keyless Signing Infrastructure:** The `Sign` RPC, data-plane `crypto.Signer` integration, connection pooling, and low-latency signing paths belong to phase 2.
 - **Hardware Security Module Integration:** Storing root keys in vTPM or KMS and running private certificate authority issuance belong to phase 3.
-- **Custom Gateway API CRD:** Direct listener references via a custom `RemoteCertificate` CRD in `certificateRefs` remain deferred. Initial integrations configure certserver via parameters ConfigMaps.
+- **Custom Gateway API CRD:** Direct listener references via a custom `RemoteCertificate` CRD in `certificateRefs` remain deferred. Listeners configure certserver per listener through `tls.options` with `gateway.gke-labs.io/certificate-source: certserver` instead.
 
 ## Open Questions
 
-### 1. Delivery of Private Keys to Data Planes in Release Mode
-
-In GARI's current architecture, the controller stores per-Gateway data-plane configuration in a Kubernetes Secret (`CertificateData.PrivateKey`). The data plane reads its configuration from this Secret.
-
-If the controller delivers certserver certificates and private keys through this existing mechanism, the private keys reside in etcd as Kubernetes Secrets. This outcome partly weakens the objective of keeping private keys out of the cluster storage layer.
-
-An alternative design allows data planes to fetch certificates and keys directly from certserver:
-- The data plane requests its certificate and key directly from certserver at pod startup.
-- The data plane authenticates using its own projected service-account token.
-- certserver already knows the data plane's service account from the controller's initial attestation and challenge binding.
-- The data plane stores the private key in process memory only and never writes it to Kubernetes Secrets or disk.
-
-The trade-off involves operational complexity. Direct data-plane retrieval requires data-plane pods to establish network connectivity to certserver and handle certserver restarts gracefully. Delivering keys through Kubernetes Secrets relies on existing configuration distribution logic at the cost of storing keys in etcd during phase 1.
-
-### 2. Challenge Forwarding Fall-Through to Custom Solvers
-
-When a data plane intercepts an incoming request for `/.well-known/acme-challenge/<token>`, it forwards the request to certserver. If certserver does not recognize the token, it returns an HTTP 404 response.
-
-The data plane must decide how to handle this 404 response:
-- The data plane can return 404 directly to the client.
-- Alternatively, the data plane can fall through to normal HTTPRoute routing evaluation when certserver returns 404 or times out.
-
-Falling through allows users to run their own ACME HTTP-01 solvers inside the cluster behind standard HTTPRoutes (such as an in-cluster cert-manager solver for custom applications). However, fall-through introduces routing latency for unknown challenge requests and requires data planes to handle upstream timeouts without dropping valid challenges.
-
-### 3. Multi-Region Deployment and Cache Sharing
+### Multi-Region Deployment and Cache Sharing
 
 When GARI operates across multiple geographic regions, deploying a single central certserver instance creates cross-region latency and a single point of failure. Cross-region network round-trips become particularly noticeable in phase 2 during keyless signing.
 
