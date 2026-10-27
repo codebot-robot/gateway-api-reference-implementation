@@ -1,0 +1,85 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package challenge
+
+import (
+	"errors"
+	"testing"
+	"time"
+)
+
+func TestMemoryStore_Lifecycle(t *testing.T) {
+	ctx := t.Context()
+	store := NewMemoryStore()
+
+	now := time.Now()
+	store.timeNow = func() time.Time { return now }
+
+	token := "lifecycle-token"
+	host := "sub.example.com"
+	keyAuth := "lifecycle-token.thumbprint"
+
+	// 1. Not found initially
+	_, err := store.ResolveChallenge(ctx, "", host, token)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+
+	// 2. Put
+	if err := store.Put(ctx, token, host, keyAuth, now.Add(5*time.Minute)); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// 3. Resolve with exact host
+	res, err := store.ResolveChallenge(ctx, "", host, token)
+	if err != nil {
+		t.Fatalf("ResolveChallenge failed: %v", err)
+	}
+	if res != keyAuth {
+		t.Fatalf("expected %q, got %q", keyAuth, res)
+	}
+
+	// 4. Resolve with port & uppercase
+	res, err = store.ResolveChallenge(ctx, "", "SUB.EXAMPLE.COM:443", token)
+	if err != nil {
+		t.Fatalf("ResolveChallenge with uppercase:port failed: %v", err)
+	}
+	if res != keyAuth {
+		t.Fatalf("expected %q, got %q", keyAuth, res)
+	}
+
+	// 5. Host mismatch
+	_, err = store.ResolveChallenge(ctx, "", "other.example.com", token)
+	if !errors.Is(err, ErrHostMismatch) {
+		t.Fatalf("expected ErrHostMismatch, got %v", err)
+	}
+
+	// 6. Expiry
+	store.timeNow = func() time.Time { return now.Add(6 * time.Minute) }
+	_, err = store.ResolveChallenge(ctx, "", host, token)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after expiry, got %v", err)
+	}
+
+	// 7. Remove
+	_ = store.Put(ctx, "temp-token", host, keyAuth, now.Add(time.Hour))
+	if err := store.Remove(ctx, "temp-token"); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+	_, err = store.ResolveChallenge(ctx, "", host, "temp-token")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after Remove, got %v", err)
+	}
+}
