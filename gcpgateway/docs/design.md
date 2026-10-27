@@ -116,7 +116,7 @@ The `gcpgateway` controller does not create, modify, or delete Google Cloud Load
 ### 7. Per-Gateway Dedicated NEGs & Deterministic Conflict Resolution
 - **Per-Gateway Identity**: Each `Gateway` has its own front-end load balancer and its own distinct set of zonal NEGs. The NEG names are specified in the Gateway's parameters ConfigMap.
 - **Deterministic Conflict Resolution**: If multiple Gateways configure conflicting NEGs, the controller resolves conflicts deterministically: the Gateway with the **oldest `creationTimestamp`** wins (ties broken alphabetically by `namespace/name`). Conflicting later Gateways receive `Accepted=False` with Reason `ConflictingParameters`.
-- **Multi-Cluster Safety**: NEG names incorporate the cluster identifier, allowing multiple clusters within the same GCP project to attach their own NEGs to a shared backend service without collision. Strict isolation between clusters can be enforced using GCP IAM Conditions.
+- **Multi-Cluster Safety**: Resource names incorporate a deterministic hash, allowing multiple clusters within the same GCP project to attach their own NEGs to a shared backend service without collision. Strict isolation between clusters can be enforced using GCP IAM Conditions when each cluster uses a distinct `--neg-prefix` (e.g., `--neg-prefix=gcpgw-${CLUSTER_ID}-`).
 
 ---
 
@@ -376,8 +376,8 @@ In multi-cluster topologies, an operator can attach NEGs from multiple clusters 
 ```
 
 #### Isolation Model
-- **Convention-based Isolation**: By default, each cluster's controller restricts its API queries and mutations strictly to NEGs prefixed with its own configured `cluster_id`.
-- **Cryptographic IAM Conditions**: Restricting the controller via Google Cloud IAM Conditions requires splitting permissions into two roles to prevent denying permissions evaluated on non-NEG resources (see Verified IAM Permissions section below).
+- **Convention-based Isolation**: By default, each cluster's controller restricts its API queries and mutations strictly to NEGs matching its configured prefix and owned according to its description metadata.
+- **Cryptographic IAM Conditions**: Strict isolation between clusters sharing a GCP project can be enforced via GCP IAM Conditions when each cluster uses a distinct `--neg-prefix` (see Note on IAM Conditions and Multi-Cluster Isolation below).
 
 ---
 
@@ -716,13 +716,18 @@ Therefore, `gcpgateway` enforces strict end-to-end readiness:
 
 ### Why Two Custom IAM Roles Are Required
 
-To uphold least privilege, `gcpgateway` cleanly separates permissions into **two custom IAM roles**:
+To uphold least privilege, `gcpgateway` cleanly separates permissions into **two custom IAM roles** based on operational boundaries:
 
 1. **`gcpgatewayNegRegistrar` (Runtime Controller Role)**:
    Used by the controller in the cluster. It can **only** inspect NEGs and backend services, attach/detach endpoints, and query health. It cannot create or destroy infrastructure.
 2. **`gcpgatewayOperatorHelper` (Provisioning Helper Role)**:
    Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py`.
    Permissions across addresses, health checks, NEGs, backend services, target TCP proxies, forwarding rules, and firewall rules.
+
+Splitting runtime registration from infrastructure provisioning ensures that in-cluster controller credentials cannot modify or delete cloud load balancing infrastructure (addresses, health checks, forwarding rules, firewalls, etc.).
+
+> **Note on IAM Conditions and Multi-Cluster Isolation**:
+> Because resource names use `<prefix>-<8-char-hash>-<suffix>` without readable cluster names, a name-based IAM Condition (e.g. `resource.name.startsWith(...)`) **cannot** separate multiple clusters sharing the same GCP project unless each cluster is configured with a unique prefix (e.g., `--neg-prefix=gcpgw-cluster1-`). If multiple clusters share a project, configure distinct prefixes per cluster to achieve IAM resource separation.
 
 In Google Cloud IAM:
 - `compute.networkEndpointGroups.*` permissions are authorized against **Network Endpoint Group** resources (`projects/.../networkEndpointGroups/...`).
@@ -734,9 +739,6 @@ In Google Cloud IAM:
 | --- | --- | --- | --- |
 | **`gcpgatewayNegRegistrar`** | `compute.networkEndpointGroups.get`<br>`compute.networkEndpointGroups.list`<br>`compute.networkEndpointGroups.use`<br>`compute.networkEndpointGroups.attachNetworkEndpoints`<br>`compute.networkEndpointGroups.detachNetworkEndpoints`<br>`compute.instances.use`<br>`compute.backendServices.get`<br>`compute.zoneOperations.get` | Network Endpoint Groups, Compute Engine Instances (VMs), Backend Services, Zone Operations | Scoped by prefix if prefixes differ per cluster (`${PREFIX}-*`) |
 | **`gcpgatewayOperatorHelper`** | Full load balancer management (`compute.addresses.*`, `compute.healthChecks.*`, `compute.networkEndpointGroups.*`, `compute.backendServices.*`, `compute.targetTcpProxies.*`, `compute.forwardingRules.*`, `compute.firewalls.*`) | All front-end resources | Provisioning helper for operators |
-
-> **Important Note on Name-Based IAM Conditions**:
-> Because resource names use `<prefix>-<8-char-hash>-<suffix>` without readable cluster names, a name-based IAM condition (e.g. `resource.name.startsWith(...)`) **can no longer separate clusters unless the prefix itself differs per cluster** (e.g., `--neg-prefix=gcpgw-${CLUSTER_ID}-`). If the prefix is shared (e.g., `gcpgw-`), IAM conditions cannot separate clusters, so clusters sharing a GCP project must use distinct prefixes to achieve IAM-level isolation. Identity and ownership within the controller are strictly established via the JSON metadata in each resource's `description`.
 
 *Note: The controller does NOT require `compute.networkEndpointGroups.create`, `compute.backendServices.create`, `compute.forwardingRules.*`, or `compute.firewalls.*`.*
 
