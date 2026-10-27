@@ -118,6 +118,24 @@ func TestSetupController_FakeComputeFlag(t *testing.T) {
 	}
 }
 
+func TestSetupController_DebugErrorResponsesFlag(t *testing.T) {
+	opts, err := SetupController(t.Context(), []string{"--cluster-id=c1", "--fake-compute", "--debug-error-responses"}, nil)
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+	if !opts.DebugErrorResponses {
+		t.Errorf("expected DebugErrorResponses=true, got %v", opts.DebugErrorResponses)
+	}
+
+	optsDefault, err := SetupController(t.Context(), []string{"--cluster-id=c1", "--fake-compute"}, nil)
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+	if optsDefault.DebugErrorResponses {
+		t.Errorf("expected default DebugErrorResponses=false, got %v", optsDefault.DebugErrorResponses)
+	}
+}
+
 func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expectedDrainSeconds int, expectedGracePeriod int64) {
 	t.Helper()
 

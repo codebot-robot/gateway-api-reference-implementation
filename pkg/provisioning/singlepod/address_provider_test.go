@@ -3739,3 +3739,69 @@ func TestAddressProvider_GcpGatewayHooks(t *testing.T) {
 		t.Errorf("expected --gateway-name in args: %s", argsStr)
 	}
 }
+
+func TestAddressProvider_DebugErrorResponses(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+			UID:       types.UID("gw-uid-1234"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "default",
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     "http",
+			Port:     80,
+			Protocol: gatewayv1.HTTPProtocolType,
+			Owner:    state.ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "test-gw"},
+		},
+	}
+
+	// 1. WithDebugErrorResponses(true) adds --debug-error-responses to container args
+	{
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
+		p := NewAddressProvider(client, WithDebugErrorResponses(true))
+		_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		name := ResourceNameForGateway("test-gw")
+		var deploy appsv1.Deployment
+		if err := client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: name}, &deploy); err != nil {
+			t.Fatalf("failed to get deployment: %v", err)
+		}
+		args := deploy.Spec.Template.Spec.Containers[0].Args
+		if !slices.Contains(args, "--debug-error-responses") {
+			t.Errorf("expected --debug-error-responses in args: %v", args)
+		}
+	}
+
+	// 2. Default (WithDebugErrorResponses not set or false) does NOT add --debug-error-responses
+	{
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).Build()
+		p := NewAddressProvider(client)
+		_, _, err := p.GatewayAddresses(t.Context(), gw, effectiveListeners)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		name := ResourceNameForGateway("test-gw")
+		var deploy appsv1.Deployment
+		if err := client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: name}, &deploy); err != nil {
+			t.Fatalf("failed to get deployment: %v", err)
+		}
+		args := deploy.Spec.Template.Spec.Containers[0].Args
+		if slices.Contains(args, "--debug-error-responses") {
+			t.Errorf("did not expect --debug-error-responses in args: %v", args)
+		}
+	}
+}

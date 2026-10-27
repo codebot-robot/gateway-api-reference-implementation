@@ -240,6 +240,9 @@ type Options struct {
 	// Disabled if empty (default).
 	DrainSentinelPath string
 
+	// DebugErrorResponses enables verbose error messages in unmatched responses.
+	DebugErrorResponses bool
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
 	// the manager starts.
@@ -374,6 +377,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.ForwardedForMode != "" {
 		p.SetForwardedForMode(opts.ForwardedForMode)
+	}
+	if opts.DebugErrorResponses {
+		p.SetDebugErrorResponses(true)
 	}
 
 	s := &Server{

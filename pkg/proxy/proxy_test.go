@@ -2606,6 +2606,10 @@ func TestProxy_H2C_GRPC(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("expected status 404, got %d", resp.StatusCode)
 		}
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "404 page not found\n" {
+			t.Errorf("expected generic 404 body %q, got %q", "404 page not found\n", string(body))
+		}
 	})
 
 	// Subtest 2: gRPC request matching no route -> HTTP 200 with grpc-status: 12 (Unimplemented)
@@ -2629,6 +2633,9 @@ func TestProxy_H2C_GRPC(t *testing.T) {
 		}
 		if gs := resp.Header.Get("Grpc-Status"); gs != "12" {
 			t.Errorf("expected Grpc-Status 12, got %q", gs)
+		}
+		if gm := resp.Header.Get("Grpc-Message"); gm != "" {
+			t.Errorf("expected empty Grpc-Message by default, got %q", gm)
 		}
 	})
 
@@ -3985,4 +3992,150 @@ func TestProxy_WrapUnwrapSession_NoWriteLock(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("deadlock: wrapSession or unwrapSession attempted to acquire write lock while read lock was held")
 	}
+}
+
+func TestProxy_UnmatchedResponses_GenericByDefaultAndDebugFlag(t *testing.T) {
+	t.Run("Plain HTTP default returns generic 404", func(t *testing.T) {
+		p := NewProxy()
+		req := httptest.NewRequest("GET", "http://example.com/unmatched-path", nil)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		expected := "404 page not found\n"
+		if string(body) != expected {
+			t.Errorf("expected body %q, got %q", expected, string(body))
+		}
+		if strings.Contains(string(body), "example.com") || strings.Contains(string(body), "/unmatched-path") {
+			t.Errorf("generic 404 body reflected client input: %q", string(body))
+		}
+	})
+
+	t.Run("Plain HTTP debug returns verbose 404", func(t *testing.T) {
+		p := NewProxy()
+		p.SetDebugErrorResponses(true)
+		req := httptest.NewRequest("GET", "http://example.com/unmatched-path", nil)
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		expected := "No route for host example.com and path /unmatched-path\n"
+		if string(body) != expected {
+			t.Errorf("expected body %q, got %q", expected, string(body))
+		}
+	})
+
+	t.Run("gRPC default returns status 12 without Grpc-Message", func(t *testing.T) {
+		p := NewProxy()
+		req := httptest.NewRequest("POST", "http://example.com/my.service/Echo", nil)
+		req.Header.Set("Content-Type", "application/grpc")
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if gs := resp.Header.Get("Grpc-Status"); gs != "12" {
+			t.Errorf("expected Grpc-Status 12, got %q", gs)
+		}
+		if gm := resp.Header.Get("Grpc-Message"); gm != "" {
+			t.Errorf("expected empty Grpc-Message by default, got %q", gm)
+		}
+	})
+
+	t.Run("gRPC debug returns status 12 with Grpc-Message", func(t *testing.T) {
+		p := NewProxy()
+		p.SetDebugErrorResponses(true)
+		req := httptest.NewRequest("POST", "http://example.com/my.service/Echo", nil)
+		req.Header.Set("Content-Type", "application/grpc")
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+		if gs := resp.Header.Get("Grpc-Status"); gs != "12" {
+			t.Errorf("expected Grpc-Status 12, got %q", gs)
+		}
+		expectedMsg := "No route for host example.com and path /my.service/Echo"
+		if gm := resp.Header.Get("Grpc-Message"); gm != expectedMsg {
+			t.Errorf("expected Grpc-Message %q, got %q", expectedMsg, gm)
+		}
+	})
+
+	t.Run("HTTPS unmatched SNI default returns generic 404", func(t *testing.T) {
+		p := NewProxy()
+		p.UpdateListeners([]state.InternalListener{
+			{
+				Name:     "https",
+				Port:     443,
+				Protocol: gatewayv1.HTTPSProtocolType,
+				Hostname: "allowed.example.com",
+			},
+		})
+		req := httptest.NewRequest("GET", "https://unmatched.example.com/test", nil)
+		req.TLS = &tls.ConnectionState{
+			ServerName: "unmatched.example.com",
+		}
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		expected := "404 page not found\n"
+		if string(body) != expected {
+			t.Errorf("expected body %q, got %q", expected, string(body))
+		}
+		if strings.Contains(string(body), "unmatched.example.com") {
+			t.Errorf("generic 404 body reflected SNI: %q", string(body))
+		}
+	})
+
+	t.Run("HTTPS unmatched SNI debug returns verbose 404", func(t *testing.T) {
+		p := NewProxy()
+		p.SetDebugErrorResponses(true)
+		p.UpdateListeners([]state.InternalListener{
+			{
+				Name:     "https",
+				Port:     443,
+				Protocol: gatewayv1.HTTPSProtocolType,
+				Hostname: "allowed.example.com",
+			},
+		})
+		req := httptest.NewRequest("GET", "https://unmatched.example.com/test", nil)
+		req.TLS = &tls.ConnectionState{
+			ServerName: "unmatched.example.com",
+		}
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, req)
+
+		resp := w.Result()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected status 404, got %d", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		expected := "No listener for server name unmatched.example.com\n"
+		if string(body) != expected {
+			t.Errorf("expected body %q, got %q", expected, string(body))
+		}
+	})
 }

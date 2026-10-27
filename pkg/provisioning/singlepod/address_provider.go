@@ -116,6 +116,13 @@ func WithForwardedForMode(mode string) Option {
 	}
 }
 
+// WithDebugErrorResponses configures whether detailed error messages are included in unmatched responses on data-plane instances.
+func WithDebugErrorResponses(debug bool) Option {
+	return func(p *AddressProvider) {
+		p.debugErrorResponses = debug
+	}
+}
+
 // WithAPIReader configures the direct API reader for the AddressProvider.
 func WithAPIReader(reader client.Reader) Option {
 	return func(p *AddressProvider) {
@@ -130,6 +137,7 @@ type AddressProvider struct {
 	dataplaneImage                string
 	enableH2C                     bool
 	forwardedForMode              string
+	debugErrorResponses           bool
 	state                         *state.State
 	extraReadinessGates           []string
 	preStopCommand                []string
@@ -433,6 +441,9 @@ func (p *AddressProvider) GatewayAddressesWithReadiness(ctx context.Context, gw 
 	}
 	if p.forwardedForMode != "" {
 		args = append(args, fmt.Sprintf("--forwarded-for-mode=%s", p.forwardedForMode))
+	}
+	if p.debugErrorResponses {
+		args = append(args, "--debug-error-responses")
 	}
 
 	image := p.dataplaneImage
