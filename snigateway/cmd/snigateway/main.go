@@ -66,8 +66,9 @@ func main() {
 		quicProbeInterval time.Duration
 		leaderElection    bool
 		leaderElectionID  string
-		gatewayAddresses  stringSliceFlag
-		tokenFilePath     string
+		gatewayAddresses    stringSliceFlag
+		tokenFilePath       string
+		debugErrorResponses bool
 	)
 
 	flag.StringVar(&frontendAddr, "frontend", "127.0.0.1:443", "Address of the snigateway-frontend server (<ip-or-host>:<port>).")
@@ -87,6 +88,7 @@ func main() {
 	flag.StringVar(&proxyAddr, "proxy-bind-address", "", "Optional HTTP proxy bind address. Disabled by default.")
 	flag.BoolVar(&leaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&leaderElectionID, "leader-election-id", "snigateway-controller", "The ID used for leader election.")
+	flag.BoolVar(&debugErrorResponses, "debug-error-responses", false, "Include detailed error messages in unmatched responses.")
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
@@ -170,6 +172,7 @@ func main() {
 	gariOpts.HTTPSListener = tunnelMgr.Listener()
 	gariOpts.LeaderElection = leaderElection
 	gariOpts.LeaderElectionID = leaderElectionID
+	gariOpts.DebugErrorResponses = debugErrorResponses
 	gariOpts.AddressProvider = addrProvider
 	gariOpts.OnGatewaysUpdate = func(gateways []*gatewayv1.Gateway) {
 		tunnelMgr.UpdateGateways(gateways)
