@@ -346,24 +346,18 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 			bp.freeFrames = append(bp.freeFrames, oldDesc.FrameIDs...)
 			oldDesc.FrameIDs = nil
 		}
-		if oldDesc.DurableLoc != NoBlock {
-			if err := bp.buddy.Free(oldDesc.DurableLoc); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old durable block %d: %w", oldDesc.DurableLoc, err))
+		freed := make(map[uint64]bool)
+		for _, loc := range []uint64{oldDesc.DurableLoc, oldDesc.FlushedLoc, oldDesc.PhysicalBlock} {
+			if loc != NoBlock && !freed[loc] {
+				freed[loc] = true
+				if err := bp.buddy.Free(loc); err != nil && bp.onFailure != nil {
+					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old block %d: %w", loc, err))
+				}
 			}
-			oldDesc.DurableLoc = NoBlock
 		}
-		if oldDesc.FlushedLoc != NoBlock && oldDesc.FlushedLoc != oldDesc.DurableLoc {
-			if err := bp.buddy.Free(oldDesc.FlushedLoc); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old flushed block %d: %w", oldDesc.FlushedLoc, err))
-			}
-			oldDesc.FlushedLoc = NoBlock
-		}
-		if oldDesc.PhysicalBlock != NoBlock && oldDesc.PhysicalBlock != oldDesc.DurableLoc && oldDesc.PhysicalBlock != oldDesc.FlushedLoc {
-			if err := bp.buddy.Free(oldDesc.PhysicalBlock); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old physical block %d: %w", oldDesc.PhysicalBlock, err))
-			}
-			oldDesc.PhysicalBlock = NoBlock
-		}
+		oldDesc.DurableLoc = NoBlock
+		oldDesc.FlushedLoc = NoBlock
+		oldDesc.PhysicalBlock = NoBlock
 	}
 
 	frameIDs, err := bp.acquireFramesLocked(numBlocks)

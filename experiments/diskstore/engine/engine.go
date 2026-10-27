@@ -149,6 +149,49 @@ func WithAutoDelete(autoDelete bool) Option {
 	}
 }
 
+// emptyPageTracker manages free logical page identifiers. It maintains a slice for LIFO
+// reuse order and a set for O(1) membership checks to prevent duplicate additions.
+type emptyPageTracker struct {
+	pages []uint64
+	set   map[uint64]bool
+}
+
+func newEmptyPageTracker(initial []uint64) *emptyPageTracker {
+	t := &emptyPageTracker{
+		pages: make([]uint64, 0, len(initial)),
+		set:   make(map[uint64]bool, len(initial)),
+	}
+	for _, p := range initial {
+		t.Add(p)
+	}
+	return t
+}
+
+func (t *emptyPageTracker) Add(pageID uint64) {
+	if !t.set[pageID] {
+		t.set[pageID] = true
+		t.pages = append(t.pages, pageID)
+	}
+}
+
+func (t *emptyPageTracker) Pop() (uint64, bool) {
+	if len(t.pages) == 0 {
+		return 0, false
+	}
+	p := t.pages[len(t.pages)-1]
+	t.pages = t.pages[:len(t.pages)-1]
+	delete(t.set, p)
+	return p, true
+}
+
+func (t *emptyPageTracker) Contains(pageID uint64) bool {
+	return t.set[pageID]
+}
+
+func (t *emptyPageTracker) Pages() []uint64 {
+	return t.pages
+}
+
 // Engine coordinates the write-ahead log, heap file, buffer pool, buddy allocator,
 // in-memory index, payload encryption, and crash consistency mechanisms.
 type Engine struct {
@@ -174,7 +217,8 @@ type Engine struct {
 	keyIndex        map[string]KeyIndexEntry // bucketQualifiedKey -> KeyIndexEntry
 	oversizeObjects map[string][]byte        // bucketQualifiedKey -> payload
 
-	emptyLogicalPages []uint64
+	// Free logical page allocations and tracking; guarded by writerMu
+	emptyPages        *emptyPageTracker
 	nextLogicalPage   uint64
 	activeSlottedPage uint64
 
@@ -472,7 +516,7 @@ func Open(opts ...Option) (*Engine, error) {
 		heapFile:                   heapFile,
 		keyIndex:                   make(map[string]KeyIndexEntry),
 		oversizeObjects:            make(map[string][]byte),
-		emptyLogicalPages:          make([]uint64, 0),
+		emptyPages:                 newEmptyPageTracker(nil),
 		lastRecoveredTokenByBucket: make(map[string]string),
 		failedCh:                   make(chan struct{}),
 		closedCh:                   make(chan struct{}),
@@ -507,7 +551,7 @@ func Open(opts ...Option) (*Engine, error) {
 
 		s.buddy = recoveryRes.Buddy
 		s.keyIndex = recoveryRes.KeyIndex
-		s.emptyLogicalPages = recoveryRes.EmptyLogicalPages
+		s.emptyPages = newEmptyPageTracker(recoveryRes.EmptyLogicalPages)
 		s.lastRecoveredToken = recoveryRes.LastToken
 		if recoveryRes.LastTokenByBucket != nil {
 			s.lastRecoveredTokenByBucket = recoveryRes.LastTokenByBucket
@@ -1024,9 +1068,8 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 			targetPage = existing.LogicalPage
 		} else if s.activeSlottedPage != 0 {
 			targetPage = s.activeSlottedPage
-		} else if len(s.emptyLogicalPages) > 0 {
-			targetPage = s.emptyLogicalPages[len(s.emptyLogicalPages)-1]
-			s.emptyLogicalPages = s.emptyLogicalPages[:len(s.emptyLogicalPages)-1]
+		} else if p, ok := s.emptyPages.Pop(); ok {
+			targetPage = p
 			s.activeSlottedPage = targetPage
 		} else {
 			targetPage = s.nextLogicalPage
@@ -1054,15 +1097,6 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 
 		slotIdx, err := slotted.Put(qKey, toStore, lsn)
 		if err == nil {
-			s.keyMu.Lock()
-			s.keyIndex[qKey] = KeyIndexEntry{
-				LogicalPage: targetPage,
-				Slot:        slotIdx,
-				LSN:         lsn,
-				NumBlocks:   1,
-			}
-			s.keyMu.Unlock()
-
 			if inIndex && !existing.IsOversize && targetPage == existing.LogicalPage && slotIdx != existing.Slot {
 				if delErr := slotted.Delete(existing.Slot, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
 					handle.Desc.Mu.Unlock()
@@ -1089,9 +1123,8 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 				}
 			}
 
-			if len(s.emptyLogicalPages) > 0 {
-				targetPage = s.emptyLogicalPages[len(s.emptyLogicalPages)-1]
-				s.emptyLogicalPages = s.emptyLogicalPages[:len(s.emptyLogicalPages)-1]
+			if p, ok := s.emptyPages.Pop(); ok {
+				targetPage = p
 			} else {
 				targetPage = s.nextLogicalPage
 				s.nextLogicalPage++
@@ -1124,6 +1157,20 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 		s.bp.MarkDirty(targetPage, lsn)
 		handle.Unpin()
 
+		if err == nil && inIndex && !existing.IsOversize && targetPage != existing.LogicalPage {
+			if existing.NumBlocks == 1 {
+				if delErr := s.deleteSlotFromPageLocked(existing.LogicalPage, existing.Slot, lsn); delErr != nil {
+					s.setFailed(delErr)
+					return s.failErr()
+				}
+			} else if existing.NumBlocks > 1 {
+				if clrErr := s.clearLogicalPageLocked(existing.LogicalPage, lsn); clrErr != nil {
+					s.setFailed(clrErr)
+					return s.failErr()
+				}
+			}
+		}
+
 		s.keyMu.Lock()
 		s.keyIndex[qKey] = KeyIndexEntry{
 			LogicalPage: targetPage,
@@ -1155,9 +1202,8 @@ func (s *Engine) Put(bucketName, key string, payload []byte, token string) error
 		}
 
 		var targetPage uint64
-		if len(s.emptyLogicalPages) > 0 {
-			targetPage = s.emptyLogicalPages[len(s.emptyLogicalPages)-1]
-			s.emptyLogicalPages = s.emptyLogicalPages[:len(s.emptyLogicalPages)-1]
+		if p, ok := s.emptyPages.Pop(); ok {
+			targetPage = p
 		} else {
 			targetPage = s.nextLogicalPage
 			s.nextLogicalPage++
@@ -1208,14 +1254,20 @@ func (s *Engine) deleteSlotFromPageLocked(pageID uint64, slotIdx uint32, lsn uin
 		handle.Unpin()
 		return fmt.Errorf("failed to wrap page %d: %w", pageID, wrapErr)
 	}
-	if delErr := slotted.Delete(slotIdx, lsn); delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
+	delErr := slotted.Delete(slotIdx, lsn)
+	if delErr != nil && !errors.Is(delErr, ErrSlotNotFound) {
 		handle.Desc.Mu.Unlock()
 		handle.Unpin()
 		return fmt.Errorf("failed to delete slot %d from page %d: %w", slotIdx, pageID, delErr)
 	}
 	slotted.Finalize()
-	if slotted.ActiveSlotsCount() == 0 {
-		s.emptyLogicalPages = append(s.emptyLogicalPages, pageID)
+	// Only add to emptyPages if a slot was successfully deleted and the page
+	// transitioned to having zero active slots. If slotted.Delete returned ErrSlotNotFound,
+	// no slot was removed and the page was already empty or unchanged.
+	// emptyPageTracker maintains an O(1) set alongside the slice to prevent
+	// duplicate entries by construction.
+	if delErr == nil && slotted.ActiveSlotsCount() == 0 {
+		s.emptyPages.Add(pageID)
 		if s.activeSlottedPage == pageID {
 			s.activeSlottedPage = 0
 		}
@@ -1241,7 +1293,10 @@ func (s *Engine) clearLogicalPageLocked(logicalPage uint64, lsn uint64) error {
 	handle.Desc.Mu.Unlock()
 	s.bp.MarkDirty(logicalPage, lsn)
 	handle.Unpin()
-	s.emptyLogicalPages = append(s.emptyLogicalPages, logicalPage)
+	// A multi-block page holds exactly one record and is only cleared when that record
+	// is deleted or moved to a different page. emptyPageTracker maintains an O(1) set
+	// alongside the slice to ensure by construction that a page is added at most once.
+	s.emptyPages.Add(logicalPage)
 	return nil
 }
 

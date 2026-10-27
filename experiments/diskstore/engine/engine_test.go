@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -876,6 +877,440 @@ func TestMultiBlockPage_RecordSizesBetweenSlottedAndBlockLimitRoundTrip(t *testi
 		if err != nil || !exists || !bytes.Equal(got, payloads[recSize]) {
 			t.Fatalf("Get after reopen for record size %d failed: exists=%v, err=%v", recSize, exists, err)
 		}
+	}
+}
+
+func makeIncompressible(size int) []byte {
+	b := make([]byte, size)
+	state := uint64(0xdeadbeefcafebabe)
+	for i := range b {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		b[i] = byte(state)
+	}
+	return b
+}
+
+func TestPageTransitions_NoResurrection(t *testing.T) {
+	type transitionCase struct {
+		name       string
+		codec      CompressionCodec
+		setup      func(t *testing.T, store *Engine, bucket string)
+		val1       []byte
+		val2       []byte
+		verifyPost func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry)
+	}
+
+	cases := []transitionCase{
+		{
+			name:  "slotted_to_slotted_another_page",
+			codec: CodecNone,
+			setup: func(t *testing.T, store *Engine, bucket string) {
+				// Fill active slotted page mostly full with a sibling record
+				if err := store.Put(bucket, "sibling", makeIncompressible(3500), "s-1"); err != nil {
+					t.Fatalf("Put sibling failed: %v", err)
+				}
+			},
+			val1: makeIncompressible(400),
+			val2: makeIncompressible(800), // cannot fit in page 1 with sibling, must allocate page 2
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.LogicalPage == oldEntry.LogicalPage {
+					t.Fatalf("expected record to move to another page, but stayed on %d", newEntry.LogicalPage)
+				}
+				// Verify slot on old page was deleted
+				handle, err := store.bp.PinPage(oldEntry.LogicalPage)
+				if err != nil {
+					t.Fatalf("PinPage failed: %v", err)
+				}
+				defer handle.Unpin()
+				handle.Desc.Mu.Lock()
+				defer handle.Desc.Mu.Unlock()
+				slotted, _ := WrapSlottedPage(handle.Block(0))
+				if _, _, _, err := slotted.Get(oldEntry.Slot); !errors.Is(err, ErrSlotNotFound) {
+					t.Fatalf("expected old slot %d to be deleted, got err=%v", oldEntry.Slot, err)
+				}
+			},
+		},
+		{
+			name:  "slotted_to_multiblock",
+			codec: CodecNone,
+			val1:  makeIncompressible(500),
+			val2:  makeIncompressible(10 * 1024),
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.NumBlocks <= 1 {
+					t.Fatalf("expected multi-block page, got NumBlocks=%d", newEntry.NumBlocks)
+				}
+				// If old page was not reused as targetPage, it should be in emptyLogicalPages
+				if newEntry.LogicalPage != oldEntry.LogicalPage && !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old slotted page %d to be in emptyPages %v", oldEntry.LogicalPage, store.emptyPages.Pages())
+				}
+			},
+		},
+		{
+			name:  "multiblock_to_slotted",
+			codec: CodecNone,
+			val1:  makeIncompressible(20 * 1024),
+			val2:  makeIncompressible(500),
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.NumBlocks != 1 {
+					t.Fatalf("expected slotted page (NumBlocks=1), got %d", newEntry.NumBlocks)
+				}
+				if !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old multi-block page %d to be in emptyPages %v", oldEntry.LogicalPage, store.emptyPages.Pages())
+				}
+			},
+		},
+		{
+			name:  "multiblock_to_multiblock_shrink",
+			codec: CodecNone,
+			val1:  makeIncompressible(25 * 1024), // 8 blocks
+			val2:  makeIncompressible(6 * 1024),  // 2 blocks
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.NumBlocks >= oldEntry.NumBlocks {
+					t.Fatalf("expected block count to shrink: old=%d, new=%d", oldEntry.NumBlocks, newEntry.NumBlocks)
+				}
+				if newEntry.LogicalPage != oldEntry.LogicalPage && !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old multi-block page %d to be in emptyPages", oldEntry.LogicalPage)
+				}
+			},
+		},
+		{
+			name:  "multiblock_to_multiblock_grow",
+			codec: CodecNone,
+			val1:  makeIncompressible(6 * 1024),  // 2 blocks
+			val2:  makeIncompressible(25 * 1024), // 8 blocks
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.NumBlocks <= oldEntry.NumBlocks {
+					t.Fatalf("expected block count to grow: old=%d, new=%d", oldEntry.NumBlocks, newEntry.NumBlocks)
+				}
+				if newEntry.LogicalPage != oldEntry.LogicalPage && !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old multi-block page %d to be in emptyPages", oldEntry.LogicalPage)
+				}
+			},
+		},
+		{
+			name:  "slotted_to_oversize",
+			codec: CodecNone,
+			val1:  makeIncompressible(500),
+			val2:  makeIncompressible(MaxPayloadCapacity + 1024),
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if !newEntry.IsOversize {
+					t.Fatalf("expected oversize object")
+				}
+				if !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old slotted page %d to be in emptyPages", oldEntry.LogicalPage)
+				}
+			},
+		},
+		{
+			name:  "multiblock_to_oversize",
+			codec: CodecNone,
+			val1:  makeIncompressible(20 * 1024),
+			val2:  makeIncompressible(MaxPayloadCapacity + 1024),
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if !newEntry.IsOversize {
+					t.Fatalf("expected oversize object")
+				}
+				if !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old multi-block page %d to be in emptyPages", oldEntry.LogicalPage)
+				}
+			},
+		},
+		{
+			name:  "oversize_to_slotted",
+			codec: CodecNone,
+			val1:  makeIncompressible(MaxPayloadCapacity + 1024),
+			val2:  makeIncompressible(500),
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.IsOversize || newEntry.NumBlocks != 1 {
+					t.Fatalf("expected slotted object, got isOversize=%v, numBlocks=%d", newEntry.IsOversize, newEntry.NumBlocks)
+				}
+				// Verify oversize file was removed
+				p := store.oversizeFilePath(qualifyKey(bucket, key))
+				if f, err := store.fs.Open(p); err == nil {
+					_ = f.Close()
+					t.Fatalf("expected oversize file %s to be removed, but still exists", p)
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("unexpected error checking oversize file: %v", err)
+				}
+			},
+		},
+		{
+			name:  "oversize_to_multiblock",
+			codec: CodecNone,
+			val1:  makeIncompressible(MaxPayloadCapacity + 1024),
+			val2:  makeIncompressible(20 * 1024),
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if newEntry.IsOversize || newEntry.NumBlocks <= 1 {
+					t.Fatalf("expected multi-block object, got isOversize=%v, numBlocks=%d", newEntry.IsOversize, newEntry.NumBlocks)
+				}
+				// Verify oversize file was removed
+				p := store.oversizeFilePath(qualifyKey(bucket, key))
+				if f, err := store.fs.Open(p); err == nil {
+					_ = f.Close()
+					t.Fatalf("expected oversize file %s to be removed, but still exists", p)
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("unexpected error checking oversize file: %v", err)
+				}
+			},
+		},
+		{
+			name:  "same_raw_size_different_compressibility",
+			codec: CodecZstd,
+			val1:  makeIncompressible(20 * 1024), // incompressible -> multi-block
+			val2:  make([]byte, 20*1024),         // all zeros -> compressible to ~50 B -> slotted
+			verifyPost: func(t *testing.T, store *Engine, bucket, key string, oldEntry KeyIndexEntry) {
+				store.keyMu.RLock()
+				newEntry := store.keyIndex[qualifyKey(bucket, key)]
+				store.keyMu.RUnlock()
+				if oldEntry.NumBlocks <= 1 {
+					t.Fatalf("expected incompressible payload to be multi-block, got %d", oldEntry.NumBlocks)
+				}
+				if newEntry.NumBlocks != 1 {
+					t.Fatalf("expected compressed zero payload to be slotted (NumBlocks=1), got %d", newEntry.NumBlocks)
+				}
+				if !store.emptyPages.Contains(oldEntry.LogicalPage) {
+					t.Fatalf("expected old multi-block page %d to be in emptyPages", oldEntry.LogicalPage)
+				}
+			},
+		},
+	}
+
+	modes := []struct {
+		name                 string
+		checkpointPostDelete bool
+	}{
+		{"HeapScan_CheckpointBeforeReopen", true},
+		{"RedoReplay_NoCheckpointBeforeReopen", false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			for _, m := range modes {
+				m := m
+				t.Run(m.name, func(t *testing.T) {
+					memFS := NewMemFS()
+					dir := fmt.Sprintf("test_transition_%s_%s", tc.name, m.name)
+
+					store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(tc.codec))
+					if err != nil {
+						t.Fatalf("Open failed: %v", err)
+					}
+
+					bucket := "testb"
+					key := "target-key"
+
+					if tc.setup != nil {
+						tc.setup(t, store, bucket)
+					}
+
+					// 1. Put val1
+					if err := store.Put(bucket, key, tc.val1, "rv-1"); err != nil {
+						t.Fatalf("Put val1 failed: %v", err)
+					}
+
+					// Checkpoint so val1 is durable on disk
+					if _, err := store.Checkpoint(); err != nil {
+						t.Fatalf("Checkpoint 1 failed: %v", err)
+					}
+
+					// Capture location of val1
+					store.keyMu.RLock()
+					oldEntry := store.keyIndex[qualifyKey(bucket, key)]
+					store.keyMu.RUnlock()
+
+					// 2. Put val2 (transition)
+					if err := store.Put(bucket, key, tc.val2, "rv-2"); err != nil {
+						t.Fatalf("Put val2 failed: %v", err)
+					}
+
+					// Verify val2 is readable
+					gotVal2, exists, err := store.Get(bucket, key)
+					if err != nil || !exists || !bytes.Equal(gotVal2, tc.val2) {
+						t.Fatalf("Get after Put val2 failed: exists=%v, err=%v", exists, err)
+					}
+
+					// Run verifyPost on old location
+					if tc.verifyPost != nil {
+						tc.verifyPost(t, store, bucket, key, oldEntry)
+					}
+
+					// 3. Delete key
+					if err := store.Delete(bucket, key); err != nil {
+						t.Fatalf("Delete failed: %v", err)
+					}
+
+					// 4. Reopen either after Checkpoint (Heap scan) or without Checkpoint (Redo replay)
+					if m.checkpointPostDelete {
+						if _, err := store.Checkpoint(); err != nil {
+							t.Fatalf("Checkpoint 2 failed: %v", err)
+						}
+						if err := store.Close(); err != nil {
+							t.Fatalf("Close failed: %v", err)
+						}
+					} else {
+						// Ensure WAL is synced
+						if err := store.wal.Sync(); err != nil {
+							t.Fatalf("wal.Sync failed: %v", err)
+						}
+						// Prevent checkpoint during Close
+						store.cp = nil
+						if err := store.Close(); err != nil {
+							t.Fatalf("Close without checkpoint failed: %v", err)
+						}
+					}
+
+					store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(tc.codec))
+					if err != nil {
+						t.Fatalf("reopen failed: %v", err)
+					}
+					defer store2.Close()
+
+					// 5. Verify deleted key does NOT resurrect
+					resVal, found, err := store2.Get(bucket, key)
+					if err != nil {
+						t.Fatalf("Get after reopen failed: %v", err)
+					}
+					if found {
+						t.Fatalf("KEY RESURRECTED! Got len=%d, expected found=false", len(resVal))
+					}
+
+					// If sibling existed, verify sibling is still intact
+					if tc.setup != nil {
+						sVal, sFound, sErr := store2.Get(bucket, "sibling")
+						if sErr != nil || !sFound {
+							t.Fatalf("sibling key missing after reopen: found=%v, err=%v", sFound, sErr)
+						}
+						if len(sVal) != 3500 {
+							t.Fatalf("sibling key corrupted: len=%d, want 3500", len(sVal))
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_mb_redo_idempotent"
+
+	store, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	bucket := "test"
+	key := "mb-key"
+	val := makeIncompressible(20 * 1024)
+
+	if err := store.Put(bucket, key, val, "rv-1"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	store.keyMu.RLock()
+	entry1 := store.keyIndex[qualifyKey(bucket, key)]
+	store.keyMu.RUnlock()
+
+	// Flush the multi-block page to the heap file so the heap already reflects the write,
+	// but do NOT checkpoint. WAL records remain durable so redo will replay them.
+	if err := store.bp.FlushPage(entry1.LogicalPage); err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+	if err := store.heapFile.Sync(); err != nil {
+		t.Fatalf("heapFile.Sync failed: %v", err)
+	}
+	if err := store.wal.Sync(); err != nil {
+		t.Fatalf("wal.Sync failed: %v", err)
+	}
+
+	// Prevent checkpoint on Close
+	store.cp = nil
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// First reopen
+	store2, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 1 failed: %v", err)
+	}
+	store2.keyMu.RLock()
+	entry2 := store2.keyIndex[qualifyKey(bucket, key)]
+	store2.keyMu.RUnlock()
+
+	if entry2.LogicalPage != entry1.LogicalPage {
+		t.Fatalf("Reopen 1 moved key to logical page %d, want %d", entry2.LogicalPage, entry1.LogicalPage)
+	}
+	if entry2.NumBlocks != entry1.NumBlocks {
+		t.Fatalf("Reopen 1 changed NumBlocks to %d, want %d", entry2.NumBlocks, entry1.NumBlocks)
+	}
+
+	// Close again without checkpoint
+	store2.cp = nil
+	if err := store2.Close(); err != nil {
+		t.Fatalf("Close 2 failed: %v", err)
+	}
+
+	// Second reopen
+	store3, err := Open(WithFS(memFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen 2 failed: %v", err)
+	}
+	defer store3.Close()
+
+	store3.keyMu.RLock()
+	entry3 := store3.keyIndex[qualifyKey(bucket, key)]
+	store3.keyMu.RUnlock()
+
+	if entry3.LogicalPage != entry1.LogicalPage {
+		t.Fatalf("Reopen 2 moved key to logical page %d, want %d", entry3.LogicalPage, entry1.LogicalPage)
+	}
+	if entry3.NumBlocks != entry1.NumBlocks {
+		t.Fatalf("Reopen 2 changed NumBlocks to %d, want %d", entry3.NumBlocks, entry1.NumBlocks)
+	}
+
+	// Verify allocated blocks in buddy allocator match expected count.
+	// A single 20 KB object uses 8 blocks (order 3). Reopening must not leak blocks.
+	store3.buddy.mu.Lock()
+	numAllocated := len(store3.buddy.allocated)
+	store3.buddy.mu.Unlock()
+	if numAllocated != 1 {
+		t.Fatalf("expected exactly 1 allocated buddy extent, got %d", numAllocated)
+	}
+
+	got, found, err := store3.Get(bucket, key)
+	if err != nil || !found || !bytes.Equal(got, val) {
+		t.Fatalf("Get after reopens failed: found=%v, err=%v", found, err)
 	}
 }
 
