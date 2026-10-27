@@ -47,8 +47,8 @@ To uphold least privilege, `gcpgateway` uses two distinct IAM roles:
      - `compute.networkEndpointGroups.use`
      - `compute.networkEndpointGroups.attachNetworkEndpoints`
      - `compute.networkEndpointGroups.detachNetworkEndpoints`
-     - `compute.backendServices.get`
-     - `compute.backendServices.getHealth`
+     - `compute.instances.use` (attachNetworkEndpoints references the pod's VM)
+     - `compute.backendServices.get` (also authorizes `getHealth`)
      - `compute.zoneOperations.get`
 2. **`gcpgatewayOperatorHelper` (Provisioning Helper Role)**:
    Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py`.
@@ -88,7 +88,7 @@ gcloud iam roles create gcpgatewayNegRegistrar \
   --title="GARI gcpgateway NEG Registrar" \
   --description="Authorizes gcpgateway controller to register endpoints and check health" \
   --stage="GA" \
-  --permissions="compute.networkEndpointGroups.get,compute.networkEndpointGroups.list,compute.networkEndpointGroups.use,compute.networkEndpointGroups.attachNetworkEndpoints,compute.networkEndpointGroups.detachNetworkEndpoints,compute.backendServices.get,compute.backendServices.getHealth,compute.zoneOperations.get"
+  --permissions="compute.networkEndpointGroups.get,compute.networkEndpointGroups.list,compute.networkEndpointGroups.use,compute.networkEndpointGroups.attachNetworkEndpoints,compute.networkEndpointGroups.detachNetworkEndpoints,compute.instances.use,compute.backendServices.get,compute.zoneOperations.get"
 ```
 
 2. Create the Google Service Account (GSA) and bind the role:

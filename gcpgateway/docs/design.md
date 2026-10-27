@@ -77,7 +77,7 @@ To preserve GARI's core principle of zero cloud-provider SDK dependencies in the
 The `gcpgateway` controller runs under its own Kubernetes ServiceAccount (KSA), e.g., `gcpgateway-controller`.
 - Permissions to interact with the Compute Engine API are granted via Google Cloud **Workload Identity Federation for GKE** (or instance metadata / service account keys for non-GKE clusters) split across two least-privilege custom IAM roles:
   - `gcpgatewayNegRegistrar`: Mutating NEG permissions, optionally constrained by IAM Conditions on NEG resource names.
-  - `gcpgatewayOperatorHelper`: Read/use permissions (`compute.instances.use`, `compute.zoneOperations.get`, `compute.backendServices.getHealth`) evaluated against instance, operation, and backend service resources.
+  - `gcpgatewayOperatorHelper`: Read/use permissions (`compute.instances.use`, `compute.zoneOperations.get`, `compute.backendServices.get`) evaluated against instance, operation, and backend service resources.
 - Only the controller communicates with the Google Cloud Compute API; data-plane pods run completely unprivileged without cloud credentials.
 
 ### 3. Layer 4 Only; GARI Decrypts TLS
@@ -760,7 +760,7 @@ gcloud iam roles create gcpgatewayOperatorHelper \
     --project="${PROJECT_ID}" \
     --title="gcpgateway Operator Helper" \
     --description="Allows gcpgateway controller to use VM instances, await operations, and check backend health" \
-    --permissions="compute.instances.use,compute.zoneOperations.get,compute.backendServices.getHealth" \
+    --permissions="compute.instances.use,compute.zoneOperations.get" \
     --stage="GA"
 ```
 
