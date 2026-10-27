@@ -97,7 +97,7 @@ The GARI controller runs inside each Kubernetes cluster. It reconciles `Gateway`
 
 - The controller identifies `Terminate` listeners that configure certserver through `tls.options` with `gateway.gke-labs.io/certificate-source: certserver`. The Gateway API specification permits `tls.options` in place of `certificateRefs` on `Terminate` listeners.
 - The controller obtains a projected Kubernetes service-account token with the audience `certserver`.
-- The controller calls `GetCertificate` on certserver over gRPC. The request contains the normalized hostnames, the Gateway namespace and name, and the service account of the data plane that serves the Gateway.
+- The controller calls `GetCertificate` on certserver over gRPC. The request contains the normalized hostnames, the Gateway namespace and name, the Gateway's attested addresses (from `status.addresses`), and the service account of the data plane that serves the Gateway.
 - When certserver returns a certificate and private key in phase 1, the controller writes them into GARI's per-Gateway data-plane config Secret. The data plane reads the certificate and key from this Secret.
 
 ### GARI Data Plane
@@ -156,7 +156,15 @@ certserver authorizes requests using three distinct controls:
    - The Gateway resource name (`namespace/name`).
    - The requested hostnames.
    - The service account of the data plane that serves the Gateway.
+   - The Gateway's external addresses (`status.addresses`).
 3. **In-Path Challenge Validation:** certserver verifies that public DNS directs HTTP-01 challenge traffic through the attested data plane before it marks an order complete.
+
+### Local Pre-Validation and DNS Checks
+
+Before certserver initiates an order with the public certificate authority, certserver performs local validation checks:
+
+1. **DNS Resolution Check:** certserver resolves public DNS (A and AAAA records) for each requested hostname from its own vantage point using authoritative or public recursive resolvers. certserver compares the resolved IP addresses against the Gateway addresses that the controller attested in `GetCertificate`. If DNS does not resolve (NXDOMAIN) or points to an unrelated address, certserver rejects or requeues the request immediately with a retryable error. This check prevents certserver from creating premature ACME orders while users wait for DNS records to propagate.
+2. **Local Self-Probing:** certserver can send an HTTP GET request to `http://<hostname>/.well-known/acme-challenge/<probe-token>` using a locally generated probe token before contacting the public certificate authority. The probe follows public DNS to the Gateway's public IP address, enters the data plane, and forwards back to certserver with the data plane's service-account token. This self-probe confirms that port 80 routing and challenge binding function properly before certserver consumes certificate authority rate limits.
 
 ### Challenge Binding and Attack Prevention
 
@@ -200,8 +208,12 @@ certserver caches issued certificates by normalized hostname set to avoid redund
 
 - If Gateway X requests a certificate that certserver already holds in cache from a prior issuance for Gateway Y, certserver does not release the certificate immediately.
 - certserver releases the cached certificate only after Gateway X proves that it currently controls the hostnames.
-- To prove control, Gateway X must complete challenge binding through an ACME challenge or present a recent, unexpired validation record that certserver stores.
-- This rule prevents an unauthorized Gateway from reading existing certificates out of the cache.
+- certserver completes this proof locally without forcing a new request to the public certificate authority:
+  1. certserver looks up public DNS for each hostname in the set and verifies that the records resolve to Gateway X's attested addresses.
+  2. certserver initiates a local self-probe by requesting `http://<hostname>/.well-known/acme-challenge/<probe-token>`.
+  3. When Gateway X's data plane receives the probe and forwards it with its projected service-account token, certserver verifies challenge binding for Gateway X.
+  4. Once Gateway X satisfies this local challenge binding, certserver safely releases the cached certificate.
+- This local validation prevents unauthorized Gateways from reading certificates out of the cache while avoiding duplicate ACME orders and unnecessary certificate authority rate limit consumption.
 
 ## Issuance and Renewal Flow
 
@@ -217,10 +229,12 @@ The following sequence diagram illustrates the complete issuance process using H
       │                  │                   │                   │                  │
       │ 1. GetCertificate│                   │                   │                  │
       │   (hostnames,    │                   │                   │                  │
-      │    gateway, SA)  │                   │                   │                  │
+      │    gateway, SA,  │                   │                   │                  │
+      │    addresses)    │                   │                   │                  │
       ├─────────────────►│                   │                   │                  │
       │                  │ 2. Check policy   │                   │                  │
       │                  │    Record binding │                   │                  │
+      │                  │    Check DNS      │                   │                  │
       │                  │                   │                   │                  │
       │                  │ 3. Create order   │                   │                  │
       │                  ├──────────────────►│                   │                  │
@@ -273,8 +287,8 @@ The following sequence diagram illustrates the complete issuance process using H
 
 The flow proceeds through these steps:
 
-1. **Controller Request:** The GARI controller reconciles a Gateway. It identifies listeners configured with `gateway.gke-labs.io/certificate-source: certserver` under `tls.options`. It extracts the listener hostnames, sorts and deduplicates them, and sends a `GetCertificate` gRPC request to certserver. The request contains the hostnames, the Gateway namespace and name, and the data plane's service account.
-2. **Policy Evaluation and Binding Registration:** certserver verifies the controller's identity and checks the requested hostnames against the cluster's allow and deny lists. certserver stores an active binding record that maps the pending order to the attested Gateway and data-plane service account.
+1. **Controller Request:** The GARI controller reconciles a Gateway. It identifies listeners configured with `gateway.gke-labs.io/certificate-source: certserver` under `tls.options`. It extracts the listener hostnames, sorts and deduplicates them, and sends a `GetCertificate` gRPC request to certserver. The request contains the hostnames, the Gateway namespace and name, the Gateway's attested addresses (`status.addresses`), and the data plane's service account.
+2. **Policy Evaluation, Binding Registration, and Local DNS Check:** certserver verifies the controller's identity and checks the requested hostnames against the cluster's allow and deny lists. certserver stores an active binding record that maps the pending order to the attested Gateway and data-plane service account. certserver also resolves public DNS for each hostname and verifies that it points to the Gateway's attested addresses. If DNS records do not match or return NXDOMAIN, certserver returns a retryable status to the controller and waits for DNS propagation before creating an order with the upstream certificate authority.
 3. **ACME Order Creation:** certserver checks its local cache. If no valid certificate exists, certserver creates an ACME order with the upstream certificate authority. The certificate authority returns HTTP-01 challenge tokens. certserver stores these tokens in its shared challenge store.
 4. **Retry Response:** certserver returns a retryable status code to the GARI controller. The controller requeues the Gateway for reconciliation after a short delay.
 5. **Validation Trigger:** certserver notifies the certificate authority that challenges are ready for validation.
@@ -287,7 +301,7 @@ The flow proceeds through these steps:
 12. **Order Finalization:** The certificate authority confirms validation and updates the order status to valid. certserver generates a Certificate Signing Request (CSR), sends it to the certificate authority, and downloads the signed certificate chain.
 13. **Cache Storage:** certserver writes the certificate chain and private key to its encrypted local disk cache.
 14. **Controller Requeue:** The GARI controller retries the `GetCertificate` RPC.
-15. **Certificate Release:** certserver detects the cached certificate, verifies that the requesting Gateway passed authorization, and returns the certificate chain and private key to the controller.
+15. **Certificate Release and Cache Reuse:** certserver detects the cached certificate, verifies that the requesting Gateway passed authorization, and returns the certificate chain and private key to the controller. When another Gateway requests an existing cached certificate, certserver validates domain control locally via DNS resolution checks and local self-probing before releasing the certificate, avoiding duplicate upstream ACME orders.
 16. **Data Plane Configuration:** In phase 1, the GARI controller writes the certificate and private key into GARI's per-Gateway data-plane config Secret. The data plane reads its configuration from this Secret and begins terminating TLS on port 443.
 
 ### Automated Renewal Flow
@@ -381,8 +395,10 @@ The initial release of certserver deliberately defers several capabilities:
 
 ### Multi-Region Deployment and Cache Sharing
 
-When GARI operates across multiple geographic regions, deploying a single central certserver instance creates cross-region latency and a single point of failure. Cross-region network round-trips become particularly noticeable in phase 2 during keyless signing.
+When GARI operates across multiple geographic regions, deploying a single central certserver instance creates cross-region latency and a single point of failure. Cross-region network round-trips become noticeable in phase 2 during keyless signing, where handshakes require low-latency signing operations.
 
-Deploying certserver instances in each region requires a strategy for sharing data:
-- **Shared Object Storage:** Regional certserver instances read and write certificates and keys to a shared, encrypted cloud object store (such as Google Cloud Storage). Instances coordinate ACME orders using distributed locking.
-- **Independent Regional Instances:** Each regional certserver operates an independent cache and ACME account. Gateways in region A obtain certificates from regional certserver A, while Gateways in region B obtain certificates from regional certserver B. This simplifies deployment but loses cross-region certificate sharing and consumes additional certificate authority rate limits.
+The intended design direction uses leader election and replication with state persisted to cloud object storage:
+- **State Persistence in Cloud Storage:** certserver persists its certificate cache, private keys, and challenge state to an encrypted Google Cloud Storage (GCS) bucket.
+- **Leader Election:** certserver instances use a distributed lease or object locking to elect an active leader replica. The leader coordinates ACME orders, interacts with upstream certificate authorities, and runs automated renewal loops.
+- **Regional Read and Sign Replicas:** Follower instances in other regions replicate cache state from storage. Regional instances serve low-latency local reads and execute local cryptographic signing operations during TLS handshakes in phase 2.
+- The project will formalize multi-region replication and election mechanics when implementing phase 2 keyless signing.
