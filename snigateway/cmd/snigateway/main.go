@@ -51,21 +51,21 @@ var setupLog = ctrl.Log.WithName("setup")
 
 func main() {
 	var (
-		frontendAddr      string
-		caCertPath        string
-		clientCertPath    string
-		clientKeyPath     string
-		internalHostname  string
-		controllerName    string
-		metricsAddr       string
-		healthProbeAddr   string
-		proxyAddr         string
-		tunnelTransport   string
-		tunnelPoolSize    int
-		quicDialTimeout   time.Duration
-		quicProbeInterval time.Duration
-		leaderElection    bool
-		leaderElectionID  string
+		frontendAddr        string
+		caCertPath          string
+		clientCertPath      string
+		clientKeyPath       string
+		internalHostname    string
+		controllerName      string
+		metricsAddr         string
+		healthProbeAddr     string
+		proxyAddr           string
+		tunnelTransport     string
+		tunnelPoolSize      int
+		quicDialTimeout     time.Duration
+		quicProbeInterval   time.Duration
+		leaderElection      bool
+		leaderElectionID    string
 		gatewayAddresses    stringSliceFlag
 		tokenFilePath       string
 		debugErrorResponses bool
