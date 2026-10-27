@@ -47,10 +47,13 @@ rules:
   resources: ["pods/status"]
   verbs: ["update", "patch"]
 # 5. Gateway API CRD verification
+# The CRD is read through controller-runtime's cached client, but GARI's CRDView also runs a
+# cluster-wide metadata informer on CRDs to track served kinds and the Gateway API bundle version
+# at runtime. List and watch are required because informers cannot be restricted by resourceNames
+# (and an uncached GetAPIReader read is not sufficient for the runtime informer).
 - apiGroups: ["apiextensions.k8s.io"]
   resources: ["customresourcedefinitions"]
-  resourceNames: ["gateways.gateway.networking.k8s.io"]
-  verbs: ["get"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
