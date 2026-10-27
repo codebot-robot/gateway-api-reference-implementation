@@ -207,9 +207,16 @@ func (f *FakeComputeClient) GetBackendServiceHealth(ctx context.Context, project
 		return nil, f.InjectHealthError
 	}
 
-	key := fmt.Sprintf("%s/%s/%s", project, backendService, groupURL)
-	if h, exists := f.health[key]; exists {
-		return h, nil
+	// Like the real API, require a NEG URL: a bare NEG name is rejected with a 400.
+	if !strings.Contains(groupURL, "/networkEndpointGroups/") {
+		return nil, fmt.Errorf("googleapi: Error 400: Invalid value for field 'resourceGroup.group': '%s'. The URL is malformed.", groupURL)
+	}
+	negName := groupURL[strings.LastIndex(groupURL, "/")+1:]
+	// Explicit mocks may be registered by URL or by NEG name.
+	for _, g := range []string{groupURL, negName} {
+		if h, exists := f.health[fmt.Sprintf("%s/%s/%s", project, backendService, g)]; exists {
+			return h, nil
+		}
 	}
 
 	// Default to returning healthy for all registered endpoints if not explicitly mocked
