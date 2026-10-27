@@ -28,7 +28,7 @@
 | `discovery.k8s.io` | `endpointslices` | `get`, `list`, `watch` | Detecting live backend endpoints for Gateway routing. |
 | `""` (core) | `pods` | `get`, `list`, `watch` | Detecting data-plane pod IP, node assignment, and container readiness (`ContainersReady`). |
 | `""` (core) | `pods/status` | `update`, `patch` | **Critical**: Setting the `gcpgateway.gke-labs.io/load-balancer-ready` readiness gate to `True` once load balancer health checks pass. |
-| `apiextensions.k8s.io` | `customresourcedefinitions` (`gateways.gateway.networking.k8s.io`) | `get` | Verifying Gateway API CRD installation and schema version. |
+| `apiextensions.k8s.io` | `customresourcedefinitions` | `get`, `list`, `watch` | Verifying Gateway API CRD installation and schema version. |
 
 > **Note on `pods/status` Cluster-Wide Scope**:
 > The `pods/status` `patch` and `update` permission is necessarily cluster-wide because Gateway instances and their associated singlepod data-plane Deployments may reside in any Kubernetes namespace. The `gcpgateway` controller uses this permission strictly and exclusively to patch its own readiness gate condition (`gcpgateway.gke-labs.io/load-balancer-ready`) on its own data-plane pods once confirmed healthy by `backendServices.getHealth`. The controller never modifies other status conditions on data-plane pods, and never inspects or mutates pods belonging to other Gateways or unrelated cluster workloads.
