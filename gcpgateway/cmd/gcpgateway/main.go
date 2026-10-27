@@ -93,6 +93,15 @@ func Run(ctx context.Context, args []string) error {
 }
 
 func runDataplane(ctx context.Context, args []string) error {
+	opts, err := SetupDataplane(args)
+	if err != nil {
+		return err
+	}
+	return gari.Run(ctx, opts)
+}
+
+// SetupDataplane parses args and builds the gari.Options for data-plane mode.
+func SetupDataplane(args []string) (gari.Options, error) {
 	opts := gari.DefaultOptions()
 	opts.DataplaneMode = true
 
@@ -117,13 +126,17 @@ func runDataplane(ctx context.Context, args []string) error {
 	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "HTTP proxy bind address")
 	fs.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "HTTPS proxy bind address")
 	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses")
+	// The singlepod provisioner passes the HTTP/3 flags to every data plane with an HTTPS listener, so the
+	// data-plane flag set must accept them (matching cmd/gateway-api-reference-implementation).
+	fs.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (defaults to the HTTPS bind address)")
+	fs.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address)")
 
 	if err := fs.Parse(args); err != nil {
-		return err
+		return opts, err
 	}
 
 	if gatewayNamespace == "" || gatewayName == "" {
-		return fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+		return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
 	}
 
 	if allowedSourceCIDRsStr != "" {
@@ -145,10 +158,12 @@ func runDataplane(ctx context.Context, args []string) error {
 	opts.DataplaneGatewayName = gatewayName
 	opts.DisableStatusUpdates = true
 	opts.LeaderElection = false
-	opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
+	if opts.ProxyHTTP3Addr == "" {
+		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
+	}
 	opts.AddressProvider = nil
 
-	return gari.Run(ctx, opts)
+	return opts, nil
 }
 
 // SetupController parses args and builds the gari.Options for controller mode.

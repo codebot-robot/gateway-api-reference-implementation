@@ -31,13 +31,17 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/testenv"
 	compute "google.golang.org/api/compute/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -89,6 +93,150 @@ func TestDataplaneMissingFlags(t *testing.T) {
 	err := Run(t.Context(), []string{"--dataplane-mode"})
 	if err == nil {
 		t.Fatalf("expected error when namespace/name missing in dataplane mode, got nil")
+	}
+}
+
+func TestSetupDataplane_Flags(t *testing.T) {
+	tests := []struct {
+		name               string
+		args               []string
+		wantHTTPSAddr      string
+		wantHTTP3Addr      string
+		wantAdvertisedPort int
+		wantErr            bool
+	}{
+		{
+			name: "default HTTP/3 bind address inherits HTTPS bind address",
+			args: []string{
+				"--dataplane-mode",
+				"--gateway-namespace=test-ns",
+				"--gateway-name=test-gw",
+				"--proxy-https-bind-address=:8443",
+				"--proxy-http3-advertised-port=8443",
+			},
+			wantHTTPSAddr:      ":8443",
+			wantHTTP3Addr:      ":8443",
+			wantAdvertisedPort: 8443,
+		},
+		{
+			name: "explicit HTTP/3 bind address",
+			args: []string{
+				"--dataplane-mode",
+				"--gateway-namespace=test-ns",
+				"--gateway-name=test-gw",
+				"--proxy-https-bind-address=:8443",
+				"--proxy-http3-bind-address=:9443",
+				"--proxy-http3-advertised-port=443",
+			},
+			wantHTTPSAddr:      ":8443",
+			wantHTTP3Addr:      ":9443",
+			wantAdvertisedPort: 443,
+		},
+		{
+			name: "missing gateway-namespace or gateway-name",
+			args: []string{
+				"--dataplane-mode",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, err := SetupDataplane(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SetupDataplane failed: %v", err)
+			}
+			if opts.ProxyHTTPSAddr != tc.wantHTTPSAddr {
+				t.Errorf("ProxyHTTPSAddr = %q, want %q", opts.ProxyHTTPSAddr, tc.wantHTTPSAddr)
+			}
+			if opts.ProxyHTTP3Addr != tc.wantHTTP3Addr {
+				t.Errorf("ProxyHTTP3Addr = %q, want %q", opts.ProxyHTTP3Addr, tc.wantHTTP3Addr)
+			}
+			if opts.ProxyHTTP3AdvertisedPort != tc.wantAdvertisedPort {
+				t.Errorf("ProxyHTTP3AdvertisedPort = %d, want %d", opts.ProxyHTTP3AdvertisedPort, tc.wantAdvertisedPort)
+			}
+		})
+	}
+}
+
+func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme failed: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("gatewayv1 AddToScheme failed: %v", err)
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	p := singlepod.NewAddressProvider(c)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     gatewayv1.SectionName("https"),
+			Port:     gatewayv1.PortNumber(8443),
+			Protocol: gatewayv1.HTTPSProtocolType,
+		},
+	}
+
+	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	if len(deploy.Spec.Template.Spec.Containers) == 0 {
+		t.Fatalf("expected at least 1 container in Deployment template, got 0")
+	}
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+
+	opts, err := SetupDataplane(args)
+	if err != nil {
+		t.Fatalf("SetupDataplane failed on provisioner-generated args %v: %v", args, err)
+	}
+
+	if !opts.DataplaneMode {
+		t.Errorf("expected DataplaneMode=true")
+	}
+	if opts.DataplaneGatewayNamespace != "test-ns" {
+		t.Errorf("expected DataplaneGatewayNamespace='test-ns', got %q", opts.DataplaneGatewayNamespace)
+	}
+	if opts.DataplaneGatewayName != "test-gw" {
+		t.Errorf("expected DataplaneGatewayName='test-gw', got %q", opts.DataplaneGatewayName)
+	}
+	if opts.ProxyHTTP3AdvertisedPort != 8443 {
+		t.Errorf("expected ProxyHTTP3AdvertisedPort=8443, got %d", opts.ProxyHTTP3AdvertisedPort)
+	}
+	if opts.ProxyHTTP3Addr != opts.ProxyHTTPSAddr {
+		t.Errorf("expected ProxyHTTP3Addr=%q to default to ProxyHTTPSAddr=%q", opts.ProxyHTTP3Addr, opts.ProxyHTTPSAddr)
 	}
 }
 
@@ -204,6 +352,14 @@ func assertProductionDeployment(t *testing.T, deploy *appsv1.Deployment, expecte
 	}
 	if !foundGate {
 		t.Errorf("expected readiness gate %s in Deployment template, got %+v", LoadBalancerReadyGate, deploy.Spec.Template.Spec.ReadinessGates)
+	}
+
+	// 6. Data-plane container args parse cleanly in SetupDataplane
+	dpOpts, err := SetupDataplane(c.Args)
+	if err != nil {
+		t.Errorf("expected container args %v to parse in SetupDataplane, got: %v", c.Args, err)
+	} else if !dpOpts.DataplaneMode {
+		t.Errorf("expected DataplaneMode=true, got false")
 	}
 }
 
