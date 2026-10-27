@@ -1050,15 +1050,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) respondNotFound(w http.ResponseWriter, r *http.Request, msg string) {
-	var host, path string
-	if r != nil {
-		host = r.Host
-		if r.URL != nil {
-			path = r.URL.Path
-		}
-	}
-	log.Log.Info(msg, "host", host, "path", path)
-	if r != nil && isGRPCRequest(r) {
+	log.Log.Info("No matching route", "host", r.Host, "path", r.URL.Path)
+	if isGRPCRequest(r) {
 		w.Header().Set("Content-Type", "application/grpc")
 		w.Header().Set("Grpc-Status", "12")
 		if p.debugErrorResponses.Load() {

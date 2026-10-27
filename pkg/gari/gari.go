@@ -240,7 +240,7 @@ type Options struct {
 	// Disabled if empty (default).
 	DrainSentinelPath string
 
-	// DebugErrorResponses enables verbose error messages in unmatched responses (default false).
+	// DebugErrorResponses enables verbose error messages in unmatched responses.
 	DebugErrorResponses bool
 
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
