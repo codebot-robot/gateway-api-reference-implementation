@@ -465,40 +465,61 @@ Recompute Latency Comparison:
    - **Alignment with Informer Access Patterns:** GARI consumes these caches through informer event handlers and doesn't call `List` on them, so broad reads mostly happen at startup and relist. Other controllers may differ in their access patterns, so workloads that frequently invoke `List` concurrently with active write streams would experience write stalls under this locking model.
 
 8. **Universal Value Compression: Small Objects & Realistic Corpus Evaluation:**
-   - **Background:** Previously, the engine only attempted compression for values larger than `DefaultCompressionThreshold` (4000 bytes, matching the single-block slotted page capacity). However, most Kubernetes objects in informer caches are smaller than 4000 bytes once `managedFields` are stripped. Removing the threshold and running every value through `zstd` (with fallback to raw storage if compressed size isn't at least 10% smaller) unifies the write path and allows small objects to benefit from compression.
+   - **Background:** Previously, the engine compressed values only if they exceeded `DefaultCompressionThreshold` (4000 bytes, matching the 1-block slotted page capacity). However, most Kubernetes objects in informer caches are smaller than 4000 bytes once `managedFields` are stripped. Removing the threshold and passing every value through the configured codec (`zstd`) unifies the write path. Values whose compressed form is not at least about 10% smaller than the raw payload (`compressedLen * 10 <= rawLen * 9`) are stored raw with `CodecNone`, protecting incompressible or tiny inputs from expanding.
    - **Evaluation Environment:**
      - Machine: AMD EPYC 9B14 (60 vCPUs), Linux 6.6 amd64
      - Go Version: go1.27.3 linux/amd64
+     - Corpus: 10,000 objects built from real Kubernetes objects: Gateway API conformance manifests (Gateways, HTTPRoutes with status, Services, Policies), EndpointSlices with 12 endpoints, Secrets with real x509 certificate chains, random base64 Secrets, and ConfigMaps (average 1,911 B per object, 18.22 MB raw JSON).
 
-   - **Put Micro-benchmarks (Before vs. After):**
-     Micro-benchmarks measuring `Put` latency (`ns/op`) and allocations (`allocs/op`) across representative sizes (100 B, 500 B, 1 KB, and 4 KB) with compressible and incompressible content:
+   - **Isolated Compression CPU Cost (`compressValue` Benchmark):**
+     Measuring `compressValue` alone without storage or I/O overhead:
 
-     | Benchmark Case | Before (Threshold = 4000 B) | After (Compress Every Value) | Delta / Behavior |
+     | Object / Size | Raw Size | Stored Codec | `compressValue` Latency | Allocs | Throughput |
+     | :--- | :--- | :--- | :--- | :--- | :--- |
+     | **HTTPRoute** | 1,563 B | `CodecZstd` (~470 B) | 8,598 ns/op | 2 allocs/op | 181.8 MB/s |
+     | **EndpointSlice** | 3,737 B | `CodecZstd` (~542 B) | 10,489 ns/op | 2 allocs/op | 356.3 MB/s |
+     | **TLSSecret (x509 PEM chain)** | 2,595 B | `CodecZstd` (~1,588 B) | 13,400 ns/op | 2 allocs/op | 195.3 MB/s |
+     | **RandomSecret (base64)** | 3,963 B | `CodecNone` (fallback) | 5,186 ns/op | 3 allocs/op | 764.2 MB/s |
+     | **ConfigMap** | 691 B | `CodecZstd` (~444 B) | 6,268 ns/op | 2 allocs/op | 110.2 MB/s |
+     | **100 B (Compressible)** | 100 B | `CodecZstd` (86 B) | 3,630 ns/op | 2 allocs/op | 27.6 MB/s |
+     | **100 B (Incompressible)** | 100 B | `CodecNone` (fallback) | 634 ns/op | 3 allocs/op | 157.8 MB/s |
+     | **500 B (Compressible)** | 500 B | `CodecZstd` (89 B) | 3,915 ns/op | 2 allocs/op | 127.7 MB/s |
+     | **1 KB (Compressible)** | 1,024 B | `CodecZstd` (89 B) | 3,551 ns/op | 2 allocs/op | 288.4 MB/s |
+     | **4 KB (Compressible)** | 4,096 B | `CodecZstd` (88 B) | 5,104 ns/op | 2 allocs/op | 802.5 MB/s |
+
+   - **Put Micro-benchmarks on Corpus Objects and Fixed Sizes:**
+     Latency (`ns/op`) and allocations (`allocs/op`) of `Engine.Put`:
+
+     | Benchmark Case | Before (Uncompressed / Threshold = 4000 B) | After (Universal Compression) | Change |
      | :--- | :--- | :--- | :--- |
-     | **Compressible 100 B** | 1,997 ns/op (5 allocs/op) | 4,612 ns/op (6 allocs/op) | Stored compressed (86 B) |
-     | **Incompressible 100 B** | 1,981 ns/op (5 allocs/op) | 2,394 ns/op (7 allocs/op) | Stored raw via 10% rule fallback |
-     | **Compressible 500 B** | 7,432 ns/op (5 allocs/op) | 4,842 ns/op (6 allocs/op) | **34.8% faster** (compressed to 89 B, fits slotted page easier) |
-     | **Incompressible 500 B** | 7,054 ns/op (5 allocs/op) | 6,506 ns/op (7 allocs/op) | Stored raw via 10% rule fallback |
-     | **Compressible 1 KB** | 21,711 ns/op (6 allocs/op) | 5,035 ns/op (6 allocs/op) | **76.8% faster** (compressed to 89 B, avoids page churn) |
-     | **Incompressible 1 KB** | 19,363 ns/op (6 allocs/op) | 15,316 ns/op (8 allocs/op) | Stored raw via 10% rule fallback |
-     | **Compressible 4 KB** | 6,095 ns/op (6 allocs/op) | 6,033 ns/op (6 allocs/op) | Stored compressed (previously > 4000 B threshold) |
-     | **Incompressible 4 KB** | 44,343 ns/op (13 allocs/op) | 44,188 ns/op (13 allocs/op) | Stored raw; falls back to multi-block page (2 blocks) |
+     | **Corpus: HTTPRoute (1.5 KB)** | 24,622 ns/op (6 allocs/op) | 13,191 ns/op (6 allocs/op) | -46.4% latency |
+     | **Corpus: EndpointSlice (3.7 KB)** | 30,561 ns/op (8 allocs/op) | 14,433 ns/op (6 allocs/op) | -52.8% latency |
+     | **Corpus: TLSSecret (2.6 KB)** | 32,136 ns/op (8 allocs/op) | 25,589 ns/op (7 allocs/op) | -20.4% latency |
+     | **Corpus: RandomSecret (4.0 KB)** | 39,318 ns/op (8 allocs/op) | 33,333 ns/op (10 allocs/op) | -15.2% latency |
+     | **Corpus: ConfigMap (0.7 KB)** | 19,632 ns/op (5 allocs/op) | 11,234 ns/op (6 allocs/op) | -42.8% latency |
+     | **Size: 100 B Compressible** | 2,453 ns/op (5 allocs/op) | 6,618 ns/op (6 allocs/op) | +170% latency (+4,165 ns) |
+     | **Size: 100 B Incompressible** | 2,848 ns/op (5 allocs/op) | 3,667 ns/op (7 allocs/op) | +28.8% latency (+819 ns) |
+     | **Size: 500 B Compressible** | 10,264 ns/op (5 allocs/op) | 6,790 ns/op (6 allocs/op) | -33.8% latency |
+     | **Size: 500 B Incompressible** | 12,587 ns/op (5 allocs/op) | 7,653 ns/op (7 allocs/op) | -39.2% latency |
+     | **Size: 1 KB Compressible** | 27,519 ns/op (6 allocs/op) | 5,187 ns/op (6 allocs/op) | -81.2% latency |
+     | **Size: 1 KB Incompressible** | 34,771 ns/op (6 allocs/op) | 17,203 ns/op (8 allocs/op) | -50.5% latency |
+     | **Size: 4 KB Compressible** | 55,459 ns/op (11 allocs/op) | 6,570 ns/op (6 allocs/op) | -88.2% latency |
+     | **Size: 4 KB Incompressible** | 53,824 ns/op (11 allocs/op) | 52,611 ns/op (13 allocs/op) | -2.3% latency |
 
-   - **Realistic Size Mix Corpus (1–4 KB JSON):**
-     To model real-world Kubernetes informer cache behavior, a corpus of 10,000 objects was evaluated with a realistic size mix centered at 1–4 KB (cycling across 1,050 B, 1,500 B, 2,200 B, 3,100 B, and 3,900 B, averaging 2,559 B per object, totaling 24.40 MB raw JSON):
+   - **Realistic Corpus Heap-File and Disk Footprint (10,000 objects, 18.22 MB raw JSON):**
 
-     | Metric | Before Change (Threshold = 4000 B) | After Change (Universal Compression) | Delta |
+     | Metric | Before (Uncompressed / Threshold = 4000 B) | After (Universal Compression) | Change |
      | :--- | :--- | :--- | :--- |
-     | **Heap File (`heap.db`)** | 23.94 MB (25,100,288 bytes) | 5.86 MB (6,148,096 bytes) | **-75.5%** (-18.08 MB) |
-     | **WAL Size** | 18.09 MB | 5.71 MB | **-68.4%** (-12.38 MB) |
-     | **Total Disk Footprint** | 42.03 MB | 11.57 MB | **-72.5%** (-30.46 MB) |
-     | **Write Duration (10k puts)** | 274.6 ms (36,414 op/s) | 298.7 ms (33,479 op/s) | +24.1 ms (+8.8% CPU time) |
+     | **Heap File (`heap.db`)** | 21.91 MB (22,978,560 B) | 10.46 MB (10,973,184 B) | **-52.2%** (-12.01 MB) |
+     | **WAL Total Size** | 18.78 MB | 9.56 MB | **-49.1%** (-9.22 MB) |
+     | **Total On-Disk Footprint** | 40.69 MB | 20.02 MB | **-50.8%** (-20.67 MB) |
+     | **Write Stream Duration** | 53.3 ms (187,600 op/s) | 118.0 ms (84,700 op/s) | +64.7 ms (+121% CPU time) |
 
-   - **Findings and CPU Cost Analysis:**
-     1. **Dramatic Storage Reduction:** Heap-file size is reduced by **75.5%** (from 23.94 MB down to 5.86 MB) and WAL volume by **68.4%**. Uncompressed 1–4 KB objects previously filled slotted pages rapidly (only 1–3 objects per 4 KiB block), causing frequent allocation of new pages. When compressed, 1–4 KB JSON objects pack at 5–8 objects per page.
-     2. **Minimal CPU Cost for Small Values:** Compressing 10,000 objects added only 24 ms total across the entire write stream (+8.8% CPU time), maintaining over 33,400 writes/sec.
-     3. **Throughput Acceleration for 500 B – 1 KB Objects:** Because writing small compressed payloads into slotted pages drastically reduces page allocation churn and buffer pool eviction, `Put` throughput for 500 B and 1 KB compressible values actually increased by 35% to 77% compared to storing raw uncompressed bytes.
-     4. **No New Threshold Needed:** The existing 10% savings rule effectively protects incompressible or tiny inputs (such as 0–64 B) from expanding without needing an artificial size threshold.
+   - **Trade-off Analysis:**
+     1. **Disk Space vs. CPU Time:** Compressing every value reduces heap-file size by 52.2% and WAL size by 49.1% on the realistic 1–4 KB corpus, with higher write stream duration (118 ms vs 53 ms, or 11.8 µs vs 5.3 µs per write).
+     2. **Small Objects Pay Compression Overhead:** For tiny payloads (such as 100 B), compression adds ~3.6 to 4.2 µs per write (+130% to +170% latency) for little space benefit. When payloads cannot compress by at least 10%, the 10% savings rule falls back to raw storage, but still incurs ~0.6 to 0.8 µs of compression attempt overhead.
+     3. **Slotted Page Density for 500 B – 4 KB Objects:** For compressible objects between 500 B and 4 KB (HTTPRoutes, Services, EndpointSlices, ConfigMaps), compressed payloads fit more densely into 4 KiB slotted pages (e.g. 5–8 objects per block instead of 1–3). This reduces buffer pool page-eviction pressure and WAL write volume, offsetting part of the compression CPU cost.
+     4. **No New Threshold Needed:** The 10% savings rule prevents incompressible or tiny values from expanding on disk without introducing an arbitrary threshold.
 
 ---
 
