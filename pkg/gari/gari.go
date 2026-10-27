@@ -22,7 +22,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -309,26 +311,75 @@ func (o *Options) complete() error {
 
 // Server encapsulates GARI components: state, proxy, manager, and proxy servers.
 type Server struct {
-	opts        Options
-	manager     ctrl.Manager
-	state       *state.State
-	proxy       *proxy.Proxy
-	proxySynced atomic.Bool
-	httpFilter  *proxyproto.Listener
-	httpsFilter *proxyproto.Listener
+	opts         Options
+	manager      ctrl.Manager
+	state        *state.State
+	proxy        *proxy.Proxy
+	proxySynced  atomic.Bool
+	filterMu     sync.Mutex
+	listenerOpts *proxyproto.ListenerOptions
+	httpFilter   *proxyproto.Listener
+	httpsFilter  *proxyproto.Listener
+}
+
+func (s *Server) listenerOptionsLocked() proxyproto.ListenerOptions {
+	if s.listenerOpts != nil {
+		return *s.listenerOpts
+	}
+	return proxyproto.ListenerOptions{
+		AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
+		ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
+		ProxyProtocol:             s.opts.ProxyProtocol,
+	}
 }
 
 func (s *Server) updateListenerFilters(opts proxyproto.ListenerOptions) {
+	s.filterMu.Lock()
+	defer s.filterMu.Unlock()
+
+	cloned := opts
+	if opts.AllowedSourceCIDRs != nil {
+		cloned.AllowedSourceCIDRs = slices.Clone(opts.AllowedSourceCIDRs)
+	}
+	if opts.ProxyProtocolTrustedCIDRs != nil {
+		cloned.ProxyProtocolTrustedCIDRs = slices.Clone(opts.ProxyProtocolTrustedCIDRs)
+	}
+	s.listenerOpts = &cloned
+
 	if s.httpFilter != nil {
-		if err := s.httpFilter.UpdateOptions(opts); err != nil {
+		if err := s.httpFilter.UpdateOptions(cloned); err != nil {
 			setupLog.Error(err, "failed to update HTTP listener options")
 		}
 	}
 	if s.httpsFilter != nil {
-		if err := s.httpsFilter.UpdateOptions(opts); err != nil {
+		if err := s.httpsFilter.UpdateOptions(cloned); err != nil {
 			setupLog.Error(err, "failed to update HTTPS listener options")
 		}
 	}
+}
+
+func (s *Server) newHTTPListenerFilter(lis net.Listener) (*proxyproto.Listener, error) {
+	s.filterMu.Lock()
+	defer s.filterMu.Unlock()
+
+	filterLis, err := proxyproto.NewListener(lis, s.listenerOptionsLocked())
+	if err != nil {
+		return nil, err
+	}
+	s.httpFilter = filterLis
+	return filterLis, nil
+}
+
+func (s *Server) newHTTPSListenerFilter(lis net.Listener) (*proxyproto.Listener, error) {
+	s.filterMu.Lock()
+	defer s.filterMu.Unlock()
+
+	filterLis, err := proxyproto.NewListener(lis, s.listenerOptionsLocked())
+	if err != nil {
+		return nil, err
+	}
+	s.httpsFilter = filterLis
+	return filterLis, nil
 }
 
 // State returns the internal state store.
@@ -720,18 +771,13 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				}
 			}
 
-			filterLis, err := proxyproto.NewListener(lis, proxyproto.ListenerOptions{
-				AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
-				ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
-				ProxyProtocol:             s.opts.ProxyProtocol,
-			})
+			filterLis, err := s.newHTTPListenerFilter(lis)
 			if err != nil {
 				if closeErr := lis.Close(); closeErr != nil {
 					klog.V(4).Infof("closing HTTP listener: %v", closeErr)
 				}
 				return fmt.Errorf("failed to create HTTP listener filter: %w", err)
 			}
-			s.httpFilter = filterLis
 
 			setupLog.Info("starting proxy server", "addr", filterLis.Addr().String())
 			var handler http.Handler = s.proxy
@@ -800,18 +846,13 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				}
 			}
 
-			filterLis, err := proxyproto.NewListener(lis, proxyproto.ListenerOptions{
-				AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
-				ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
-				ProxyProtocol:             s.opts.ProxyProtocol,
-			})
+			filterLis, err := s.newHTTPSListenerFilter(lis)
 			if err != nil {
 				if closeErr := lis.Close(); closeErr != nil {
 					klog.V(4).Infof("closing HTTPS listener: %v", closeErr)
 				}
 				return fmt.Errorf("failed to create HTTPS listener filter: %w", err)
 			}
-			s.httpsFilter = filterLis
 
 			setupLog.Info("starting proxy HTTPS server", "addr", filterLis.Addr().String())
 
