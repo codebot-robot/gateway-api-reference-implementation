@@ -51,8 +51,10 @@ type Server struct {
 	dnsServer       *dns.Server
 	dnsListener     net.Listener
 	pebbleServer    *httptest.Server
-	closed          bool
-	mu              sync.Mutex
+
+	// mu guards closed state to prevent concurrent or duplicate server shutdown.
+	mu     sync.Mutex
+	closed bool
 }
 
 // StartPebble creates and starts an in-process Pebble server without external network dependencies.

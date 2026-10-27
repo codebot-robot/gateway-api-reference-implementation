@@ -125,17 +125,15 @@ func TestDiskCache_PermissionsAndLifecycle(t *testing.T) {
 		t.Fatalf("Put failed: %v", err)
 	}
 
-	// Verify file permissions 0600 on disk
+	// Verify file permissions 0600 on disk for the single bundle file
 	h := hashKey(hostnamesKey)
-	for _, ext := range []string{".crt", ".key", ".meta"} {
-		fPath := filepath.Join(cacheDir, h+ext)
-		info, err := os.Stat(fPath)
-		if err != nil {
-			t.Fatalf("Stat %s failed: %v", fPath, err)
-		}
-		if info.Mode().Perm() != 0600 {
-			t.Errorf("file %s expected perm 0600, got %o", fPath, info.Mode().Perm())
-		}
+	fPath := filepath.Join(cacheDir, h+".bundle")
+	info, err := os.Stat(fPath)
+	if err != nil {
+		t.Fatalf("Stat %s failed: %v", fPath, err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("file %s expected perm 0600, got %o", fPath, info.Mode().Perm())
 	}
 
 	// 2. Get certificate

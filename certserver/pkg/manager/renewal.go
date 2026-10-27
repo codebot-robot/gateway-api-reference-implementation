@@ -191,7 +191,7 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 	m.updateMetricsLocked(now)
 	m.mu.Unlock()
 
-	// Execute renewals through obtainOrCreate to share the singleflight key and pending order cap
+	// Execute renewals through Renew to coalesce via renewSf, bound pending orders, and always issue a new certificate
 	for _, task := range dueTasks {
 		select {
 		case <-ctx.Done():
@@ -199,7 +199,7 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 		default:
 		}
 
-		newCert, err := m.obtainOrCreate(ctx, task.hostnames, true)
+		newCert, err := m.Renew(ctx, task.hostnames)
 		now = m.opts.Clock.Now()
 
 		m.mu.Lock()

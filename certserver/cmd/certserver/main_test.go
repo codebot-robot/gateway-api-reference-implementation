@@ -98,7 +98,7 @@ func waitForReady(t *testing.T, addr string) {
 		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
 		if err == nil {
 			if closeErr := conn.Close(); closeErr != nil {
-				// ignore
+				t.Errorf("error closing probe connection to %s: %v", addr, closeErr)
 			}
 			return
 		}

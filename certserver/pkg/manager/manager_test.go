@@ -652,6 +652,17 @@ func TestManager_SingleflightDetachedContext_FirstCallerCancels(t *testing.T) {
 	clock := &mockClock{now: time.Now()}
 	mgr, _ := createTestManager(t, pebble, cacheDir, clock)
 
+	orderStarted := make(chan struct{})
+	var once sync.Once
+	mgr.challengeStore = &hookChallengeStore{
+		Store: pebble.ChallengeStore,
+		onPut: func() {
+			once.Do(func() {
+				close(orderStarted)
+			})
+		},
+	}
+
 	ctx := t.Context()
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -665,7 +676,7 @@ func TestManager_SingleflightDetachedContext_FirstCallerCancels(t *testing.T) {
 	caller2Done := make(chan error, 1)
 	caller2Cert := make(chan *cache.Certificate, 1)
 
-	// Caller 1 starts order and cancels its context early
+	// Caller 1 starts order and will cancel its context
 	go func() {
 		_, err := mgr.Obtain(ctx1, hostnames)
 		caller1Done <- err
@@ -678,8 +689,8 @@ func TestManager_SingleflightDetachedContext_FirstCallerCancels(t *testing.T) {
 		caller2Done <- err
 	}()
 
-	// Cancel caller 1's context shortly after initiation
-	time.Sleep(5 * time.Millisecond)
+	// Synchronize on order initiation instead of sleeping
+	<-orderStarted
 	cancel1()
 
 	err1 := <-caller1Done
@@ -696,6 +707,63 @@ func TestManager_SingleflightDetachedContext_FirstCallerCancels(t *testing.T) {
 	if cert2 == nil {
 		t.Fatal("expected caller 2 to receive non-nil certificate")
 	}
+}
+
+func TestManager_Renewal_AlwaysProducesNewOrder_DoesNotCoalesceToNoop(t *testing.T) {
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{})
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+
+	clock := &mockClock{now: time.Now()}
+	mgr, _ := createTestManager(t, pebble, cacheDir, clock)
+
+	ctx := t.Context()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer mgr.Stop()
+
+	hostnames := []string{"renew-noop.example.com"}
+
+	// 1. Initial Obtain issues cert1
+	cert1, err := mgr.Obtain(ctx, hostnames)
+	if err != nil {
+		t.Fatalf("initial Obtain failed: %v", err)
+	}
+
+	// 2. While cert1 is still completely valid in cache, call Renew
+	cert2, err := mgr.Renew(ctx, hostnames)
+	if err != nil {
+		t.Fatalf("Renew failed: %v", err)
+	}
+
+	// 3. Verify Renew produced a new ACME order and new certificate instead of coalescing into no-op cached cert
+	if cert2.Leaf.SerialNumber.Cmp(cert1.Leaf.SerialNumber) == 0 {
+		t.Fatalf("expected Renew to produce a new order with different serial number, got identical serial %v",
+			cert1.Leaf.SerialNumber)
+	}
+
+	// 4. Subsequent Obtain should now return the renewed certificate from cache
+	cert3, err := mgr.Obtain(ctx, hostnames)
+	if err != nil {
+		t.Fatalf("subsequent Obtain failed: %v", err)
+	}
+	if cert3.Leaf.SerialNumber.Cmp(cert2.Leaf.SerialNumber) != 0 {
+		t.Fatalf("expected subsequent Obtain to return newly renewed certificate serial %v, got %v",
+			cert2.Leaf.SerialNumber, cert3.Leaf.SerialNumber)
+	}
+}
+
+type hookChallengeStore struct {
+	challenge.Store
+	onPut func()
+}
+
+func (h *hookChallengeStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time) error {
+	if h.onPut != nil {
+		h.onPut()
+	}
+	return h.Store.Put(ctx, token, identifier, keyAuth, expiresAt)
 }
 
 type brokenChallengeStore struct {

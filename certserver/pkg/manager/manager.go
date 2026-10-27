@@ -50,7 +50,8 @@ type Manager struct {
 	metrics        *metrics.Metrics
 	opts           Options
 
-	sf            singleflight.Group
+	obtainSf      singleflight.Group
+	renewSf       singleflight.Group
 	pendingOrders atomic.Int64
 
 	// mu guards renewals map and metrics updates.
@@ -120,13 +121,8 @@ func (m *Manager) Cache() *cache.DiskCache {
 }
 
 // Obtain creates or reuses a certificate order for the normalized hostname set.
-// Concurrent calls for the same set share one order via singleflight.
+// Concurrent calls for the same set share one order via obtainSf.
 func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certificate, error) {
-	return m.obtainOrCreate(ctx, hostnames, false)
-}
-
-// obtainOrCreate coordinates order execution for Obtain and renewals through a shared singleflight key.
-func (m *Manager) obtainOrCreate(ctx context.Context, hostnames []string, isRenewal bool) (*cache.Certificate, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
 		return nil, err
@@ -134,11 +130,9 @@ func (m *Manager) obtainOrCreate(ctx context.Context, hostnames []string, isRene
 
 	now := m.opts.Clock.Now()
 
-	// 1. Fast-path: check if valid certificate already exists in cache (skip on renewal)
-	if !isRenewal {
-		if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(now) {
-			return existing, nil
-		}
+	// 1. Fast-path: check if valid certificate already exists in cache
+	if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(now) {
+		return existing, nil
 	}
 
 	// 2. Bound pending orders
@@ -146,13 +140,11 @@ func (m *Manager) obtainOrCreate(ctx context.Context, hostnames []string, isRene
 		return nil, ErrTooManyPendingOrders
 	}
 
-	// 3. Singleflight execution for concurrent requests and renewals of the same set
-	ch := m.sf.DoChan(hostnamesKey, func() (any, error) {
-		// Re-check cache under singleflight lock if not a renewal
-		if !isRenewal {
-			if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
-				return existing, nil
-			}
+	// 3. Singleflight execution for concurrent Obtain requests of the same set
+	ch := m.obtainSf.DoChan(hostnamesKey, func() (any, error) {
+		// Re-check cache under singleflight lock
+		if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
+			return existing, nil
 		}
 
 		if m.opts.MaxPendingOrders > 0 {
@@ -168,7 +160,51 @@ func (m *Manager) obtainOrCreate(ctx context.Context, hostnames []string, isRene
 		orderCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
-		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, isRenewal)
+		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, false)
+		if err != nil {
+			return nil, err
+		}
+		return cert, nil
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(*cache.Certificate), nil
+	}
+}
+
+// Renew forces a certificate renewal for the normalized hostname set, creating a new ACME order.
+// Concurrent renewals for the same set coalesce via renewSf and never return a cached certificate.
+func (m *Manager) Renew(ctx context.Context, hostnames []string) (*cache.Certificate, error) {
+	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
+	if err != nil {
+		return nil, err
+	}
+
+	// 1. Bound pending orders
+	if m.opts.MaxPendingOrders > 0 && m.pendingOrders.Load() >= m.opts.MaxPendingOrders {
+		return nil, ErrTooManyPendingOrders
+	}
+
+	// 2. Singleflight execution for renewals of the same set. Always issues a new certificate.
+	ch := m.renewSf.DoChan(hostnamesKey, func() (any, error) {
+		if m.opts.MaxPendingOrders > 0 {
+			if curr := m.pendingOrders.Add(1); curr > m.opts.MaxPendingOrders {
+				m.pendingOrders.Add(-1)
+				return nil, ErrTooManyPendingOrders
+			}
+			defer m.pendingOrders.Add(-1)
+		}
+
+		orderCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, true)
 		if err != nil {
 			return nil, err
 		}

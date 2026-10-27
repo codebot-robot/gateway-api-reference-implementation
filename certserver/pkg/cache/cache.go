@@ -49,7 +49,7 @@ type Certificate struct {
 	Hostnames    []string          `json:"hostnames"`
 	HostnamesKey string            `json:"hostnames_key"`
 	CertPEM      []byte            `json:"cert_pem"`
-	KeyPEM       []byte            `json:"-"` // Never serialized in metadata
+	KeyPEM       []byte            `json:"key_pem"`
 	Leaf         *x509.Certificate `json:"-"`
 	IssuedAt     time.Time         `json:"issued_at"`
 	ExpiresAt    time.Time         `json:"expires_at"`
@@ -76,10 +76,12 @@ func (c *Certificate) IsExpired(now time.Time) bool {
 	return now.After(c.ExpiresAt)
 }
 
-// certMetadata is saved to <hash>.meta at mode 0600.
-type certMetadata struct {
+// certBundle stores a complete certificate chain and key atomically in a single file per set.
+type certBundle struct {
 	Hostnames    []string  `json:"hostnames"`
 	HostnamesKey string    `json:"hostnames_key"`
+	CertPEM      []byte    `json:"cert_pem"`
+	KeyPEM       []byte    `json:"key_pem"`
 	IssuedAt     time.Time `json:"issued_at"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
@@ -235,41 +237,31 @@ func (dc *DiskCache) LoadOrGenerateAccountKey() (*ecdsa.PrivateKey, error) {
 	return key, nil
 }
 
-// Put saves the certificate chain and private key to disk at mode 0600 atomically,
-// ensuring the certificate and metadata are placed before the key is renamed into place.
+// Put saves the certificate chain and private key to disk as a single atomic bundle file at mode 0600.
 func (dc *DiskCache) Put(cert *Certificate) error {
 	if cert == nil || cert.HostnamesKey == "" {
 		return errors.New("cannot store nil or empty certificate")
 	}
 
-	h := hashKey(cert.HostnamesKey)
-	crtFile := h + ".crt"
-	keyFile := h + ".key"
-	metaFile := h + ".meta"
-
-	// 1. Write certificate chain atomically
-	if err := dc.writeAtomic(crtFile, cert.CertPEM); err != nil {
-		return fmt.Errorf("failed to write certificate file: %w", err)
-	}
-
-	// 2. Write metadata atomically
-	meta := certMetadata{
+	bundle := certBundle{
 		Hostnames:    cert.Hostnames,
 		HostnamesKey: cert.HostnamesKey,
+		CertPEM:      cert.CertPEM,
+		KeyPEM:       cert.KeyPEM,
 		IssuedAt:     cert.IssuedAt,
 		ExpiresAt:    cert.ExpiresAt,
 	}
-	metaBytes, err := json.Marshal(meta)
+
+	bundleBytes, err := json.Marshal(bundle)
 	if err != nil {
-		return fmt.Errorf("failed to marshal certificate metadata: %w", err)
-	}
-	if err := dc.writeAtomic(metaFile, metaBytes); err != nil {
-		return fmt.Errorf("failed to write metadata file: %w", err)
+		return fmt.Errorf("failed to marshal certificate bundle: %w", err)
 	}
 
-	// 3. Write private key into place last
-	if err := dc.writeAtomic(keyFile, cert.KeyPEM); err != nil {
-		return fmt.Errorf("failed to write key file: %w", err)
+	h := hashKey(cert.HostnamesKey)
+	bundleFileName := h + ".bundle"
+
+	if err := dc.writeAtomic(bundleFileName, bundleBytes); err != nil {
+		return fmt.Errorf("failed to write certificate bundle: %w", err)
 	}
 
 	dc.mu.Lock()
@@ -289,22 +281,16 @@ func (dc *DiskCache) Get(hostnamesKey string) (*Certificate, error) {
 	return cert, nil
 }
 
-// Delete removes the certificate from disk and in-memory cache.
+// Delete removes the certificate bundle from disk and in-memory cache.
 func (dc *DiskCache) Delete(hostnamesKey string) error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	delete(dc.entries, hostnamesKey)
 
 	h := hashKey(hostnamesKey)
-	var errs []error
-	for _, ext := range []string{".crt", ".key", ".meta"} {
-		fPath := filepath.Join(dc.dir, h+ext)
-		if err := os.Remove(fPath); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("errors occurred during certificate deletion: %v", errs)
+	fPath := filepath.Join(dc.dir, h+".bundle")
+	if err := os.Remove(fPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove certificate bundle %s: %w", fPath, err)
 	}
 	return dc.syncDir()
 }
@@ -320,7 +306,7 @@ func (dc *DiskCache) List() []*Certificate {
 	return list
 }
 
-// Load reads all certificate chains and keys from disk, validates them, and populates the in-memory cache.
+// Load reads all certificate bundles from disk, validates them, and populates the in-memory cache.
 func (dc *DiskCache) Load() error {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -336,90 +322,59 @@ func (dc *DiskCache) Load() error {
 	}
 
 	for _, f := range files {
-		if f.IsDir() || filepath.Ext(f.Name()) != ".crt" {
+		if f.IsDir() || filepath.Ext(f.Name()) != ".bundle" {
 			continue
 		}
-		base := f.Name()[:len(f.Name())-4]
-		crtPath := filepath.Join(dc.dir, base+".crt")
-		keyPath := filepath.Join(dc.dir, base+".key")
-		metaPath := filepath.Join(dc.dir, base+".meta")
+		bundlePath := filepath.Join(dc.dir, f.Name())
 
-		// Enforce mode 0600 on files
-		if err := os.Chmod(crtPath, 0600); err != nil && !os.IsNotExist(err) {
-			log.Printf("certserver: failed to set permissions on %s: %v", crtPath, err)
-			continue
-		}
-		if err := os.Chmod(keyPath, 0600); err != nil && !os.IsNotExist(err) {
-			log.Printf("certserver: failed to set permissions on %s: %v", keyPath, err)
-			continue
-		}
-		if err := os.Chmod(metaPath, 0600); err != nil && !os.IsNotExist(err) {
-			log.Printf("certserver: failed to set permissions on %s: %v", metaPath, err)
+		// Enforce mode 0600 on bundle file
+		if err := os.Chmod(bundlePath, 0600); err != nil && !os.IsNotExist(err) {
+			log.Printf("certserver: failed to set permissions on %s: %v", bundlePath, err)
 			continue
 		}
 
-		certPEM, err := os.ReadFile(crtPath)
+		bundleBytes, err := os.ReadFile(bundlePath)
 		if err != nil {
-			log.Printf("certserver: failed to read certificate file %s: %v", crtPath, err)
-			continue
-		}
-		keyPEM, err := os.ReadFile(keyPath)
-		if err != nil {
-			log.Printf("certserver: failed to read key file %s: %v", keyPath, err)
+			log.Printf("certserver: failed to read certificate bundle %s: %v", bundlePath, err)
 			continue
 		}
 
-		leaf, err := parseLeafCert(certPEM)
-		if err != nil {
-			log.Printf("certserver: failed to parse leaf certificate from %s: %v", crtPath, err)
+		var bundle certBundle
+		if err := json.Unmarshal(bundleBytes, &bundle); err != nil {
+			log.Printf("certserver: failed to unmarshal certificate bundle from %s: %v", bundlePath, err)
 			continue
 		}
 
-		key, err := parseECPrivateKey(keyPEM)
+		leaf, err := parseLeafCert(bundle.CertPEM)
 		if err != nil {
-			log.Printf("certserver: failed to parse private key from %s: %v", keyPath, err)
+			log.Printf("certserver: failed to parse leaf certificate from %s: %v", bundlePath, err)
+			continue
+		}
+
+		key, err := parseECPrivateKey(bundle.KeyPEM)
+		if err != nil {
+			log.Printf("certserver: failed to parse private key from %s: %v", bundlePath, err)
 			continue
 		}
 
 		// Verify key corresponds to leaf certificate public key
 		leafPubKey, ok := leaf.PublicKey.(*ecdsa.PublicKey)
 		if !ok || !leafPubKey.Equal(key.Public()) {
-			log.Printf("certserver: public key mismatch for certificate %s and key %s", crtPath, keyPath)
+			log.Printf("certserver: public key mismatch for certificate bundle %s", bundlePath)
 			continue
-		}
-
-		var hostnames []string
-		var hostnamesKey string
-		metaBytes, err := os.ReadFile(metaPath)
-		if err == nil {
-			var meta certMetadata
-			if err := json.Unmarshal(metaBytes, &meta); err == nil && meta.HostnamesKey != "" {
-				hostnames = meta.Hostnames
-				hostnamesKey = meta.HostnamesKey
-			} else {
-				log.Printf("certserver: failed to unmarshal metadata from %s", metaPath)
-			}
-		} else if !os.IsNotExist(err) {
-			log.Printf("certserver: failed to read metadata file %s: %v", metaPath, err)
-			continue
-		}
-
-		if hostnamesKey == "" {
-			hostnames = leaf.DNSNames
-			hostnamesKey = leaf.Subject.CommonName
 		}
 
 		cert := &Certificate{
-			Hostnames:    hostnames,
-			HostnamesKey: hostnamesKey,
-			CertPEM:      certPEM,
-			KeyPEM:       keyPEM,
+			Hostnames:    bundle.Hostnames,
+			HostnamesKey: bundle.HostnamesKey,
+			CertPEM:      bundle.CertPEM,
+			KeyPEM:       bundle.KeyPEM,
 			Leaf:         leaf,
-			IssuedAt:     leaf.NotBefore,
-			ExpiresAt:    leaf.NotAfter,
+			IssuedAt:     bundle.IssuedAt,
+			ExpiresAt:    bundle.ExpiresAt,
 		}
 
-		dc.entries[hostnamesKey] = cert
+		dc.entries[bundle.HostnamesKey] = cert
 	}
 
 	return nil

@@ -79,8 +79,6 @@ func run(ctx context.Context, cfg *Config) error {
 			return fmt.Errorf("failed to read EAB HMAC key file: %w", err)
 		}
 		eabHMACKey = strings.TrimSpace(string(keyBytes))
-	} else if envKey := os.Getenv("CERT_SERVER_EAB_HMAC_KEY"); envKey != "" {
-		eabHMACKey = strings.TrimSpace(envKey)
 	} else if envKey := os.Getenv("EAB_HMAC_KEY"); envKey != "" {
 		eabHMACKey = strings.TrimSpace(envKey)
 	}
