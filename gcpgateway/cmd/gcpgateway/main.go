@@ -292,6 +292,8 @@ func runController(ctx context.Context, args []string) error {
 }
 
 func main() {
+	// controller-runtime drops all log output until a logger is set.
+	ctrl.SetLogger(klog.NewKlogr())
 	ctx := ctrl.SetupSignalHandler()
 	if err := Run(ctx, os.Args[1:]); err != nil {
 		klog.Errorf("gcpgateway: %v", err)

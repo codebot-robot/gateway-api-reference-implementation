@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -545,4 +547,28 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 
 	// drain-seconds=45 -> 45 + 25 = 70 (strictly greater than the 60s minimum clamp)
 	assertProductionDeployment(t, &deploy, 45, 70)
+}
+
+func TestMain_SetsLogger(t *testing.T) {
+	if os.Getenv("TEST_MAIN_SUBPROCESS") == "1" {
+		sentinelPath := filepath.Join(t.TempDir(), "sentinel")
+		os.Args = []string{"gcpgateway", "hook", "pre-stop", "--drain-seconds=0", "--sentinel-file=" + sentinelPath}
+		main()
+		ctrl.Log.WithName("test").Info("controller-runtime log message verified")
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMain_SetsLogger$", "-test.v")
+	cmd.Env = append(os.Environ(), "TEST_MAIN_SUBPROCESS=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("subprocess failed: %v\nOutput: %s", err, string(out))
+	}
+	output := string(out)
+	if !strings.Contains(output, "controller-runtime log message verified") {
+		t.Errorf("expected output to contain 'controller-runtime log message verified', got:\n%s", output)
+	}
+	if strings.Contains(output, "[controller-runtime] log.SetLogger(...) was never called") {
+		t.Errorf("expected no warning about SetLogger not being called, got:\n%s", output)
+	}
 }
