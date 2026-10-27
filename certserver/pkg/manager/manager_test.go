@@ -68,9 +68,15 @@ func createTestManager(
 		t.Fatalf("failed to create disk cache: %v", err)
 	}
 
+	accountKey, err := diskCache.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("failed to load/generate account key: %v", err)
+	}
+
 	acmeCli, err := acmeclient.NewClient(t.Context(), acmeclient.Config{
 		DirectoryURL: pebble.DirectoryURL,
 		HTTPClient:   pebble.HTTPClient,
+		AccountKey:   accountKey,
 	})
 	if err != nil {
 		t.Fatalf("failed to create ACME client: %v", err)
@@ -537,6 +543,158 @@ func TestManager_PrivateKeyNotInErrorsOrLogs(t *testing.T) {
 	certStr := fmt.Sprintf("%v %s", cert, cert)
 	if strings.Contains(certStr, string(rawKeyPEM)) || strings.Contains(certStr, "EC PRIVATE KEY") {
 		t.Fatalf("private key found in certificate string: %s", certStr)
+	}
+}
+
+func TestManager_AccountKeyPersistenceAndReuseOnRestart(t *testing.T) {
+	eabKID := "test-persistent-kid"
+	eabKey := "dzA2OGZkZTBkYzljZWYxYTRlMTQ2YjEzYTE4ODQyZDI"
+
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{
+		EABKeyID:  eabKID,
+		EABMACKey: eabKey,
+	})
+
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+
+	ctx := t.Context()
+
+	// 1. Initial run: generate and persist account key
+	diskCache1, err := cache.NewDiskCache(cacheDir)
+	if err != nil {
+		t.Fatalf("NewDiskCache failed: %v", err)
+	}
+	acctKey1, err := diskCache1.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateAccountKey 1 failed: %v", err)
+	}
+
+	acmeCli1, err := acmeclient.NewClient(ctx, acmeclient.Config{
+		DirectoryURL: pebble.DirectoryURL,
+		EABKID:       eabKID,
+		EABHMACKey:   eabKey,
+		AccountKey:   acctKey1,
+		HTTPClient:   pebble.HTTPClient,
+	})
+	if err != nil {
+		t.Fatalf("NewClient 1 failed: %v", err)
+	}
+
+	reg := prometheus.NewRegistry()
+	mgr1 := NewManager(acmeCli1, diskCache1, pebble.ChallengeStore, metrics.New(reg))
+	if err := mgr1.Start(ctx); err != nil {
+		t.Fatalf("mgr1.Start failed: %v", err)
+	}
+
+	if _, err := mgr1.Obtain(ctx, []string{"first.example.com"}); err != nil {
+		t.Fatalf("mgr1.Obtain failed: %v", err)
+	}
+	acctURI1 := acmeCli1.Account.URI
+	mgr1.Stop()
+
+	// Verify account.key permissions 0600 on disk
+	keyPath := filepath.Join(cacheDir, "account.key")
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("account.key stat failed: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("account.key expected mode 0600, got %o", info.Mode().Perm())
+	}
+
+	// 2. Restart simulation: second manager loads same account key
+	diskCache2, err := cache.NewDiskCache(cacheDir)
+	if err != nil {
+		t.Fatalf("NewDiskCache 2 failed: %v", err)
+	}
+	acctKey2, err := diskCache2.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateAccountKey 2 failed: %v", err)
+	}
+
+	if !acctKey1.Equal(acctKey2) {
+		t.Fatal("expected loaded account key to match original account key")
+	}
+
+	acmeCli2, err := acmeclient.NewClient(ctx, acmeclient.Config{
+		DirectoryURL: pebble.DirectoryURL,
+		EABKID:       eabKID,
+		EABHMACKey:   eabKey,
+		AccountKey:   acctKey2,
+		HTTPClient:   pebble.HTTPClient,
+	})
+	if err != nil {
+		t.Fatalf("NewClient 2 failed: %v", err)
+	}
+
+	mgr2 := NewManager(acmeCli2, diskCache2, pebble.ChallengeStore, metrics.New(prometheus.NewRegistry()))
+	if err := mgr2.Start(ctx); err != nil {
+		t.Fatalf("mgr2.Start failed: %v", err)
+	}
+	defer mgr2.Stop()
+
+	// New domain issuance using reused account key
+	if _, err := mgr2.Obtain(ctx, []string{"second.example.com"}); err != nil {
+		t.Fatalf("mgr2.Obtain failed: %v", err)
+	}
+
+	if acmeCli2.Account.URI != acctURI1 {
+		t.Errorf("expected reused account URI %s, got %s", acctURI1, acmeCli2.Account.URI)
+	}
+}
+
+func TestManager_SingleflightDetachedContext_FirstCallerCancels(t *testing.T) {
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{})
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+
+	clock := &mockClock{now: time.Now()}
+	mgr, _ := createTestManager(t, pebble, cacheDir, clock)
+
+	ctx := t.Context()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer mgr.Stop()
+
+	hostnames := []string{"caller-cancel.example.com"}
+
+	ctx1, cancel1 := context.WithCancel(ctx)
+	caller1Done := make(chan error, 1)
+	caller2Done := make(chan error, 1)
+	caller2Cert := make(chan *cache.Certificate, 1)
+
+	// Caller 1 starts order and cancels its context early
+	go func() {
+		_, err := mgr.Obtain(ctx1, hostnames)
+		caller1Done <- err
+	}()
+
+	// Caller 2 concurrently waits for the same hostname set
+	go func() {
+		cert, err := mgr.Obtain(ctx, hostnames)
+		caller2Cert <- cert
+		caller2Done <- err
+	}()
+
+	// Cancel caller 1's context shortly after initiation
+	time.Sleep(5 * time.Millisecond)
+	cancel1()
+
+	err1 := <-caller1Done
+	if !errors.Is(err1, context.Canceled) {
+		t.Fatalf("expected caller 1 to receive context.Canceled, got %v", err1)
+	}
+
+	// Caller 2 should successfully obtain the certificate despite caller 1 canceling
+	err2 := <-caller2Done
+	if err2 != nil {
+		t.Fatalf("expected caller 2 to succeed despite caller 1 canceling, got %v", err2)
+	}
+	cert2 := <-caller2Cert
+	if cert2 == nil {
+		t.Fatal("expected caller 2 to receive non-nil certificate")
 	}
 }
 

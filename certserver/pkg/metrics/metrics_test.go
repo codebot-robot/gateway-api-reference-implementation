@@ -38,8 +38,8 @@ func TestMetrics_Lifecycle(t *testing.T) {
 	m.SetCertificatesCount(StateExpired, 0)
 
 	// Set and remove expiry seconds
-	m.SetCertificateExpiry("example.com", 3600)
-	m.RemoveCertificateExpiry("example.com")
+	m.SetCertificateExpiry("a1b2c3d4e5f60718", 3600)
+	m.RemoveCertificateExpiry("a1b2c3d4e5f60718")
 
 	// Verify metric values can be gathered
 	metricFamilies, err := reg.Gather()

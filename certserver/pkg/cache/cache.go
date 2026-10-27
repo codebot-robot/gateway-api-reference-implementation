@@ -16,6 +16,8 @@ package cache
 
 import (
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -23,10 +25,15 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+)
+
+const (
+	accountKeyFileName = "account.key"
 )
 
 var (
@@ -79,7 +86,9 @@ type certMetadata struct {
 
 // DiskCache implements certificate caching on local disk.
 type DiskCache struct {
-	dir     string
+	dir string
+
+	// mu guards in-memory cache entries.
 	mu      sync.RWMutex
 	entries map[string]*Certificate
 }
@@ -112,40 +121,138 @@ func hashKey(hostnamesKey string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Put saves the certificate chain and private key to disk at mode 0600, and updates the in-memory cache.
+// writeAtomic writes data to a temporary file in the cache directory, fsyncs it,
+// sets mode 0600, renames it into place, and fsyncs the directory.
+func (dc *DiskCache) writeAtomic(filename string, data []byte) error {
+	destPath := filepath.Join(dc.dir, filename)
+	tmpPath := filepath.Join(dc.dir, fmt.Sprintf(".%s.tmp.%d", filename, time.Now().UnixNano()))
+
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	if _, err := f.Write(data); err != nil {
+		closeErr := f.Close()
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("failed to write temp file (%w) and close failed: %v", err, closeErr)
+		}
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		closeErr := f.Close()
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("failed to fsync temp file (%w) and close failed: %v", err, closeErr)
+		}
+		return fmt.Errorf("failed to fsync temp file: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
+		}
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	if err := os.Chmod(tmpPath, 0600); err != nil {
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
+		}
+		return fmt.Errorf("failed to set temp file permissions: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
+		}
+		return fmt.Errorf("failed to rename %s to %s: %w", tmpPath, destPath, err)
+	}
+
+	return dc.syncDir()
+}
+
+// syncDir fsyncs the cache directory to commit directory entries to storage.
+func (dc *DiskCache) syncDir() error {
+	dirFile, err := os.Open(dc.dir)
+	if err != nil {
+		return fmt.Errorf("failed to open cache dir for sync: %w", err)
+	}
+
+	syncErr := dirFile.Sync()
+	closeErr := dirFile.Close()
+	if syncErr != nil {
+		return fmt.Errorf("failed to sync cache dir: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close cache dir: %w", closeErr)
+	}
+	return nil
+}
+
+// LoadOrGenerateAccountKey loads the ECDSA P-256 account key from account.key in the cache directory,
+// or generates, fsyncs, and stores a new one at mode 0600 if none exists.
+func (dc *DiskCache) LoadOrGenerateAccountKey() (*ecdsa.PrivateKey, error) {
+	keyPath := filepath.Join(dc.dir, accountKeyFileName)
+
+	keyPEM, err := os.ReadFile(keyPath)
+	if err == nil {
+		key, parseErr := parseECPrivateKey(keyPEM)
+		if parseErr != nil {
+			return nil, fmt.Errorf("failed to parse existing account key from %s: %w", keyPath, parseErr)
+		}
+		return key, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read account key file %s: %w", keyPath, err)
+	}
+
+	// Generate new ECDSA P-256 account key
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate account key: %w", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal generated account key: %w", err)
+	}
+
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "EC PRIVATE KEY",
+		Bytes: keyDER,
+	})
+
+	if err := dc.writeAtomic(accountKeyFileName, pemBytes); err != nil {
+		return nil, fmt.Errorf("failed to persist account key to %s: %w", keyPath, err)
+	}
+
+	return key, nil
+}
+
+// Put saves the certificate chain and private key to disk at mode 0600 atomically,
+// ensuring the certificate and metadata are placed before the key is renamed into place.
 func (dc *DiskCache) Put(cert *Certificate) error {
 	if cert == nil || cert.HostnamesKey == "" {
 		return errors.New("cannot store nil or empty certificate")
 	}
 
 	h := hashKey(cert.HostnamesKey)
-	crtPath := filepath.Join(dc.dir, h+".crt")
-	keyPath := filepath.Join(dc.dir, h+".key")
-	metaPath := filepath.Join(dc.dir, h+".meta")
+	crtFile := h + ".crt"
+	keyFile := h + ".key"
+	metaFile := h + ".meta"
 
-	// Ensure directory permissions remain 0700
-	if err := os.Chmod(dc.dir, 0700); err != nil {
-		return fmt.Errorf("failed to ensure cache directory permissions 0700: %w", err)
-	}
-
-	// Write files with mode 0600
-	if err := os.WriteFile(crtPath, cert.CertPEM, 0600); err != nil {
+	// 1. Write certificate chain atomically
+	if err := dc.writeAtomic(crtFile, cert.CertPEM); err != nil {
 		return fmt.Errorf("failed to write certificate file: %w", err)
 	}
-	if err := os.Chmod(crtPath, 0600); err != nil {
-		return fmt.Errorf("failed to set certificate file mode: %w", err)
-	}
 
-	if err := os.WriteFile(keyPath, cert.KeyPEM, 0600); err != nil {
-		if rmErr := os.Remove(crtPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			return fmt.Errorf("failed to write key file: %w (cleanup error: %v)", err, rmErr)
-		}
-		return fmt.Errorf("failed to write key file: %w", err)
-	}
-	if err := os.Chmod(keyPath, 0600); err != nil {
-		return fmt.Errorf("failed to set key file mode: %w", err)
-	}
-
+	// 2. Write metadata atomically
 	meta := certMetadata{
 		Hostnames:    cert.Hostnames,
 		HostnamesKey: cert.HostnamesKey,
@@ -154,25 +261,15 @@ func (dc *DiskCache) Put(cert *Certificate) error {
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
-		if rmErr := os.Remove(crtPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			return fmt.Errorf("failed to marshal certificate metadata: %w (cleanup crt error: %v)", err, rmErr)
-		}
-		if rmErr := os.Remove(keyPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			return fmt.Errorf("failed to marshal certificate metadata: %w (cleanup key error: %v)", err, rmErr)
-		}
 		return fmt.Errorf("failed to marshal certificate metadata: %w", err)
 	}
-	if err := os.WriteFile(metaPath, metaBytes, 0600); err != nil {
-		if rmErr := os.Remove(crtPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			return fmt.Errorf("failed to write metadata file: %w (cleanup crt error: %v)", err, rmErr)
-		}
-		if rmErr := os.Remove(keyPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			return fmt.Errorf("failed to write metadata file: %w (cleanup key error: %v)", err, rmErr)
-		}
+	if err := dc.writeAtomic(metaFile, metaBytes); err != nil {
 		return fmt.Errorf("failed to write metadata file: %w", err)
 	}
-	if err := os.Chmod(metaPath, 0600); err != nil {
-		return fmt.Errorf("failed to set metadata file mode: %w", err)
+
+	// 3. Write private key into place last
+	if err := dc.writeAtomic(keyFile, cert.KeyPEM); err != nil {
+		return fmt.Errorf("failed to write key file: %w", err)
 	}
 
 	dc.mu.Lock()
@@ -209,7 +306,7 @@ func (dc *DiskCache) Delete(hostnamesKey string) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("errors occurred during certificate deletion: %v", errs)
 	}
-	return nil
+	return dc.syncDir()
 }
 
 // List returns a snapshot of all certificates loaded in memory.
@@ -249,37 +346,45 @@ func (dc *DiskCache) Load() error {
 
 		// Enforce mode 0600 on files
 		if err := os.Chmod(crtPath, 0600); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to set %s permissions: %w", crtPath, err)
+			log.Printf("certserver: failed to set permissions on %s: %v", crtPath, err)
+			continue
 		}
 		if err := os.Chmod(keyPath, 0600); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to set %s permissions: %w", keyPath, err)
+			log.Printf("certserver: failed to set permissions on %s: %v", keyPath, err)
+			continue
 		}
 		if err := os.Chmod(metaPath, 0600); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to set %s permissions: %w", metaPath, err)
+			log.Printf("certserver: failed to set permissions on %s: %v", metaPath, err)
+			continue
 		}
 
 		certPEM, err := os.ReadFile(crtPath)
 		if err != nil {
+			log.Printf("certserver: failed to read certificate file %s: %v", crtPath, err)
 			continue
 		}
 		keyPEM, err := os.ReadFile(keyPath)
 		if err != nil {
+			log.Printf("certserver: failed to read key file %s: %v", keyPath, err)
 			continue
 		}
 
 		leaf, err := parseLeafCert(certPEM)
 		if err != nil {
+			log.Printf("certserver: failed to parse leaf certificate from %s: %v", crtPath, err)
 			continue
 		}
 
 		key, err := parseECPrivateKey(keyPEM)
 		if err != nil {
+			log.Printf("certserver: failed to parse private key from %s: %v", keyPath, err)
 			continue
 		}
 
 		// Verify key corresponds to leaf certificate public key
 		leafPubKey, ok := leaf.PublicKey.(*ecdsa.PublicKey)
 		if !ok || !leafPubKey.Equal(key.Public()) {
+			log.Printf("certserver: public key mismatch for certificate %s and key %s", crtPath, keyPath)
 			continue
 		}
 
@@ -291,9 +396,12 @@ func (dc *DiskCache) Load() error {
 			if err := json.Unmarshal(metaBytes, &meta); err == nil && meta.HostnamesKey != "" {
 				hostnames = meta.Hostnames
 				hostnamesKey = meta.HostnamesKey
+			} else {
+				log.Printf("certserver: failed to unmarshal metadata from %s", metaPath)
 			}
 		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("failed to read %s: %w", metaPath, err)
+			log.Printf("certserver: failed to read metadata file %s: %v", metaPath, err)
+			continue
 		}
 
 		if hostnamesKey == "" {

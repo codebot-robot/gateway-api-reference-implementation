@@ -21,7 +21,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -61,9 +60,7 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	t.Helper()
 
 	// Disable VA validation sleeps for instant testing
-	if err := os.Setenv("PEBBLE_VA_NOSLEEP", "1"); err != nil {
-		t.Fatalf("failed to set PEBBLE_VA_NOSLEEP: %v", err)
-	}
+	t.Setenv("PEBBLE_VA_NOSLEEP", "1")
 
 	// 1. Start Challenge HTTP server
 	challengeStore := cfg.ChallengeStore

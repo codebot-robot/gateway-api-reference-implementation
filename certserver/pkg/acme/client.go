@@ -42,9 +42,11 @@ type Config struct {
 type Client struct {
 	*acme.Client
 	AccountKey *ecdsa.PrivateKey
-	Account    *acme.Account
 	cfg        Config
-	mu         sync.Mutex
+
+	// mu guards lazy registration of Account.
+	mu      sync.Mutex
+	Account *acme.Account
 }
 
 // NewClient initializes an ACME client with an ECDSA P-256 account key and configuration.

@@ -16,6 +16,9 @@ package manager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"log"
 	"math/rand"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 
 type renewalItem struct {
 	hostnamesKey string
+	metricID     string
 	hostnames    []string
 	cert         *cache.Certificate
 	state        metrics.State
@@ -32,6 +36,12 @@ type renewalItem struct {
 	retryCount   int
 	nextRetry    time.Time
 	backoff      time.Duration
+}
+
+// metricSetID computes a short stable identifier for a hostname set.
+func metricSetID(hostnamesKey string) string {
+	h := sha256.Sum256([]byte(hostnamesKey))
+	return hex.EncodeToString(h[:8])
 }
 
 // trackCertificateLocked registers or updates a certificate in the renewal tracker.
@@ -49,8 +59,12 @@ func (m *Manager) trackCertificateLocked(cert *cache.Certificate, now time.Time)
 		state = metrics.StateRenewing
 	}
 
+	metricID := metricSetID(cert.HostnamesKey)
+	log.Printf("certserver: mapped certificate hostname set %q to metric ID %s", cert.HostnamesKey, metricID)
+
 	m.renewals[cert.HostnamesKey] = &renewalItem{
 		hostnamesKey: cert.HostnamesKey,
+		metricID:     metricID,
 		hostnames:    cert.Hostnames,
 		cert:         cert,
 		state:        state,
@@ -104,7 +118,7 @@ func (m *Manager) updateMetricsLocked(now time.Time) {
 		}
 
 		remainingSeconds := item.cert.ExpiresAt.Sub(now).Seconds()
-		m.metrics.SetCertificateExpiry(item.hostnamesKey, remainingSeconds)
+		m.metrics.SetCertificateExpiry(item.metricID, remainingSeconds)
 	}
 
 	m.metrics.SetCertificatesCount(metrics.StateValid, float64(validCount))
@@ -177,7 +191,7 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 	m.updateMetricsLocked(now)
 	m.mu.Unlock()
 
-	// Execute renewals outside the mutex to prevent blocking
+	// Execute renewals through obtainOrCreate to share the singleflight key and pending order cap
 	for _, task := range dueTasks {
 		select {
 		case <-ctx.Done():
@@ -185,7 +199,7 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 		default:
 		}
 
-		newCert, err := m.issueCertificate(ctx, task.hostnames, task.hostnamesKey, true)
+		newCert, err := m.obtainOrCreate(ctx, task.hostnames, true)
 		now = m.opts.Clock.Now()
 
 		m.mu.Lock()
@@ -209,6 +223,8 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 				} else {
 					item.state = metrics.StateRenewing
 				}
+				log.Printf("certserver: certificate renewal failed for %s (attempt %d, next retry in %v): %v",
+					task.hostnamesKey, item.retryCount, backoff, err)
 			} else {
 				// On success: reset retry state, update certificate and recompute renewal time
 				item.cert = newCert

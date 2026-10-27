@@ -53,9 +53,11 @@ type challengeItem struct {
 
 // MemoryStore is an in-memory thread-safe implementation of Store.
 type MemoryStore struct {
+	// mu guards the challenges map.
 	mu         sync.RWMutex
 	challenges map[string]*challengeItem
-	timeNow    func() time.Time
+
+	timeNow func() time.Time
 }
 
 // NewMemoryStore initializes a new in-memory challenge store.

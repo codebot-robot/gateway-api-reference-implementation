@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,6 +87,18 @@ func TestChallengeHandler_AcceptanceCriteria(t *testing.T) {
 			host:           "EXAMPLE.COM:8080",
 			expectedStatus: http.StatusOK,
 			expectedBody:   validKeyAuth,
+		},
+		{
+			name:           "token too long (exceeds 128 characters)",
+			token:          strings.Repeat("a", 129),
+			host:           validHost,
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "token with non-base64url characters",
+			token:          "invalid+token=with/symbols",
+			host:           validHost,
+			expectedStatus: http.StatusNotFound,
 		},
 	}
 

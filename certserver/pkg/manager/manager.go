@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +53,7 @@ type Manager struct {
 	sf            singleflight.Group
 	pendingOrders atomic.Int64
 
+	// mu guards renewals map and metrics updates.
 	mu       sync.RWMutex
 	renewals map[string]*renewalItem
 
@@ -120,6 +122,11 @@ func (m *Manager) Cache() *cache.DiskCache {
 // Obtain creates or reuses a certificate order for the normalized hostname set.
 // Concurrent calls for the same set share one order via singleflight.
 func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certificate, error) {
+	return m.obtainOrCreate(ctx, hostnames, false)
+}
+
+// obtainOrCreate coordinates order execution for Obtain and renewals through a shared singleflight key.
+func (m *Manager) obtainOrCreate(ctx context.Context, hostnames []string, isRenewal bool) (*cache.Certificate, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
 		return nil, err
@@ -127,9 +134,11 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 
 	now := m.opts.Clock.Now()
 
-	// 1. Fast-path: check if valid certificate already exists in cache
-	if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(now) {
-		return existing, nil
+	// 1. Fast-path: check if valid certificate already exists in cache (skip on renewal)
+	if !isRenewal {
+		if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(now) {
+			return existing, nil
+		}
 	}
 
 	// 2. Bound pending orders
@@ -137,11 +146,13 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 		return nil, ErrTooManyPendingOrders
 	}
 
-	// 3. Singleflight execution for concurrent requests of the same set
-	res, err, _ := m.sf.Do(hostnamesKey, func() (any, error) {
-		// Re-check cache under singleflight lock
-		if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
-			return existing, nil
+	// 3. Singleflight execution for concurrent requests and renewals of the same set
+	ch := m.sf.DoChan(hostnamesKey, func() (any, error) {
+		// Re-check cache under singleflight lock if not a renewal
+		if !isRenewal {
+			if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
+				return existing, nil
+			}
 		}
 
 		if m.opts.MaxPendingOrders > 0 {
@@ -152,17 +163,27 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 			defer m.pendingOrders.Add(-1)
 		}
 
-		cert, err := m.issueCertificate(ctx, normalized, hostnamesKey, false)
+		// Detached context with independent timeout so that cancellation of the first caller
+		// does not abort the shared order for other waiting callers.
+		orderCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, isRenewal)
 		if err != nil {
 			return nil, err
 		}
 		return cert, nil
 	})
 
-	if err != nil {
-		return nil, err
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.(*cache.Certificate), nil
 	}
-	return res.(*cache.Certificate), nil
 }
 
 // issueCertificate executes the ACME order creation, HTTP-01 challenge completion, CSR submission, and caching.
@@ -322,9 +343,8 @@ func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string) err
 		return fmt.Errorf("failed to register challenge in store: %w", err)
 	}
 	defer func(token string) {
-		rmErr := m.challengeStore.Remove(context.Background(), token)
-		if rmErr != nil && !errors.Is(rmErr, challenge.ErrNotFound) {
-			return
+		if rmErr := m.challengeStore.Remove(context.Background(), token); rmErr != nil && !errors.Is(rmErr, challenge.ErrNotFound) {
+			log.Printf("certserver: failed to remove challenge token %s: %v", token, rmErr)
 		}
 	}(chal.Token)
 

@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -50,7 +52,7 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	customArgs := []string{
 		"--directory-url=https://custom-acme.local/dir",
 		"--eab-kid=custom-kid",
-		"--eab-hmac-key=custom-key",
+		"--eab-hmac-key-file=/tmp/custom-key-file",
 		"--cache-dir=/tmp/custom-cache",
 		"--challenge-listen-addr=:18080",
 		"--metrics-listen-addr=:19090",
@@ -69,8 +71,8 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	if cfg.EABKID != "custom-kid" {
 		t.Errorf("unexpected custom EAB KID: %s", cfg.EABKID)
 	}
-	if cfg.EABHMACKey != "custom-key" {
-		t.Errorf("unexpected custom EAB HMAC key: %s", cfg.EABHMACKey)
+	if cfg.EABHMACKeyFile != "/tmp/custom-key-file" {
+		t.Errorf("unexpected custom EAB HMAC key file: %s", cfg.EABHMACKeyFile)
 	}
 	if cfg.CacheDir != "/tmp/custom-cache" {
 		t.Errorf("unexpected custom cache dir: %s", cfg.CacheDir)
@@ -89,17 +91,51 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	}
 }
 
+func waitForReady(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			if closeErr := conn.Close(); closeErr != nil {
+				// ignore
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for server to be ready on %s", addr)
+}
+
 func TestRun_LifecycleWithPebble(t *testing.T) {
 	pebble := testserver.StartPebble(t, testserver.ServerConfig{})
 	tempDir := t.TempDir()
 	cacheDir := filepath.Join(tempDir, "cache")
 
+	chalLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for challenge addr failed: %v", err)
+	}
+	chalAddr := chalLn.Addr().String()
+	if err := chalLn.Close(); err != nil {
+		t.Fatalf("Close chalLn failed: %v", err)
+	}
+
+	metricsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen for metrics addr failed: %v", err)
+	}
+	metricsAddr := metricsLn.Addr().String()
+	if err := metricsLn.Close(); err != nil {
+		t.Fatalf("Close metricsLn failed: %v", err)
+	}
+
 	cfg := &Config{
 		DirectoryURL:        pebble.DirectoryURL,
 		HTTPClient:          pebble.HTTPClient,
 		CacheDir:            cacheDir,
-		ChallengeListenAddr: "127.0.0.1:0",
-		MetricsListenAddr:   "127.0.0.1:0",
+		ChallengeListenAddr: chalAddr,
+		MetricsListenAddr:   metricsAddr,
 		MaxHostnames:        100,
 		MaxPendingOrders:    50,
 	}
@@ -111,8 +147,9 @@ func TestRun_LifecycleWithPebble(t *testing.T) {
 		errCh <- run(ctx, cfg)
 	}()
 
-	// Allow servers to initialize
-	time.Sleep(100 * time.Millisecond)
+	// Wait for readiness instead of sleep
+	waitForReady(t, chalAddr)
+	waitForReady(t, metricsAddr)
 
 	// Trigger graceful shutdown
 	cancel()
@@ -124,5 +161,10 @@ func TestRun_LifecycleWithPebble(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for certserver run to shut down")
+	}
+
+	// Verify account key was saved to cache directory
+	if _, err := os.Stat(filepath.Join(cacheDir, "account.key")); err != nil {
+		t.Fatalf("expected account.key to be created in cache dir: %v", err)
 	}
 }

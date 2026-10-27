@@ -59,9 +59,9 @@ func New(reg prometheus.Registerer) *Metrics {
 			prometheus.GaugeOpts{
 				Namespace: "certserver",
 				Name:      "certificate_expiry_seconds",
-				Help:      "Seconds remaining until certificate expiration.",
+				Help:      "Seconds remaining until certificate expiration, labelled by truncated stable set ID.",
 			},
-			[]string{"hostnames"},
+			[]string{"id"},
 		),
 		IssuanceTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -126,20 +126,20 @@ func (m *Metrics) RecordRenewal(success bool) {
 	m.RenewalTotal.WithLabelValues(status).Inc()
 }
 
-// SetCertificateExpiry records the remaining seconds until expiration for a hostname set.
-func (m *Metrics) SetCertificateExpiry(hostnames string, secondsRemaining float64) {
+// SetCertificateExpiry records the remaining seconds until expiration for a hostname set ID.
+func (m *Metrics) SetCertificateExpiry(id string, secondsRemaining float64) {
 	if m == nil {
 		return
 	}
-	m.TimeToExpiry.WithLabelValues(hostnames).Set(secondsRemaining)
+	m.TimeToExpiry.WithLabelValues(id).Set(secondsRemaining)
 }
 
-// RemoveCertificateExpiry removes the expiry metric entry for a hostname set.
-func (m *Metrics) RemoveCertificateExpiry(hostnames string) {
+// RemoveCertificateExpiry removes the expiry metric entry for a hostname set ID.
+func (m *Metrics) RemoveCertificateExpiry(id string) {
 	if m == nil {
 		return
 	}
-	m.TimeToExpiry.DeleteLabelValues(hostnames)
+	m.TimeToExpiry.DeleteLabelValues(id)
 }
 
 // SetCertificatesCount updates the count of certificates in a given state.

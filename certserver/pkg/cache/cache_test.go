@@ -202,3 +202,41 @@ func TestCertificate_PrivateKeySafety(t *testing.T) {
 		t.Fatalf("private key found in GoString(): %s", goStr)
 	}
 }
+
+func TestDiskCache_AccountKey(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "certserver-acct-test-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dc, err := NewDiskCache(filepath.Join(tempDir, "cache"))
+	if err != nil {
+		t.Fatalf("NewDiskCache failed: %v", err)
+	}
+
+	// 1. Generate and persist key on first call
+	key1, err := dc.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateAccountKey first call failed: %v", err)
+	}
+
+	// Verify account.key permissions 0600
+	info, err := os.Stat(filepath.Join(dc.Dir(), "account.key"))
+	if err != nil {
+		t.Fatalf("Stat account.key failed: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("expected account.key perm 0600, got %o", info.Mode().Perm())
+	}
+
+	// 2. Load existing key on second call
+	key2, err := dc.LoadOrGenerateAccountKey()
+	if err != nil {
+		t.Fatalf("LoadOrGenerateAccountKey second call failed: %v", err)
+	}
+
+	if !key1.Equal(key2) {
+		t.Fatal("expected second call to return identical account key")
+	}
+}

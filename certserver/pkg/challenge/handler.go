@@ -22,7 +22,25 @@ import (
 const (
 	// ACMEChallengePrefix is the standard URI prefix for ACME HTTP-01 challenges.
 	ACMEChallengePrefix = "/.well-known/acme-challenge/"
+
+	// maxTokenLength bounds the maximum length accepted for ACME challenge tokens.
+	maxTokenLength = 128
 )
+
+// isValidToken reports whether token is non-empty, within length bounds, and composed
+// exclusively of base64url characters (RFC 8555 Section 8.3).
+func isValidToken(token string) bool {
+	if len(token) == 0 || len(token) > maxTokenLength {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
 
 // HandlerOption configures the challenge HTTP handler.
 type HandlerOption func(*Handler)
@@ -64,8 +82,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
-	// Reject empty tokens or path traversal attempts
-	if token == "" || strings.Contains(token, "/") || strings.Contains(token, "..") {
+	if !isValidToken(token) {
 		http.NotFound(w, r)
 		return
 	}
