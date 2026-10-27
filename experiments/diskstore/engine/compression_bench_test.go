@@ -261,15 +261,22 @@ func makeRealConfigMap(i int) []byte {
 }
 
 // loadConformanceManifestObjects loads all Kubernetes manifests from Gateway API conformance suite.
-func loadConformanceManifestObjects() [][]byte {
+// It fails if any manifest cannot be read or parsed, or if any expected resource kind is missing.
+func loadConformanceManifestObjects(tb testing.TB) [][]byte {
+	tb.Helper()
 	var objects [][]byte
-	_ = fs.WalkDir(conformance.Manifests, ".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".yaml") {
+	kindCounts := make(map[string]int)
+
+	err := fs.WalkDir(conformance.Manifests, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("WalkDir error on %s: %w", path, err)
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".yaml") {
 			return nil
 		}
 		data, err := conformance.Manifests.ReadFile(path)
 		if err != nil {
-			return nil
+			return fmt.Errorf("ReadFile failed on %s: %w", path, err)
 		}
 		docs := strings.Split(string(data), "\n---")
 		for _, doc := range docs {
@@ -279,15 +286,19 @@ func loadConformanceManifestObjects() [][]byte {
 			}
 			rawJSON, err := yaml.YAMLToJSON([]byte(doc))
 			if err != nil {
-				continue
+				return fmt.Errorf("YAMLToJSON failed on %s: %w", path, err)
 			}
 			var obj map[string]any
-			if err := json.Unmarshal(rawJSON, &obj); err != nil || len(obj) == 0 {
+			if err := json.Unmarshal(rawJSON, &obj); err != nil {
+				return fmt.Errorf("json.Unmarshal failed on %s: %w", path, err)
+			}
+			if len(obj) == 0 {
 				continue
 			}
 			kind, _ := obj["kind"].(string)
 			switch kind {
 			case "Gateway", "HTTPRoute", "Service", "EndpointSlice", "TLSRoute", "GRPCRoute", "TCPRoute", "UDPRoute", "BackendTLSPolicy":
+				kindCounts[kind]++
 				if kind == "HTTPRoute" {
 					if _, hasStatus := obj["status"]; !hasStatus {
 						obj["status"] = map[string]any{
@@ -320,13 +331,24 @@ func loadConformanceManifestObjects() [][]byte {
 					}
 				}
 				raw, err := json.Marshal(obj)
-				if err == nil {
-					objects = append(objects, raw)
+				if err != nil {
+					return fmt.Errorf("json.Marshal failed for %s object in %s: %w", kind, path, err)
 				}
+				objects = append(objects, raw)
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		tb.Fatalf("loadConformanceManifestObjects failed: %v", err)
+	}
+
+	expectedKinds := []string{"Gateway", "HTTPRoute", "Service", "TLSRoute", "GRPCRoute", "TCPRoute", "UDPRoute", "BackendTLSPolicy"}
+	for _, k := range expectedKinds {
+		if kindCounts[k] == 0 {
+			tb.Fatalf("conformance manifests missing expected kind %q", k)
+		}
+	}
 	return objects
 }
 
@@ -335,8 +357,8 @@ type corpusItem struct {
 	payload  []byte
 }
 
-func buildRealisticCorpus(totalCount int) []corpusItem {
-	manifests := loadConformanceManifestObjects()
+func buildRealisticCorpus(tb testing.TB, totalCount int) []corpusItem {
+	manifests := loadConformanceManifestObjects(tb)
 	items := make([]corpusItem, totalCount)
 
 	for i := 0; i < totalCount; i++ {
@@ -365,13 +387,16 @@ func buildRealisticCorpus(totalCount int) []corpusItem {
 }
 
 func BenchmarkCompressValue(b *testing.B) {
-	manifests := loadConformanceManifestObjects()
+	manifests := loadConformanceManifestObjects(b)
 	var httpRoutePayload []byte
 	for _, m := range manifests {
 		if strings.Contains(string(m), `"kind":"HTTPRoute"`) {
 			httpRoutePayload = m
 			break
 		}
+	}
+	if len(httpRoutePayload) == 0 {
+		b.Fatal("missing HTTPRoute in conformance manifests")
 	}
 	endpointSlicePayload := makeRealEndpointSlice(0)
 	tlsSecretPayload := makeRealTLSSecret(0)
@@ -442,13 +467,16 @@ func BenchmarkCompressValue(b *testing.B) {
 }
 
 func BenchmarkPut(b *testing.B) {
-	manifests := loadConformanceManifestObjects()
+	manifests := loadConformanceManifestObjects(b)
 	var httpRoutePayload []byte
 	for _, m := range manifests {
 		if strings.Contains(string(m), `"kind":"HTTPRoute"`) {
 			httpRoutePayload = m
 			break
 		}
+	}
+	if len(httpRoutePayload) == 0 {
+		b.Fatal("missing HTTPRoute in conformance manifests")
 	}
 	endpointSlicePayload := makeRealEndpointSlice(0)
 	tlsSecretPayload := makeRealTLSSecret(0)
@@ -466,12 +494,19 @@ func BenchmarkPut(b *testing.B) {
 		{"ConfigMap", configMapPayload},
 	}
 
+	// Under the old 4000-byte threshold:
+	// - All objects <= 4000 B were stored with CodecNone.
+	// - Objects > 4000 B were compressed with CodecZstd.
 	for _, c := range corpusCases {
-		b.Run("Corpus/Before_Uncompressed/"+c.name, func(b *testing.B) {
-			runBenchmarkPutWithCodec(b, c.payload, CodecNone)
+		b.Run("Corpus/Before_Threshold4000/"+c.name, func(b *testing.B) {
+			codec := CodecNone
+			if len(c.payload) > 4000 {
+				codec = CodecZstd
+			}
+			runBenchmarkPutOverwrite(b, c.payload, codec)
 		})
 		b.Run("Corpus/After_Universal/"+c.name, func(b *testing.B) {
-			runBenchmarkPutWithCodec(b, c.payload, CodecZstd)
+			runBenchmarkPutOverwrite(b, c.payload, CodecZstd)
 		})
 	}
 
@@ -486,26 +521,34 @@ func BenchmarkPut(b *testing.B) {
 	}
 
 	for _, s := range sizes {
-		b.Run("Size/Before_Uncompressed/Compressible/"+s.name, func(b *testing.B) {
+		b.Run("Size/Before_Threshold4000/Compressible/"+s.name, func(b *testing.B) {
 			payload := makeRepetitivePayload(s.size)
-			runBenchmarkPutWithCodec(b, payload, CodecNone)
+			codec := CodecNone
+			if s.size > 4000 {
+				codec = CodecZstd
+			}
+			runBenchmarkPutOverwrite(b, payload, codec)
 		})
 		b.Run("Size/After_Universal/Compressible/"+s.name, func(b *testing.B) {
 			payload := makeRepetitivePayload(s.size)
-			runBenchmarkPutWithCodec(b, payload, CodecZstd)
+			runBenchmarkPutOverwrite(b, payload, CodecZstd)
 		})
-		b.Run("Size/Before_Uncompressed/Incompressible/"+s.name, func(b *testing.B) {
+		b.Run("Size/Before_Threshold4000/Incompressible/"+s.name, func(b *testing.B) {
 			payload := makeRandomPayload(s.size)
-			runBenchmarkPutWithCodec(b, payload, CodecNone)
+			codec := CodecNone
+			if s.size > 4000 {
+				codec = CodecZstd
+			}
+			runBenchmarkPutOverwrite(b, payload, codec)
 		})
 		b.Run("Size/After_Universal/Incompressible/"+s.name, func(b *testing.B) {
 			payload := makeRandomPayload(s.size)
-			runBenchmarkPutWithCodec(b, payload, CodecZstd)
+			runBenchmarkPutOverwrite(b, payload, CodecZstd)
 		})
 	}
 }
 
-func runBenchmarkPutWithCodec(b *testing.B, payload []byte, codec CompressionCodec) {
+func runBenchmarkPutOverwrite(b *testing.B, payload []byte, codec CompressionCodec) {
 	dir := b.TempDir()
 	store, err := Open(WithDir(dir), WithNumFrames(4096), WithCompressionCodec(codec))
 	if err != nil {
@@ -513,9 +556,13 @@ func runBenchmarkPutWithCodec(b *testing.B, payload []byte, codec CompressionCod
 	}
 	defer store.Close()
 
-	keys := make([]string, b.N)
-	for i := 0; i < b.N; i++ {
-		keys[i] = fmt.Sprintf("k-%08d", i)
+	const numKeys = 500
+	keys := make([]string, numKeys)
+	for i := 0; i < numKeys; i++ {
+		keys[i] = fmt.Sprintf("k-%04d", i)
+		if err := store.Put("bench", keys[i], payload, "init"); err != nil {
+			b.Fatalf("Init Put failed: %v", err)
+		}
 	}
 
 	b.ReportAllocs()
@@ -523,7 +570,7 @@ func runBenchmarkPutWithCodec(b *testing.B, payload []byte, codec CompressionCod
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if err := store.Put("bench", keys[i], payload, "1"); err != nil {
+		if err := store.Put("bench", keys[i%numKeys], payload, "1"); err != nil {
 			b.Fatalf("Put failed at %d: %v", i, err)
 		}
 	}
@@ -531,9 +578,9 @@ func runBenchmarkPutWithCodec(b *testing.B, payload []byte, codec CompressionCod
 
 func BenchmarkRealisticCorpusHeapSize(b *testing.B) {
 	const objectCount = 10000
-	corpus := buildRealisticCorpus(objectCount)
+	corpus := buildRealisticCorpus(b, objectCount)
 
-	b.Run("Before_Uncompressed", func(b *testing.B) {
+	b.Run("Before_Threshold4000", func(b *testing.B) {
 		runCorpusHeapSizeBenchmark(b, corpus, CodecNone)
 	})
 	b.Run("After_UniversalCompression", func(b *testing.B) {
@@ -593,7 +640,30 @@ func runCorpusHeapSizeBenchmark(b *testing.B, corpus []corpusItem, codec Compres
 		walTotalBytes += st.Size()
 	}
 
+	pageRecords := make(map[uint64]int)
+	var multiblockCount int
+	store.keyMu.RLock()
+	for _, entry := range store.keyIndex {
+		if entry.NumBlocks == 1 {
+			pageRecords[entry.LogicalPage]++
+		} else {
+			multiblockCount++
+		}
+	}
+	store.keyMu.RUnlock()
+
+	var totalSlottedRecords int
+	for _, count := range pageRecords {
+		totalSlottedRecords += count
+	}
+	avgDensity := 0.0
+	if len(pageRecords) > 0 {
+		avgDensity = float64(totalSlottedRecords) / float64(len(pageRecords))
+	}
+
 	b.Logf("Realistic Corpus: %d objects, Total raw: %.2f MB (avg %.0f B/obj)", len(corpus), float64(totalRawBytes)/(1024*1024), float64(totalRawBytes)/float64(len(corpus)))
 	b.Logf("Codec %s: Heap file: %.2f MB (%d B), WAL: %.2f MB, Write time: %v (%.0f op/s, %.1f ns/op)",
 		codec, float64(heapStat.Size())/(1024*1024), heapStat.Size(), float64(walTotalBytes)/(1024*1024), writeDur, float64(len(corpus))/writeDur.Seconds(), float64(writeDur.Nanoseconds())/float64(len(corpus)))
+	b.Logf("Codec %s: Slotted pages: %d, Avg records/page: %.2f, Multi-block pages: %d",
+		codec, len(pageRecords), avgDensity, multiblockCount)
 }

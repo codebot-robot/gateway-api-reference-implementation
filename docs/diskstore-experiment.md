@@ -488,37 +488,39 @@ Recompute Latency Comparison:
      | **4 KB (Compressible)** | 4,096 B | `CodecZstd` (88 B) | 5,104 ns/op | 2 allocs/op | 802.5 MB/s |
 
    - **Put Micro-benchmarks on Corpus Objects and Fixed Sizes:**
-     Latency (`ns/op`) and allocations (`allocs/op`) of `Engine.Put`:
+     Latency (`ns/op`) and allocations (`allocs/op`) of `Engine.Put`, measured by overwriting a fixed keyset in a warmed-up store to isolate CPU write cost without store-growth or direct I/O flush artifacts:
 
-     | Benchmark Case | Before (Uncompressed / Threshold = 4000 B) | After (Universal Compression) | Change |
+     | Benchmark Case | Before (Threshold = 4000 B) | After (Universal Compression) | Change |
      | :--- | :--- | :--- | :--- |
-     | **Corpus: HTTPRoute (1.5 KB)** | 24,622 ns/op (6 allocs/op) | 13,191 ns/op (6 allocs/op) | -46.4% latency |
-     | **Corpus: EndpointSlice (3.7 KB)** | 30,561 ns/op (8 allocs/op) | 14,433 ns/op (6 allocs/op) | -52.8% latency |
-     | **Corpus: TLSSecret (2.6 KB)** | 32,136 ns/op (8 allocs/op) | 25,589 ns/op (7 allocs/op) | -20.4% latency |
-     | **Corpus: RandomSecret (4.0 KB)** | 39,318 ns/op (8 allocs/op) | 33,333 ns/op (10 allocs/op) | -15.2% latency |
-     | **Corpus: ConfigMap (0.7 KB)** | 19,632 ns/op (5 allocs/op) | 11,234 ns/op (6 allocs/op) | -42.8% latency |
-     | **Size: 100 B Compressible** | 2,453 ns/op (5 allocs/op) | 6,618 ns/op (6 allocs/op) | +170% latency (+4,165 ns) |
-     | **Size: 100 B Incompressible** | 2,848 ns/op (5 allocs/op) | 3,667 ns/op (7 allocs/op) | +28.8% latency (+819 ns) |
-     | **Size: 500 B Compressible** | 10,264 ns/op (5 allocs/op) | 6,790 ns/op (6 allocs/op) | -33.8% latency |
-     | **Size: 500 B Incompressible** | 12,587 ns/op (5 allocs/op) | 7,653 ns/op (7 allocs/op) | -39.2% latency |
-     | **Size: 1 KB Compressible** | 27,519 ns/op (6 allocs/op) | 5,187 ns/op (6 allocs/op) | -81.2% latency |
-     | **Size: 1 KB Incompressible** | 34,771 ns/op (6 allocs/op) | 17,203 ns/op (8 allocs/op) | -50.5% latency |
-     | **Size: 4 KB Compressible** | 55,459 ns/op (11 allocs/op) | 6,570 ns/op (6 allocs/op) | -88.2% latency |
-     | **Size: 4 KB Incompressible** | 53,824 ns/op (11 allocs/op) | 52,611 ns/op (13 allocs/op) | -2.3% latency |
+     | **Corpus: HTTPRoute (1.5 KB)** | 1,589 ns/op (5 allocs/op) | 8,973 ns/op (6 allocs/op) | +7,384 ns/op (matches ~8.6 µs `compressValue`) |
+     | **Corpus: EndpointSlice (3.7 KB)** | 3,283 ns/op (9 allocs/op) | 10,555 ns/op (6 allocs/op) | +7,272 ns/op (matches ~10.5 µs `compressValue`) |
+     | **Corpus: TLSSecret (2.6 KB)** | 2,755 ns/op (9 allocs/op) | 14,272 ns/op (6 allocs/op) | +11,517 ns/op (matches ~13.4 µs `compressValue`) |
+     | **Corpus: RandomSecret (4.0 KB)** | 3,606 ns/op (9 allocs/op) | 6,368 ns/op (11 allocs/op) | +2,762 ns/op (matches ~5.2 µs raw fallback) |
+     | **Corpus: ConfigMap (0.7 KB)** | 1,256 ns/op (5 allocs/op) | 7,773 ns/op (6 allocs/op) | +6,517 ns/op (matches ~6.3 µs `compressValue`) |
+     | **Size: 100 B Compressible** | 1,139 ns/op (5 allocs/op) | 4,459 ns/op (6 allocs/op) | +291% latency (+3,320 ns) |
+     | **Size: 100 B Incompressible** | 1,127 ns/op (5 allocs/op) | 1,840 ns/op (7 allocs/op) | +63% latency (+713 ns, 10% rule fallback) |
+     | **Size: 500 B Compressible** | 1,204 ns/op (5 allocs/op) | 4,588 ns/op (6 allocs/op) | +281% latency (+3,384 ns) |
+     | **Size: 500 B Incompressible** | 1,171 ns/op (5 allocs/op) | 2,218 ns/op (7 allocs/op) | +89% latency (+1,047 ns, 10% rule fallback) |
+     | **Size: 1 KB Compressible** | 1,369 ns/op (5 allocs/op) | 4,874 ns/op (6 allocs/op) | +256% latency (+3,505 ns) |
+     | **Size: 1 KB Incompressible** | 1,324 ns/op (5 allocs/op) | 2,785 ns/op (7 allocs/op) | +110% latency (+1,461 ns, 10% rule fallback) |
+     | **Size: 4 KB Compressible** | 5,455 ns/op (6 allocs/op) | 5,436 ns/op (6 allocs/op) | -0.3% latency (already compressed under old threshold) |
+     | **Size: 4 KB Incompressible** | 8,946 ns/op (15 allocs/op) | 9,195 ns/op (15 allocs/op) | +2.8% latency (already attempted under old threshold) |
 
    - **Realistic Corpus Heap-File and Disk Footprint (10,000 objects, 18.22 MB raw JSON):**
 
-     | Metric | Before (Uncompressed / Threshold = 4000 B) | After (Universal Compression) | Change |
+     | Metric | Before (Threshold = 4000 B) | After (Universal Compression) | Change |
      | :--- | :--- | :--- | :--- |
      | **Heap File (`heap.db`)** | 21.91 MB (22,978,560 B) | 10.46 MB (10,973,184 B) | **-52.2%** (-12.01 MB) |
      | **WAL Total Size** | 18.78 MB | 9.56 MB | **-49.1%** (-9.22 MB) |
      | **Total On-Disk Footprint** | 40.69 MB | 20.02 MB | **-50.8%** (-20.67 MB) |
-     | **Write Stream Duration** | 53.3 ms (187,600 op/s) | 118.0 ms (84,700 op/s) | +64.7 ms (+121% CPU time) |
+     | **Write Stream Duration** | 50.2 ms (199,200 op/s) | 112.5 ms (88,900 op/s) | +62.3 ms (+124% CPU time, ~6.2 µs/write) |
+     | **Slotted Pages Allocated** | 5,610 pages | 2,679 pages | **-52.2%** (-2,931 pages) |
+     | **Average Slotted Page Density** | 1.78 records/page | 3.73 records/page | **+110%** (+1.95 records/page) |
 
    - **Trade-off Analysis:**
-     1. **Disk Space vs. CPU Time:** Compressing every value reduces heap-file size by 52.2% and WAL size by 49.1% on the realistic 1–4 KB corpus, with higher write stream duration (118 ms vs 53 ms, or 11.8 µs vs 5.3 µs per write).
-     2. **Small Objects Pay Compression Overhead:** For tiny payloads (such as 100 B), compression adds ~3.6 to 4.2 µs per write (+130% to +170% latency) for little space benefit. When payloads cannot compress by at least 10%, the 10% savings rule falls back to raw storage, but still incurs ~0.6 to 0.8 µs of compression attempt overhead.
-     3. **Slotted Page Density for 500 B – 4 KB Objects:** For compressible objects between 500 B and 4 KB (HTTPRoutes, Services, EndpointSlices, ConfigMaps), compressed payloads fit more densely into 4 KiB slotted pages (e.g. 5–8 objects per block instead of 1–3). This reduces buffer pool page-eviction pressure and WAL write volume, offsetting part of the compression CPU cost.
+     1. **Disk Space vs. CPU Time:** Compressing every value reduces heap-file size by 52.2% and WAL size by 49.1% on the realistic 1–4 KB corpus, with higher write stream duration (112.5 ms vs 50.2 ms, or 11.2 µs vs 5.0 µs per write). The delta (~6.2 µs per write) corresponds to the CPU time spent in `compressValue`.
+     2. **Small Objects Pay Compression Overhead:** For tiny payloads (such as 100 B), compression adds ~3.3 µs per write (+291% latency) for little space benefit. When payloads cannot compress by at least 10%, the 10% savings rule falls back to raw storage, but still incurs ~0.7 µs of compression attempt overhead.
+     3. **Slotted Page Density and Block Pool Residency:** On the 10,000-object corpus, compression increases average record density from 1.78 to 3.73 records per slotted page, reducing allocated slotted pages from 5,610 to 2,679 (-52.2%). In an engine configured with the default 4,096-block arena (`DefaultBufferPoolFrames = 4096`), all 2,679 compressed slotted pages reside simultaneously in the block pool, whereas the 5,610 uncompressed pages exceed the 4,096-block capacity during ingestion.
      4. **No New Threshold Needed:** The 10% savings rule prevents incompressible or tiny values from expanding on disk without introducing an arbitrary threshold.
 
 ---
