@@ -2335,6 +2335,7 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 		if cg == nil {
 			continue
 		}
+		acmeEnabled := cg.Parameters != nil && cg.Parameters.ACMEChallenge == "enabled"
 		for _, el := range cg.EffectiveListeners {
 			if !el.IsAccepted() || !el.IsProgrammed() {
 				continue
@@ -2346,6 +2347,7 @@ func BuildProxyConfig(gateways []*CompiledGateway) ([]InternalListener, []Intern
 				continue
 			}
 			iListener := el.ToInternalListener()
+			iListener.ACMEChallenge = acmeEnabled
 			proxyListeners = append(proxyListeners, iListener)
 			proxyRoutes = append(proxyRoutes, el.Routes...)
 		}
