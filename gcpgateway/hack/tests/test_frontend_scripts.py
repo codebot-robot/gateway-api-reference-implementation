@@ -15,17 +15,24 @@
 
 """Unit tests for create_frontend.py and teardown_frontend.py using a fake gcloud runner."""
 
+import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import unittest
+import urllib.error
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
 
 # Add parent directory to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from create_frontend import (
+    default_post_rest,
     generate_manifest,
+    get_access_token,
     make_description,
     make_hash,
     make_resource_name,
@@ -42,15 +49,36 @@ class FakeGcloud:
         self.store: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self.call_log: List[List[str]] = []
 
+    def post_rest(self, url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        self.call_log.append(["POST", url, json.dumps(body)])
+        parts = url.split("/")
+        # URL format: .../zones/<zone>/networkEndpointGroups
+        zone = parts[parts.index("zones") + 1]
+        name = body["name"]
+        key = ("network-endpoint-groups", name, zone)
+        self.store[key] = {
+            "name": name,
+            "description": body.get("description", ""),
+            "network": body.get("network", ""),
+            "subnetwork": body.get("subnetwork", ""),
+            "defaultPort": body.get("defaultPort"),
+        }
+        return {"status": "DONE", "name": f"operation-create-{name}"}
+
     def __call__(self, args: List[str], check: bool = True) -> Optional[Any]:
         self.call_log.append(args)
 
         # Parse command
         if len(args) < 3 or args[0] != "compute":
+            if len(args) >= 2 and args[0] == "auth" and args[1] == "print-access-token":
+                return {"access_token": "fake-token"}
             return {}
 
         res_type = args[1]
         action = args[2]
+
+        if res_type == "operations" and action == "wait":
+            return {"status": "DONE"}
 
         if res_type == "zones" and action == "list":
             return [{"name": "us-central1-a"}, {"name": "us-central1-b"}]
@@ -251,6 +279,127 @@ class TestFrontendScripts(unittest.TestCase):
         self.assertIn('allowedSourceCIDRs: "35.191.0.0/16,130.211.0.0/22"', manifest)
         self.assertIn('proxyProtocol: "enabled"', manifest)
         self.assertIn('negHTTPS: "gcpgw-12345678-8443"', manifest)
+
+    def test_get_access_token(self):
+        """Verifies get_access_token extracts access tokens from dict, string, and environment variables."""
+        # 1. From dict runner output
+        def dict_runner(args: List[str], check: bool = True):
+            return {"access_token": "dict-token-123"}
+
+        self.assertEqual(get_access_token(dict_runner), "dict-token-123")
+
+        # 2. From raw string runner output
+        def string_runner(args: List[str], check: bool = True):
+            return "string-token-456\n"
+
+        self.assertEqual(get_access_token(string_runner), "string-token-456")
+
+        # 3. From environment variable
+        with patch.dict(os.environ, {"CLOUDSDK_AUTH_ACCESS_TOKEN": "env-token-789"}):
+            self.assertEqual(get_access_token(dict_runner), "env-token-789")
+
+        # 4. Error on unparseable output
+        def invalid_runner(args: List[str], check: bool = True):
+            return 12345
+
+        with self.assertRaises(RuntimeError):
+            get_access_token(invalid_runner)
+
+    def test_default_post_rest(self):
+        """Verifies default_post_rest sends HTTP POST with JSON body and bearer authentication."""
+        # Successful response
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"status": "DONE", "name": "op-1"}).encode("utf-8")
+        mock_response.__enter__.return_value = mock_response
+
+        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
+            resp = default_post_rest(
+                "https://compute.googleapis.com/test",
+                {"name": "test-neg"},
+                "bearer-token",
+            )
+            self.assertEqual(resp.get("status"), "DONE")
+            self.assertEqual(resp.get("name"), "op-1")
+
+            mock_urlopen.assert_called_once()
+            req = mock_urlopen.call_args[0][0]
+            self.assertEqual(req.get_method(), "POST")
+            self.assertEqual(req.headers.get("Authorization"), "Bearer bearer-token")
+            self.assertEqual(req.headers.get("Content-type"), "application/json")
+            self.assertEqual(json.loads(req.data.decode("utf-8")), {"name": "test-neg"})
+
+        # HTTP error response
+        error_file = io.BytesIO(b'{"error": {"message": "Invalid field"}}')
+        http_error = urllib.error.HTTPError(
+            url="https://compute.googleapis.com/test",
+            code=400,
+            msg="Bad Request",
+            hdrs=None,
+            fp=error_file,
+        )
+        with patch("urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(RuntimeError) as ctx:
+                default_post_rest(
+                    "https://compute.googleapis.com/test",
+                    {"name": "test-neg"},
+                    "bearer-token",
+                )
+            self.assertIn("Invalid field", str(ctx.exception))
+
+    def test_gcloud_cli_syntax(self):
+        """Validates all generated gcloud command arguments against gcloud --help if gcloud is installed."""
+        gcloud_bin = shutil.which("gcloud")
+        if not gcloud_bin:
+            self.skipTest("gcloud binary not available in environment")
+
+        fake = FakeGcloud()
+        provision_frontend(
+            project="test-project",
+            region="us-central1",
+            cluster_id="cluster-1",
+            namespace="default",
+            gateway_name="my-gw",
+            zones=["us-central1-a", "us-central1-b"],
+            runner=fake,
+        )
+        teardown_frontend(
+            project="test-project",
+            region="us-central1",
+            cluster_id="cluster-1",
+            namespace="default",
+            gateway_name="my-gw",
+            zones=["us-central1-a", "us-central1-b"],
+            runner=fake,
+        )
+
+        help_cache = {}
+        for cmd in fake.call_log:
+            if not cmd or cmd[0] != "compute":
+                continue
+
+            subcmd = ["compute", cmd[1], cmd[2]]
+            if len(cmd) >= 4 and cmd[1] == "health-checks" and cmd[2] == "create":
+                subcmd.append(cmd[3])
+
+            flags = [arg.split("=", 1)[0] for arg in cmd if arg.startswith("--")]
+
+            subcmd_key = tuple(subcmd)
+            if subcmd_key not in help_cache:
+                proc = subprocess.run(
+                    [gcloud_bin] + list(subcmd_key) + ["--help"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                help_cache[subcmd_key] = proc.stdout + proc.stderr
+
+            help_text = help_cache[subcmd_key]
+            for flag in flags:
+                self.assertIn(
+                    flag,
+                    help_text,
+                    f"Flag '{flag}' was not found in help text for {' '.join(subcmd)}",
+                )
 
 
 if __name__ == "__main__":

@@ -936,7 +936,7 @@ def main():
                 "--protocol=TCP",
                 f"--health-checks={hc_name}",
                 f"--timeout={args.draining_timeout}s",
-                f"--draining-timeout={args.draining_timeout}s",
+                f"--connection-draining-timeout={args.draining_timeout}s",
                 f"--project={project}",
             ])
 

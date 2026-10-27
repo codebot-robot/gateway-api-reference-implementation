@@ -17,6 +17,7 @@ package metadata
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -71,5 +72,19 @@ func TestSharedVectors(t *testing.T) {
 				t.Errorf("metadata does not match expected fields: %+v", parsed)
 			}
 		})
+	}
+}
+
+func TestPythonFrontendScripts(t *testing.T) {
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not found in PATH")
+	}
+
+	cmd := exec.Command(pythonPath, "-m", "unittest", "discover", "-s", filepath.Join("hack", "tests"))
+	cmd.Dir = filepath.Join("..", "..")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("python unit tests failed:\n%s", string(out))
 	}
 }

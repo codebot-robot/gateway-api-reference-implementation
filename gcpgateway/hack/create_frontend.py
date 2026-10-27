@@ -18,8 +18,11 @@
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -77,6 +80,45 @@ def default_run_gcloud(args: List[str], check: bool = True) -> Optional[Any]:
         return stdout
 
 
+def get_access_token(runner: Callable[[List[str], bool], Optional[Any]]) -> str:
+    """Retrieves an access token using gcloud auth print-access-token or environment variables."""
+    env_token = os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN") or os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN")
+    if env_token:
+        return env_token.strip()
+
+    token_info = runner(["auth", "print-access-token"], True)
+    if isinstance(token_info, dict):
+        token = token_info.get("access_token") or token_info.get("token")
+        if token:
+            return token.strip()
+    elif isinstance(token_info, str):
+        return token_info.strip().strip('"')
+    raise RuntimeError(f"Unable to extract access token from: {token_info}")
+
+
+def default_post_rest(url: str, body: Dict[str, Any], token: str) -> Dict[str, Any]:
+    """Posts a JSON payload to a Google Cloud REST API endpoint using an OAuth 2.0 Bearer token."""
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            content = resp.read().decode("utf-8")
+            return json.loads(content) if content else {}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"REST POST to {url} failed with status {e.code}:\n{error_body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"REST POST to {url} failed: {e.reason}") from e
+
+
 def provision_frontend(
     project: str,
     region: str,
@@ -89,8 +131,23 @@ def provision_frontend(
     draining_timeout: int = 35,
     zones: Optional[List[str]] = None,
     runner: Callable[[List[str], bool], Optional[Any]] = default_run_gcloud,
+    rest_poster: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Provisions all required GCP resources idempotently and returns the configuration dictionary."""
+    if rest_poster is None:
+        if hasattr(runner, "post_rest"):
+            rest_poster = runner.post_rest
+        else:
+            token: Optional[str] = None
+
+            def _poster(u: str, b: Dict[str, Any]) -> Dict[str, Any]:
+                nonlocal token
+                if token is None:
+                    token = get_access_token(runner)
+                return default_post_rest(u, b, token)
+
+            rest_poster = _poster
+
     if not zones:
         zone_info = runner(
             ["compute", "zones", "list", f"--filter=region:({region})", f"--project={project}"],
@@ -145,19 +202,23 @@ def provision_frontend(
         desc_neg = make_description(cluster_id, namespace, gateway_name, port)
         for zone in zones:
             if not runner(["compute", "network-endpoint-groups", "describe", neg_name, f"--zone={zone}", f"--project={project}"], False):
-                runner(
-                    [
-                        "compute", "network-endpoint-groups", "create", neg_name,
-                        f"--zone={zone}",
-                        "--network-endpoint-type=GCE_VM_IP_PORT",
-                        f"--network={network}",
-                        f"--subnet={subnet}",
-                        f"--default-port={port}",
-                        f"--description={desc_neg}",
-                        f"--project={project}",
-                    ],
-                    True,
-                )
+                url = f"https://compute.googleapis.com/compute/v1/projects/{project}/zones/{zone}/networkEndpointGroups"
+                net_url = network if ("/" in network) else f"projects/{project}/global/networks/{network}"
+                body: Dict[str, Any] = {
+                    "name": neg_name,
+                    "description": desc_neg,
+                    "networkEndpointType": "GCE_VM_IP_PORT",
+                    "defaultPort": port,
+                    "network": net_url,
+                }
+                if subnet:
+                    sub_url = subnet if ("/" in subnet) else f"projects/{project}/regions/{region}/subnetworks/{subnet}"
+                    body["subnetwork"] = sub_url
+
+                op = rest_poster(url, body)
+                op_name = op.get("name") if isinstance(op, dict) else None
+                if op_name and isinstance(op, dict) and op.get("status") != "DONE":
+                    runner(["compute", "operations", "wait", op_name, f"--zone={zone}", f"--project={project}"], False)
 
     # 4. Backend Services & Backends
     port_map = {443: 8443, 80: 8080}
@@ -174,7 +235,7 @@ def provision_frontend(
                     "--protocol=TCP",
                     f"--health-checks={hc_name}",
                     f"--timeout={draining_timeout}s",
-                    f"--draining-timeout={draining_timeout}s",
+                    f"--connection-draining-timeout={draining_timeout}s",
                     f"--description={desc_bs}",
                     f"--project={project}",
                 ],
