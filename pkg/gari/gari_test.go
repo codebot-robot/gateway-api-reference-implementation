@@ -34,6 +34,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxyproto"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -2256,5 +2257,651 @@ func TestGari_HealthProbeReadyz_And_DrainingSentinel(t *testing.T) {
 	gariReadyzHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200 OK after sentinel removed, got %d", rr.Code)
+	}
+}
+
+func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	var receivedXFF string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedXFF = r.Header.Get("X-Forwarded-For")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend ok"))
+	}))
+	defer backend.Close()
+
+	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split backend addr: %v", err)
+	}
+	var backendPort int
+	_, _ = fmt.Sscanf(backendPortStr, "%d", &backendPort)
+
+	p := proxy.NewProxy()
+
+	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: backendHost, Port: int32(backendPort), Weight: 1},
+				},
+			},
+		},
+	}
+
+	dpConfig := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
+		},
+		Routes:                    []state.InternalRoute{route},
+		ProxyProtocol:             "enabled",
+		ProxyProtocolTrustedCIDRs: []string{"127.0.0.0/8"},
+		AllowedSourceCIDRs:        []string{"127.0.0.0/8"},
+	}
+	configBytes, err := dpConfig.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+
+	gwName := "test-gw"
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer httpLis.Close()
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      gwName,
+			HTTPListener:              httpLis,
+			ProxyAddr:                 "",
+			ProxyHTTPSAddr:            "",
+			Scheme:                    scheme,
+		},
+		proxy: p,
+	}
+
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       secretName,
+		onConfigUpdate:   server.updateListenerFilters,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// 1. Reconcile Secret BEFORE StartProxyServers is invoked.
+	// This simulates a rollout where the config Secret already exists before the new pod's listeners are created.
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+	}
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// 2. Start proxy servers now (listeners created after secret sync).
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	// 3. Dial listener and send a PROXY v1 header followed by HTTP request.
+	conn, err := net.DialTimeout("tcp", httpLis.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial HTTP listener: %v", err)
+	}
+	defer conn.Close()
+
+	proxyHeader := "PROXY TCP4 203.0.113.195 127.0.0.1 54321 80\r\n"
+	httpRequest := "GET /ok HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	if _, err := conn.Write([]byte(proxyHeader + httpRequest)); err != nil {
+		t.Fatalf("failed to write PROXY header and request: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200 OK, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "backend ok" {
+		t.Errorf("expected 'backend ok' body, got %q", string(body))
+	}
+
+	if receivedXFF != "203.0.113.195" {
+		t.Errorf("expected X-Forwarded-For to match PROXY source IP 203.0.113.195, got %q", receivedXFF)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for StartProxyServers to stop")
+	}
+}
+
+func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("https backend ok"))
+	}))
+	defer backend.Close()
+
+	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split backend addr: %v", err)
+	}
+	var backendPort int
+	_, _ = fmt.Sscanf(backendPortStr, "%d", &backendPort)
+
+	p := proxy.NewProxy()
+
+	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: backendHost, Port: int32(backendPort), Weight: 1},
+				},
+			},
+		},
+	}
+
+	cert, err := GenerateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate cert: %v", err)
+	}
+	listeners := []state.InternalListener{
+		{Name: "https", Port: 443, Protocol: gatewayv1.HTTPSProtocolType, Routes: []state.InternalRoute{route}},
+	}
+	certsMap := map[string]*tls.Certificate{
+		"example.com": &cert,
+	}
+	dpConfig, err := state.BuildDataplaneConfig(gwKey, listeners, []state.InternalRoute{route}, certsMap, &cert, nil)
+	if err != nil {
+		t.Fatalf("BuildDataplaneConfig failed: %v", err)
+	}
+	dpConfig.ProxyProtocol = "enabled"
+	dpConfig.ProxyProtocolTrustedCIDRs = []string{"127.0.0.0/8"}
+	dpConfig.AllowedSourceCIDRs = []string{"127.0.0.0/8"}
+
+	configBytes, err := dpConfig.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+
+	gwName := "test-gw"
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+
+	httpsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer httpsLis.Close()
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      gwName,
+			HTTPSListener:             httpsLis,
+			ProxyAddr:                 "",
+			ProxyHTTPSAddr:            "",
+			Scheme:                    scheme,
+			DefaultCertificate:        &cert,
+		},
+		proxy: p,
+	}
+
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       secretName,
+		onConfigUpdate:   server.updateListenerFilters,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// 1. Reconcile Secret before StartProxyServers
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+	}
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// 2. Start proxy servers
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	// 3. Dial TCP, send PROXY v1 header, then perform TLS handshake
+	rawConn, err := net.DialTimeout("tcp", httpsLis.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial HTTPS listener: %v", err)
+	}
+	defer rawConn.Close()
+
+	proxyHeader := "PROXY TCP4 203.0.113.195 127.0.0.1 54321 443\r\n"
+	if _, err := rawConn.Write([]byte(proxyHeader)); err != nil {
+		t.Fatalf("failed to write PROXY header: %v", err)
+	}
+
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName:         "example.com",
+		InsecureSkipVerify: true,
+	})
+	defer tlsConn.Close()
+
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		t.Fatalf("TLS handshake failed (PROXY header likely not stripped): %v", err)
+	}
+
+	// Send HTTP request over TLS
+	httpRequest := "GET /ok HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	if _, err := tlsConn.Write([]byte(httpRequest)); err != nil {
+		t.Fatalf("failed to write HTTP request over TLS: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatalf("failed to read TLS response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200 OK, got %d", resp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for StartProxyServers to stop")
+	}
+}
+
+func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	backendHost, backendPortStr, err := net.SplitHostPort(backend.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to split backend addr: %v", err)
+	}
+	var backendPort int
+	_, _ = fmt.Sscanf(backendPortStr, "%d", &backendPort)
+
+	p := proxy.NewProxy()
+
+	gwKey := types.NamespacedName{Namespace: "test-ns", Name: "test-gw"}
+	route := state.InternalRoute{
+		Hostnames: []string{"example.com"},
+		Rules: []state.InternalRule{
+			{
+				Matches: []state.InternalMatch{
+					{Path: &state.InternalPathMatch{Type: gatewayv1.PathMatchExact, Value: "/ok"}},
+				},
+				Backends: []state.InternalBackend{
+					{Host: backendHost, Port: int32(backendPort), Weight: 1},
+				},
+			},
+		},
+	}
+
+	httpLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer httpLis.Close()
+
+	gwName := "test-gw"
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      gwName,
+			HTTPListener:              httpLis,
+			ProxyAddr:                 "",
+			ProxyHTTPSAddr:            "",
+			Scheme:                    scheme,
+		},
+		proxy: p,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// 1. Start proxy servers with initial/empty listener options (PROXY disabled)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.StartProxyServers(ctx)
+	}()
+
+	// Direct dial sending PROXY header should fail with 400 Bad Request because PROXY is not yet enabled
+	conn1, err := net.DialTimeout("tcp", httpLis.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	proxyHeader := "PROXY TCP4 203.0.113.195 127.0.0.1 54321 80\r\n"
+	httpRequest := "GET /ok HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	if _, err := conn1.Write([]byte(proxyHeader + httpRequest)); err != nil {
+		t.Fatalf("failed to write PROXY header and request: %v", err)
+	}
+	resp1, err := http.ReadResponse(bufio.NewReader(conn1), nil)
+	if err != nil {
+		t.Fatalf("failed to read response when PROXY is disabled: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request when PROXY is disabled, got %d", resp1.StatusCode)
+	}
+	_ = conn1.Close()
+
+	// 2. Now reconcile Secret enabling PROXY protocol
+	dpConfig := &state.DataplaneConfig{
+		GatewayName: gwKey,
+		Listeners: []state.InternalListener{
+			{Name: "http", Port: 80, Protocol: gatewayv1.HTTPProtocolType, Routes: []state.InternalRoute{route}},
+		},
+		Routes:                    []state.InternalRoute{route},
+		ProxyProtocol:             "enabled",
+		ProxyProtocolTrustedCIDRs: []string{"127.0.0.0/8"},
+	}
+	configBytes, err := dpConfig.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal config: %v", err)
+	}
+	secretName := singlepod.ResourceNameForGateway(gwName)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: configBytes,
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       secretName,
+		onConfigUpdate:   server.updateListenerFilters,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+	}
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// 3. Dial again with PROXY header: should now succeed with 200 OK
+	conn2, err := net.DialTimeout("tcp", httpLis.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer conn2.Close()
+
+	if _, err := conn2.Write([]byte(proxyHeader + httpRequest)); err != nil {
+		t.Fatalf("failed to write PROXY header: %v", err)
+	}
+	resp2, err := http.ReadResponse(bufio.NewReader(conn2), nil)
+	if err != nil {
+		t.Fatalf("failed to read response after dynamic update: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK after enabling PROXY, got %d", resp2.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for StartProxyServers to stop")
+	}
+}
+
+func TestDataplane_ConcurrentReconcileAndListenerInit(t *testing.T) {
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      "test-gw",
+		},
+		proxy: proxy.NewProxy(),
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(idx int) {
+			defer wg.Done()
+			if err := server.updateListenerFilters(proxyproto.ListenerOptions{
+				ProxyProtocol:             "enabled",
+				ProxyProtocolTrustedCIDRs: []string{"10.0.0.0/8"},
+				AllowedSourceCIDRs:        []string{"0.0.0.0/0"},
+			}); err != nil {
+				t.Errorf("updateListenerFilters failed: %v", err)
+			}
+		}(i)
+		go func(idx int) {
+			defer wg.Done()
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Errorf("net.Listen failed: %v", err)
+				return
+			}
+			defer lis.Close()
+			if idx%2 == 0 {
+				if _, err := server.initHTTPFilter(lis); err != nil {
+					t.Errorf("initHTTPFilter failed: %v", err)
+				}
+			} else {
+				if _, err := server.initHTTPSFilter(lis); err != nil {
+					t.Errorf("initHTTPSFilter failed: %v", err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	server.filterMu.Lock()
+	opts := server.listenerOptionsLocked()
+	hasHTTP := server.httpFilter != nil
+	hasHTTPS := server.httpsFilter != nil
+	server.filterMu.Unlock()
+
+	if opts.ProxyProtocol != "enabled" {
+		t.Errorf("expected ProxyProtocol to be enabled, got %q", opts.ProxyProtocol)
+	}
+	if !hasHTTP {
+		t.Errorf("expected httpFilter to be set")
+	}
+	if !hasHTTPS {
+		t.Errorf("expected httpsFilter to be set")
+	}
+}
+
+func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	p := proxy.NewProxy()
+
+	gwName := "test-gw"
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      gwName,
+		},
+		proxy: p,
+	}
+
+	// 1. Initial valid config
+	dpConfigValid := &state.DataplaneConfig{
+		GatewayName:               types.NamespacedName{Namespace: "test-ns", Name: gwName},
+		ProxyProtocol:             "enabled",
+		ProxyProtocolTrustedCIDRs: []string{"10.0.0.0/8"},
+		AllowedSourceCIDRs:        []string{"10.0.0.0/8"},
+	}
+	validBytes, err := dpConfigValid.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal valid config: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: validBytes,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       secretName,
+		onConfigUpdate:   server.updateListenerFilters,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: secretName},
+	}
+	if _, err := reconciler.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("initial valid reconcile failed: %v", err)
+	}
+
+	// Verify options were stored
+	server.filterMu.Lock()
+	opts := server.listenerOptionsLocked()
+	server.filterMu.Unlock()
+	if opts.ProxyProtocol != "enabled" || len(opts.AllowedSourceCIDRs) != 1 || opts.AllowedSourceCIDRs[0] != "10.0.0.0/8" {
+		t.Fatalf("unexpected stored options: %+v", opts)
+	}
+
+	// 2. Secret updated with invalid CIDR
+	dpConfigInvalid := &state.DataplaneConfig{
+		GatewayName:               types.NamespacedName{Namespace: "test-ns", Name: gwName},
+		ProxyProtocol:             "enabled",
+		ProxyProtocolTrustedCIDRs: []string{"not-a-valid-cidr"},
+		AllowedSourceCIDRs:        []string{"invalid-cidr"},
+	}
+	invalidBytes, err := dpConfigInvalid.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal invalid config: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = invalidBytes
+	if err := cl.Update(t.Context(), secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// Reconcile should fail with an error
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err == nil {
+		t.Fatalf("expected Reconcile to fail for invalid CIDR, but succeeded")
+	}
+
+	// Verify old valid options are preserved and invalid ones were not stored
+	server.filterMu.Lock()
+	optsAfter := server.listenerOptionsLocked()
+	server.filterMu.Unlock()
+	if optsAfter.ProxyProtocol != "enabled" || len(optsAfter.AllowedSourceCIDRs) != 1 || optsAfter.AllowedSourceCIDRs[0] != "10.0.0.0/8" {
+		t.Errorf("expected previous valid options to be preserved, got %+v", optsAfter)
 	}
 }

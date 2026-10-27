@@ -22,7 +22,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -312,26 +314,87 @@ func (o *Options) complete() error {
 
 // Server encapsulates GARI components: state, proxy, manager, and proxy servers.
 type Server struct {
-	opts        Options
-	manager     ctrl.Manager
-	state       *state.State
-	proxy       *proxy.Proxy
+	opts Options
+
+	manager ctrl.Manager
+	state   *state.State
+	proxy   *proxy.Proxy
+
 	proxySynced atomic.Bool
-	httpFilter  *proxyproto.Listener
-	httpsFilter *proxyproto.Listener
+
+	// filterMu guards listenerOpts, httpFilter, and httpsFilter.
+	filterMu     sync.Mutex
+	listenerOpts *proxyproto.ListenerOptions
+	httpFilter   *proxyproto.Listener
+	httpsFilter  *proxyproto.Listener
 }
 
-func (s *Server) updateListenerFilters(opts proxyproto.ListenerOptions) {
+func (s *Server) listenerOptionsLocked() proxyproto.ListenerOptions {
+	if s.listenerOpts != nil {
+		return *s.listenerOpts
+	}
+	return proxyproto.ListenerOptions{
+		AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
+		ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
+		ProxyProtocol:             s.opts.ProxyProtocol,
+	}
+}
+
+func (s *Server) updateListenerFilters(opts proxyproto.ListenerOptions) error {
+	if _, err := proxyproto.ParseCIDRs(opts.AllowedSourceCIDRs); err != nil {
+		return fmt.Errorf("parsing allowedSourceCIDRs: %w", err)
+	}
+	if _, err := proxyproto.ParseCIDRs(opts.ProxyProtocolTrustedCIDRs); err != nil {
+		return fmt.Errorf("parsing proxyProtocolTrustedCIDRs: %w", err)
+	}
+
+	s.filterMu.Lock()
+	defer s.filterMu.Unlock()
+
+	cloned := opts
+	if opts.AllowedSourceCIDRs != nil {
+		cloned.AllowedSourceCIDRs = slices.Clone(opts.AllowedSourceCIDRs)
+	}
+	if opts.ProxyProtocolTrustedCIDRs != nil {
+		cloned.ProxyProtocolTrustedCIDRs = slices.Clone(opts.ProxyProtocolTrustedCIDRs)
+	}
+	s.listenerOpts = &cloned
+
 	if s.httpFilter != nil {
-		if err := s.httpFilter.UpdateOptions(opts); err != nil {
+		if err := s.httpFilter.UpdateOptions(cloned); err != nil {
 			setupLog.Error(err, "failed to update HTTP listener options")
 		}
 	}
 	if s.httpsFilter != nil {
-		if err := s.httpsFilter.UpdateOptions(opts); err != nil {
+		if err := s.httpsFilter.UpdateOptions(cloned); err != nil {
 			setupLog.Error(err, "failed to update HTTPS listener options")
 		}
 	}
+	return nil
+}
+
+func (s *Server) initHTTPFilter(lis net.Listener) (*proxyproto.Listener, error) {
+	s.filterMu.Lock()
+	defer s.filterMu.Unlock()
+
+	filterLis, err := proxyproto.NewListener(lis, s.listenerOptionsLocked())
+	if err != nil {
+		return nil, err
+	}
+	s.httpFilter = filterLis
+	return filterLis, nil
+}
+
+func (s *Server) initHTTPSFilter(lis net.Listener) (*proxyproto.Listener, error) {
+	s.filterMu.Lock()
+	defer s.filterMu.Unlock()
+
+	filterLis, err := proxyproto.NewListener(lis, s.listenerOptionsLocked())
+	if err != nil {
+		return nil, err
+	}
+	s.httpsFilter = filterLis
+	return filterLis, nil
 }
 
 // State returns the internal state store.
@@ -591,7 +654,7 @@ type dataplaneSecretReconciler struct {
 	proxySynced      *atomic.Bool
 	gatewayNamespace string
 	secretName       string
-	onConfigUpdate   func(opts proxyproto.ListenerOptions)
+	onConfigUpdate   func(opts proxyproto.ListenerOptions) error
 }
 
 func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -627,7 +690,9 @@ func (r *dataplaneSecretReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			ProxyProtocol:             dpCfg.ProxyProtocol,
 			ProxyProtocolTrustedCIDRs: dpCfg.ProxyProtocolTrustedCIDRs,
 		}
-		r.onConfigUpdate(opts)
+		if err := r.onConfigUpdate(opts); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update listener filters: %w", err)
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -726,18 +791,13 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				}
 			}
 
-			filterLis, err := proxyproto.NewListener(lis, proxyproto.ListenerOptions{
-				AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
-				ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
-				ProxyProtocol:             s.opts.ProxyProtocol,
-			})
+			filterLis, err := s.initHTTPFilter(lis)
 			if err != nil {
 				if closeErr := lis.Close(); closeErr != nil {
 					klog.V(4).Infof("closing HTTP listener: %v", closeErr)
 				}
 				return fmt.Errorf("failed to create HTTP listener filter: %w", err)
 			}
-			s.httpFilter = filterLis
 
 			setupLog.Info("starting proxy server", "addr", filterLis.Addr().String())
 			var handler http.Handler = s.proxy
@@ -806,18 +866,13 @@ func (s *Server) StartProxyServers(ctx context.Context) error {
 				}
 			}
 
-			filterLis, err := proxyproto.NewListener(lis, proxyproto.ListenerOptions{
-				AllowedSourceCIDRs:        s.opts.AllowedSourceCIDRs,
-				ProxyProtocolTrustedCIDRs: s.opts.ProxyProtocolTrustedCIDRs,
-				ProxyProtocol:             s.opts.ProxyProtocol,
-			})
+			filterLis, err := s.initHTTPSFilter(lis)
 			if err != nil {
 				if closeErr := lis.Close(); closeErr != nil {
 					klog.V(4).Infof("closing HTTPS listener: %v", closeErr)
 				}
 				return fmt.Errorf("failed to create HTTPS listener filter: %w", err)
 			}
-			s.httpsFilter = filterLis
 
 			setupLog.Info("starting proxy HTTPS server", "addr", filterLis.Addr().String())
 
