@@ -68,7 +68,7 @@ The header fields contain the following values:
 - **Logical Page Number (8 bytes):** The logical page identifier for this block.
 - **LSN (8 bytes):** The log sequence number of the most recent modification to this page.
 - **Block Index (4 bytes):** The index of this block within the page, ranging from 0 to `NumBlocks - 1`.
-- **Num Blocks (4 bytes):** The total count of blocks in the page. This value is a power of two from 1 to 512.
+- **Num Blocks (4 bytes):** The total count of blocks in the page. This value is 1 for a slotted page and a power of two from 2 to 512 for a multi-block page.
 
 Each block provides 4064 bytes of usable data space (`BlockSize - BlockHeaderSize`).
 
@@ -102,7 +102,7 @@ When active payloads fragment space, the engine compacts the page. Compaction sl
 
 ### Multi-Block Page
 
-A multi-block page stores a single large record across a power-of-two block run ($2^k$ blocks, from 1 to 512 blocks, up to 2 MiB, as produced by `CalculateMultiBlockCount`).
+A multi-block page stores a single large record across a power-of-two block run ($2^k$ blocks, from 2 to 512 blocks, up to 2 MiB, as produced by `CalculateMultiBlockCount`).
 
 The format distributes the record across the block run:
 - Every block in the run begins with the 32-byte block header. Each block header carries the page's logical page number, LSN, total block count ($2^k$), and individual block index ($0$ through $2^k - 1$).
@@ -114,6 +114,16 @@ The format distributes the record across the block run:
   - `Payload`: Raw or compressed value bytes.
   Because the engine writes this data as a single continuous stream, both the key and the payload can cross block boundaries.
 - The in-memory key index maps the record to its logical page number and record slot 0.
+
+### Record Placement
+
+The engine stores each record in one of three locations based on the full record size (record header, key, and stored payload):
+
+- **Slotted page:** A record goes into a slotted page if it fits in an empty one (up to 4052 bytes of usable record space).
+- **Multi-block page:** Otherwise, if the record fits across 512 blocks (up to 2 MiB), it goes into a power-of-two multi-block page spanning 2 to 512 blocks. A 1-block multi-block page is not allowed because recovery treats any block with a block count of 1 as a slotted page.
+- **Oversize store:** Otherwise, records exceeding 512 blocks bypass the block heap and reside in the oversize store, written as individual files (one file per key) in the `oversize/` directory.
+
+Record placement depends on the stored size after compression and payload encryption. An update to an existing key may compress differently or change payload size, allowing the record to move between page types or into the oversize store. When a key moves to a different page type or storage location on an update, the engine must clear its previous location (deleting the old slot, writing an empty page tombstone, or removing the old oversize file) to prevent stale data from lingering or resurrecting.
 
 ### WAL Segment Header
 
@@ -197,7 +207,7 @@ Every block run of order $k$ ($2^k$ blocks) allocated by the buddy allocator beg
 
 The engine maintains natural alignment for two reasons:
 1. **Identifying page starts:** The recovery scanner can tell where a page starts only from alignment. Because every block in a multi-block page carries a self-describing header, inner blocks of a larger run or leftover payload bytes could otherwise masquerade as the start of a smaller page. Enforcing natural alignment rejects misidentified starts immediately and ensures candidate runs do not cross allocation boundaries.
-2. **Buddy allocator operations:** The buddy allocator requires natural alignment to split larger blocks and merge adjacent buddies. Allocator reconstruction during recovery marks winning runs as allocated, and unaligned block numbers would corrupt the allocator's tree structure.
+2. **Buddy allocator operations:** The buddy allocator requires natural alignment to split larger block runs and merge adjacent buddy runs. Allocator reconstruction during recovery marks winning runs as allocated, and unaligned block numbers would corrupt the allocator's tree structure.
 
 ### 4. Immutability of Fsynced WAL Blocks
 
@@ -247,7 +257,7 @@ The engine serializes mutating operations (`Put`, `Delete`). A single active wri
 
 ### Non-Blocking Checkpointing
 
-The checkpointer runs concurrently with user writes. It does not serialize behind the engine writer lock. Instead, the checkpointer snapshots dirty page state and flushed locations under brief block pool synchronization, flushes dirty pages in the background, invokes heap fsync, and appends a checkpoint record to the WAL.
+The checkpointer runs concurrently with user writes. It does not serialize behind the engine writer lock. Instead, the checkpointer snapshots dirty page state and flushed locations under brief block pool synchronization, flushes dirty pages itself while writes continue, invokes heap fsync, and appends a checkpoint record to the WAL.
 
 ### Synchronization Boundaries
 
