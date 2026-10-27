@@ -66,6 +66,10 @@ type H2ChunkQueue struct {
 	closeErr      error
 	readDeadline  time.Time
 	writeDeadline time.Time
+
+	// OnWriteAccepted, if non-nil, is invoked after bytes have been accepted into the queue
+	// before Write returns.
+	OnWriteAccepted func(n int)
 }
 
 // NewH2ChunkQueue constructs an H2ChunkQueue with the given byte bound.
@@ -142,16 +146,18 @@ func (q *H2ChunkQueue) Write(b []byte) (int, error) {
 	}
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 
 	for {
 		if q.closed {
-			if q.closeErr != nil {
-				return 0, q.closeErr
+			err := q.closeErr
+			if err == nil {
+				err = net.ErrClosed
 			}
-			return 0, net.ErrClosed
+			q.mu.Unlock()
+			return 0, err
 		}
 		if !q.writeDeadline.IsZero() && !time.Now().Before(q.writeDeadline) {
+			q.mu.Unlock()
 			return 0, os.ErrDeadlineExceeded
 		}
 		if q.queuedBytes == 0 || q.queuedBytes+len(b) <= q.maxBytes {
@@ -168,6 +174,12 @@ func (q *H2ChunkQueue) Write(b []byte) (int, error) {
 
 	if wasEmpty {
 		q.cond.Signal()
+	}
+	hook := q.OnWriteAccepted
+	q.mu.Unlock()
+
+	if hook != nil {
+		hook(len(b))
 	}
 	return len(b), nil
 }

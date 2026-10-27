@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -152,6 +153,83 @@ func TestH2Transport_LeastLoadedSelection(t *testing.T) {
 	}
 }
 
+type delayedFailConn struct {
+	net.Conn
+	mu          sync.Mutex
+	failTrigger bool
+	headersSeen chan struct{}
+	headersDone sync.Once
+	readErrSeen chan struct{}
+	readErrOnce sync.Once
+	selected    atomic.Bool
+}
+
+func newDelayedFailConn(c net.Conn) *delayedFailConn {
+	return &delayedFailConn{
+		Conn:        c,
+		headersSeen: make(chan struct{}),
+		readErrSeen: make(chan struct{}),
+	}
+}
+
+func (d *delayedFailConn) triggerFailAfterHeaders() {
+	d.mu.Lock()
+	d.failTrigger = true
+	d.mu.Unlock()
+}
+
+func (d *delayedFailConn) triggerFailNow() {
+	d.mu.Lock()
+	d.failTrigger = true
+	d.headersDone.Do(func() {
+		close(d.headersSeen)
+	})
+	d.mu.Unlock()
+	_ = d.Conn.Close()
+}
+
+func (d *delayedFailConn) Read(b []byte) (int, error) {
+	d.mu.Lock()
+	triggered := d.failTrigger
+	d.mu.Unlock()
+
+	if triggered {
+		<-d.headersSeen
+		d.readErrOnce.Do(func() {
+			close(d.readErrSeen)
+		})
+		return 0, net.ErrClosed
+	}
+
+	n, err := d.Conn.Read(b)
+	if err != nil {
+		d.readErrOnce.Do(func() {
+			close(d.readErrSeen)
+		})
+	}
+	return n, err
+}
+
+func (d *delayedFailConn) Write(b []byte) (int, error) {
+	d.mu.Lock()
+	triggered := d.failTrigger
+	d.mu.Unlock()
+
+	if triggered {
+		d.selected.Store(true)
+		// Let the CONNECT request HEADERS frame be written successfully to wire
+		n, err := d.Conn.Write(b)
+		// Trigger the failure right as headers are written so 0-RTT returns streamConn on c1
+		d.headersDone.Do(func() {
+			close(d.headersSeen)
+			_ = d.Conn.Close()
+		})
+		return n, err
+	}
+
+	return d.Conn.Write(b)
+}
+
 func TestH2Transport_FailoverBeforeFirstByte(t *testing.T) {
 	// Mock handler that echoes data
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -183,6 +261,504 @@ func TestH2Transport_FailoverBeforeFirstByte(t *testing.T) {
 	h2Tr.RegisterSession(sessID)
 
 	// Dial 2 pooled connections
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	// Trigger delayed failure on c1: socket is closed, but read error detection is delayed
+	// until after GetConn selects c1 and writes CONNECT headers.
+	c1.triggerFailAfterHeaders()
+
+	// Immediately request a connection mid-burst; GetConn should failover
+	// to c2 before first byte without failing
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("expected failover to succeed, got error: %v", err)
+	}
+	defer stream.Close()
+
+	// Wait for c1's socket closure error to surface to its client conn
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Write and read first byte to verify stream is fully functional
+	if _, err := stream.Write([]byte("ping")); err != nil {
+		t.Fatalf("stream.Write failed: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatalf("stream.Read failed: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("expected ping echo, got %s", string(buf))
+	}
+	if !c1.selected.Load() {
+		t.Fatal("expected c1 to be initially selected before failover")
+	}
+}
+
+func TestH2Transport_FailoverBeforeFirstByte_ReadFirst(t *testing.T) {
+	// Mock handler that greets on connect
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = w.Write([]byte("welcome"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-failover-read"
+	h2Tr.RegisterSession(sessID)
+
+	// Dial 2 pooled connections
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	c1.triggerFailAfterHeaders()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("expected failover to succeed, got error: %v", err)
+	}
+	defer stream.Close()
+
+	// Read first without writing anything: verify transparent reopen on c2
+	buf := make([]byte, 7)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatalf("stream.Read failed: %v", err)
+	}
+	if string(buf) != "welcome" {
+		t.Fatalf("expected welcome, got %s", string(buf))
+	}
+	if !c1.selected.Load() {
+		t.Fatal("expected c1 to be initially selected before failover")
+	}
+}
+
+func TestH2Transport_CommittedStreamSurfacesError(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-committed"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Perform initial write and read to commit stream and confirm 200 OK
+	if _, err := stream.Write([]byte("ping")); err != nil {
+		t.Fatalf("stream.Write failed: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(stream, buf); err != nil {
+		t.Fatalf("stream.Read failed: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("got %s, want ping", string(buf))
+	}
+
+	// Trigger failure on c1's socket AFTER body bytes have been queued and stream committed
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Further writes or reads on this stream must surface the error, not reopen
+	_, writeErr := stream.Write([]byte("more-data"))
+	_, readErr := stream.Read(buf)
+	if writeErr == nil && readErr == nil {
+		t.Error("expected error on stream after underlying connection closed post-commit, but both Write and Read succeeded")
+	}
+
+	// Verify c2 was not used for a reopen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c2 {
+			if load := c.Load(); load != 0 {
+				t.Errorf("expected c2 to have 0 streams, got %d", load)
+			}
+		}
+	}
+}
+
+func TestH2Transport_Non200ResponseDoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			connectCount.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			return
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-non200"
+	h2Tr.RegisterSession(sessID)
+
+	// Add 3 pooled connections
+	var pooledConns []net.Conn
+	defer func() {
+		for _, c := range pooledConns {
+			_ = c.Close()
+		}
+	}()
+	for i := 0; i < 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial %d failed: %v", i, err)
+		}
+		pooledConns = append(pooledConns, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn %d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err == nil {
+		defer stream.Close()
+		buf := make([]byte, 16)
+		_, err = stream.Read(buf)
+	}
+
+	if err == nil {
+		t.Fatal("expected non-200 error from CONNECT, got nil")
+	}
+
+	// Assert exactly 1 CONNECT was sent (no reopen attempts)
+	if count := connectCount.Load(); count != 1 {
+		t.Fatalf("expected exactly 1 CONNECT request, got %d", count)
+	}
+
+	// Assert pool size remains 3 (no connection was drained)
+	conns := h2Tr.SessionConns(sessID)
+	if len(conns) != 3 {
+		t.Fatalf("expected pool size to remain 3, got %d", len(conns))
+	}
+}
+
+func TestH2Transport_FailedReopenReturnsErrorAndDoesNotHang(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-failed-reopen"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	// GetConn returns streamConn on c1 with 0-RTT
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Kill c1 before any body bytes are queued
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Set a short read deadline so reopen fails fast (no other pooled conns exist)
+	_ = stream.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
+	buf := make([]byte, 10)
+	_, rerr := stream.Read(buf)
+	if rerr == nil {
+		t.Fatal("expected error from failed reopen, got nil")
+	}
+
+	// Clear deadline: verify a second Read does not hang waiting on respCh
+	_ = stream.SetReadDeadline(time.Time{})
+	secondReadDone := make(chan error, 1)
+	go func() {
+		_, err := stream.Read(buf)
+		secondReadDone <- err
+	}()
+
+	select {
+	case err := <-secondReadDone:
+		if err == nil {
+			t.Fatal("expected second Read to return error, got nil")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("second stream.Read hung indefinitely waiting on respCh")
+	}
+}
+
+func TestH2Transport_ConcurrentFirstReadAndWrite_ResultArrivesWhileWaiting(t *testing.T) {
+	resultGate := make(chan struct{})
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		// Hold response until both Read and Write are waiting
+		<-resultGate
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-concurrent-waiting"
+	h2Tr.RegisterSession(sessID)
+
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer c1.Close()
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	readDone := make(chan error, 1)
+	readStarted := make(chan struct{})
+	buf := make([]byte, 4)
+	go func() {
+		close(readStarted)
+		_, rerr := io.ReadFull(stream, buf)
+		readDone <- rerr
+	}()
+
+	writeDone := make(chan error, 1)
+	writeStarted := make(chan struct{})
+	go func() {
+		close(writeStarted)
+		_, werr := stream.Write([]byte("ping"))
+		writeDone <- werr
+	}()
+
+	<-readStarted
+	<-writeStarted
+
+	// Give both goroutines time to reach their wait on att.done / pollResult
+	time.Sleep(10 * time.Millisecond)
+
+	// Release the response: att.done will close while both Read and Write are waiting
+	close(resultGate)
+
+	select {
+	case werr := <-writeDone:
+		if werr != nil {
+			t.Fatalf("stream.Write failed: %v", werr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Write hung waiting for response")
+	}
+
+	select {
+	case rerr := <-readDone:
+		if rerr != nil {
+			t.Fatalf("stream.Read failed: %v", rerr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Read hung waiting for response")
+	}
+
+	if string(buf) != "ping" {
+		t.Fatalf("expected ping echo, got %s", string(buf))
+	}
+}
+
+func TestH2Transport_QueueClosedBeforeFirstWrite_Reopens(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-queue-closed-first-write"
+	h2Tr.RegisterSession(sessID)
+
 	c1, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("Dial c1 failed: %v", err)
@@ -201,30 +777,268 @@ func TestH2Transport_FailoverBeforeFirstByte(t *testing.T) {
 		t.Fatalf("AddConn c2 failed: %v", err)
 	}
 
-	// Kill c1 abruptly by closing its raw socket
-	_ = c1.Close()
-
-	// Immediately request a connection mid-burst; GetConn should failover
-	// to c2 before first byte without failing
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	stream, err := h2Tr.GetConn(ctx, sessID)
 	if err != nil {
-		t.Fatalf("expected failover to succeed, got error: %v", err)
+		t.Fatalf("GetConn failed: %v", err)
 	}
 	defer stream.Close()
 
-	// Write and read first byte to verify stream is fully functional
+	// Simulate queue being closed/aborted right before the first queued write:
+	// zero bytes have been accepted into the queue
+	h2sc := stream.(*h2StreamConn)
+	att := h2sc.attempt.Load()
+	att.queue.Abort(net.ErrClosed)
+
+	// Write must recognize that 0 bytes were accepted and transparently reopen on c2
 	if _, err := stream.Write([]byte("ping")); err != nil {
-		t.Fatalf("stream.Write failed: %v", err)
+		t.Fatalf("stream.Write failed to reopen: %v", err)
 	}
+
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(stream, buf); err != nil {
 		t.Fatalf("stream.Read failed: %v", err)
 	}
 	if string(buf) != "ping" {
+		t.Fatalf("expected ping echo from reopened connection, got %s", string(buf))
+	}
+
+	// Verify the active attempt was swapped to a new attempt
+	if h2sc.attempt.Load() == att {
+		t.Fatal("expected attempt to be replaced after transparent reopen")
+	}
+}
+
+func TestH2Transport_ConcurrentFirstReadAndWrite_Failover(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-concurrent-failover"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Kill c1 before first byte
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	readDone := make(chan error, 1)
+	buf := make([]byte, 4)
+	go func() {
+		_, rerr := io.ReadFull(stream, buf)
+		readDone <- rerr
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, werr := stream.Write([]byte("ping"))
+		writeDone <- werr
+	}()
+
+	select {
+	case werr := <-writeDone:
+		if werr != nil {
+			t.Fatalf("stream.Write failed during concurrent failover: %v", werr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Write hung during concurrent failover")
+	}
+
+	select {
+	case rerr := <-readDone:
+		if rerr != nil {
+			t.Fatalf("stream.Read failed during concurrent failover: %v", rerr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Read hung during concurrent failover")
+	}
+
+	if string(buf) != "ping" {
 		t.Fatalf("expected ping echo, got %s", string(buf))
+	}
+}
+
+func TestH2Transport_ConcurrentFirstWriteAccepted_ReadDoesNotReopen(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-write-accepted-no-reopen"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	h2sc := stream.(*h2StreamConn)
+	att := h2sc.attempt.Load()
+
+	bytesAccepted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	att.queue.OnWriteAccepted = func(n int) {
+		close(bytesAccepted)
+		<-releaseWrite
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, werr := stream.Write([]byte("ping"))
+		writeDone <- werr
+	}()
+
+	// Wait until the write has accepted bytes into the queue and is held
+	<-bytesAccepted
+
+	// Fail the transport on c1 while the first write is held inside the queue
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Concurrent Read runs while first write is held: it must wait for the write
+	// and must NOT reopen because bytes were already accepted.
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 10)
+		_, rerr := stream.Read(buf)
+		readDone <- rerr
+	}()
+
+	// Small pause to ensure Read has reached awaitResponse and is waiting on firstWriting
+	time.Sleep(10 * time.Millisecond)
+
+	// Release the held write
+	close(releaseWrite)
+
+	// Write must complete
+	select {
+	case werr := <-writeDone:
+		_ = werr
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Write hung")
+	}
+
+	// Read must return an error and MUST NOT have reopened on c2
+	select {
+	case rerr := <-readDone:
+		if rerr == nil {
+			t.Fatal("expected Read to fail with error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream.Read hung")
+	}
+
+	// Assert c2 has 0 streams (no reopen was attempted!)
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c2 {
+			if load := c.Load(); load != 0 {
+				t.Fatalf("expected c2 load to be 0 (no reopen), got %d", load)
+			}
+		}
+	}
+
+	// Assert the stream attempt is still att (not replaced!)
+	if h2sc.attempt.Load() != att {
+		t.Fatal("stream attempt was unexpectedly replaced; reopen occurred after bytes were accepted")
 	}
 }
 
@@ -292,7 +1106,7 @@ func TestH2Transport_GOAWAYDrain(t *testing.T) {
 	}
 
 	// Verify new GetConn on this session does NOT pick the draining conn (queues or times out)
-	shortCtx, shortCancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 15*time.Millisecond)
 	_, err = h2Tr.GetConn(shortCtx, sessID)
 	shortCancel()
 	if err == nil {
@@ -385,7 +1199,7 @@ func TestH2Transport_MaxConcurrentStreamsQueuing(t *testing.T) {
 	select {
 	case <-queuedDone:
 		t.Fatalf("3rd stream should have queued behind MaxConcurrentStreams limit, but returned immediately")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(20 * time.Millisecond):
 		// Expected to queue
 	}
 
@@ -415,7 +1229,7 @@ func TestH2Transport_IdlePing(t *testing.T) {
 	defer cleanup()
 
 	// Use very short ping interval for test
-	h2Tr := NewH2Transport(WithH2PingInterval(50 * time.Millisecond))
+	h2Tr := NewH2Transport(WithH2PingInterval(10 * time.Millisecond))
 	defer h2Tr.Close()
 
 	sessID := "sess-idle-ping"
@@ -431,7 +1245,7 @@ func TestH2Transport_IdlePing(t *testing.T) {
 	}
 
 	// Allow several pings to execute on idle connection
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
 
 	conns := h2Tr.sessions[sessID]
 	if len(conns) != 1 {
@@ -448,21 +1262,22 @@ func TestH2StreamConn_WriteToAndReadFrom(t *testing.T) {
 		_, _ = io.Copy(io.Discard, queue)
 	}()
 
-	respCh := make(chan rtResult, 1)
 	prRes, pwRes := io.Pipe()
 
-	respCh <- rtResult{
+	streamCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	conn := newH2StreamConn(queue, cancel, &net.TCPAddr{Port: 1234}, &net.TCPAddr{Port: 5678}, nil, nil)
+	att := conn.attempt.Load()
+	att.result = &rtResult{
 		res: &http.Response{
 			StatusCode: http.StatusOK,
 			Status:     "200 OK",
 			Body:       prRes,
 		},
 	}
-
-	streamCtx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	conn := newH2StreamConn(queue, respCh, cancel, &net.TCPAddr{Port: 1234}, &net.TCPAddr{Port: 5678}, nil)
+	att.resBody = prRes
+	close(att.done)
 	defer conn.Close()
 
 	// Verify WriteTo
@@ -517,12 +1332,11 @@ func TestH2StreamConn_WriteToAndReadFrom(t *testing.T) {
 
 func TestH2StreamConn_StreamingProbe(t *testing.T) {
 	queue := api.NewH2ChunkQueue(api.DefaultH2StreamQueueBound)
-	respCh := make(chan rtResult, 1)
 
 	_, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	conn := newH2StreamConn(queue, respCh, cancel, nil, nil, nil)
+	conn := newH2StreamConn(queue, cancel, nil, nil, nil, nil)
 	defer conn.Close()
 
 	// Probe: a 13-byte Write without concurrent Read is delivered within a few ms
@@ -549,12 +1363,11 @@ func TestH2StreamConn_StreamingProbe(t *testing.T) {
 func TestH2StreamConn_BackpressureAndClose(t *testing.T) {
 	bound := 64 * 1024
 	queue := api.NewH2ChunkQueue(bound)
-	respCh := make(chan rtResult, 1)
 
 	_, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	conn := newH2StreamConn(queue, respCh, cancel, nil, nil, nil)
+	conn := newH2StreamConn(queue, cancel, nil, nil, nil, nil)
 
 	// Write up to queue bound
 	chunk := make([]byte, 16*1024)
@@ -609,14 +1422,22 @@ func TestH2Transport_ReadsNeverWaitOnWrites(t *testing.T) {
 		_, cancelReq := context.WithCancel(r.Context())
 		defer cancelReq()
 		sConn := tunnel.NewServerStreamConn(w, r.Body, cancelReq, nil)
-		defer sConn.Close()
-		go sConn.RunDrainLoop()
+		var drainDone sync.WaitGroup
+		drainDone.Add(1)
+		defer func() {
+			sConn.Close()
+			drainDone.Wait()
+		}()
+		go func() {
+			defer drainDone.Done()
+			sConn.RunDrainLoop()
+		}()
 
 		// Background writer: continuously write until writes stall (flow-control window + queue filled)
 		go func() {
 			bigChunk := make([]byte, 64*1024)
 			for {
-				_ = sConn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				_ = sConn.SetWriteDeadline(time.Now().Add(25 * time.Millisecond))
 				_, err := sConn.Write(bigChunk)
 				if err != nil {
 					// Write stalled on flow control / deadline!
