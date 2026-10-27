@@ -48,6 +48,7 @@ class FakeGcloud:
         # Key: (resource_type, name, scope) -> dict
         self.store: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self.call_log: List[List[str]] = []
+        self.operation_errors: Dict[str, Any] = {}
 
     def post_rest(self, url: str, body: Dict[str, Any]) -> Dict[str, Any]:
         self.call_log.append(["POST", url, json.dumps(body)])
@@ -78,6 +79,9 @@ class FakeGcloud:
         action = args[2]
 
         if res_type == "operations" and action == "wait":
+            op_name = args[3] if len(args) > 3 else ""
+            if op_name in self.operation_errors:
+                return {"status": "DONE", "error": self.operation_errors[op_name]}
             return {"status": "DONE"}
 
         if res_type == "zones" and action == "list":
@@ -198,6 +202,7 @@ class TestFrontendScripts(unittest.TestCase):
             gateway_name="my-gw",
             zones=["us-central1-a", "us-central1-b"],
             runner=fake,
+            rest_poster=fake.post_rest,
         )
 
         self.assertEqual(cfg1["ip_address"], "34.120.254.10")
@@ -218,6 +223,7 @@ class TestFrontendScripts(unittest.TestCase):
             gateway_name="my-gw",
             zones=["us-central1-a", "us-central1-b"],
             runner=fake,
+            rest_poster=fake.post_rest,
         )
 
         self.assertEqual(cfg1, cfg2)
@@ -361,6 +367,7 @@ class TestFrontendScripts(unittest.TestCase):
             gateway_name="my-gw",
             zones=["us-central1-a", "us-central1-b"],
             runner=fake,
+            rest_poster=fake.post_rest,
         )
         teardown_frontend(
             project="test-project",
@@ -400,6 +407,57 @@ class TestFrontendScripts(unittest.TestCase):
                     help_text,
                     f"Flag '{flag}' was not found in help text for {' '.join(subcmd)}",
                 )
+
+    def test_neg_creation_error_immediate(self):
+        """Verifies provision_frontend raises RuntimeError when NEG creation returns DONE with an error."""
+        fake = FakeGcloud()
+
+        def failing_poster(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "status": "DONE",
+                "error": {
+                    "errors": [{"message": "Subnet does not exist"}]
+                },
+            }
+
+        with self.assertRaises(RuntimeError) as ctx:
+            provision_frontend(
+                project="test-project",
+                region="us-central1",
+                cluster_id="cluster-1",
+                namespace="default",
+                gateway_name="my-gw",
+                zones=["us-central1-a"],
+                runner=fake,
+                rest_poster=failing_poster,
+            )
+        self.assertIn("Subnet does not exist", str(ctx.exception))
+
+    def test_neg_creation_error_async(self):
+        """Verifies provision_frontend raises RuntimeError when operation wait returns an error."""
+        fake = FakeGcloud()
+        fake.operation_errors["op-async-fail"] = {
+            "errors": [{"message": "Quota exceeded"}]
+        }
+
+        def async_poster(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "status": "RUNNING",
+                "name": "op-async-fail",
+            }
+
+        with self.assertRaises(RuntimeError) as ctx:
+            provision_frontend(
+                project="test-project",
+                region="us-central1",
+                cluster_id="cluster-1",
+                namespace="default",
+                gateway_name="my-gw",
+                zones=["us-central1-a"],
+                runner=fake,
+                rest_poster=async_poster,
+            )
+        self.assertIn("Quota exceeded", str(ctx.exception))
 
 
 if __name__ == "__main__":

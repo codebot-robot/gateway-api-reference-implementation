@@ -93,9 +93,14 @@ def get_access_token(runner: Callable[[List[str], bool], Optional[Any]]) -> str:
             return token.strip()
     elif isinstance(token_info, str):
         return token_info.strip().strip('"')
-    raise RuntimeError(f"Unable to extract access token from: {token_info}")
+    raise RuntimeError("Unable to extract access token from runner output")
 
 
+# Note: We intentionally use standard library urllib with a Bearer token from 'gcloud auth print-access-token'
+# rather than importing the official 'google-cloud-compute' library. This avoids introducing heavy external
+# pip dependencies (google-cloud-compute, google-auth, protobuf, grpcio) for an operator script where all other
+# resources are managed via gcloud CLI, and ensures authentication uses the active gcloud identity without
+# requiring separate Application Default Credentials (ADC) setup.
 def default_post_rest(url: str, body: Dict[str, Any], token: str) -> Dict[str, Any]:
     """Posts a JSON payload to a Google Cloud REST API endpoint using an OAuth 2.0 Bearer token."""
     data = json.dumps(body).encode("utf-8")
@@ -135,18 +140,15 @@ def provision_frontend(
 ) -> Dict[str, Any]:
     """Provisions all required GCP resources idempotently and returns the configuration dictionary."""
     if rest_poster is None:
-        if hasattr(runner, "post_rest"):
-            rest_poster = runner.post_rest
-        else:
-            token: Optional[str] = None
+        token: Optional[str] = None
 
-            def _poster(u: str, b: Dict[str, Any]) -> Dict[str, Any]:
-                nonlocal token
-                if token is None:
-                    token = get_access_token(runner)
-                return default_post_rest(u, b, token)
+        def _poster(u: str, b: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal token
+            if token is None:
+                token = get_access_token(runner)
+            return default_post_rest(u, b, token)
 
-            rest_poster = _poster
+        rest_poster = _poster
 
     if not zones:
         zone_info = runner(
@@ -218,7 +220,15 @@ def provision_frontend(
                 op = rest_poster(url, body)
                 op_name = op.get("name") if isinstance(op, dict) else None
                 if op_name and isinstance(op, dict) and op.get("status") != "DONE":
-                    runner(["compute", "operations", "wait", op_name, f"--zone={zone}", f"--project={project}"], False)
+                    op = runner(["compute", "operations", "wait", op_name, f"--zone={zone}", f"--project={project}"], True)
+                if isinstance(op, dict) and op.get("error"):
+                    errors = op["error"]
+                    if isinstance(errors, dict) and "errors" in errors:
+                        err_msgs = [e.get("message", str(e)) for e in errors["errors"] if isinstance(e, dict)]
+                        msg = "; ".join(err_msgs) if err_msgs else json.dumps(errors)
+                    else:
+                        msg = json.dumps(errors)
+                    raise RuntimeError(f"Failed to create network endpoint group {neg_name} in {zone}: {msg}")
 
     # 4. Backend Services & Backends
     port_map = {443: 8443, 80: 8080}
