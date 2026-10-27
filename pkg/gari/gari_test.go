@@ -46,6 +46,7 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -285,14 +286,18 @@ func TestOptions_SetupWithManagerCalled(t *testing.T) {
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
 	opts.Scheme = scheme
-	opts.SetupWithManager = func(mgr ctrl.Manager) error {
+	opts.SetupWithManager = func(mgr ctrl.Manager, s *Server) error {
 		called = true
 		return nil
 	}
 
+	skipNameValidation := true
 	mgr, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
 		Scheme:  scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
 	})
 	if err != nil {
 		t.Fatalf("failed to create manager: %v", err)
@@ -305,6 +310,51 @@ func TestOptions_SetupWithManagerCalled(t *testing.T) {
 	if !called {
 		t.Errorf("expected SetupWithManager to be called, but was not")
 	}
+}
+
+func TestOptions_SetupWithManagerServerAccess(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.Install(scheme)
+
+	var serverFromSetup *Server
+	opts := DefaultOptions()
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = "default"
+	opts.DataplaneGatewayName = "test-gw"
+	opts.MetricsAddr = "0"
+	opts.HealthProbeBindAddress = "0"
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.Scheme = scheme
+	opts.SetupWithManager = func(mgr ctrl.Manager, s *Server) error {
+		serverFromSetup = s
+		return nil
+	}
+
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(&rest.Config{}, ctrl.Options{
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+
+	server, err := NewWithManager(mgr, opts)
+	if err != nil {
+		t.Fatalf("NewWithManager failed: %v", err)
+	}
+	if serverFromSetup == nil || serverFromSetup != server {
+		t.Fatalf("expected SetupWithManager to receive Server instance, got %v", serverFromSetup)
+	}
+
+	// Trigger server.EnqueueGateway directly (should not panic)
+	server.EnqueueGateway(types.NamespacedName{Namespace: "default", Name: "test-gw"})
+	server.EnqueueGateway(types.NamespacedName{Namespace: "default", Name: "test-gw"})
 }
 
 func TestServerCustomHTTPListener(t *testing.T) {

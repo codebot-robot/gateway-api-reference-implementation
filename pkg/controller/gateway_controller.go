@@ -21,7 +21,9 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -124,6 +126,18 @@ type OwnershipConflictError = state.OwnershipConflictError
 // DefaultConflictRequeueDelay is the duration after which a Gateway with an ownership conflict is requeued.
 const DefaultConflictRequeueDelay = time.Minute
 
+// GatewayStatusHook is an optional hook invoked by GatewayReconciler after computing
+// the desired Gateway status and before writing it to the API server.
+// The hook receives a deep copy of the desired status and may adjust Programmed
+// (status, reason, and message) and addresses, downgrade Accepted to False,
+// and add its own condition types.
+// The gw parameter must not be modified.
+// GARI retains ownership of Accepted (other than downgrading), listener conditions,
+// and other core status fields.
+// The hook should read from local/cached state and avoid slow or blocking remote calls,
+// as it executes on GARI's reconcile path.
+type GatewayStatusHook func(ctx context.Context, gw *gatewayv1.Gateway, status *gatewayv1.GatewayStatus) error
+
 type GatewayReconciler struct {
 	client.Client
 	Scheme               *runtime.Scheme
@@ -131,6 +145,14 @@ type GatewayReconciler struct {
 	ControllerName       string
 	AddressProvider      AddressProvider
 	ConflictRequeueDelay time.Duration
+	GatewayStatusHook    GatewayStatusHook
+}
+
+// EnqueueGateway requests a reconcile of the given Gateway in the Gateway controller.
+func (r *GatewayReconciler) EnqueueGateway(req types.NamespacedName) {
+	if r.State != nil {
+		r.State.EnqueueGateway(req)
+	}
 }
 
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -222,6 +244,31 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		desired, ok := r.State.GetDesiredGatewayStatus(req.NamespacedName)
 		if !ok {
 			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+		}
+
+		if r.GatewayStatusHook != nil {
+			desiredCopy := desired.DeepCopy()
+			if err := r.GatewayStatusHook(ctx, gw, desiredCopy); err != nil {
+				l.Error(err, "GatewayStatusHook failed")
+				return ctrl.Result{}, err
+			}
+			// Enforce hook contract: hook may downgrade Accepted to False, but cannot upgrade it to True.
+			var origAccepted *metav1.Condition
+			for _, c := range desired.Conditions {
+				if c.Type == string(gatewayv1.GatewayConditionAccepted) {
+					origAccepted = &c
+					break
+				}
+			}
+			if origAccepted != nil && origAccepted.Status == metav1.ConditionFalse {
+				for i, c := range desiredCopy.Conditions {
+					if c.Type == string(gatewayv1.GatewayConditionAccepted) && c.Status != metav1.ConditionFalse {
+						desiredCopy.Conditions[i] = *origAccepted
+						break
+					}
+				}
+			}
+			desired = *desiredCopy
 		}
 
 		if state.MergeGatewayStatus(&gw.Status, desired) {

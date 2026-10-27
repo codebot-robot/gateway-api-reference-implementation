@@ -60,6 +60,7 @@ type ReconcilerOptions struct {
 	GatewayFilter        func(gw *gatewayv1.Gateway) bool
 	DisableStatusUpdates bool
 	CRDView              *CRDView
+	GatewayStatusHook    GatewayStatusHook
 }
 
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
@@ -226,6 +227,8 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		State:           st,
 		ControllerName:  controllerName,
 		AddressProvider: opts.AddressProvider,
+
+		GatewayStatusHook: opts.GatewayStatusHook,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("error creating Gateway controller: %w", err)
 	}

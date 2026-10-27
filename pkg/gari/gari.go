@@ -44,6 +44,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -76,6 +77,10 @@ type AddressReadinessProvider = controller.AddressReadinessProvider
 // AddressTypeProvider is an optional interface an AddressProvider can implement
 // to declare which address types it supports for requested addresses (spec.addresses).
 type AddressTypeProvider = controller.AddressTypeProvider
+
+// GatewayStatusHook is an optional hook called by GARI's Gateway reconciler after computing
+// the desired status and before writing it to the API server.
+type GatewayStatusHook = controller.GatewayStatusHook
 
 // GatewayReadiness represents the data-plane readiness state of a Gateway.
 type GatewayReadiness = state.GatewayReadiness
@@ -245,10 +250,19 @@ type Options struct {
 	// DebugErrorResponses enables verbose error messages in unmatched responses.
 	DebugErrorResponses bool
 
+	// GatewayStatusHook is an optional hook called by GARI's Gateway reconciler after computing
+	// the desired status and before writing it to the API server.
+	// The hook receives a deep copy of the desired status and may adjust Programmed
+	// (status, reason, and message) and addresses, downgrade Accepted to False,
+	// and add its own condition types. The gw parameter must not be modified.
+	// GARI retains ownership of Accepted (other than downgrading), listener conditions,
+	// and other core status fields.
+	GatewayStatusHook GatewayStatusHook
+
 	// SetupWithManager is an optional callback called after the controller-runtime Manager
 	// is created, allowing callers to register additional reconcilers or runnables before
-	// the manager starts.
-	SetupWithManager func(mgr ctrl.Manager) error
+	// the manager starts. If non-nil, it is passed the manager and the GARI Server.
+	SetupWithManager func(mgr ctrl.Manager, s *Server) error
 }
 
 // ErrDraining indicates that the server is draining connections.
@@ -417,6 +431,13 @@ func (s *Server) Options() Options {
 	return s.opts
 }
 
+// EnqueueGateway requests a reconcile of the given Gateway in the GARI Gateway controller.
+func (s *Server) EnqueueGateway(req types.NamespacedName) {
+	if s.state != nil {
+		s.state.EnqueueGateway(req)
+	}
+}
+
 // New creates and initializes a new GARI Server.
 // If opts.Manager is nil, a controller-runtime Manager is created using opts.RestConfig and registered with GARI reconcilers.
 func New(opts Options) (*Server, error) {
@@ -537,7 +558,7 @@ func New(opts Options) (*Server, error) {
 	}
 
 	if s.opts.SetupWithManager != nil {
-		if err := s.opts.SetupWithManager(mgr); err != nil {
+		if err := s.opts.SetupWithManager(mgr, s); err != nil {
 			return nil, fmt.Errorf("custom SetupWithManager failed: %w", err)
 		}
 	}
@@ -645,6 +666,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		AddressProvider:      s.opts.AddressProvider,
 		GatewayFilter:        s.opts.GatewayFilter,
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,
+		GatewayStatusHook:    s.opts.GatewayStatusHook,
 	})
 }
 

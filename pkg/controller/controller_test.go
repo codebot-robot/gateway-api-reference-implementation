@@ -1886,6 +1886,175 @@ func TestGatewayReconciler_AddressReadinessProvider(t *testing.T) {
 	}
 }
 
+func TestGatewayReconciler_GatewayStatusHook(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-class"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+	st.UpsertGatewayClass(gwClass)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "test-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-class",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(&gatewayv1.Gateway{}).
+		Build()
+
+	hookCalled := false
+	addrType := gatewayv1.IPAddressType
+	hook := func(ctx context.Context, g *gatewayv1.Gateway, status *gatewayv1.GatewayStatus) error {
+		hookCalled = true
+		// Downgrade Accepted
+		for i, c := range status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionAccepted) {
+				status.Conditions[i].Status = metav1.ConditionFalse
+				status.Conditions[i].Reason = "ConflictingParameters"
+				status.Conditions[i].Message = "NEGs already claimed"
+			}
+		}
+		// Override Programmed
+		for i, c := range status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) {
+				status.Conditions[i].Status = metav1.ConditionFalse
+				status.Conditions[i].Reason = "WaitingForEndpoints"
+				status.Conditions[i].Message = "Waiting for NEGs"
+			}
+		}
+		// Set addresses
+		status.Addresses = []gatewayv1.GatewayStatusAddress{
+			{Type: &addrType, Value: "10.10.10.10"},
+		}
+		// Add custom condition
+		status.Conditions = append(status.Conditions, metav1.Condition{
+			Type:               "CustomNEGReady",
+			Status:             metav1.ConditionTrue,
+			Reason:             "NEGAttached",
+			Message:            "Endpoints attached to zonal NEGs",
+			LastTransitionTime: metav1.Now(),
+		})
+		return nil
+	}
+
+	r := &GatewayReconciler{
+		Client:            client,
+		Scheme:            scheme,
+		State:             st,
+		ControllerName:    "test-controller",
+		GatewayStatusHook: hook,
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+
+	if !hookCalled {
+		t.Fatalf("expected GatewayStatusHook to be called")
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	// 1. Verify Accepted was downgraded by the hook
+	acceptedCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse || acceptedCond.Reason != "ConflictingParameters" {
+		t.Fatalf("expected Accepted downgraded to False by hook, got: %+v", acceptedCond)
+	}
+
+	// 2. Verify Programmed is adjusted by the hook
+	progCond := findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != "WaitingForEndpoints" || progCond.Message != "Waiting for NEGs" {
+		t.Fatalf("expected Programmed adjusted by hook, got: %+v", progCond)
+	}
+
+	// 3. Verify addresses set by the hook
+	if len(reconciledGW.Status.Addresses) != 1 || reconciledGW.Status.Addresses[0].Value != "10.10.10.10" {
+		t.Fatalf("expected addresses from hook, got: %+v", reconciledGW.Status.Addresses)
+	}
+
+	// 4. Verify custom condition added by hook
+	customCond := findCondition(reconciledGW.Status.Conditions, "CustomNEGReady")
+	if customCond == nil || customCond.Status != metav1.ConditionTrue || customCond.Reason != "NEGAttached" {
+		t.Fatalf("expected custom condition from hook, got: %+v", customCond)
+	}
+
+	// 5. Test hook returning error stops reconcile
+	errHook := func(ctx context.Context, g *gatewayv1.Gateway, status *gatewayv1.GatewayStatus) error {
+		return errors.New("hook simulated error")
+	}
+	r.GatewayStatusHook = errHook
+	_, err = r.Reconcile(ctx, req)
+	if err == nil || !strings.Contains(err.Error(), "hook simulated error") {
+		t.Fatalf("expected error from hook, got: %v", err)
+	}
+
+	// 6. Test hook cannot upgrade Accepted from False to True
+	gw.Spec.Listeners = nil
+	st.UpsertGateway(gw)
+	st.Recompute()
+	_ = client.Update(ctx, gw)
+	upgradeHook := func(ctx context.Context, g *gatewayv1.Gateway, status *gatewayv1.GatewayStatus) error {
+		for i, c := range status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionAccepted) {
+				status.Conditions[i].Status = metav1.ConditionTrue
+				status.Conditions[i].Reason = "HookUpgradeAttempt"
+			}
+		}
+		return nil
+	}
+	r.GatewayStatusHook = upgradeHook
+	_, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	acceptedCond = findCondition(reconciledGW.Status.Conditions, string(gatewayv1.GatewayConditionAccepted))
+	if acceptedCond == nil || acceptedCond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected GARI to enforce Accepted=False and prevent hook upgrade, got: %+v", acceptedCond)
+	}
+}
+
+func TestGatewayReconciler_EnqueueGateway(t *testing.T) {
+	st := state.NewState()
+	r := &GatewayReconciler{
+		State: st,
+	}
+
+	req := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	// Should not panic or fail
+	r.EnqueueGateway(req)
+}
+
 type fakeAddressTypeProvider struct {
 	fakeAddressProvider
 	supportedTypes []gatewayv1.AddressType
