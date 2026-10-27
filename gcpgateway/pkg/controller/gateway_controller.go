@@ -321,8 +321,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		// Check health on backend service
 		bsName := metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "bs-443")
 		negName := metadata.ResourceName(r.NegPrefix, r.ClusterID, gw.Namespace, gw.Name, "8443")
+		// backendServices.getHealth takes a resourceGroup reference, which must be the full NEG URL;
+		// a bare name is rejected with "Invalid value for field 'resourceGroup.group' ... malformed".
+		negURL := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/networkEndpointGroups/%s", r.Project, nodeInfo.Zone, negName)
 
-		health, err := r.GCPClient.GetBackendServiceHealth(ctx, r.Project, bsName, negName)
+		health, err := r.GCPClient.GetBackendServiceHealth(ctx, r.Project, bsName, negURL)
 		if err != nil {
 			return reconcile.Result{}, fmt.Errorf("getting backend service health for %s: %w", bsName, err)
 		}
