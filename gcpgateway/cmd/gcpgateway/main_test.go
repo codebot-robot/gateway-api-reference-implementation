@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/metadata"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
@@ -453,6 +454,20 @@ func TestSetupController_EndToEndRealSetup(t *testing.T) {
 
 	if !foundProg {
 		t.Errorf("expected Gateway Programmed=True after polling, conditions are: %+v", updatedGW.Status.Conditions)
+	} else {
+		var progCond *metav1.Condition
+		for _, c := range updatedGW.Status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) {
+				progCond = &c
+				break
+			}
+		}
+		if progCond == nil || progCond.Reason != controller.ReasonProgrammed {
+			t.Errorf("expected Programmed condition reason %s, got %+v", controller.ReasonProgrammed, progCond)
+		}
+		if progCond != nil && progCond.Message != "Ready data-plane pods attached to zonal NEGs and passing health checks behind Google Cloud Load Balancer" {
+			t.Errorf("expected gcpgateway Programmed message, got %q", progCond.Message)
+		}
 	}
 }
 
@@ -565,6 +580,265 @@ func TestSetupController_EndToEndRealSetup_NonDefaultDrainSeconds(t *testing.T) 
 
 	// drain-seconds=45 -> 45 + 25 = 70 (strictly greater than the 60s minimum clamp)
 	assertProductionDeployment(t, &deploy, 45, 70)
+}
+
+// TestSetupController_SteadyStateZeroWritesAndNoFlapping validates issue #870:
+// 1. With one gcpgateway Gateway in steady state, there are zero Gateway status writes.
+// 2. The Gateway's Programmed condition shows gcpgateway's reason and message, and stays stable without flapping.
+// 3. A change in NEG health is reflected in Gateway status without waiting for GARI's resync interval.
+func TestSetupController_SteadyStateZeroWritesAndNoFlapping(t *testing.T) {
+	env := testenv.Start(t)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gcpgateway",
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: DefaultControllerName,
+		},
+	}
+	if err := env.Client.Create(t.Context(), gc); err != nil {
+		t.Fatalf("creating GatewayClass: %v", err)
+	}
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "steady-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  &ipAddrType,
+					Value: "34.120.254.30",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+	if err := env.Client.Create(t.Context(), gw); err != nil {
+		t.Fatalf("creating Gateway: %v", err)
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+		},
+		Spec: corev1.NodeSpec{
+			ProviderID: "gce://my-project/us-central1-a/gke-node-1",
+		},
+	}
+	if err := env.Client.Create(t.Context(), node); err != nil {
+		t.Fatalf("creating Node: %v", err)
+	}
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	negDesc, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "steady-gw",
+		Port:        8443,
+	}).Encode()
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "steady-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+
+	bsName := metadata.ResourceName("gcpgw", "cluster-1", "default", "steady-gw", "bs-443")
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "UNHEALTHY"},
+		},
+	})
+
+	opts, err := SetupController(t.Context(), []string{
+		"--cluster-id=cluster-1",
+		"--neg-prefix=gcpgw",
+		"--project=my-project",
+		"--zones=us-central1-a",
+		"--health-poll-interval=100ms",
+		"--resync-interval=250ms",
+		"--fake-compute",
+	}, fakeGCP)
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+
+	trueVal := true
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:                 env.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		Controller: config.Controller{
+			SkipNameValidation: &trueVal,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create manager: %v", err)
+	}
+	opts.Manager = mgr
+
+	server, err := gari.New(opts)
+	if err != nil {
+		t.Fatalf("gari.New failed: %v", err)
+	}
+
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	defer cancelMgr()
+	mgrErrCh := make(chan error, 1)
+	go func() {
+		if err := server.Manager().Start(mgrCtx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("manager exited with error: %v", err)
+			mgrErrCh <- err
+		}
+	}()
+	t.Cleanup(func() {
+		cancelMgr()
+		select {
+		case err := <-mgrErrCh:
+			t.Errorf("manager error reported during cleanup: %v", err)
+		default:
+		}
+	})
+
+	resName := singlepod.ResourceNameForGateway(gw.Name)
+	var deploy appsv1.Deployment
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err == nil {
+			break
+		}
+	}
+	if deploy.Name == "" {
+		t.Fatalf("timed out waiting for Deployment %s to be created by GARI", resName)
+	}
+
+	pod := testenv.BuildPodFromDeployment(
+		&deploy,
+		testenv.WithPodName("dp-pod-steady"),
+		testenv.WithNodeName("node-1"),
+		testenv.WithPodIP("10.0.1.5"),
+		testenv.WithContainersReady(true),
+	)
+	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+		Type:   corev1.PodConditionType(LoadBalancerReadyGate),
+		Status: corev1.ConditionFalse,
+	})
+	if err := env.Client.Create(t.Context(), pod); err != nil {
+		t.Fatalf("creating pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.1.5"
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+	}
+	if err := env.Client.Status().Update(t.Context(), pod); err != nil {
+		t.Fatalf("updating pod status: %v", err)
+	}
+
+	// 1. Initial state: UNHEALTHY on load balancer -> Programmed condition shows WaitingForEndpoints
+	var updatedGW gatewayv1.Gateway
+	for start := time.Now(); time.Since(start) < 30*time.Second; time.Sleep(100 * time.Millisecond) {
+		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW)
+		for _, c := range updatedGW.Status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) && c.Status == metav1.ConditionFalse && c.Reason == controller.ReasonWaitingForEndpoints {
+				goto unhealthVerified
+			}
+		}
+	}
+	t.Fatalf("expected initial Programmed=False with Reason WaitingForEndpoints, conditions are: %+v", updatedGW.Status.Conditions)
+unhealthVerified:
+
+	// 2. Transition fake GCP load balancer to HEALTHY
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	// Wait for steady state: Programmed=True with gcpgateway's reason and message
+	for start := time.Now(); time.Since(start) < 30*time.Second; time.Sleep(100 * time.Millisecond) {
+		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW)
+		for _, c := range updatedGW.Status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) && c.Status == metav1.ConditionTrue && c.Reason == controller.ReasonProgrammed {
+				goto steadyStateReached
+			}
+		}
+	}
+	t.Fatalf("expected Programmed=True with Reason Programmed, conditions are: %+v", updatedGW.Status.Conditions)
+steadyStateReached:
+
+	// Verify reason and message in steady state
+	for _, c := range updatedGW.Status.Conditions {
+		if c.Type == string(gatewayv1.GatewayConditionProgrammed) {
+			if c.Reason != controller.ReasonProgrammed {
+				t.Errorf("expected reason %s, got %s", controller.ReasonProgrammed, c.Reason)
+			}
+			if c.Message != "Ready data-plane pods attached to zonal NEGs and passing health checks behind Google Cloud Load Balancer" {
+				t.Errorf("expected gcpgateway Programmed message, got %q", c.Message)
+			}
+		}
+	}
+	if len(updatedGW.Status.Addresses) != 1 || updatedGW.Status.Addresses[0].Value != "34.120.254.30" {
+		t.Errorf("expected Gateway address 34.120.254.30, got %+v", updatedGW.Status.Addresses)
+	}
+
+	// 3. Acceptance Criterion: In steady state, verify ZERO Gateway status writes and NO flapping over time.
+	// With HealthPollInterval=100ms and ResyncInterval=250ms, a 5-second window observes 50 health poll cycles
+	// and 20 full resync cycles, verifying that steady-state resync and polling produce zero writes.
+	steadyRV := updatedGW.ResourceVersion
+	steadyStart := time.Now()
+	testDuration := 5 * time.Second
+	for time.Since(steadyStart) < testDuration {
+		time.Sleep(100 * time.Millisecond)
+		var checkGW gatewayv1.Gateway
+		if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &checkGW); err != nil {
+			t.Fatalf("failed to get gateway during steady state: %v", err)
+		}
+		if checkGW.ResourceVersion != steadyRV {
+			t.Fatalf("flapping detected: Gateway ResourceVersion changed in steady state from %s to %s", steadyRV, checkGW.ResourceVersion)
+		}
+		for _, c := range checkGW.Status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) {
+				if c.Status != metav1.ConditionTrue || c.Reason != controller.ReasonProgrammed {
+					t.Fatalf("flapping detected: Programmed condition changed in steady state: %+v", c)
+				}
+			}
+		}
+	}
+
+	// 4. Acceptance Criterion: Data-plane changes are promptly reflected in Gateway status without waiting for GARI's resync interval.
+	if err := env.Client.Delete(t.Context(), pod); err != nil {
+		t.Fatalf("deleting pod: %v", err)
+	}
+
+	// Must reflect Programmed=False promptly via EnqueueGateway
+	dataPlaneReflected := false
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(100 * time.Millisecond) {
+		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW)
+		for _, c := range updatedGW.Status.Conditions {
+			if c.Type == string(gatewayv1.GatewayConditionProgrammed) && c.Status == metav1.ConditionFalse && (c.Reason == controller.ReasonWaitingForDataPlane || c.Reason == controller.ReasonWaitingForEndpoints) {
+				dataPlaneReflected = true
+				break
+			}
+		}
+		if dataPlaneReflected {
+			break
+		}
+	}
+	if !dataPlaneReflected {
+		t.Fatalf("expected pod deletion to be promptly reflected in Gateway status as Programmed=False, conditions are: %+v", updatedGW.Status.Conditions)
+	}
 }
 
 func TestMain_SetsLogger(t *testing.T) {

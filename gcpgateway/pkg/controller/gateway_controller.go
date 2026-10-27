@@ -71,6 +71,52 @@ const (
 	ReasonEndpointAttachmentFailed = "EndpointAttachmentFailed"
 )
 
+// GatewayStatusResult represents the cached status result for a Gateway.
+type GatewayStatusResult struct {
+	AcceptedStatus   metav1.ConditionStatus
+	ProgrammedStatus metav1.ConditionStatus
+	Reason           string
+	Message          string
+	Addresses        []gatewayv1.GatewayStatusAddress
+	CustomConditions []metav1.Condition
+}
+
+func (r *GatewayStatusResult) equal(other *GatewayStatusResult) bool {
+	if r == nil || other == nil {
+		return r == other
+	}
+	if r.AcceptedStatus != other.AcceptedStatus || r.ProgrammedStatus != other.ProgrammedStatus || r.Reason != other.Reason || r.Message != other.Message {
+		return false
+	}
+	if len(r.Addresses) != len(other.Addresses) {
+		return false
+	}
+	for i := range r.Addresses {
+		a1 := r.Addresses[i]
+		a2 := other.Addresses[i]
+		if a1.Value != a2.Value {
+			return false
+		}
+		if (a1.Type == nil) != (a2.Type == nil) {
+			return false
+		}
+		if a1.Type != nil && *a1.Type != *a2.Type {
+			return false
+		}
+	}
+	if len(r.CustomConditions) != len(other.CustomConditions) {
+		return false
+	}
+	for i := range r.CustomConditions {
+		c1 := r.CustomConditions[i]
+		c2 := other.CustomConditions[i]
+		if c1.Type != c2.Type || c1.Status != c2.Status || c1.Reason != c2.Reason || c1.Message != c2.Message {
+			return false
+		}
+	}
+	return true
+}
+
 // GatewayReconciler reconciles Gateways using Google Cloud zonal NEGs and L4 load balancers.
 type GatewayReconciler struct {
 	client.Client
@@ -84,28 +130,67 @@ type GatewayReconciler struct {
 	HealthTimeout  time.Duration
 	Registrar      *registrar.Registrar
 
-	healthPollInterval time.Duration
-	resyncInterval     time.Duration
+	HealthPollInterval time.Duration
+	ResyncInterval     time.Duration
 
+	// mu guards waitingSince.
 	mu           sync.Mutex
 	waitingSince map[string]time.Time
+
+	// EnqueueGateway is an optional callback to trigger a GARI Gateway reconcile when state changes.
+	EnqueueGateway func(types.NamespacedName)
+
+	// statusMu guards statusCache.
+	statusMu    sync.RWMutex
+	statusCache map[types.NamespacedName]*GatewayStatusResult
+}
+
+// GatewayReconcilerConfig contains configuration parameters for GatewayReconciler.
+type GatewayReconcilerConfig struct {
+	ClusterID          string
+	NegPrefix          string
+	Project            string
+	Zones              []string
+	ControllerName     string
+	HealthTimeout      time.Duration
+	HealthPollInterval time.Duration
+	ResyncInterval     time.Duration
+	EnqueueGateway     func(types.NamespacedName)
 }
 
 // NewGatewayReconciler creates a new GatewayReconciler.
-func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp.ComputeClient, reg *registrar.Registrar, clusterID, negPrefix, project string) *GatewayReconciler {
-	if negPrefix == "" {
-		negPrefix = "gcpgw"
+func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp.ComputeClient, reg *registrar.Registrar, cfg GatewayReconcilerConfig) *GatewayReconciler {
+	if cfg.NegPrefix == "" {
+		cfg.NegPrefix = "gcpgw"
+	}
+	healthTimeout := cfg.HealthTimeout
+	if healthTimeout <= 0 {
+		healthTimeout = DefaultHealthTimeout
+	}
+	pollInterval := cfg.HealthPollInterval
+	if pollInterval <= 0 {
+		pollInterval = HealthPollInterval
+	}
+	resyncInterval := cfg.ResyncInterval
+	if resyncInterval <= 0 {
+		resyncInterval = ResyncInterval
 	}
 	return &GatewayReconciler{
-		Client:        c,
-		Scheme:        scheme,
-		GCPClient:     gcpClient,
-		ClusterID:     clusterID,
-		NegPrefix:     negPrefix,
-		Project:       project,
-		HealthTimeout: DefaultHealthTimeout,
-		Registrar:     reg,
-		waitingSince:  make(map[string]time.Time),
+		Client:             c,
+		Scheme:             scheme,
+		GCPClient:          gcpClient,
+		ClusterID:          cfg.ClusterID,
+		NegPrefix:          cfg.NegPrefix,
+		Project:            cfg.Project,
+		Zones:              cfg.Zones,
+		ControllerName:     cfg.ControllerName,
+		HealthTimeout:      healthTimeout,
+		HealthPollInterval: pollInterval,
+		ResyncInterval:     resyncInterval,
+		EnqueueGateway:     cfg.EnqueueGateway,
+		Registrar:          reg,
+		waitingSince:       make(map[string]time.Time),
+		statusCache:        make(map[types.NamespacedName]*GatewayStatusResult),
 	}
 }
 
@@ -186,11 +271,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	pollInterval := r.healthPollInterval
+	pollInterval := r.HealthPollInterval
 	if pollInterval <= 0 {
 		pollInterval = HealthPollInterval
 	}
-	resyncInterval := r.resyncInterval
+	resyncInterval := r.ResyncInterval
 	if resyncInterval <= 0 {
 		resyncInterval = ResyncInterval
 	}
@@ -198,6 +283,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	var gw gatewayv1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
 		if apierrors.IsNotFound(err) {
+			r.statusMu.Lock()
+			delete(r.statusCache, req.NamespacedName)
+			r.statusMu.Unlock()
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -210,6 +298,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			return reconcile.Result{}, err
 		}
 	} else if r.ControllerName != "" && string(gc.Spec.ControllerName) != r.ControllerName {
+		r.statusMu.Lock()
+		delete(r.statusCache, req.NamespacedName)
+		r.statusMu.Unlock()
 		return reconcile.Result{}, nil
 	}
 
@@ -240,16 +331,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	if len(conflicting) > 1 {
 		winner := registrar.ResolveNEGConflict(conflicting)
 		if winner != nil && (winner.Namespace != gw.Namespace || winner.Name != gw.Name) {
-			setCondition(&gw, string(gatewayv1.GatewayConditionAccepted), metav1.ConditionFalse, ReasonConflictingParameters, "Configured NEGs are already claimed by an older active Gateway in the cluster.")
-			setCondition(&gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonConflictingParameters, "Configured NEGs are already claimed by an older active Gateway in the cluster.")
-			if err := r.Status().Update(ctx, &gw); err != nil {
-				return reconcile.Result{}, err
-			}
+			r.updateCachedStatus(req.NamespacedName, &GatewayStatusResult{
+				AcceptedStatus:   metav1.ConditionFalse,
+				ProgrammedStatus: metav1.ConditionFalse,
+				Reason:           ReasonConflictingParameters,
+				Message:          "Configured NEGs are already claimed by an older active Gateway in the cluster.",
+			})
 			return reconcile.Result{RequeueAfter: resyncInterval}, nil
 		}
 	}
-
-	setCondition(&gw, string(gatewayv1.GatewayConditionAccepted), metav1.ConditionTrue, ReasonAccepted, "Gateway spec and parameters are valid.")
 
 	// 3. Resolve external static IP
 	externalIP, err := r.resolveExternalIP(ctx, &gw)
@@ -260,18 +350,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	// 4. Reconcile endpoints with zonal NEGs via the registrar
 	reconcileRes, err := r.Registrar.ReconcileEndpoints(ctx, &gw)
 	if err != nil {
-		r.handleGCPError(&gw, err)
-		if updateErr := r.Status().Update(ctx, &gw); updateErr != nil {
-			return reconcile.Result{}, updateErr
-		}
+		reason, msg := r.gcpErrorReasonAndMessage(err)
+		r.updateCachedStatus(req.NamespacedName, &GatewayStatusResult{
+			ProgrammedStatus: metav1.ConditionFalse,
+			Reason:           reason,
+			Message:          msg,
+		})
 		return reconcile.Result{RequeueAfter: pollInterval}, nil
 	}
 
 	if externalIP == "" {
-		setCondition(&gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonAddressNotAssigned, "Neither spec.addresses nor parameters ConfigMap provides external static IP.")
-		if err := r.Status().Update(ctx, &gw); err != nil {
-			return reconcile.Result{}, err
-		}
+		r.updateCachedStatus(req.NamespacedName, &GatewayStatusResult{
+			ProgrammedStatus: metav1.ConditionFalse,
+			Reason:           ReasonAddressNotAssigned,
+			Message:          "Neither spec.addresses nor parameters ConfigMap provides external static IP.",
+		})
 		return reconcile.Result{RequeueAfter: resyncInterval}, nil
 	}
 
@@ -365,33 +458,166 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		}
 	}
 
-	// 6. Update Gateway status conditions and addresses
+	// 6. Cache Gateway status conditions and addresses
+	var res *GatewayStatusResult
 	if dataplanePodCount == 0 {
-		setCondition(&gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonWaitingForDataPlane, "Data-plane Deployment has 0 available/ready replicas.")
+		res = &GatewayStatusResult{
+			ProgrammedStatus: metav1.ConditionFalse,
+			Reason:           ReasonWaitingForDataPlane,
+			Message:          "Data-plane Deployment has 0 available/ready replicas.",
+		}
 	} else if isRolloutStalled {
-		setCondition(&gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonRolloutStalled, "New data-plane pod failed to become healthy on load balancer; rollout halted to protect old pods.")
+		res = &GatewayStatusResult{
+			ProgrammedStatus: metav1.ConditionFalse,
+			Reason:           ReasonRolloutStalled,
+			Message:          "New data-plane pod failed to become healthy on load balancer; rollout halted to protect old pods.",
+		}
 	} else if !hasHealthyReplica {
-		setCondition(&gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonWaitingForEndpoints, "Ready pods exist, but attachment to zonal NEGs or health check convergence is in-flight.")
+		res = &GatewayStatusResult{
+			ProgrammedStatus: metav1.ConditionFalse,
+			Reason:           ReasonWaitingForEndpoints,
+			Message:          "Ready pods exist, but attachment to zonal NEGs or health check convergence is in-flight.",
+		}
 	} else {
-		setCondition(&gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionTrue, ReasonProgrammed, "Ready data-plane pods attached to zonal NEGs and passing health checks behind Google Cloud Load Balancer")
 		addrType := gatewayv1.IPAddressType
-		gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{
-			{
-				Type:  &addrType,
-				Value: externalIP,
+		res = &GatewayStatusResult{
+			ProgrammedStatus: metav1.ConditionTrue,
+			Reason:           ReasonProgrammed,
+			Message:          "Ready data-plane pods attached to zonal NEGs and passing health checks behind Google Cloud Load Balancer",
+			Addresses: []gatewayv1.GatewayStatusAddress{
+				{
+					Type:  &addrType,
+					Value: externalIP,
+				},
 			},
 		}
 	}
 
 	_ = reconcileRes
-	if err := r.Status().Update(ctx, &gw); err != nil {
-		return reconcile.Result{}, err
-	}
+	r.updateCachedStatus(req.NamespacedName, res)
 
 	if waitingForHealth {
 		return reconcile.Result{RequeueAfter: pollInterval}, nil
 	}
 	return reconcile.Result{RequeueAfter: resyncInterval}, nil
+}
+
+// GetCachedStatus returns the cached GatewayStatusResult for the given Gateway.
+func (r *GatewayReconciler) GetCachedStatus(nn types.NamespacedName) *GatewayStatusResult {
+	r.statusMu.RLock()
+	defer r.statusMu.RUnlock()
+	return r.statusCache[nn]
+}
+
+func (r *GatewayReconciler) updateCachedStatus(nn types.NamespacedName, newRes *GatewayStatusResult) {
+	r.statusMu.Lock()
+	oldRes := r.statusCache[nn]
+	changed := !oldRes.equal(newRes)
+	if changed {
+		r.statusCache[nn] = newRes
+	}
+	r.statusMu.Unlock()
+
+	if changed && r.EnqueueGateway != nil {
+		r.EnqueueGateway(nn)
+	}
+}
+
+// GatewayStatusHook is called by GARI's Gateway reconciler to adjust Gateway status before writing.
+func (r *GatewayReconciler) GatewayStatusHook(ctx context.Context, gw *gatewayv1.Gateway, status *gatewayv1.GatewayStatus) error {
+	key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	r.statusMu.RLock()
+	cached, ok := r.statusCache[key]
+	r.statusMu.RUnlock()
+
+	// On a cache miss, leave status as GARI computed it to avoid flipping Programmed
+	// to False during controller restart before gcpgateway has completed its first reconcile.
+	if !ok || cached == nil {
+		return nil
+	}
+
+	// The hook may downgrade Accepted to False (never upgrade it).
+	if cached.AcceptedStatus == metav1.ConditionFalse {
+		foundAccepted := false
+		for i := range status.Conditions {
+			if status.Conditions[i].Type == string(gatewayv1.GatewayConditionAccepted) {
+				status.Conditions[i].Status = metav1.ConditionFalse
+				status.Conditions[i].Reason = cached.Reason
+				status.Conditions[i].Message = cached.Message
+				status.Conditions[i].ObservedGeneration = gw.Generation
+				foundAccepted = true
+				break
+			}
+		}
+		if !foundAccepted {
+			status.Conditions = append(status.Conditions, metav1.Condition{
+				Type:               string(gatewayv1.GatewayConditionAccepted),
+				Status:             metav1.ConditionFalse,
+				Reason:             cached.Reason,
+				Message:            cached.Message,
+				ObservedGeneration: gw.Generation,
+			})
+		}
+	}
+
+	found := false
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == string(gatewayv1.GatewayConditionProgrammed) {
+			status.Conditions[i].Status = cached.ProgrammedStatus
+			status.Conditions[i].Reason = cached.Reason
+			status.Conditions[i].Message = cached.Message
+			status.Conditions[i].ObservedGeneration = gw.Generation
+			found = true
+			break
+		}
+	}
+	if !found {
+		status.Conditions = append(status.Conditions, metav1.Condition{
+			Type:               string(gatewayv1.GatewayConditionProgrammed),
+			Status:             cached.ProgrammedStatus,
+			Reason:             cached.Reason,
+			Message:            cached.Message,
+			ObservedGeneration: gw.Generation,
+		})
+	}
+
+	// Copy addresses so the cached slice is not mutated or shared directly
+	if len(cached.Addresses) > 0 {
+		status.Addresses = make([]gatewayv1.GatewayStatusAddress, len(cached.Addresses))
+		copy(status.Addresses, cached.Addresses)
+	}
+
+	if len(cached.CustomConditions) > 0 {
+		for _, cc := range cached.CustomConditions {
+			foundCC := false
+			for i := range status.Conditions {
+				if status.Conditions[i].Type == cc.Type {
+					status.Conditions[i] = cc
+					foundCC = true
+					break
+				}
+			}
+			if !foundCC {
+				status.Conditions = append(status.Conditions, cc)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *GatewayReconciler) gcpErrorReasonAndMessage(err error) (string, string) {
+	if gcp.IsPermissionDenied(err) {
+		return ReasonPermissionDenied, "GCP service account lacks compute.networkEndpointGroups.use or attach permission."
+	} else if gcp.IsQuotaExceeded(err) {
+		return ReasonQuotaExceeded, "Compute API quota exceeded when registering endpoints."
+	} else if gcp.IsNEGNotFound(err) {
+		return ReasonNEGNotFound, "One or more configured NEGs do not exist in the GCP project/zones."
+	} else if gcp.IsInvalidIP(err) {
+		return ReasonUnsupportedCluster, "Pod IP is not a valid VPC alias IP."
+	}
+	klog.Errorf("Endpoint attachment failed: %v", err)
+	return ReasonEndpointAttachmentFailed, "Failed to attach endpoints to zonal NEGs; see controller logs for details."
 }
 
 func isPodReadinessGateTrue(pod *corev1.Pod) bool {
@@ -486,39 +712,4 @@ func (r *GatewayReconciler) updatePodReadinessGate(ctx context.Context, pod *cor
 		LastTransitionTime: metav1.Now(),
 	})
 	return r.Status().Update(ctx, pod)
-}
-
-func (r *GatewayReconciler) handleGCPError(gw *gatewayv1.Gateway, err error) {
-	if gcp.IsPermissionDenied(err) {
-		setCondition(gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonPermissionDenied, "GCP service account lacks compute.networkEndpointGroups.use or attach permission.")
-	} else if gcp.IsQuotaExceeded(err) {
-		setCondition(gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonQuotaExceeded, "Compute API quota exceeded when registering endpoints.")
-	} else if gcp.IsNEGNotFound(err) {
-		setCondition(gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonNEGNotFound, "One or more configured NEGs do not exist in the GCP project/zones.")
-	} else if gcp.IsInvalidIP(err) {
-		setCondition(gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonUnsupportedCluster, "Pod IP is not a valid VPC alias IP.")
-	} else {
-		setCondition(gw, string(gatewayv1.GatewayConditionProgrammed), metav1.ConditionFalse, ReasonEndpointAttachmentFailed, err.Error())
-	}
-}
-
-func setCondition(gw *gatewayv1.Gateway, condType string, status metav1.ConditionStatus, reason, message string) {
-	for i, cond := range gw.Status.Conditions {
-		if cond.Type == condType {
-			gw.Status.Conditions[i].Status = status
-			gw.Status.Conditions[i].Reason = reason
-			gw.Status.Conditions[i].Message = message
-			gw.Status.Conditions[i].LastTransitionTime = metav1.Now()
-			gw.Status.Conditions[i].ObservedGeneration = gw.Generation
-			return
-		}
-	}
-	gw.Status.Conditions = append(gw.Status.Conditions, metav1.Condition{
-		Type:               condType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
-		ObservedGeneration: gw.Generation,
-	})
 }
