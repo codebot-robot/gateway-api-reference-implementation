@@ -76,8 +76,8 @@ To preserve GARI's core principle of zero cloud-provider SDK dependencies in the
 ### 2. Dedicated Kubernetes ServiceAccount & Workload Identity
 The `gcpgateway` controller runs under its own Kubernetes ServiceAccount (KSA), e.g., `gcpgateway-controller`.
 - Permissions to interact with the Compute Engine API are granted via Google Cloud **Workload Identity Federation for GKE** (or instance metadata / service account keys for non-GKE clusters) split across two least-privilege custom IAM roles:
-  - `gcpgatewayNegRegistrar`: Mutating NEG permissions, optionally constrained by IAM Conditions on NEG resource names.
-  - `gcpgatewayOperatorHelper`: Read/use permissions (`compute.instances.use`, `compute.zoneOperations.get`, `compute.backendServices.get`) evaluated against instance, operation, and backend service resources.
+  - `gcpgatewayNegRegistrar` (Runtime Controller Role): Used by the controller in the cluster to inspect NEGs and backend services, attach/detach endpoints, and query health.
+  - `gcpgatewayOperatorHelper` (Provisioning Helper Role): Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py` with full load balancer management permissions.
 - Only the controller communicates with the Google Cloud Compute API; data-plane pods run completely unprivileged without cloud credentials.
 
 ### 3. Layer 4 Only; GARI Decrypts TLS
@@ -716,19 +716,23 @@ Therefore, `gcpgateway` enforces strict end-to-end readiness:
 
 ### Why Two Custom IAM Roles Are Required
 
+To uphold least privilege, `gcpgateway` cleanly separates permissions into **two custom IAM roles**:
+
+1. **`gcpgatewayNegRegistrar` (Runtime Controller Role)**:
+   Used by the controller in the cluster. It can **only** inspect NEGs and backend services, attach/detach endpoints, and query health. It cannot create or destroy infrastructure.
+2. **`gcpgatewayOperatorHelper` (Provisioning Helper Role)**:
+   Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py`.
+   Permissions across addresses, health checks, NEGs, backend services, target TCP proxies, forwarding rules, and firewall rules.
+
 In Google Cloud IAM:
 - `compute.networkEndpointGroups.*` permissions are authorized against **Network Endpoint Group** resources (`projects/.../networkEndpointGroups/...`).
 - `compute.instances.use` is authorized against **Compute Engine Instance (VM)** resources (`projects/.../zones/.../instances/...`).
 - `compute.zoneOperations.get` is authorized against **Zone Operation** resources (`projects/.../zones/.../operations/...`).
-- `compute.backendServices.getHealth` is authorized against **Backend Service** resources (`projects/.../global/backendServices/...`).
-
-If all permissions were placed in a single role and bound with an IAM Condition requiring `resource.name.startsWith('.../networkEndpointGroups/...')`, then authorization checks for instances, operations, and backend services would **fail unconditionally**, breaking endpoint attachment and health checks.
-
-Therefore, permissions are cleanly separated into **two custom IAM roles**:
+- `compute.backendServices.get` is authorized against **Backend Service** resources (`projects/.../global/backendServices/...`) (and also authorizes `getHealth`).
 
 | Custom Role | Permissions | Target Resource Type | IAM Condition Support |
 | --- | --- | --- | --- |
-| **`gcpgatewayNegRegistrar`** | `compute.networkEndpointGroups.get`<br>`compute.networkEndpointGroups.listNetworkEndpoints`<br>`compute.networkEndpointGroups.attachNetworkEndpoints`<br>`compute.networkEndpointGroups.detachNetworkEndpoints`<br>`compute.backendServices.get`<br>`compute.backendServices.getHealth`<br>`compute.zoneOperations.get` | Network Endpoint Groups, Backend Services, Zone Operations | Scoped by prefix if prefixes differ per cluster (`${PREFIX}-*`) |
+| **`gcpgatewayNegRegistrar`** | `compute.networkEndpointGroups.get`<br>`compute.networkEndpointGroups.list`<br>`compute.networkEndpointGroups.use`<br>`compute.networkEndpointGroups.attachNetworkEndpoints`<br>`compute.networkEndpointGroups.detachNetworkEndpoints`<br>`compute.instances.use`<br>`compute.backendServices.get`<br>`compute.zoneOperations.get` | Network Endpoint Groups, Compute Engine Instances (VMs), Backend Services, Zone Operations | Scoped by prefix if prefixes differ per cluster (`${PREFIX}-*`) |
 | **`gcpgatewayOperatorHelper`** | Full load balancer management (`compute.addresses.*`, `compute.healthChecks.*`, `compute.networkEndpointGroups.*`, `compute.backendServices.*`, `compute.targetTcpProxies.*`, `compute.forwardingRules.*`, `compute.firewalls.*`) | All front-end resources | Provisioning helper for operators |
 
 > **Important Note on Name-Based IAM Conditions**:
@@ -745,46 +749,38 @@ In addition to standard Gateway API permissions, the `gcpgateway` controller req
 
 ### Workload Identity Configuration (GKE)
 
-#### 1. Create the Custom IAM Roles
+#### 1. Create the Custom IAM Role
 ```bash
-# Role 1: NEG-scoped mutating operations
 gcloud iam roles create gcpgatewayNegRegistrar \
     --project="${PROJECT_ID}" \
-    --title="gcpgateway NEG Registrar" \
-    --description="Allows gcpgateway controller to attach/detach endpoints in zonal NEGs" \
-    --permissions="compute.networkEndpointGroups.get,compute.networkEndpointGroups.listNetworkEndpoints,compute.networkEndpointGroups.attachNetworkEndpoints,compute.networkEndpointGroups.detachNetworkEndpoints" \
-    --stage="GA"
-
-# Role 2: VM use, operation polling, and health check reading
-gcloud iam roles create gcpgatewayOperatorHelper \
-    --project="${PROJECT_ID}" \
-    --title="gcpgateway Operator Helper" \
-    --description="Allows gcpgateway controller to use VM instances, await operations, and check backend health" \
-    --permissions="compute.instances.use,compute.zoneOperations.get" \
-    --stage="GA"
+    --title="GARI gcpgateway NEG Registrar" \
+    --description="Authorizes gcpgateway controller to register endpoints and check health" \
+    --stage="GA" \
+    --permissions="compute.networkEndpointGroups.get,compute.networkEndpointGroups.list,compute.networkEndpointGroups.use,compute.networkEndpointGroups.attachNetworkEndpoints,compute.networkEndpointGroups.detachNetworkEndpoints,compute.instances.use,compute.backendServices.get,compute.zoneOperations.get"
 ```
 
-#### 2. Bind the Custom Roles to the Kubernetes ServiceAccount
+#### 2. Bind the Custom Role to the Kubernetes ServiceAccount
 ```bash
-# Retrieve the Google Cloud project number
-PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')
-PRINCIPAL="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${CONTROLLER_NAMESPACE}/sa/${CONTROLLER_KSA_NAME}"
+# 1. Create the Google Service Account (GSA) and bind the role:
+gcloud iam service-accounts create "${GSA_NAME}" \
+    --project="${PROJECT_ID}" \
+    --display-name="gcpgateway Controller Service Account"
 
-# Binding 1: NEG Registrar role with cryptographic cluster isolation condition
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --role="projects/${PROJECT_ID}/roles/gcpgatewayNegRegistrar" \
-    --member="${PRINCIPAL}" \
-    --condition="expression=resource.name.extract('/networkEndpointGroups/{name}').startsWith('gcpgw-${CLUSTER_ID}-'),title=RestrictToClusterNEGs,description=Only allow managing NEGs for cluster ${CLUSTER_ID}"
+    --member="serviceAccount:${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="projects/${PROJECT_ID}/roles/gcpgatewayNegRegistrar"
 
-# Binding 2: Operator Helper role (without NEG resource-name condition)
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --role="projects/${PROJECT_ID}/roles/gcpgatewayOperatorHelper" \
-    --member="${PRINCIPAL}"
+# 2. Bind Workload Identity between the GSA and Kubernetes Service Account (KSA):
+gcloud iam service-accounts add-iam-policy-binding \
+    "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --project="${PROJECT_ID}" \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${KSA_NAMESPACE}/${KSA_NAME}]"
 ```
 
 ### Setup for Non-GKE Clusters (kOps / GCE)
 For non-GKE clusters running on Google Compute Engine:
-1. **Compute Engine Node Service Account**: Grant both custom roles to the GCE service account attached to the worker node VM instances (`<vm-sa>@${PROJECT_ID}.iam.gserviceaccount.com`). The controller inherits credentials transparently via the GCE instance metadata service.
+1. **Compute Engine Node Service Account**: Grant the runtime custom role (`gcpgatewayNegRegistrar`) to the GCE service account attached to the worker node VM instances (`<vm-sa>@${PROJECT_ID}.iam.gserviceaccount.com`). The controller inherits credentials transparently via the GCE instance metadata service.
 2. **Workload Identity Federation for External OIDC**: If the cluster has an external OIDC issuer, configure a Workload Identity Pool and Provider in Google Cloud IAM, mapping the KSA token to the GCP principal.
 
 ---
