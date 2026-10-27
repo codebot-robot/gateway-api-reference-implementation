@@ -2406,6 +2406,16 @@ func TestDataplane_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t 
 	if receivedXFF != "203.0.113.195" {
 		t.Errorf("expected X-Forwarded-For to match PROXY source IP 203.0.113.195, got %q", receivedXFF)
 	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for StartProxyServers to stop")
+	}
 }
 
 func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerStart(t *testing.T) {
@@ -2567,6 +2577,16 @@ func TestDataplane_HTTPS_ListenerOptionsPreservedWhenSecretSyncsBeforeListenerSt
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200 OK, got %d", resp.StatusCode)
 	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for StartProxyServers to stop")
+	}
 }
 
 func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testing.T) {
@@ -2628,11 +2648,10 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	defer cancel()
 
 	// 1. Start proxy servers with initial/empty listener options (PROXY disabled)
+	errCh := make(chan error, 1)
 	go func() {
-		_ = server.StartProxyServers(ctx)
+		errCh <- server.StartProxyServers(ctx)
 	}()
-
-	time.Sleep(50 * time.Millisecond)
 
 	// Direct dial sending PROXY header should fail with 400 Bad Request because PROXY is not yet enabled
 	conn1, err := net.DialTimeout("tcp", httpLis.Addr().String(), 2*time.Second)
@@ -2641,13 +2660,16 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	}
 	proxyHeader := "PROXY TCP4 203.0.113.195 127.0.0.1 54321 80\r\n"
 	httpRequest := "GET /ok HTTP/1.1\r\nHost: example.com\r\n\r\n"
-	_, _ = conn1.Write([]byte(proxyHeader + httpRequest))
+	if _, err := conn1.Write([]byte(proxyHeader + httpRequest)); err != nil {
+		t.Fatalf("failed to write PROXY header and request: %v", err)
+	}
 	resp1, err := http.ReadResponse(bufio.NewReader(conn1), nil)
-	if err == nil {
-		_ = resp1.Body.Close()
-		if resp1.StatusCode != http.StatusBadRequest {
-			t.Errorf("expected 400 Bad Request when PROXY is disabled, got %d", resp1.StatusCode)
-		}
+	if err != nil {
+		t.Fatalf("failed to read response when PROXY is disabled: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request when PROXY is disabled, got %d", resp1.StatusCode)
 	}
 	_ = conn1.Close()
 
@@ -2713,6 +2735,16 @@ func TestDataplane_ListenerOptionsUpdatedDynamicallyAfterListenerStart(t *testin
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("expected 200 OK after enabling PROXY, got %d", resp2.StatusCode)
 	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("unexpected error from StartProxyServers: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("timed out waiting for StartProxyServers to stop")
+	}
 }
 
 func TestDataplane_ConcurrentReconcileAndListenerInit(t *testing.T) {
@@ -2730,25 +2762,146 @@ func TestDataplane_ConcurrentReconcileAndListenerInit(t *testing.T) {
 		wg.Add(2)
 		go func(idx int) {
 			defer wg.Done()
-			server.updateListenerFilters(proxyproto.ListenerOptions{
+			if err := server.updateListenerFilters(proxyproto.ListenerOptions{
 				ProxyProtocol:             "enabled",
 				ProxyProtocolTrustedCIDRs: []string{"10.0.0.0/8"},
 				AllowedSourceCIDRs:        []string{"0.0.0.0/0"},
-			})
+			}); err != nil {
+				t.Errorf("updateListenerFilters failed: %v", err)
+			}
 		}(i)
 		go func(idx int) {
 			defer wg.Done()
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
+				t.Errorf("net.Listen failed: %v", err)
 				return
 			}
 			defer lis.Close()
 			if idx%2 == 0 {
-				_, _ = server.newHTTPListenerFilter(lis)
+				if _, err := server.initHTTPFilter(lis); err != nil {
+					t.Errorf("initHTTPFilter failed: %v", err)
+				}
 			} else {
-				_, _ = server.newHTTPSListenerFilter(lis)
+				if _, err := server.initHTTPSFilter(lis); err != nil {
+					t.Errorf("initHTTPSFilter failed: %v", err)
+				}
 			}
 		}(i)
 	}
 	wg.Wait()
+
+	server.filterMu.Lock()
+	opts := server.listenerOptionsLocked()
+	hasHTTP := server.httpFilter != nil
+	hasHTTPS := server.httpsFilter != nil
+	server.filterMu.Unlock()
+
+	if opts.ProxyProtocol != "enabled" {
+		t.Errorf("expected ProxyProtocol to be enabled, got %q", opts.ProxyProtocol)
+	}
+	if !hasHTTP {
+		t.Errorf("expected httpFilter to be set")
+	}
+	if !hasHTTPS {
+		t.Errorf("expected httpsFilter to be set")
+	}
+}
+
+func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	p := proxy.NewProxy()
+
+	gwName := "test-gw"
+	secretName := singlepod.ResourceNameForGateway(gwName)
+
+	server := &Server{
+		opts: Options{
+			DataplaneMode:             true,
+			DataplaneGatewayNamespace: "test-ns",
+			DataplaneGatewayName:      gwName,
+		},
+		proxy: p,
+	}
+
+	// 1. Initial valid config
+	dpConfigValid := &state.DataplaneConfig{
+		GatewayName:               types.NamespacedName{Namespace: "test-ns", Name: gwName},
+		ProxyProtocol:             "enabled",
+		ProxyProtocolTrustedCIDRs: []string{"10.0.0.0/8"},
+		AllowedSourceCIDRs:        []string{"10.0.0.0/8"},
+	}
+	validBytes, err := dpConfigValid.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal valid config: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-ns",
+			Name:      secretName,
+		},
+		Data: map[string][]byte{
+			singlepod.DataplaneSecretDataKey: validBytes,
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reconciler := &dataplaneSecretReconciler{
+		Client:           cl,
+		proxy:            p,
+		proxySynced:      &server.proxySynced,
+		gatewayNamespace: "test-ns",
+		secretName:       secretName,
+		onConfigUpdate:   server.updateListenerFilters,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "test-ns", Name: secretName},
+	}
+	if _, err := reconciler.Reconcile(t.Context(), req); err != nil {
+		t.Fatalf("initial valid reconcile failed: %v", err)
+	}
+
+	// Verify options were stored
+	server.filterMu.Lock()
+	opts := server.listenerOptionsLocked()
+	server.filterMu.Unlock()
+	if opts.ProxyProtocol != "enabled" || len(opts.AllowedSourceCIDRs) != 1 || opts.AllowedSourceCIDRs[0] != "10.0.0.0/8" {
+		t.Fatalf("unexpected stored options: %+v", opts)
+	}
+
+	// 2. Secret updated with invalid CIDR
+	dpConfigInvalid := &state.DataplaneConfig{
+		GatewayName:               types.NamespacedName{Namespace: "test-ns", Name: gwName},
+		ProxyProtocol:             "enabled",
+		ProxyProtocolTrustedCIDRs: []string{"not-a-valid-cidr"},
+		AllowedSourceCIDRs:        []string{"invalid-cidr"},
+	}
+	invalidBytes, err := dpConfigInvalid.Marshal()
+	if err != nil {
+		t.Fatalf("failed to marshal invalid config: %v", err)
+	}
+
+	secret.Data[singlepod.DataplaneSecretDataKey] = invalidBytes
+	if err := cl.Update(t.Context(), secret); err != nil {
+		t.Fatalf("failed to update secret: %v", err)
+	}
+
+	// Reconcile should fail with an error
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err == nil {
+		t.Fatalf("expected Reconcile to fail for invalid CIDR, but succeeded")
+	}
+
+	// Verify old valid options are preserved and invalid ones were not stored
+	server.filterMu.Lock()
+	optsAfter := server.listenerOptionsLocked()
+	server.filterMu.Unlock()
+	if optsAfter.ProxyProtocol != "enabled" || len(optsAfter.AllowedSourceCIDRs) != 1 || optsAfter.AllowedSourceCIDRs[0] != "10.0.0.0/8" {
+		t.Errorf("expected previous valid options to be preserved, got %+v", optsAfter)
+	}
 }
