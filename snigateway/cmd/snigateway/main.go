@@ -71,6 +71,8 @@ func main() {
 		debugErrorResponses bool
 	)
 
+	gariOpts := gari.DefaultOptions()
+
 	flag.StringVar(&frontendAddr, "frontend", "127.0.0.1:443", "Address of the snigateway-frontend server (<ip-or-host>:<port>).")
 	flag.Var(&gatewayAddresses, "gateway-address", "Address to report in Gateway status (repeatable, IP or hostname). Defaults to host part of --frontend.")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Path to the CA certificate PEM file used to verify snigateway-frontend.")
@@ -89,6 +91,9 @@ func main() {
 	flag.BoolVar(&leaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&leaderElectionID, "leader-election-id", "snigateway-controller", "The ID used for leader election.")
 	flag.BoolVar(&debugErrorResponses, "debug-error-responses", false, "Include detailed error messages in unmatched responses.")
+	flag.StringVar(&gariOpts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", "", "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to.")
+	flag.StringVar(&gariOpts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", "", "Path to the CA bundle PEM file to verify the upstream certificate server.")
+	flag.StringVar(&gariOpts.ACMEChallengeTokenPath, "acme-challenge-token-path", "", "Path to the projected service-account token file for data-plane identity.")
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
@@ -163,7 +168,6 @@ func main() {
 	addrProvider := tunnel.NewAddressProvider(tunnelMgr, addrs...)
 	addrProvider.SetControllerName(controllerName)
 
-	gariOpts := gari.DefaultOptions()
 	gariOpts.ControllerName = controllerName
 	gariOpts.MetricsAddr = metricsAddr
 	gariOpts.HealthProbeBindAddress = healthProbeAddr
