@@ -157,13 +157,13 @@ func runDataplane(ctx context.Context, args []string) error {
 //   - otherwise compute.NewService(ctx) is called, returning an error on failure.
 func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
 	var (
-		clusterID      string
-		negPrefix      string
-		project        string
-		region         string
-		zonesStr       string
-		controllerName string
-		dataplaneImg   string
+		clusterID           string
+		negPrefix           string
+		project             string
+		region              string
+		zonesStr            string
+		controllerName      string
+		dataplaneImg        string
 		drainSeconds        int
 		leaderElect         bool
 		fakeCompute         bool
