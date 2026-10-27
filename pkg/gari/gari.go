@@ -82,6 +82,23 @@ type AddressTypeProvider = controller.AddressTypeProvider
 // the desired status and before writing it to the API server.
 type GatewayStatusHook = controller.GatewayStatusHook
 
+// CertificateSourceOptionKey is the tls.options key used to select a certificate source for a listener.
+const CertificateSourceOptionKey = controller.CertificateSourceOptionKey
+
+// CertificateResult contains the resolved certificates and condition details for a listener.
+type CertificateResult = controller.CertificateResult
+
+// CertificateSource supplies TLS certificates for a Gateway's listeners.
+// Implementations must be non-blocking and must not modify gw or listener (they are shared State objects).
+type CertificateSource = controller.CertificateSource
+
+// TriggerableCertificateSource is an optional interface that a CertificateSource can implement
+// to receive a trigger callback when registered with GARI.
+type TriggerableCertificateSource = controller.TriggerableCertificateSource
+
+// SecretsCertificateSource resolves certificates from Secret references specified in listener.TLS.CertificateRefs.
+type SecretsCertificateSource = controller.SecretsCertificateSource
+
 // GatewayReadiness represents the data-plane readiness state of a Gateway.
 type GatewayReadiness = state.GatewayReadiness
 
@@ -183,6 +200,10 @@ type Options struct {
 	// DisableStatusUpdates disables writing status back to the Kubernetes API.
 	// Useful for data-plane instances where the control-plane controller owns status reporting.
 	DisableStatusUpdates bool
+
+	// CertificateSources is an optional map of named CertificateSource implementations
+	// for Gateway TLS listeners configured with tls.options[gateway.gke-labs.io/certificate-source].
+	CertificateSources map[string]CertificateSource
 
 	// Manager is an optional controller-runtime manager. If provided, New will
 	// register reconcilers with it instead of creating a new manager.
@@ -667,6 +688,8 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		GatewayFilter:        s.opts.GatewayFilter,
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,
 		GatewayStatusHook:    s.opts.GatewayStatusHook,
+
+		CertificateSources: s.opts.CertificateSources,
 	})
 }
 

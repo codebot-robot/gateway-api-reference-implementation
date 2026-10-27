@@ -61,6 +61,8 @@ type ReconcilerOptions struct {
 	DisableStatusUpdates bool
 	CRDView              *CRDView
 	GatewayStatusHook    GatewayStatusHook
+
+	CertificateSources map[string]CertificateSource
 }
 
 // RegisterReconcilers registers all GARI reconcilers and informer event handlers with the given Manager.
@@ -68,6 +70,10 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 	controllerName := opts.ControllerName
 	if controllerName == "" {
 		controllerName = DefaultControllerName
+	}
+
+	if st != nil && len(opts.CertificateSources) > 0 {
+		st.RegisterCertificateSources(opts.CertificateSources)
 	}
 
 	crdView := opts.CRDView

@@ -675,7 +675,7 @@ func TestExtractCertificates(t *testing.T) {
 		RefValidator: st,
 	})
 
-	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList(), secrets, st)
+	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList())
 
 	if certsMap["example.com"] == nil {
 		t.Errorf("expected certificate for example.com")
@@ -1146,12 +1146,13 @@ func TestValidateListener_CertificateRefGroup(t *testing.T) {
 				},
 			}
 
-			_, conds, _ := ValidateListener(
+			_, conds, _, _ := ValidateListener(
 				ListenerToSpec(listener),
 				ListenerOwner{Kind: "Gateway", Namespace: "default", Name: "gw"},
-				"default",
+				&gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gw"}},
 				1,
 				secrets,
+				nil,
 				nil,
 				nil,
 				nil,
@@ -4278,7 +4279,7 @@ func TestFrontendClientCertValidation_PerPortOverridesDefault(t *testing.T) {
 	if len(proxyListeners) != 2 {
 		t.Errorf("expected 2 proxy listeners, got %d", len(proxyListeners))
 	}
-	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
+	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList())
 	if defaultCert == nil && len(certsMap) == 0 {
 		t.Errorf("expected certificates extracted, got certsMap=%v defaultCert=%v", certsMap, defaultCert)
 	}
@@ -4673,7 +4674,7 @@ func TestFrontendClientCertValidation_AllowInsecureFallback_ProgrammedAndServed(
 	if len(proxyListeners) != 1 {
 		t.Errorf("expected 1 proxy listener, got %d", len(proxyListeners))
 	}
-	certsMap, _ := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
+	certsMap, _ := ExtractCertificates(compiled.GatewaysList())
 	if len(certsMap) != 1 {
 		t.Errorf("expected 1 certificate extracted, got %d", len(certsMap))
 	}
@@ -5076,7 +5077,7 @@ func TestFrontendClientCertValidation_AllowValidOnly_ProgrammedAndServed(t *test
 	if len(proxyListeners) != 1 {
 		t.Errorf("expected 1 proxy listener, got %d", len(proxyListeners))
 	}
-	certsMap, _ := ExtractCertificates(compiled.GatewaysList(), secrets, nil)
+	certsMap, _ := ExtractCertificates(compiled.GatewaysList())
 	if len(certsMap) != 1 {
 		t.Errorf("expected 1 certificate extracted, got %d", len(certsMap))
 	}
@@ -6191,4 +6192,143 @@ func TestGateway_AllInOneMode_RejectsListenerParameters(t *testing.T) {
 	if accCondSinglepod == nil || accCondSinglepod.Status != metav1.ConditionTrue {
 		t.Errorf("in singlepod mode, expected Accepted=True, got %+v", accCondSinglepod)
 	}
+}
+
+type fakeStaticCertSource struct {
+	result CertificateResult
+	err    error
+}
+
+func (f *fakeStaticCertSource) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.Listener) (CertificateResult, error) {
+	return f.result, f.err
+}
+
+func TestCompileModel_CertificateSource(t *testing.T) {
+	gwKey := types.NamespacedName{Namespace: "default", Name: "my-gw"}
+	certPEM, keyPEM := generateTestCertPEM(t, "example.com")
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("failed to parse test cert: %v", err)
+	}
+
+	t.Run("resolved certificate", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "default",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "https",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							Options: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+								gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways: []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{
+				{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+			},
+			CertificateSources: map[string]CertificateSource{
+				"test-source": &fakeStaticCertSource{
+					result: CertificateResult{
+						Certificates: []*tls.Certificate{&tlsCert},
+					},
+				},
+			},
+		}
+
+		outputs := ComputeOutputs(inputs)
+		cg := outputs.CompiledGateways[gwKey]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		if len(cg.EffectiveListeners) != 1 {
+			t.Fatalf("expected 1 effective listener, got %d", len(cg.EffectiveListeners))
+		}
+		el := cg.EffectiveListeners[0]
+		if !el.IsAccepted() {
+			t.Errorf("expected listener to be accepted")
+		}
+		if !el.IsProgrammed() {
+			t.Errorf("expected listener to be programmed")
+		}
+		refCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if refCond == nil || refCond.Status != metav1.ConditionTrue || refCond.Reason != string(gatewayv1.ListenerReasonResolvedRefs) {
+			t.Errorf("expected ResolvedRefs=True/ResolvedRefs, got %+v", refCond)
+		}
+
+		certsMap, defaultCert := ExtractCertificates([]*CompiledGateway{cg})
+		if certsMap["example.com"] == nil {
+			t.Errorf("expected certsMap[example.com] to be populated")
+		}
+		if defaultCert == nil {
+			t.Errorf("expected defaultCert to be populated")
+		}
+	})
+
+	t.Run("pending certificate", func(t *testing.T) {
+		gw := &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-gw"},
+			Spec: gatewayv1.GatewaySpec{
+				GatewayClassName: "default",
+				Listeners: []gatewayv1.Listener{
+					{
+						Name:     "https",
+						Port:     443,
+						Protocol: gatewayv1.HTTPSProtocolType,
+						Hostname: Ptr(gatewayv1.Hostname("example.com")),
+						TLS: &gatewayv1.ListenerTLSConfig{
+							Options: map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+								gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		inputs := ModelInputs{
+			Gateways: []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{
+				{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+			},
+			CertificateSources: map[string]CertificateSource{
+				"test-source": &fakeStaticCertSource{
+					result: CertificateResult{
+						Pending: true,
+					},
+				},
+			},
+		}
+
+		outputs := ComputeOutputs(inputs)
+		cg := outputs.CompiledGateways[gwKey]
+		if cg == nil {
+			t.Fatalf("expected compiled gateway")
+		}
+		el := cg.EffectiveListeners[0]
+		if !el.IsAccepted() {
+			t.Errorf("expected listener to be accepted when pending")
+		}
+		if el.IsProgrammed() {
+			t.Errorf("expected listener to NOT be programmed when pending")
+		}
+		refCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonPending) {
+			t.Errorf("expected ResolvedRefs=False/Pending, got %+v", refCond)
+		}
+		progCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
+			t.Errorf("expected Programmed=False/Pending, got %+v", progCond)
+		}
+	})
 }

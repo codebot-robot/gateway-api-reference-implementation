@@ -32,6 +32,23 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// CertificateSourceOptionKey is the tls.options key used to select a certificate source for a listener.
+const CertificateSourceOptionKey = state.CertificateSourceOptionKey
+
+// CertificateResult contains the resolved certificates and condition details for a listener.
+type CertificateResult = state.CertificateResult
+
+// CertificateSource supplies TLS certificates for a Gateway's listeners.
+// Implementations must be non-blocking and must not modify gw or listener (they are shared State objects).
+type CertificateSource = state.CertificateSource
+
+// TriggerableCertificateSource is an optional interface that a CertificateSource can implement
+// to receive a trigger callback when registered with GARI.
+type TriggerableCertificateSource = state.TriggerableCertificateSource
+
+// SecretsCertificateSource resolves certificates from Secret references specified in listener.TLS.CertificateRefs.
+type SecretsCertificateSource = state.SecretsCertificateSource
+
 type GatewayClassReconciler struct {
 	client.Client
 	APIReader      client.Reader
@@ -228,7 +245,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 						if delay == 0 {
 							delay = DefaultConflictRequeueDelay
 						}
-						requeueAfter = delay
+						if requeueAfter == 0 || delay < requeueAfter {
+							requeueAfter = delay
+						}
 					} else {
 						l.Error(err, "unable to provision or fetch gateway addresses from address provider")
 						return ctrl.Result{}, err

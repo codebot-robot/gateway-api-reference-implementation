@@ -16,12 +16,15 @@ package state
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,6 +37,251 @@ import (
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
 )
+
+var (
+	sourceErrorLogMu   sync.Mutex
+	lastSourceErrorLog = make(map[string]time.Time)
+)
+
+const sourceErrorLogInterval = 10 * time.Second
+
+func logSourceError(sourceName string, gw *gatewayv1.Gateway, listener gatewayv1.SectionName, err error) {
+	gwKey := ""
+	if gw != nil {
+		gwKey = fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
+	}
+	key := fmt.Sprintf("%s:%s:%s", sourceName, gwKey, listener)
+
+	sourceErrorLogMu.Lock()
+	now := time.Now()
+	// Prune entries older than the log interval to prevent unbounded map growth over time
+	for k, last := range lastSourceErrorLog {
+		if now.Sub(last) > sourceErrorLogInterval {
+			delete(lastSourceErrorLog, k)
+		}
+	}
+
+	lastLog, seen := lastSourceErrorLog[key]
+	shouldLog := !seen || now.Sub(lastLog) >= sourceErrorLogInterval
+	if shouldLog {
+		lastSourceErrorLog[key] = now
+	}
+	sourceErrorLogMu.Unlock()
+
+	if shouldLog {
+		klog.Errorf("certificate source %q returned error for listener %s on gateway %s: %v", sourceName, listener, gwKey, err)
+	}
+}
+
+// CertificateSourceOptionKey is the tls.options key used to select a certificate source for a listener.
+const CertificateSourceOptionKey = "gateway.gke-labs.io/certificate-source"
+
+// CertificateResult contains the resolved certificates and condition details for a listener.
+type CertificateResult struct {
+	Certificates []*tls.Certificate
+
+	// FailedReason is set when certificate resolution failed (e.g. InvalidCertificateRef, RefNotPermitted).
+	// If empty and not Pending, resolution succeeded.
+	FailedReason gatewayv1.ListenerConditionReason
+	// FailedMessage is the message for ResolvedRefs and Programmed when resolution failed.
+	FailedMessage string
+	// ProgrammedMessage overrides the Programmed condition message when resolution failed.
+	ProgrammedMessage string
+
+	// Pending is true when the certificate is not yet available (e.g. external fetch in progress).
+	// When Pending is true, ResolvedRefs and Programmed report ListenerReasonPending.
+	Pending bool
+}
+
+// CertificateSource supplies TLS certificates for a Gateway's listeners.
+//
+// Contract:
+//   - Implementations must be non-blocking: return what is currently known in local cache.
+//   - Implementations must NOT modify gw or listener: they are shared State objects.
+//   - When an external source's background worker updates its cache, it invokes the trigger
+//     callback provided via SetRecomputeTrigger to request a State recompute.
+type CertificateSource interface {
+	// ResolveCertificates returns the certificates for the listener and the
+	// listener conditions to report. It must not block: return what is known now.
+	// It must not modify gw or listener.
+	ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.Listener) (CertificateResult, error)
+}
+
+// TriggerableCertificateSource is an optional interface that a CertificateSource can implement
+// to receive a trigger callback when registered with GARI. Calling the trigger requests a State recompute.
+type TriggerableCertificateSource interface {
+	CertificateSource
+	SetRecomputeTrigger(trigger func())
+}
+
+// SecretsCertificateSource resolves certificates from Secret references specified in listener.TLS.CertificateRefs.
+type SecretsCertificateSource struct {
+	Secrets      map[types.NamespacedName]*corev1.Secret
+	RefValidator ReferenceGrantValidator
+	Owner        ListenerOwner
+}
+
+// ResolveCertificates resolves and validates all certificates referenced in listener.TLS.CertificateRefs.
+func (s *SecretsCertificateSource) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.Listener) (CertificateResult, error) {
+	if listener == nil || listener.TLS == nil || len(listener.TLS.CertificateRefs) == 0 {
+		return CertificateResult{
+			FailedReason:      gatewayv1.ListenerReasonInvalidCertificateRef,
+			FailedMessage:     "No certificate refs specified",
+			ProgrammedMessage: "Invalid TLS configuration: no certificate refs specified",
+		}, nil
+	}
+
+	ownerKind := s.Owner.Kind
+	if ownerKind == "" {
+		ownerKind = "Gateway"
+	}
+	ownerNamespace := s.Owner.Namespace
+	if ownerNamespace == "" && gw != nil {
+		ownerNamespace = gw.Namespace
+	}
+
+	var certs []*tls.Certificate
+	for _, ref := range listener.TLS.CertificateRefs {
+		group := ValueOf(ref.Group)
+		kind := ValueOf(ref.Kind)
+		if group != "" || (kind != "" && kind != "Secret") {
+			return CertificateResult{
+				FailedReason:      gatewayv1.ListenerReasonInvalidCertificateRef,
+				FailedMessage:     fmt.Sprintf("Unsupported certificate ref group %q kind %q", group, kind),
+				ProgrammedMessage: fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind),
+			}, nil
+		}
+
+		if kind == "" {
+			kind = "Secret"
+		}
+
+		secretNs := ownerNamespace
+		if ref.Namespace != nil && string(*ref.Namespace) != "" {
+			secretNs = string(*ref.Namespace)
+		}
+		secretKey := types.NamespacedName{
+			Namespace: secretNs,
+			Name:      string(ref.Name),
+		}
+
+		if secretNs != ownerNamespace {
+			from := Reference{
+				GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: string(ownerKind)},
+				Namespace: ownerNamespace,
+			}
+			to := Reference{
+				GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
+				Namespace: secretKey.Namespace,
+				Name:      secretKey.Name,
+			}
+			if s.RefValidator == nil || !s.RefValidator.IsReferencePermitted(from, to) {
+				return CertificateResult{
+					FailedReason:      gatewayv1.ListenerReasonRefNotPermitted,
+					FailedMessage:     fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name),
+					ProgrammedMessage: fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name),
+				}, nil
+			}
+		}
+
+		var secret *corev1.Secret
+		if s.Secrets != nil {
+			secret = s.Secrets[secretKey]
+		}
+		if secret == nil {
+			return CertificateResult{
+				FailedReason:      gatewayv1.ListenerReasonInvalidCertificateRef,
+				FailedMessage:     fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name),
+				ProgrammedMessage: fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name),
+			}, nil
+		}
+
+		certBytes := secret.Data[corev1.TLSCertKey]
+		keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
+		if len(certBytes) == 0 || len(keyBytes) == 0 {
+			return CertificateResult{
+				FailedReason:      gatewayv1.ListenerReasonInvalidCertificateRef,
+				FailedMessage:     fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name),
+				ProgrammedMessage: fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name),
+			}, nil
+		}
+
+		tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
+		if err != nil {
+			return CertificateResult{
+				FailedReason:      gatewayv1.ListenerReasonInvalidCertificateRef,
+				FailedMessage:     fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err),
+				ProgrammedMessage: fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err),
+			}, nil
+		}
+
+		certs = append(certs, &tlsCert)
+	}
+
+	return CertificateResult{
+		Certificates: certs,
+	}, nil
+}
+
+// ValidateCertificate verifies that cert has a non-empty certificate chain,
+// that the leaf certificate parses as X.509, and that the private key matches
+// the leaf certificate's public key.
+func ValidateCertificate(cert *tls.Certificate) error {
+	if cert == nil {
+		return fmt.Errorf("certificate is nil")
+	}
+	if len(cert.Certificate) == 0 {
+		return fmt.Errorf("certificate chain is empty")
+	}
+	if cert.PrivateKey == nil {
+		return fmt.Errorf("certificate private key is missing")
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("failed to parse leaf certificate: %w", err)
+		}
+	}
+	signer, ok := cert.PrivateKey.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("certificate private key does not implement crypto.Signer")
+	}
+	pub, ok := signer.Public().(interface{ Equal(crypto.PublicKey) bool })
+	if !ok || !pub.Equal(leaf.PublicKey) {
+		return fmt.Errorf("certificate private key does not match public key")
+	}
+	return nil
+}
+
+// CopyTLSCertificate returns a deep copy of a tls.Certificate.
+func CopyTLSCertificate(cert *tls.Certificate) *tls.Certificate {
+	if cert == nil {
+		return nil
+	}
+	cp := *cert
+	if len(cert.Certificate) > 0 {
+		cp.Certificate = make([][]byte, len(cert.Certificate))
+		for i, c := range cert.Certificate {
+			cp.Certificate[i] = bytes.Clone(c)
+		}
+	}
+	if len(cert.OCSPStaple) > 0 {
+		cp.OCSPStaple = bytes.Clone(cert.OCSPStaple)
+	}
+	if len(cert.SignedCertificateTimestamps) > 0 {
+		cp.SignedCertificateTimestamps = make([][]byte, len(cert.SignedCertificateTimestamps))
+		for i, sct := range cert.SignedCertificateTimestamps {
+			cp.SignedCertificateTimestamps[i] = bytes.Clone(sct)
+		}
+	}
+	if len(cert.SupportedSignatureAlgorithms) > 0 {
+		cp.SupportedSignatureAlgorithms = make([]tls.SignatureScheme, len(cert.SupportedSignatureAlgorithms))
+		copy(cp.SupportedSignatureAlgorithms, cert.SupportedSignatureAlgorithms)
+	}
+	return &cp
+}
 
 // ListenerOwner identifies the resource (Gateway or ListenerSet) that defines a listener.
 type ListenerOwner struct {
@@ -98,6 +346,9 @@ type EffectiveListener struct {
 	UDPBackends      []InternalUDPBackend
 	ClientValidation *InternalClientValidation
 	Generation       int64
+
+	ResolvedCertificates []*tls.Certificate
+	ResolvedCertificate  *tls.Certificate
 }
 
 // IsAccepted returns true if the listener has an Accepted condition with status True.
@@ -478,6 +729,8 @@ type ModelInputs struct {
 	AllInOneMode            bool
 	GatewayCRDBundleVersion *string
 	DisabledRouteKinds      map[gatewayv1.Kind]bool
+
+	CertificateSources map[string]CertificateSource
 }
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
@@ -583,14 +836,19 @@ func EffectiveFrontendValidation(gwTLS *gatewayv1.GatewayTLSConfig, port gateway
 func ValidateListener(
 	listener ListenerSpec,
 	owner ListenerOwner,
-	gwNamespace string,
+	gw *gatewayv1.Gateway,
 	generation int64,
 	secrets map[types.NamespacedName]*corev1.Secret,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	frontendValidation *gatewayv1.FrontendTLSValidation,
 	refValidator ReferenceGrantValidator,
+	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
-) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation) {
+) (supportedKinds []gatewayv1.RouteGroupKind, conditions []metav1.Condition, clientValidation *InternalClientValidation, resolvedCerts []*tls.Certificate) {
+	gwNamespace := ""
+	if gw != nil {
+		gwNamespace = gw.Namespace
+	}
 	if gwNamespace == "" {
 		gwNamespace = owner.Namespace
 	}
@@ -623,7 +881,7 @@ func ValidateListener(
 				generation,
 			),
 		}
-		return supportedKinds, conditions, nil
+		return supportedKinds, conditions, nil, nil
 	}
 
 	hasInvalidRouteKind := false
@@ -678,79 +936,104 @@ func ValidateListener(
 	var tlsInvalidReason string
 	var tlsInvalidMessage string
 	var tlsProgrammedMessage string
+	var tlsPendingMessage string
 
 	needsTLSSecretValidation := isSupported && (listener.Protocol == gatewayv1.HTTPSProtocolType || (listener.Protocol == gatewayv1.TLSProtocolType && listener.TLS != nil && (listener.TLS.Mode == nil || *listener.TLS.Mode == gatewayv1.TLSModeTerminate))) && listener.TLS != nil
+	hasSourceOption := false
+	var sourceName string
+	if needsTLSSecretValidation && listener.TLS.Options != nil {
+		if optVal, ok := listener.TLS.Options[gatewayv1.AnnotationKey(CertificateSourceOptionKey)]; ok && string(optVal) != "" {
+			hasSourceOption = true
+			sourceName = string(optVal)
+		}
+	}
+
 	if needsTLSSecretValidation {
-		if len(listener.TLS.CertificateRefs) == 0 {
+		gListener := &gatewayv1.Listener{
+			Name:          listener.Name,
+			Port:          listener.Port,
+			Protocol:      listener.Protocol,
+			Hostname:      listener.Hostname,
+			TLS:           listener.TLS,
+			AllowedRoutes: listener.AllowedRoutes,
+		}
+
+		var source CertificateSource
+		var selectedSourceName string
+		var isSecretSource bool
+
+		if len(listener.TLS.CertificateRefs) > 0 {
+			// A listener with certificateRefs resolves via SecretsCertificateSource.
+			source = &SecretsCertificateSource{
+				Secrets:      secrets,
+				RefValidator: refValidator,
+				Owner:        owner,
+			}
+			isSecretSource = true
+			selectedSourceName = "secrets"
+		} else if hasSourceOption {
+			if listener.Hostname == nil || *listener.Hostname == "" || strings.Contains(string(*listener.Hostname), "*") {
+				tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+				tlsInvalidMessage = "Certificate source requires an exact, non-wildcard hostname"
+				tlsProgrammedMessage = "Certificate source requires an exact, non-wildcard hostname"
+			} else {
+				source = certSources[sourceName]
+				if source == nil {
+					tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+					tlsInvalidMessage = fmt.Sprintf("Unknown certificate source %q", sourceName)
+					tlsProgrammedMessage = fmt.Sprintf("Unknown certificate source %q", sourceName)
+				} else {
+					selectedSourceName = sourceName
+				}
+			}
+		} else {
 			tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
 			tlsInvalidMessage = "No certificate refs specified"
 			tlsProgrammedMessage = "Invalid TLS configuration: no certificate refs specified"
-		} else {
-			for _, ref := range listener.TLS.CertificateRefs {
-				group := ValueOf(ref.Group)
-				kind := ValueOf(ref.Kind)
-				if group != "" || (kind != "" && kind != "Secret") {
+		}
+
+		if source != nil && tlsInvalidReason == "" {
+			res, err := source.ResolveCertificates(gw, gListener)
+			if err != nil {
+				logSourceError(selectedSourceName, gw, listener.Name, err)
+				tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+				msg := fmt.Sprintf("Certificate source %q returned an error", selectedSourceName)
+				if isSecretSource {
+					msg = err.Error()
+				}
+				tlsInvalidMessage = msg
+				tlsProgrammedMessage = msg
+			} else if res.Pending {
+				tlsPendingMessage = "Certificate pending from source"
+			} else if res.FailedReason != "" {
+				tlsInvalidReason = string(res.FailedReason)
+				tlsInvalidMessage = res.FailedMessage
+				tlsProgrammedMessage = res.ProgrammedMessage
+			} else if len(res.Certificates) == 0 {
+				tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
+				tlsInvalidMessage = "No certificate resolved"
+				tlsProgrammedMessage = "No certificate resolved"
+			} else {
+				var validCerts []*tls.Certificate
+				var valErr error
+				for _, c := range res.Certificates {
+					cp := CopyTLSCertificate(c)
+					if err := ValidateCertificate(cp); err != nil {
+						valErr = err
+						break
+					}
+					validCerts = append(validCerts, cp)
+				}
+				if valErr != nil {
 					tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
-					tlsInvalidMessage = fmt.Sprintf("Unsupported certificate ref group %q kind %q", group, kind)
-					tlsProgrammedMessage = fmt.Sprintf("Invalid certificate ref group %q kind %q", group, kind)
-					break
-				}
-
-				if kind == "" {
-					kind = "Secret"
-				}
-
-				secretNs := owner.Namespace
-				if ref.Namespace != nil && string(*ref.Namespace) != "" {
-					secretNs = string(*ref.Namespace)
-				}
-				secretKey := types.NamespacedName{
-					Namespace: secretNs,
-					Name:      string(ref.Name),
-				}
-
-				if secretKey.Namespace != owner.Namespace {
-					from := Reference{
-						GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: string(owner.Kind)},
-						Namespace: owner.Namespace,
+					msg := fmt.Sprintf("Certificate source %q returned an invalid certificate", selectedSourceName)
+					if isSecretSource {
+						msg = valErr.Error()
 					}
-					to := Reference{
-						GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-						Namespace: secretKey.Namespace,
-						Name:      secretKey.Name,
-					}
-					if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
-						tlsInvalidReason = string(gatewayv1.ListenerReasonRefNotPermitted)
-						tlsInvalidMessage = fmt.Sprintf("Cross-namespace reference to %s/%s is not permitted by any ReferenceGrant", secretKey.Namespace, secretKey.Name)
-						tlsProgrammedMessage = tlsInvalidMessage
-						break
-					}
-				}
-
-				if secrets != nil {
-					secret, ok := secrets[secretKey]
-					if !ok || secret == nil {
-						tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
-						tlsInvalidMessage = fmt.Sprintf("Secret %s/%s not found", secretKey.Namespace, secretKey.Name)
-						tlsProgrammedMessage = tlsInvalidMessage
-						break
-					}
-
-					certBytes := secret.Data[corev1.TLSCertKey]
-					keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
-					if len(certBytes) == 0 || len(keyBytes) == 0 {
-						tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
-						tlsInvalidMessage = fmt.Sprintf("Secret %s/%s is missing tls.crt or tls.key", secretKey.Namespace, secretKey.Name)
-						tlsProgrammedMessage = tlsInvalidMessage
-						break
-					}
-
-					if _, err := tls.X509KeyPair(certBytes, keyBytes); err != nil {
-						tlsInvalidReason = string(gatewayv1.ListenerReasonInvalidCertificateRef)
-						tlsInvalidMessage = fmt.Sprintf("Secret %s/%s contains invalid certificate or key: %v", secretKey.Namespace, secretKey.Name, err)
-						tlsProgrammedMessage = tlsInvalidMessage
-						break
-					}
+					tlsInvalidMessage = msg
+					tlsProgrammedMessage = msg
+				} else {
+					resolvedCerts = validCerts
 				}
 			}
 		}
@@ -832,6 +1115,9 @@ func ValidateListener(
 	resolvedRefsStatus := metav1.ConditionTrue
 	resolvedRefsReason := gatewayv1.ListenerReasonResolvedRefs
 	resolvedRefsMessage := "All references resolved"
+	if listener.TLS != nil && len(listener.TLS.CertificateRefs) > 0 && hasSourceOption {
+		resolvedRefsMessage = fmt.Sprintf("All references resolved; %s option was ignored", CertificateSourceOptionKey)
+	}
 
 	if hasInvalidRouteKind {
 		resolvedRefsStatus = metav1.ConditionFalse
@@ -841,6 +1127,14 @@ func ValidateListener(
 		listenerProgrammedStatus = metav1.ConditionFalse
 		listenerProgrammedReason = gatewayv1.ListenerReasonInvalid
 		listenerProgrammedMessage = "One or more route kinds are not supported"
+	} else if tlsPendingMessage != "" {
+		resolvedRefsStatus = metav1.ConditionFalse
+		resolvedRefsReason = gatewayv1.ListenerReasonPending
+		resolvedRefsMessage = tlsPendingMessage
+
+		listenerProgrammedStatus = metav1.ConditionFalse
+		listenerProgrammedReason = gatewayv1.ListenerReasonPending
+		listenerProgrammedMessage = tlsPendingMessage
 	} else if tlsInvalidReason != "" {
 		resolvedRefsStatus = metav1.ConditionFalse
 		resolvedRefsReason = gatewayv1.ListenerConditionReason(tlsInvalidReason)
@@ -896,47 +1190,56 @@ func ValidateListener(
 		),
 	}
 
-	return supportedKinds, conditions, clientValidation
+	return supportedKinds, conditions, clientValidation, resolvedCerts
 }
 
 // BuildEffectiveListener constructs an EffectiveListener from a listener specification.
 func BuildEffectiveListener(
 	listener ListenerSpec,
 	owner ListenerOwner,
-	parentGateway types.NamespacedName,
+	gw *gatewayv1.Gateway,
 	generation int64,
 	secrets map[types.NamespacedName]*corev1.Secret,
 	configMaps map[types.NamespacedName]*corev1.ConfigMap,
 	frontendValidation *gatewayv1.FrontendTLSValidation,
 	refValidator ReferenceGrantValidator,
+	certSources map[string]CertificateSource,
 	disabledRouteKinds ...map[gatewayv1.Kind]bool,
 ) *EffectiveListener {
-	supportedKinds, conditions, clientValidation := ValidateListener(
+	supportedKinds, conditions, clientValidation, resolvedCerts := ValidateListener(
 		listener,
 		owner,
-		parentGateway.Namespace,
+		gw,
 		generation,
 		secrets,
 		configMaps,
 		frontendValidation,
 		refValidator,
+		certSources,
 		disabledRouteKinds...,
 	)
+	var parentGateway types.NamespacedName
+	if gw != nil {
+		parentGateway = types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	} else {
+		parentGateway = types.NamespacedName{Namespace: owner.Namespace, Name: owner.Name}
+	}
 	return &EffectiveListener{
-		Owner:            owner,
-		ParentGateway:    parentGateway,
-		Name:             listener.Name,
-		Port:             listener.Port,
-		Protocol:         listener.Protocol,
-		Hostname:         listener.Hostname,
-		TLS:              listener.TLS,
-		AllowedRoutes:    listener.AllowedRoutes,
-		SupportedKinds:   supportedKinds,
-		Conditions:       conditions,
-		ClientValidation: clientValidation,
-		AttachedRoutes:   0,
-		Routes:           nil,
-		Generation:       generation,
+		Owner:                owner,
+		ParentGateway:        parentGateway,
+		Name:                 listener.Name,
+		Port:                 listener.Port,
+		Protocol:             listener.Protocol,
+		Hostname:             listener.Hostname,
+		TLS:                  listener.TLS,
+		AllowedRoutes:        listener.AllowedRoutes,
+		SupportedKinds:       supportedKinds,
+		Conditions:           conditions,
+		AttachedRoutes:       0,
+		Routes:               nil,
+		ClientValidation:     clientValidation,
+		ResolvedCertificates: resolvedCerts,
+		Generation:           generation,
 	}
 }
 
@@ -1411,12 +1714,13 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 			el := BuildEffectiveListener(
 				ListenerToSpec(l),
 				ListenerOwner{Kind: "Gateway", Namespace: gw.Namespace, Name: gw.Name},
-				gwKey,
+				gw,
 				gw.Generation,
 				inputs.Secrets,
 				inputs.ConfigMaps,
 				frontendVal,
 				refValidator,
+				inputs.CertificateSources,
 				inputs.DisabledRouteKinds,
 			)
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
@@ -1451,12 +1755,13 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				el := BuildEffectiveListener(
 					ListenerEntryToSpec(l),
 					ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name},
-					gwKey,
+					gw,
 					ls.Generation,
 					inputs.Secrets,
 					inputs.ConfigMaps,
 					frontendVal,
 					refValidator,
+					inputs.CertificateSources,
 					inputs.DisabledRouteKinds,
 				)
 				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
@@ -2225,11 +2530,7 @@ func bindUDPRouteParentRef(
 }
 
 // ExtractCertificates extracts TLS certificates once per effective listener across all compiled gateways.
-func ExtractCertificates(
-	gateways []*CompiledGateway,
-	secrets map[types.NamespacedName]*corev1.Secret,
-	refValidator ReferenceGrantValidator,
-) (map[string]*tls.Certificate, *tls.Certificate) {
+func ExtractCertificates(gateways []*CompiledGateway) (map[string]*tls.Certificate, *tls.Certificate) {
 	certsMap := make(map[string]*tls.Certificate)
 	var defaultCert *tls.Certificate
 
@@ -2248,69 +2549,28 @@ func ExtractCertificates(
 				continue
 			}
 
-			for _, ref := range el.TLS.CertificateRefs {
-				group := ValueOf(ref.Group)
-				kind := ValueOf(ref.Kind)
-				if kind == "" {
-					kind = "Secret"
-				}
-				if group != "" || kind != "Secret" {
+			certs := el.ResolvedCertificates
+
+			for _, cert := range certs {
+				if cert == nil || len(cert.Certificate) == 0 {
 					continue
 				}
-
-				secretNs := el.Owner.Namespace
-				if ref.Namespace != nil && string(*ref.Namespace) != "" {
-					secretNs = string(*ref.Namespace)
-				}
-				secretKey := types.NamespacedName{
-					Namespace: secretNs,
-					Name:      string(ref.Name),
-				}
-
-				if secretKey.Namespace != el.Owner.Namespace {
-					from := Reference{
-						GroupKind: schema.GroupKind{Group: gatewayv1.GroupName, Kind: string(el.Owner.Kind)},
-						Namespace: el.Owner.Namespace,
-					}
-					to := Reference{
-						GroupKind: schema.GroupKind{Group: string(group), Kind: string(kind)},
-						Namespace: secretKey.Namespace,
-						Name:      secretKey.Name,
-					}
-					if refValidator == nil || !refValidator.IsReferencePermitted(from, to) {
+				certCopy := *cert
+				leaf := certCopy.Leaf
+				if leaf == nil {
+					var err error
+					leaf, err = x509.ParseCertificate(certCopy.Certificate[0])
+					if err != nil {
 						continue
 					}
+					certCopy.Leaf = leaf
 				}
-
-				secret := secrets[secretKey]
-				if secret == nil {
-					continue
-				}
-
-				certBytes := secret.Data[corev1.TLSCertKey]
-				keyBytes := secret.Data[corev1.TLSPrivateKeyKey]
-				if len(certBytes) == 0 || len(keyBytes) == 0 {
-					continue
-				}
-
-				tlsCert, err := tls.X509KeyPair(certBytes, keyBytes)
-				if err != nil {
-					continue
-				}
-
-				certCopy := tlsCert
-				if len(certCopy.Certificate) > 0 {
-					leaf, err := x509.ParseCertificate(certCopy.Certificate[0])
-					if err != nil {
-						klog.V(2).Infof("failed to parse certificate for secret %s: %v", secretKey, err)
-					} else {
-						certCopy.Leaf = leaf
-						if leaf.Subject.CommonName != "" {
-							certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy
-						}
-						for _, dnsName := range leaf.DNSNames {
-							certsMap[strings.ToLower(dnsName)] = &certCopy
-						}
+				if leaf != nil {
+					if leaf.Subject.CommonName != "" {
+						certsMap[strings.ToLower(leaf.Subject.CommonName)] = &certCopy
+					}
+					for _, dnsName := range leaf.DNSNames {
+						certsMap[strings.ToLower(dnsName)] = &certCopy
 					}
 				}
 				if el.Hostname != nil && string(*el.Hostname) != "" {
@@ -2506,7 +2766,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 
 	// 6. Proxy Config & Certs
 	proxyListeners, proxyRoutes := BuildProxyConfig(compiled.GatewaysList())
-	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList(), inputs.Secrets, inputs.RefValidator)
+	certsMap, defaultCert := ExtractCertificates(compiled.GatewaysList())
 
 	outputs.ProxyListeners = proxyListeners
 	outputs.ProxyRoutes = proxyRoutes
@@ -2517,7 +2777,7 @@ func ComputeOutputs(inputs ModelInputs) *Outputs {
 
 	outputs.DataplaneConfigs = make(map[types.NamespacedName]*DataplaneConfig)
 	for gwKey, cg := range compiled.Gateways {
-		dpConfig, err := BuildGatewayDataplaneConfig(cg, inputs.Secrets, inputs.RefValidator)
+		dpConfig, err := BuildGatewayDataplaneConfig(cg)
 		if err == nil && dpConfig != nil {
 			outputs.DataplaneConfigs[gwKey] = dpConfig
 		}

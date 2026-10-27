@@ -121,6 +121,8 @@ type State struct {
 	referenceGrants       map[types.NamespacedName]*gatewayv1beta1.ReferenceGrant
 	namespaces            map[string]*corev1.Namespace
 
+	certificateSources map[string]CertificateSource
+
 	controllerName          string
 	gatewayCRDBundleVersion *string
 	disabledRouteKinds      map[gatewayv1.Kind]bool
@@ -777,6 +779,14 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		}
 	}
 
+	var certSources map[string]CertificateSource
+	if len(s.certificateSources) > 0 {
+		certSources = make(map[string]CertificateSource, len(s.certificateSources))
+		for k, v := range s.certificateSources {
+			certSources[k] = v
+		}
+	}
+
 	return ModelInputs{
 		Revision:                s.revision,
 		Gateways:                gws,
@@ -802,6 +812,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		AllInOneMode:            allInOne,
 		GatewayCRDBundleVersion: s.gatewayCRDBundleVersion,
 		DisabledRouteKinds:      disabledRouteKinds,
+		CertificateSources:      certSources,
 	}
 }
 
@@ -1239,6 +1250,43 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 		s.revision++
 		s.markDirtyLocked()
 	}
+}
+
+// RegisterCertificateSources registers named CertificateSource implementations and provides them with
+// a trigger callback to request a State recompute when their caches change.
+func (s *State) RegisterCertificateSources(sources map[string]CertificateSource) {
+	s.mu.Lock()
+	if len(sources) == 0 {
+		s.certificateSources = nil
+		s.revision++
+		s.markDirtyLocked()
+		s.mu.Unlock()
+		return
+	}
+	s.certificateSources = make(map[string]CertificateSource, len(sources))
+	var triggerables []TriggerableCertificateSource
+	for name, src := range sources {
+		s.certificateSources[name] = src
+		if t, ok := src.(TriggerableCertificateSource); ok {
+			triggerables = append(triggerables, t)
+		}
+	}
+	s.revision++
+	s.markDirtyLocked()
+	s.mu.Unlock()
+
+	// Set triggers outside the lock so that any synchronous actions in SetRecomputeTrigger cannot deadlock.
+	for _, t := range triggerables {
+		t.SetRecomputeTrigger(s.TriggerRecompute)
+	}
+}
+
+// TriggerRecompute requests a State recompute, notifying watchers when complete.
+func (s *State) TriggerRecompute() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revision++
+	s.markDirtyLocked()
 }
 
 func (s *State) SetGatewayAddresses(key types.NamespacedName, addrs []gatewayv1.GatewayStatusAddress) {

@@ -2955,3 +2955,29 @@ func TestDataplane_InvalidCIDRsRejectedAndNotStored(t *testing.T) {
 		t.Errorf("expected previous valid options to be preserved, got %+v", optsAfter)
 	}
 }
+
+type fakeGariCertSource struct{}
+
+func (f *fakeGariCertSource) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.Listener) (CertificateResult, error) {
+	return CertificateResult{Pending: true}, nil
+}
+
+func TestCertificateSources_OptionsWiring(t *testing.T) {
+	src := &fakeGariCertSource{}
+	opts := Options{
+		RestConfig: &rest.Config{
+			Host: "http://localhost:8080",
+		},
+		MetricsAddr:            "0",
+		HealthProbeBindAddress: "0",
+		CertificateSources:     map[string]CertificateSource{"my-source": src},
+	}
+
+	err := opts.complete()
+	if err != nil {
+		t.Fatalf("complete returned error: %v", err)
+	}
+	if opts.CertificateSources["my-source"] != src {
+		t.Errorf("expected CertificateSources[my-source] to be preserved")
+	}
+}
