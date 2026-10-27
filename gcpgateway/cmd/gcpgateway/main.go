@@ -116,6 +116,7 @@ func runDataplane(ctx context.Context, args []string) error {
 	fs.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "Health probe bind address")
 	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "HTTP proxy bind address")
 	fs.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "HTTPS proxy bind address")
+	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -163,9 +164,10 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		zonesStr       string
 		controllerName string
 		dataplaneImg   string
-		drainSeconds   int
-		leaderElect    bool
-		fakeCompute    bool
+		drainSeconds        int
+		leaderElect         bool
+		fakeCompute         bool
+		debugErrorResponses bool
 	)
 
 	defaultClusterID := os.Getenv("CLUSTER_ID")
@@ -194,6 +196,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	fs.IntVar(&drainSeconds, "drain-seconds", DefaultDrainSeconds, "Seconds to drain connections during rolling updates")
 	fs.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election")
 	fs.BoolVar(&fakeCompute, "fake-compute", false, "Use in-memory fake Compute client for testing/offline mode")
+	fs.BoolVar(&debugErrorResponses, "debug-error-responses", false, "Include detailed error messages in unmatched responses")
 
 	if err := fs.Parse(args); err != nil {
 		return gari.Options{}, err
@@ -219,6 +222,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	opts.ProxyHTTPSAddr = ""
 	opts.ProxyHTTP3Addr = ""
 	opts.DrainSentinelPath = DefaultSentinelPath
+	opts.DebugErrorResponses = debugErrorResponses
 
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").
@@ -246,6 +250,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		singlepod.WithPreStopCommand(preStopCmd...),
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
 		singlepod.WithTerminationGracePeriodSeconds(gracePeriodSeconds),
+		singlepod.WithDebugErrorResponses(debugErrorResponses),
 	)
 
 	var zoneList []string
