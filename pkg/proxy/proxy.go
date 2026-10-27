@@ -85,7 +85,8 @@ type Proxy struct {
 	sniConfig              atomic.Pointer[sniConfig]
 	clientValidationConfig atomic.Pointer[clientValidationConfig]
 
-	forwardedForMode atomic.Pointer[ForwardedForMode]
+	forwardedForMode    atomic.Pointer[ForwardedForMode]
+	debugErrorResponses atomic.Bool
 
 	tcpListeners      map[gatewayv1.PortNumber]*tcpPortListener
 	tcpBindHost       string
@@ -253,6 +254,16 @@ func (p *Proxy) getForwardedForMode() ForwardedForMode {
 		return *m
 	}
 	return ForwardedForModeAppend
+}
+
+// SetDebugErrorResponses configures whether detailed error messages are included in unmatched responses.
+func (p *Proxy) SetDebugErrorResponses(enabled bool) {
+	p.debugErrorResponses.Store(enabled)
+}
+
+// DebugErrorResponses returns whether detailed error messages are included in unmatched responses.
+func (p *Proxy) DebugErrorResponses() bool {
+	return p.debugErrorResponses.Load()
 }
 
 func getOriginalHost(r *http.Request) string {
@@ -1039,14 +1050,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) respondNotFound(w http.ResponseWriter, r *http.Request, msg string) {
-	if isGRPCRequest(r) {
+	var host, path string
+	if r != nil {
+		host = r.Host
+		if r.URL != nil {
+			path = r.URL.Path
+		}
+	}
+	log.Log.Info(msg, "host", host, "path", path)
+	if r != nil && isGRPCRequest(r) {
 		w.Header().Set("Content-Type", "application/grpc")
 		w.Header().Set("Grpc-Status", "12")
-		w.Header().Set("Grpc-Message", msg)
+		if p.debugErrorResponses.Load() {
+			w.Header().Set("Grpc-Message", msg)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	http.Error(w, msg, http.StatusNotFound)
+	if p.debugErrorResponses.Load() {
+		http.Error(w, msg, http.StatusNotFound)
+		return
+	}
+	http.Error(w, "404 page not found", http.StatusNotFound)
 }
 
 func isGRPCRequest(r *http.Request) bool {
