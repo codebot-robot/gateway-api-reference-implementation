@@ -110,15 +110,15 @@ func TestDiskCache_PermissionsAndLifecycle(t *testing.T) {
 	hostnamesKey := "app.example.com,example.com"
 	certPEM, keyPEM, leaf, _ := generateSelfSignedCert(t, hostnames)
 
-	cert := &Certificate{
-		Hostnames:    hostnames,
-		HostnamesKey: hostnamesKey,
-		CertPEM:      certPEM,
-		KeyPEM:       keyPEM,
-		Leaf:         leaf,
-		IssuedAt:     leaf.NotBefore,
-		ExpiresAt:    leaf.NotAfter,
-	}
+	cert := NewCertificate(
+		hostnames,
+		hostnamesKey,
+		certPEM,
+		keyPEM,
+		leaf,
+		leaf.NotBefore,
+		leaf.NotAfter,
+	)
 
 	// 1. Put certificate
 	if err := c.Put(cert); err != nil {
@@ -161,7 +161,7 @@ func TestDiskCache_PermissionsAndLifecycle(t *testing.T) {
 	if gotAfterRestart.HostnamesKey != hostnamesKey {
 		t.Errorf("expected %s, got %s", hostnamesKey, gotAfterRestart.HostnamesKey)
 	}
-	if gotAfterRestart.Leaf.SerialNumber.Cmp(leaf.SerialNumber) != 0 {
+	if gotAfterRestart.Leaf().SerialNumber.Cmp(leaf.SerialNumber) != 0 {
 		t.Errorf("serial numbers do not match after restart")
 	}
 
@@ -179,15 +179,15 @@ func TestCertificate_PrivateKeySafety(t *testing.T) {
 	hostnames := []string{"safe.example.com"}
 	certPEM, keyPEM, leaf, _ := generateSelfSignedCert(t, hostnames)
 
-	cert := &Certificate{
-		Hostnames:    hostnames,
-		HostnamesKey: "safe.example.com",
-		CertPEM:      certPEM,
-		KeyPEM:       keyPEM,
-		Leaf:         leaf,
-		IssuedAt:     leaf.NotBefore,
-		ExpiresAt:    leaf.NotAfter,
-	}
+	cert := NewCertificate(
+		hostnames,
+		"safe.example.com",
+		certPEM,
+		keyPEM,
+		leaf,
+		leaf.NotBefore,
+		leaf.NotAfter,
+	)
 
 	str := cert.String()
 	goStr := fmt.Sprintf("%#v", cert)

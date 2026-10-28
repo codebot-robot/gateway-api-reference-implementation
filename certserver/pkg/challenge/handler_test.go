@@ -100,6 +100,12 @@ func TestChallengeHandler_AcceptanceCriteria(t *testing.T) {
 			host:           validHost,
 			expectedStatus: http.StatusNotFound,
 		},
+		{
+			name:           "token with slash",
+			token:          "foo/bar",
+			host:           validHost,
+			expectedStatus: http.StatusNotFound,
+		},
 	}
 
 	for _, tc := range tests {

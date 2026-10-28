@@ -129,8 +129,8 @@ func TestManager_Pebble_Issuance(t *testing.T) {
 	}
 
 	// Verify SANs in leaf
-	if len(cert.Leaf.DNSNames) != 2 {
-		t.Errorf("expected 2 DNSNames in leaf, got %d", len(cert.Leaf.DNSNames))
+	if len(cert.Leaf().DNSNames) != 2 {
+		t.Errorf("expected 2 DNSNames in leaf, got %d", len(cert.Leaf().DNSNames))
 	}
 
 	// Verify file permissions
@@ -180,9 +180,9 @@ func TestManager_Pebble_ReuseFromCacheAfterRestart(t *testing.T) {
 		t.Fatalf("mgr2.Obtain from cache failed: %v", err)
 	}
 
-	if cert2.Leaf.SerialNumber.Cmp(cert1.Leaf.SerialNumber) != 0 {
+	if cert2.Leaf().SerialNumber.Cmp(cert1.Leaf().SerialNumber) != 0 {
 		t.Errorf("expected reused certificate with same serial number, got %v vs %v",
-			cert2.Leaf.SerialNumber, cert1.Leaf.SerialNumber)
+			cert2.Leaf().SerialNumber, cert1.Leaf().SerialNumber)
 	}
 }
 
@@ -225,8 +225,8 @@ func TestManager_Pebble_Renewal(t *testing.T) {
 		t.Fatalf("Cache.Get failed: %v", err)
 	}
 
-	if cert2.Leaf.SerialNumber.Cmp(cert1.Leaf.SerialNumber) == 0 {
-		t.Errorf("expected new certificate serial after renewal, got identical serial: %v", cert1.Leaf.SerialNumber)
+	if cert2.Leaf().SerialNumber.Cmp(cert1.Leaf().SerialNumber) == 0 {
+		t.Errorf("expected new certificate serial after renewal, got identical serial: %v", cert1.Leaf().SerialNumber)
 	}
 }
 
@@ -271,9 +271,9 @@ func TestManager_Pebble_ConcurrentObtainSameSet(t *testing.T) {
 			t.Fatalf("goroutine %d received nil certificate", i)
 		}
 		// Verify all concurrent callers received the identical certificate
-		if certs[i].Leaf.SerialNumber.Cmp(certs[0].Leaf.SerialNumber) != 0 {
+		if certs[i].Leaf().SerialNumber.Cmp(certs[0].Leaf().SerialNumber) != 0 {
 			t.Errorf("goroutine %d received different certificate serial: %v vs %v",
-				i, certs[i].Leaf.SerialNumber, certs[0].Leaf.SerialNumber)
+				i, certs[i].Leaf().SerialNumber, certs[0].Leaf().SerialNumber)
 		}
 	}
 }
@@ -390,9 +390,9 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Obtain after renewal failure should keep serving existing certificate, got error: %v", err)
 	}
-	if served.Leaf.SerialNumber.Cmp(cert1.Leaf.SerialNumber) != 0 {
+	if served.Leaf().SerialNumber.Cmp(cert1.Leaf().SerialNumber) != 0 {
 		t.Fatalf("served certificate changed after renewal failure: %v vs %v",
-			served.Leaf.SerialNumber, cert1.Leaf.SerialNumber)
+			served.Leaf().SerialNumber, cert1.Leaf().SerialNumber)
 	}
 
 	// Verify state is renewing
@@ -414,7 +414,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Obtain after recovered renewal failed: %v", err)
 	}
-	if renewed.Leaf.SerialNumber.Cmp(cert1.Leaf.SerialNumber) == 0 {
+	if renewed.Leaf().SerialNumber.Cmp(cert1.Leaf().SerialNumber) == 0 {
 		t.Fatalf("expected renewed certificate serial number to change")
 	}
 
@@ -738,9 +738,9 @@ func TestManager_Renewal_AlwaysProducesNewOrder_DoesNotCoalesceToNoop(t *testing
 	}
 
 	// 3. Verify Renew produced a new ACME order and new certificate instead of coalescing into no-op cached cert
-	if cert2.Leaf.SerialNumber.Cmp(cert1.Leaf.SerialNumber) == 0 {
+	if cert2.Leaf().SerialNumber.Cmp(cert1.Leaf().SerialNumber) == 0 {
 		t.Fatalf("expected Renew to produce a new order with different serial number, got identical serial %v",
-			cert1.Leaf.SerialNumber)
+			cert1.Leaf().SerialNumber)
 	}
 
 	// 4. Subsequent Obtain should now return the renewed certificate from cache
@@ -748,9 +748,9 @@ func TestManager_Renewal_AlwaysProducesNewOrder_DoesNotCoalesceToNoop(t *testing
 	if err != nil {
 		t.Fatalf("subsequent Obtain failed: %v", err)
 	}
-	if cert3.Leaf.SerialNumber.Cmp(cert2.Leaf.SerialNumber) != 0 {
+	if cert3.Leaf().SerialNumber.Cmp(cert2.Leaf().SerialNumber) != 0 {
 		t.Fatalf("expected subsequent Obtain to return newly renewed certificate serial %v, got %v",
-			cert2.Leaf.SerialNumber, cert3.Leaf.SerialNumber)
+			cert2.Leaf().SerialNumber, cert3.Leaf().SerialNumber)
 	}
 }
 

@@ -46,13 +46,34 @@ var (
 
 // Certificate represents a managed TLS certificate chain and its private key.
 type Certificate struct {
-	Hostnames    []string          `json:"hostnames"`
-	HostnamesKey string            `json:"hostnames_key"`
-	CertPEM      []byte            `json:"cert_pem"`
-	KeyPEM       []byte            `json:"key_pem"`
-	Leaf         *x509.Certificate `json:"-"`
-	IssuedAt     time.Time         `json:"issued_at"`
-	ExpiresAt    time.Time         `json:"expires_at"`
+	Hostnames    []string `json:"hostnames"`
+	HostnamesKey string   `json:"hostnames_key"`
+	CertPEM      []byte   `json:"cert_pem"`
+	KeyPEM       []byte   `json:"key_pem"`
+	leaf         *x509.Certificate
+	IssuedAt     time.Time `json:"issued_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+// NewCertificate constructs a Certificate with a parsed leaf and metadata.
+func NewCertificate(hostnames []string, hostnamesKey string, certPEM, keyPEM []byte, leaf *x509.Certificate, issuedAt, expiresAt time.Time) *Certificate {
+	return &Certificate{
+		Hostnames:    hostnames,
+		HostnamesKey: hostnamesKey,
+		CertPEM:      certPEM,
+		KeyPEM:       keyPEM,
+		leaf:         leaf,
+		IssuedAt:     issuedAt,
+		ExpiresAt:    expiresAt,
+	}
+}
+
+// Leaf returns the parsed x509 leaf certificate.
+func (c *Certificate) Leaf() *x509.Certificate {
+	if c == nil {
+		return nil
+	}
+	return c.leaf
 }
 
 // String implements fmt.Stringer, ensuring private keys are never printed in logs or errors.
@@ -70,7 +91,7 @@ func (c *Certificate) GoString() string {
 
 // IsExpired reports whether the certificate is expired at the given time.
 func (c *Certificate) IsExpired(now time.Time) bool {
-	if c == nil || c.Leaf == nil {
+	if c == nil || c.leaf == nil {
 		return true
 	}
 	return now.After(c.ExpiresAt)
@@ -118,6 +139,8 @@ func (dc *DiskCache) Dir() string {
 }
 
 // hashKey returns the hex-encoded SHA-256 hash of a normalized hostnames key.
+// Storing each certificate bundle under a deterministic hash gives a stable,
+// collision-resistant 1:1 filename per hostname set on disk.
 func hashKey(hostnamesKey string) string {
 	sum := sha256.Sum256([]byte(hostnamesKey))
 	return hex.EncodeToString(sum[:])
@@ -134,49 +157,39 @@ func (dc *DiskCache) writeAtomic(filename string, data []byte) error {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 
+	cleanup := true
+	defer func() {
+		if cleanup {
+			if closeErr := f.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+				log.Printf("certserver: error closing temp file %s: %v", tmpPath, closeErr)
+			}
+			if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
+			}
+		}
+	}()
+
 	if _, err := f.Write(data); err != nil {
-		closeErr := f.Close()
-		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("failed to write temp file (%w) and close failed: %v", err, closeErr)
-		}
 		return fmt.Errorf("failed to write temp file: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
-		closeErr := f.Close()
-		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("failed to fsync temp file (%w) and close failed: %v", err, closeErr)
-		}
 		return fmt.Errorf("failed to fsync temp file: %w", err)
 	}
 
 	if err := f.Close(); err != nil {
-		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
-		}
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
 	if err := os.Chmod(tmpPath, 0600); err != nil {
-		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
-		}
 		return fmt.Errorf("failed to set temp file permissions: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, destPath); err != nil {
-		if rmErr := os.Remove(tmpPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Printf("certserver: error removing temp file %s: %v", tmpPath, rmErr)
-		}
 		return fmt.Errorf("failed to rename %s to %s: %w", tmpPath, destPath, err)
 	}
 
+	cleanup = false
 	return dc.syncDir()
 }
 
@@ -186,14 +199,14 @@ func (dc *DiskCache) syncDir() error {
 	if err != nil {
 		return fmt.Errorf("failed to open cache dir for sync: %w", err)
 	}
+	defer func() {
+		if closeErr := dirFile.Close(); closeErr != nil {
+			log.Printf("certserver: error closing cache dir %s: %v", dc.dir, closeErr)
+		}
+	}()
 
-	syncErr := dirFile.Sync()
-	closeErr := dirFile.Close()
-	if syncErr != nil {
-		return fmt.Errorf("failed to sync cache dir: %w", syncErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("failed to close cache dir: %w", closeErr)
+	if err := dirFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync cache dir: %w", err)
 	}
 	return nil
 }
@@ -364,15 +377,15 @@ func (dc *DiskCache) Load() error {
 			continue
 		}
 
-		cert := &Certificate{
-			Hostnames:    bundle.Hostnames,
-			HostnamesKey: bundle.HostnamesKey,
-			CertPEM:      bundle.CertPEM,
-			KeyPEM:       bundle.KeyPEM,
-			Leaf:         leaf,
-			IssuedAt:     bundle.IssuedAt,
-			ExpiresAt:    bundle.ExpiresAt,
-		}
+		cert := NewCertificate(
+			bundle.Hostnames,
+			bundle.HostnamesKey,
+			bundle.CertPEM,
+			bundle.KeyPEM,
+			leaf,
+			bundle.IssuedAt,
+			bundle.ExpiresAt,
+		)
 
 		dc.entries[bundle.HostnamesKey] = cert
 	}

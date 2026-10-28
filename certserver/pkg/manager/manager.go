@@ -122,6 +122,11 @@ func (m *Manager) Cache() *cache.DiskCache {
 
 // Obtain creates or reuses a certificate order for the normalized hostname set.
 // Concurrent calls for the same set share one order via obtainSf.
+//
+// Note on separate flights: Obtain and Renew use separate singleflight groups (obtainSf and renewSf).
+// If a certificate has already expired while a background renewal is retrying, an incoming Obtain
+// can initiate its own order. Both orders produce valid certificates and write atomically to cache,
+// ensuring caller requests are satisfied without coalescing renewals into no-op cached returns.
 func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certificate, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
@@ -157,7 +162,7 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 
 		// Detached context with independent timeout so that cancellation of the first caller
 		// does not abort the shared order for other waiting callers.
-		orderCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		orderCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 		defer cancel()
 
 		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, false)
@@ -201,7 +206,7 @@ func (m *Manager) Renew(ctx context.Context, hostnames []string) (*cache.Certifi
 			defer m.pendingOrders.Add(-1)
 		}
 
-		orderCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		orderCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 		defer cancel()
 
 		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, true)
@@ -334,15 +339,15 @@ func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hos
 		Bytes: keyDER,
 	})
 
-	return &cache.Certificate{
-		Hostnames:    normalized,
-		HostnamesKey: hostnamesKey,
-		CertPEM:      certPEM,
-		KeyPEM:       keyPEM,
-		Leaf:         leaf,
-		IssuedAt:     leaf.NotBefore,
-		ExpiresAt:    leaf.NotAfter,
-	}, nil
+	return cache.NewCertificate(
+		normalized,
+		hostnamesKey,
+		certPEM,
+		keyPEM,
+		leaf,
+		leaf.NotBefore,
+		leaf.NotAfter,
+	), nil
 }
 
 func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string) error {
