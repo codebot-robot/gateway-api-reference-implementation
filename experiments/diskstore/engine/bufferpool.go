@@ -91,30 +91,42 @@ func (h *PageHandle) Block(i int) []byte {
 
 // Unpin releases the caller's pin on the page.
 func (h *PageHandle) Unpin() {
-	h.Desc.PinCount.Add(-1)
+	if h.Desc.PinCount.Add(-1) == 0 && h.pool != nil && h.pool.cond != nil {
+		h.pool.mu.Lock()
+		h.pool.cond.Broadcast()
+		h.pool.mu.Unlock()
+	}
 }
 
 // BufferPool manages a fixed-size arena of 4 KiB frames with direct I/O, out-of-place writes,
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
 type BufferPool struct {
-	file      File
-	wal       *WAL
-	buddy     *BuddyAllocator
-	directIO  DirectIO
-	cipher    Cipher
-	dbID      [16]byte
-	mu        sync.Mutex
-	onFailure func(error)
+	file     File
+	wal      *WAL
+	buddy    *BuddyAllocator
+	directIO DirectIO
+	cipher   Cipher
+	dbID     [16]byte
 
-	numFrames  int
-	arena      []byte // Pointer-free byte arena aligned to 4096 bytes
+	numFrames int
+	arena     []byte // Pointer-free byte arena aligned to 4096 bytes
+
+	// mu guards freeFrames, pageTable, and onFailure.
+	mu sync.Mutex
+
+	// cond uses mu. It is broadcast when an in-flight flush completes or when
+	// a page handle's pin count drops to zero. Waiters re-check whether the
+	// target page descriptor has finished flushing (InFlight == false) and has
+	// released all pins (PinCount == 0).
+	cond *sync.Cond
+
 	freeFrames []int
+	pageTable  map[uint64]*PageDesc // logicalPage -> PageDesc
+	onFailure  func(error)
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
-
-	pageTable map[uint64]*PageDesc // logicalPage -> PageDesc
 
 	bgStop chan struct{}
 	bgDone chan struct{}
@@ -171,6 +183,7 @@ func NewBufferPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, op
 		bgStop:     make(chan struct{}),
 		bgDone:     make(chan struct{}),
 	}
+	bp.cond = sync.NewCond(&bp.mu)
 
 	go bp.backgroundIdleSweep()
 	return bp
@@ -340,29 +353,57 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	// Item 4: Reusing a logical page must release previous frames and disk blocks!
-	if oldDesc, exists := bp.pageTable[logicalPage]; exists && oldDesc != nil {
-		if len(oldDesc.FrameIDs) > 0 {
-			bp.freeFrames = append(bp.freeFrames, oldDesc.FrameIDs...)
-			oldDesc.FrameIDs = nil
+	// Wait until any in-flight flush finishes and all pins are released on the existing descriptor.
+	for {
+		oldDesc := bp.pageTable[logicalPage]
+		if oldDesc == nil {
+			break
 		}
-		freed := make(map[uint64]bool)
-		for _, loc := range []uint64{oldDesc.DurableLoc, oldDesc.FlushedLoc, oldDesc.PhysicalBlock} {
-			if loc != NoBlock && !freed[loc] {
-				freed[loc] = true
-				if err := bp.buddy.Free(loc); err != nil && bp.onFailure != nil {
-					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free old block %d: %w", loc, err))
-				}
-			}
+		if !oldDesc.InFlight && oldDesc.PinCount.Load() == 0 {
+			break
 		}
-		oldDesc.DurableLoc = NoBlock
-		oldDesc.FlushedLoc = NoBlock
-		oldDesc.PhysicalBlock = NoBlock
+		bp.cond.Wait()
 	}
 
 	frameIDs, err := bp.acquireFramesLocked(numBlocks)
 	if err != nil {
 		return nil, err
+	}
+
+	// Re-check idleness because acquireFramesLocked may have temporarily released bp.mu
+	// to flush dirty pages. Loop on cond.Wait() while keeping the acquired frames until
+	// the old descriptor is idle, and hold bp.mu without releasing it through the teardown.
+	for {
+		oldDesc := bp.pageTable[logicalPage]
+		if oldDesc == nil {
+			break
+		}
+		if !oldDesc.InFlight && oldDesc.PinCount.Load() == 0 {
+			break
+		}
+		bp.cond.Wait()
+	}
+
+	var oldDurableLoc uint64 = NoBlock
+	var oldFlushedBeforeSync uint64 = NoBlock
+	var oldFlushedLoc uint64 = NoBlock
+
+	if oldDesc := bp.pageTable[logicalPage]; oldDesc != nil {
+		if len(oldDesc.FrameIDs) > 0 {
+			bp.freeFrames = append(bp.freeFrames, oldDesc.FrameIDs...)
+			oldDesc.FrameIDs = nil
+		}
+
+		// Defer freeing the old durable location until the new copy is promoted to durable,
+		// fulfilling the Reuse Rule.
+		oldDurableLoc = oldDesc.DurableLoc
+		oldFlushedBeforeSync = oldDesc.FlushedBeforeSync
+		oldFlushedLoc = oldDesc.FlushedLoc
+
+		oldDesc.DurableLoc = NoBlock
+		oldDesc.FlushedBeforeSync = NoBlock
+		oldDesc.FlushedLoc = NoBlock
+		oldDesc.PhysicalBlock = NoBlock
 	}
 
 	now := time.Now()
@@ -375,9 +416,9 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 		DirtyTime:         now,
 		LastAccess:        now,
 		PhysicalBlock:     NoBlock,
-		FlushedLoc:        NoBlock,
-		FlushedBeforeSync: NoBlock,
-		DurableLoc:        NoBlock,
+		FlushedLoc:        oldFlushedLoc,
+		FlushedBeforeSync: oldFlushedBeforeSync,
+		DurableLoc:        oldDurableLoc,
 	}
 	desc.PageLSN.Store(lsn)
 	desc.PinCount.Store(1)
@@ -405,30 +446,38 @@ func (bp *BufferPool) FreePage(logicalPage uint64) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	if desc, exists := bp.pageTable[logicalPage]; exists && desc != nil {
-		if len(desc.FrameIDs) > 0 {
-			bp.freeFrames = append(bp.freeFrames, desc.FrameIDs...)
-			desc.FrameIDs = nil
+	for {
+		desc, exists := bp.pageTable[logicalPage]
+		if !exists || desc == nil {
+			return
 		}
-		if desc.DurableLoc != NoBlock {
-			if err := bp.buddy.Free(desc.DurableLoc); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free durable block %d: %w", desc.DurableLoc, err))
+		if !desc.InFlight && desc.PinCount.Load() == 0 {
+			if len(desc.FrameIDs) > 0 {
+				bp.freeFrames = append(bp.freeFrames, desc.FrameIDs...)
+				desc.FrameIDs = nil
 			}
-			desc.DurableLoc = NoBlock
-		}
-		if desc.FlushedLoc != NoBlock && desc.FlushedLoc != desc.DurableLoc {
-			if err := bp.buddy.Free(desc.FlushedLoc); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free flushed block %d: %w", desc.FlushedLoc, err))
+			if desc.DurableLoc != NoBlock {
+				if err := bp.buddy.Free(desc.DurableLoc); err != nil && bp.onFailure != nil {
+					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free durable block %d: %w", desc.DurableLoc, err))
+				}
+				desc.DurableLoc = NoBlock
 			}
-			desc.FlushedLoc = NoBlock
-		}
-		if desc.PhysicalBlock != NoBlock && desc.PhysicalBlock != desc.DurableLoc && desc.PhysicalBlock != desc.FlushedLoc {
-			if err := bp.buddy.Free(desc.PhysicalBlock); err != nil && bp.onFailure != nil {
-				bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free physical block %d: %w", desc.PhysicalBlock, err))
+			if desc.FlushedLoc != NoBlock && desc.FlushedLoc != desc.DurableLoc {
+				if err := bp.buddy.Free(desc.FlushedLoc); err != nil && bp.onFailure != nil {
+					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free flushed block %d: %w", desc.FlushedLoc, err))
+				}
+				desc.FlushedLoc = NoBlock
 			}
-			desc.PhysicalBlock = NoBlock
+			if desc.PhysicalBlock != NoBlock && desc.PhysicalBlock != desc.DurableLoc && desc.PhysicalBlock != desc.FlushedLoc {
+				if err := bp.buddy.Free(desc.PhysicalBlock); err != nil && bp.onFailure != nil {
+					bp.onFailure(fmt.Errorf("buddy allocator corruption: failed to free physical block %d: %w", desc.PhysicalBlock, err))
+				}
+				desc.PhysicalBlock = NoBlock
+			}
+			delete(bp.pageTable, logicalPage)
+			return
 		}
-		delete(bp.pageTable, logicalPage)
+		bp.cond.Wait()
 	}
 }
 
@@ -679,6 +728,7 @@ func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
 		desc.InFlight = false
 		desc.PinCount.Add(-1)
 	}
+	bp.cond.Broadcast()
 
 	flushErr := errors.Join(syncErr, writeErr)
 	if flushErr != nil {
