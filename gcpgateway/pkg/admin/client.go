@@ -89,39 +89,38 @@ func NewGCEAdminClientWithService(svc *compute.Service) *GCEAdminClient {
 }
 
 func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
 	var gErr *googleapi.Error
-	if errors.As(err, &gErr) && gErr.Code == 404 {
-		return true
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "not found") || strings.Contains(errStr, "notfound")
+	return errors.As(err, &gErr) && gErr.Code == 404
 }
 
 func (c *GCEAdminClient) waitGlobalOp(ctx context.Context, project string, op *compute.Operation) error {
 	if op == nil {
 		return nil
 	}
+	opName := op.Name
 	for {
-		if op.Status == "DONE" {
+		if op != nil && op.Status == "DONE" {
 			if op.Error != nil && len(op.Error.Errors) > 0 {
 				var msgs []string
 				for _, e := range op.Error.Errors {
 					msgs = append(msgs, fmt.Sprintf("%s: %s", e.Code, e.Message))
 				}
-				return fmt.Errorf("operation %s failed: %s", op.Name, strings.Join(msgs, "; "))
+				return fmt.Errorf("operation %s failed: %s", opName, strings.Join(msgs, "; "))
 			}
 			return nil
 		}
 		var err error
-		op, err = c.svc.GlobalOperations.Wait(project, op.Name).Context(ctx).Do()
+		op, err = c.svc.GlobalOperations.Wait(project, opName).Context(ctx).Do()
 		if err != nil {
-			time.Sleep(1 * time.Second)
-			op, err = c.svc.GlobalOperations.Get(project, op.Name).Context(ctx).Do()
-			if err != nil {
-				return err
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("waiting for operation %s: %w", opName, ctx.Err())
+			case <-time.After(1 * time.Second):
+			}
+			var getErr error
+			op, getErr = c.svc.GlobalOperations.Get(project, opName).Context(ctx).Do()
+			if getErr != nil {
+				return fmt.Errorf("waiting for operation %s (wait error: %v, get error: %w)", opName, err, getErr)
 			}
 		}
 	}
@@ -131,24 +130,30 @@ func (c *GCEAdminClient) waitZonalOp(ctx context.Context, project, zone string, 
 	if op == nil {
 		return nil
 	}
+	opName := op.Name
 	for {
-		if op.Status == "DONE" {
+		if op != nil && op.Status == "DONE" {
 			if op.Error != nil && len(op.Error.Errors) > 0 {
 				var msgs []string
 				for _, e := range op.Error.Errors {
 					msgs = append(msgs, fmt.Sprintf("%s: %s", e.Code, e.Message))
 				}
-				return fmt.Errorf("operation %s failed: %s", op.Name, strings.Join(msgs, "; "))
+				return fmt.Errorf("operation %s failed: %s", opName, strings.Join(msgs, "; "))
 			}
 			return nil
 		}
 		var err error
-		op, err = c.svc.ZoneOperations.Wait(project, zone, op.Name).Context(ctx).Do()
+		op, err = c.svc.ZoneOperations.Wait(project, zone, opName).Context(ctx).Do()
 		if err != nil {
-			time.Sleep(1 * time.Second)
-			op, err = c.svc.ZoneOperations.Get(project, zone, op.Name).Context(ctx).Do()
-			if err != nil {
-				return err
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("waiting for operation %s: %w", opName, ctx.Err())
+			case <-time.After(1 * time.Second):
+			}
+			var getErr error
+			op, getErr = c.svc.ZoneOperations.Get(project, zone, opName).Context(ctx).Do()
+			if getErr != nil {
+				return fmt.Errorf("waiting for operation %s (wait error: %v, get error: %w)", opName, err, getErr)
 			}
 		}
 	}

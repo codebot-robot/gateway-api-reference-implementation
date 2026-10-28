@@ -25,10 +25,14 @@ import (
 
 // FakeAdminClient provides an in-memory test double implementing AdminClient.
 type FakeAdminClient struct {
+	// mu guards CallCount, MutatingCallCount, InjectOperationError, InjectCallError, and the in-memory resource maps below.
 	mu sync.RWMutex
 
 	// CallCount tracks the total number of calls to any client method.
 	CallCount int
+
+	// MutatingCallCount tracks the number of mutating calls (Create, Update, Delete).
+	MutatingCallCount int
 
 	// InjectOperationError causes mutating operations (or all operations) to fail.
 	InjectOperationError error
@@ -62,8 +66,11 @@ func NewFakeAdminClient() *FakeAdminClient {
 	}
 }
 
-func (f *FakeAdminClient) recordCall(opName string) error {
+func (f *FakeAdminClient) recordCall(opName string, mutating bool) error {
 	f.CallCount++
+	if mutating {
+		f.MutatingCallCount++
+	}
 	if err, ok := f.InjectCallError[opName]; ok {
 		return err
 	}
@@ -78,7 +85,7 @@ func (f *FakeAdminClient) recordCall(opName string) error {
 func (f *FakeAdminClient) GetAddress(ctx context.Context, project, name string) (*compute.Address, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetAddress"); err != nil {
+	if err := f.recordCall("GetAddress", false); err != nil {
 		return nil, err
 	}
 	if addr, ok := f.Addresses[name]; ok {
@@ -90,7 +97,7 @@ func (f *FakeAdminClient) GetAddress(ctx context.Context, project, name string) 
 func (f *FakeAdminClient) CreateAddress(ctx context.Context, project string, addr *compute.Address) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateAddress"); err != nil {
+	if err := f.recordCall("CreateAddress", true); err != nil {
 		return err
 	}
 	cp := *addr
@@ -104,7 +111,7 @@ func (f *FakeAdminClient) CreateAddress(ctx context.Context, project string, add
 func (f *FakeAdminClient) DeleteAddress(ctx context.Context, project, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteAddress"); err != nil {
+	if err := f.recordCall("DeleteAddress", true); err != nil {
 		return err
 	}
 	delete(f.Addresses, name)
@@ -116,7 +123,7 @@ func (f *FakeAdminClient) DeleteAddress(ctx context.Context, project, name strin
 func (f *FakeAdminClient) GetHealthCheck(ctx context.Context, project, name string) (*compute.HealthCheck, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetHealthCheck"); err != nil {
+	if err := f.recordCall("GetHealthCheck", false); err != nil {
 		return nil, err
 	}
 	if hc, ok := f.HealthChecks[name]; ok {
@@ -128,7 +135,7 @@ func (f *FakeAdminClient) GetHealthCheck(ctx context.Context, project, name stri
 func (f *FakeAdminClient) CreateHealthCheck(ctx context.Context, project string, hc *compute.HealthCheck) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateHealthCheck"); err != nil {
+	if err := f.recordCall("CreateHealthCheck", true); err != nil {
 		return err
 	}
 	cp := *hc
@@ -139,7 +146,7 @@ func (f *FakeAdminClient) CreateHealthCheck(ctx context.Context, project string,
 func (f *FakeAdminClient) DeleteHealthCheck(ctx context.Context, project, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteHealthCheck"); err != nil {
+	if err := f.recordCall("DeleteHealthCheck", true); err != nil {
 		return err
 	}
 	delete(f.HealthChecks, name)
@@ -151,7 +158,7 @@ func (f *FakeAdminClient) DeleteHealthCheck(ctx context.Context, project, name s
 func (f *FakeAdminClient) GetFirewall(ctx context.Context, project, name string) (*compute.Firewall, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetFirewall"); err != nil {
+	if err := f.recordCall("GetFirewall", false); err != nil {
 		return nil, err
 	}
 	if fw, ok := f.Firewalls[name]; ok {
@@ -163,7 +170,7 @@ func (f *FakeAdminClient) GetFirewall(ctx context.Context, project, name string)
 func (f *FakeAdminClient) CreateFirewall(ctx context.Context, project string, fw *compute.Firewall) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateFirewall"); err != nil {
+	if err := f.recordCall("CreateFirewall", true); err != nil {
 		return err
 	}
 	cp := *fw
@@ -174,7 +181,7 @@ func (f *FakeAdminClient) CreateFirewall(ctx context.Context, project string, fw
 func (f *FakeAdminClient) DeleteFirewall(ctx context.Context, project, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteFirewall"); err != nil {
+	if err := f.recordCall("DeleteFirewall", true); err != nil {
 		return err
 	}
 	delete(f.Firewalls, name)
@@ -190,7 +197,7 @@ func negKey(zone, name string) string {
 func (f *FakeAdminClient) GetNEG(ctx context.Context, project, zone, name string) (*compute.NetworkEndpointGroup, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetNEG"); err != nil {
+	if err := f.recordCall("GetNEG", false); err != nil {
 		return nil, err
 	}
 	if neg, ok := f.NEGs[negKey(zone, name)]; ok {
@@ -202,7 +209,7 @@ func (f *FakeAdminClient) GetNEG(ctx context.Context, project, zone, name string
 func (f *FakeAdminClient) CreateNEG(ctx context.Context, project, zone string, neg *compute.NetworkEndpointGroup) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateNEG"); err != nil {
+	if err := f.recordCall("CreateNEG", true); err != nil {
 		return err
 	}
 	cp := *neg
@@ -213,7 +220,7 @@ func (f *FakeAdminClient) CreateNEG(ctx context.Context, project, zone string, n
 func (f *FakeAdminClient) DeleteNEG(ctx context.Context, project, zone, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteNEG"); err != nil {
+	if err := f.recordCall("DeleteNEG", true); err != nil {
 		return err
 	}
 	delete(f.NEGs, negKey(zone, name))
@@ -225,7 +232,7 @@ func (f *FakeAdminClient) DeleteNEG(ctx context.Context, project, zone, name str
 func (f *FakeAdminClient) GetBackendService(ctx context.Context, project, name string) (*compute.BackendService, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetBackendService"); err != nil {
+	if err := f.recordCall("GetBackendService", false); err != nil {
 		return nil, err
 	}
 	if bs, ok := f.BackendServices[name]; ok {
@@ -237,7 +244,7 @@ func (f *FakeAdminClient) GetBackendService(ctx context.Context, project, name s
 func (f *FakeAdminClient) CreateBackendService(ctx context.Context, project string, bs *compute.BackendService) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateBackendService"); err != nil {
+	if err := f.recordCall("CreateBackendService", true); err != nil {
 		return err
 	}
 	cp := *bs
@@ -252,7 +259,7 @@ func (f *FakeAdminClient) CreateBackendService(ctx context.Context, project stri
 func (f *FakeAdminClient) UpdateBackendService(ctx context.Context, project, name string, bs *compute.BackendService) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("UpdateBackendService"); err != nil {
+	if err := f.recordCall("UpdateBackendService", true); err != nil {
 		return err
 	}
 	cp := *bs
@@ -267,7 +274,7 @@ func (f *FakeAdminClient) UpdateBackendService(ctx context.Context, project, nam
 func (f *FakeAdminClient) DeleteBackendService(ctx context.Context, project, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteBackendService"); err != nil {
+	if err := f.recordCall("DeleteBackendService", true); err != nil {
 		return err
 	}
 	delete(f.BackendServices, name)
@@ -279,7 +286,7 @@ func (f *FakeAdminClient) DeleteBackendService(ctx context.Context, project, nam
 func (f *FakeAdminClient) GetTargetTCPProxy(ctx context.Context, project, name string) (*compute.TargetTcpProxy, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetTargetTCPProxy"); err != nil {
+	if err := f.recordCall("GetTargetTCPProxy", false); err != nil {
 		return nil, err
 	}
 	if proxy, ok := f.TargetTcpProxies[name]; ok {
@@ -291,7 +298,7 @@ func (f *FakeAdminClient) GetTargetTCPProxy(ctx context.Context, project, name s
 func (f *FakeAdminClient) CreateTargetTCPProxy(ctx context.Context, project string, proxy *compute.TargetTcpProxy) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateTargetTCPProxy"); err != nil {
+	if err := f.recordCall("CreateTargetTCPProxy", true); err != nil {
 		return err
 	}
 	cp := *proxy
@@ -302,7 +309,7 @@ func (f *FakeAdminClient) CreateTargetTCPProxy(ctx context.Context, project stri
 func (f *FakeAdminClient) DeleteTargetTCPProxy(ctx context.Context, project, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteTargetTCPProxy"); err != nil {
+	if err := f.recordCall("DeleteTargetTCPProxy", true); err != nil {
 		return err
 	}
 	delete(f.TargetTcpProxies, name)
@@ -314,7 +321,7 @@ func (f *FakeAdminClient) DeleteTargetTCPProxy(ctx context.Context, project, nam
 func (f *FakeAdminClient) GetForwardingRule(ctx context.Context, project, name string) (*compute.ForwardingRule, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("GetForwardingRule"); err != nil {
+	if err := f.recordCall("GetForwardingRule", false); err != nil {
 		return nil, err
 	}
 	if fr, ok := f.ForwardingRules[name]; ok {
@@ -326,7 +333,7 @@ func (f *FakeAdminClient) GetForwardingRule(ctx context.Context, project, name s
 func (f *FakeAdminClient) CreateForwardingRule(ctx context.Context, project string, fr *compute.ForwardingRule) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("CreateForwardingRule"); err != nil {
+	if err := f.recordCall("CreateForwardingRule", true); err != nil {
 		return err
 	}
 	cp := *fr
@@ -337,7 +344,7 @@ func (f *FakeAdminClient) CreateForwardingRule(ctx context.Context, project stri
 func (f *FakeAdminClient) DeleteForwardingRule(ctx context.Context, project, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("DeleteForwardingRule"); err != nil {
+	if err := f.recordCall("DeleteForwardingRule", true); err != nil {
 		return err
 	}
 	delete(f.ForwardingRules, name)
@@ -349,7 +356,7 @@ func (f *FakeAdminClient) DeleteForwardingRule(ctx context.Context, project, nam
 func (f *FakeAdminClient) ListZones(ctx context.Context, project, region string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.recordCall("ListZones"); err != nil {
+	if err := f.recordCall("ListZones", false); err != nil {
 		return nil, err
 	}
 	if zones, ok := f.RegionZones[region]; ok && len(zones) > 0 {
@@ -358,5 +365,5 @@ func (f *FakeAdminClient) ListZones(ctx context.Context, project, region string)
 		sort.Strings(sorted)
 		return sorted, nil
 	}
-	return []string{region + "-a", region + "-b", region + "-c"}, nil
+	return nil, nil
 }

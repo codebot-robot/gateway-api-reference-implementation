@@ -25,7 +25,7 @@ import (
 )
 
 func usage(w io.Writer) {
-	fmt.Fprintf(w, `gcpgatewayctl: admin tool for Google Cloud Load Balancing and NEGs in gcpgateway.
+	if _, err := fmt.Fprintf(w, `gcpgatewayctl: admin tool for Google Cloud Load Balancing and NEGs in gcpgateway.
 
 Usage:
   gcpgatewayctl frontend create [flags]
@@ -34,11 +34,18 @@ Usage:
 Subcommands:
   frontend create    Provision GCP load balancer and zonal NEGs idempotently
   frontend delete    Tear down GCP load balancer and zonal NEGs idempotently
-`)
+`); err != nil {
+		return
+	}
 }
 
 // Run parses CLI arguments and runs the specified admin subcommand.
 func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
+	return RunWithClient(ctx, nil, args, out, errOut)
+}
+
+// RunWithClient allows passing an optional pre-configured AdminClient (useful for testing).
+func RunWithClient(ctx context.Context, client admin.AdminClient, args []string, out, errOut io.Writer) error {
 	if len(args) < 2 || args[0] != "frontend" {
 		usage(errOut)
 		if len(args) == 0 {
@@ -58,8 +65,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return err
 		}
 
-		var client admin.AdminClient
-		if !cfg.DryRun {
+		if client == nil {
 			var err error
 			client, err = admin.NewGCEAdminClient(ctx)
 			if err != nil {
@@ -79,8 +85,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 			return err
 		}
 
-		var client admin.AdminClient
-		if !cfg.DryRun {
+		if client == nil {
 			var err error
 			client, err = admin.NewGCEAdminClient(ctx)
 			if err != nil {
@@ -100,7 +105,7 @@ func Run(ctx context.Context, args []string, out, errOut io.Writer) error {
 func main() {
 	ctx := context.Background()
 	if err := Run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }

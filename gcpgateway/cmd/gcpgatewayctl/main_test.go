@@ -16,14 +16,15 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/admin"
 )
 
 func TestRun_HelpAndInvalid(t *testing.T) {
 	var out, errOut bytes.Buffer
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Empty args
 	if err := Run(ctx, []string{}, &out, &errOut); err != nil {
@@ -36,9 +37,10 @@ func TestRun_HelpAndInvalid(t *testing.T) {
 		t.Fatalf("expected error for invalid subcommand, got nil")
 	}
 
-	// Missing required flags in create dry-run
+	// Missing required flags in create
 	errOut.Reset()
-	err := Run(ctx, []string{"frontend", "create", "--dry-run"}, &out, &errOut)
+	fake := admin.NewFakeAdminClient()
+	err := RunWithClient(ctx, fake, []string{"frontend", "create", "--dry-run"}, &out, &errOut)
 	if err == nil {
 		t.Fatalf("expected error when project/region missing")
 	}
@@ -49,23 +51,28 @@ func TestRun_HelpAndInvalid(t *testing.T) {
 
 func TestRun_DryRun(t *testing.T) {
 	var out, errOut bytes.Buffer
-	ctx := context.Background()
+	ctx := t.Context()
+	fake := admin.NewFakeAdminClient()
 
 	// Dry-run create
 	args := []string{
 		"frontend", "create",
 		"--project=test-proj",
 		"--region=us-central1",
+		"--zones=us-central1-a,us-central1-b",
 		"--cluster-id=cluster-1",
 		"--namespace=default",
 		"--gateway-name=my-gw",
 		"--dry-run",
 	}
-	if err := Run(ctx, args, &out, &errOut); err != nil {
+	if err := RunWithClient(ctx, fake, args, &out, &errOut); err != nil {
 		t.Fatalf("Run frontend create --dry-run failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "[dry-run] Plan to create front-end resources") {
+	if !strings.Contains(out.String(), "=== Dry Run Plan Complete ===") {
 		t.Errorf("expected plan output, got: %s", out.String())
+	}
+	if fake.MutatingCallCount != 0 {
+		t.Errorf("expected 0 mutating calls, got %d", fake.MutatingCallCount)
 	}
 
 	// Dry-run delete
@@ -75,15 +82,19 @@ func TestRun_DryRun(t *testing.T) {
 		"frontend", "delete",
 		"--project=test-proj",
 		"--region=us-central1",
+		"--zones=us-central1-a,us-central1-b",
 		"--cluster-id=cluster-1",
 		"--namespace=default",
 		"--gateway-name=my-gw",
 		"--dry-run",
 	}
-	if err := Run(ctx, args, &out, &errOut); err != nil {
+	if err := RunWithClient(ctx, fake, args, &out, &errOut); err != nil {
 		t.Fatalf("Run frontend delete --dry-run failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "[dry-run] Plan to delete front-end resources") {
+	if !strings.Contains(out.String(), "=== Dry Run Teardown Plan Complete ===") {
 		t.Errorf("expected plan output, got: %s", out.String())
+	}
+	if fake.MutatingCallCount != 0 {
+		t.Errorf("expected 0 mutating calls, got %d", fake.MutatingCallCount)
 	}
 }

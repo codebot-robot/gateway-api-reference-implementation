@@ -16,7 +16,6 @@ package admin
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -47,7 +46,7 @@ func TestCreateFrontend_FromEmpty(t *testing.T) {
 	cfg := newTestConfig()
 	var out bytes.Buffer
 
-	res, err := CreateFrontend(context.Background(), fake, cfg, &out)
+	res, err := CreateFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("CreateFrontend failed: %v", err)
 	}
@@ -99,7 +98,7 @@ func TestCreateFrontend_EverythingAlreadyExists(t *testing.T) {
 	cfg := newTestConfig()
 
 	// Initial run
-	_, err := CreateFrontend(context.Background(), fake, cfg, nil)
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("first CreateFrontend failed: %v", err)
 	}
@@ -114,7 +113,7 @@ func TestCreateFrontend_EverythingAlreadyExists(t *testing.T) {
 
 	var out bytes.Buffer
 	// Second run (idempotency check)
-	res, err := CreateFrontend(context.Background(), fake, cfg, &out)
+	res, err := CreateFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("second CreateFrontend failed: %v", err)
 	}
@@ -140,20 +139,24 @@ func TestCreateFrontend_SomeResourcesExist(t *testing.T) {
 	fake := NewFakeAdminClient()
 	cfg := newTestConfig()
 
-	// Pre-create Address and HealthCheck
+	// Pre-create Address and HealthCheck with correct ownership metadata
 	ipName := metadata.ResourceName(cfg.Prefix, cfg.ClusterID, cfg.Namespace, cfg.GatewayName, "ip")
+	descIP, _ := makeDescription(cfg.ClusterID, cfg.Namespace, cfg.GatewayName, 0)
 	fake.Addresses[ipName] = &compute.Address{
-		Name:      ipName,
-		Address:   "35.200.100.50",
-		IpVersion: "IPV4",
+		Name:        ipName,
+		Address:     "35.200.100.50",
+		Description: descIP,
+		IpVersion:   "IPV4",
 	}
 	hcName := metadata.ResourceName(cfg.Prefix, cfg.ClusterID, cfg.Namespace, cfg.GatewayName, "hc")
+	descHC, _ := makeDescription(cfg.ClusterID, cfg.Namespace, cfg.GatewayName, 8999)
 	fake.HealthChecks[hcName] = &compute.HealthCheck{
-		Name: hcName,
+		Name:        hcName,
+		Description: descHC,
 	}
 
 	var out bytes.Buffer
-	res, err := CreateFrontend(context.Background(), fake, cfg, &out)
+	res, err := CreateFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("CreateFrontend failed: %v", err)
 	}
@@ -180,18 +183,55 @@ func TestCreateFrontend_SomeResourcesExist(t *testing.T) {
 	}
 }
 
+func TestCreateFrontend_FailsOnForeignOwnership(t *testing.T) {
+	fake := NewFakeAdminClient()
+	cfg := newTestConfig()
+
+	// Pre-create an address with mismatched cluster ownership
+	ipName := metadata.ResourceName(cfg.Prefix, cfg.ClusterID, cfg.Namespace, cfg.GatewayName, "ip")
+	foreignDesc, _ := makeDescription("other-cluster", cfg.Namespace, cfg.GatewayName, 0)
+	fake.Addresses[ipName] = &compute.Address{
+		Name:        ipName,
+		Address:     "35.200.100.50",
+		Description: foreignDesc,
+		IpVersion:   "IPV4",
+	}
+
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
+	if err == nil {
+		t.Fatalf("expected error when existing resource has foreign ownership, got nil")
+	}
+	if !strings.Contains(err.Error(), "ownership mismatch") {
+		t.Errorf("expected ownership mismatch error, got: %v", err)
+	}
+}
+
+func TestCreateFrontend_NoZonesError(t *testing.T) {
+	fake := NewFakeAdminClient()
+	cfg := newTestConfig()
+	cfg.Zones = "" // No explicit zones, and fake returns no zones for region
+
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
+	if err == nil {
+		t.Fatalf("expected error when no zones found, got nil")
+	}
+	if !strings.Contains(err.Error(), "specify --zones") {
+		t.Errorf("expected specify --zones error, got: %v", err)
+	}
+}
+
 func TestDeleteFrontend_All(t *testing.T) {
 	fake := NewFakeAdminClient()
 	cfg := newTestConfig()
 
 	// Provision first
-	_, err := CreateFrontend(context.Background(), fake, cfg, nil)
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("CreateFrontend failed: %v", err)
 	}
 
 	var out bytes.Buffer
-	deleted, err := DeleteFrontend(context.Background(), fake, cfg, &out)
+	deleted, err := DeleteFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("DeleteFrontend failed: %v", err)
 	}
@@ -219,7 +259,7 @@ func TestDeleteFrontend_SomeAlreadyGoneAndForeignPreserved(t *testing.T) {
 	cfg := newTestConfig()
 
 	// Provision first
-	_, err := CreateFrontend(context.Background(), fake, cfg, nil)
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("CreateFrontend failed: %v", err)
 	}
@@ -231,19 +271,22 @@ func TestDeleteFrontend_SomeAlreadyGoneAndForeignPreserved(t *testing.T) {
 	delete(fake.HealthChecks, hcName)
 
 	// Add foreign NEG with mismatched metadata
-	foreignDesc := makeDescription("foreign-cluster", "default", "my-gw", 8443)
-	fake.NEGs["us-central1-a/gcpgw-foreign-neg"] = &compute.NetworkEndpointGroup{
-		Name:        "gcpgw-foreign-neg",
+	foreignDesc, _ := makeDescription("foreign-cluster", "default", "my-gw", 8443)
+	foreignNegKey := negKey("us-central1-a", metadata.ResourceName(cfg.Prefix, cfg.ClusterID, cfg.Namespace, cfg.GatewayName, "8443"))
+	fake.NEGs[foreignNegKey] = &compute.NetworkEndpointGroup{
+		Name:        metadata.ResourceName(cfg.Prefix, cfg.ClusterID, cfg.Namespace, cfg.GatewayName, "8443"),
 		Description: foreignDesc,
 	}
 
 	// Add resource with no description (unparseable)
-	fake.ForwardingRules["gcpgw-no-desc"] = &compute.ForwardingRule{
-		Name:        "gcpgw-no-desc",
+	frName := metadata.ResourceName(cfg.Prefix, cfg.ClusterID, cfg.Namespace, cfg.GatewayName, "fr-443")
+	fake.ForwardingRules[frName] = &compute.ForwardingRule{
+		Name:        frName,
 		Description: "",
 	}
 
-	deleted, err := DeleteFrontend(context.Background(), fake, cfg, nil)
+	var out bytes.Buffer
+	deleted, err := DeleteFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("DeleteFrontend failed: %v", err)
 	}
@@ -252,16 +295,21 @@ func TestDeleteFrontend_SomeAlreadyGoneAndForeignPreserved(t *testing.T) {
 	}
 
 	// Foreign NEG must still exist
-	if _, ok := fake.NEGs["us-central1-a/gcpgw-foreign-neg"]; !ok {
+	if _, ok := fake.NEGs[foreignNegKey]; !ok {
 		t.Errorf("foreign NEG was deleted, should be preserved")
 	}
 	// No-desc rule must still exist
-	if _, ok := fake.ForwardingRules["gcpgw-no-desc"]; !ok {
+	if _, ok := fake.ForwardingRules[frName]; !ok {
 		t.Errorf("unparseable forwarding rule was deleted, should be preserved")
 	}
 
+	outStr := out.String()
+	if !strings.Contains(outStr, "[skipped]") {
+		t.Errorf("expected skipped log for unowned resources, got: %s", outStr)
+	}
+
 	// Running DeleteFrontend again is a clean no-op
-	deletedSecond, err := DeleteFrontend(context.Background(), fake, cfg, nil)
+	deletedSecond, err := DeleteFrontend(t.Context(), fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("second DeleteFrontend failed: %v", err)
 	}
@@ -275,7 +323,7 @@ func TestOperationsEndWithError(t *testing.T) {
 	cfg := newTestConfig()
 	fake.InjectOperationError = errors.New("simulated error: QUOTA_EXCEEDED")
 
-	_, err := CreateFrontend(context.Background(), fake, cfg, nil)
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
 	if err == nil {
 		t.Fatalf("expected error from CreateFrontend, got nil")
 	}
@@ -285,7 +333,7 @@ func TestOperationsEndWithError(t *testing.T) {
 
 	// Delete with error
 	fake.InjectOperationError = errors.New("simulated error: PERMISSION_DENIED")
-	_, err = DeleteFrontend(context.Background(), fake, cfg, nil)
+	_, err = DeleteFrontend(t.Context(), fake, cfg, nil)
 	if err == nil {
 		t.Fatalf("expected error from DeleteFrontend, got nil")
 	}
@@ -294,39 +342,45 @@ func TestOperationsEndWithError(t *testing.T) {
 	}
 }
 
-func TestDryRun_MakesNoCalls(t *testing.T) {
+func TestDryRun_MakesNoMutatingCalls(t *testing.T) {
 	fake := NewFakeAdminClient()
 	cfg := newTestConfig()
 	cfg.DryRun = true
 
 	var out bytes.Buffer
-	res, err := CreateFrontend(context.Background(), fake, cfg, &out)
+	res, err := CreateFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("CreateFrontend dry-run failed: %v", err)
 	}
 	if res == nil {
 		t.Fatalf("expected result from dry-run")
 	}
-	if fake.CallCount != 0 {
-		t.Errorf("expected 0 calls to client in create dry-run, got %d", fake.CallCount)
+	if fake.MutatingCallCount != 0 {
+		t.Errorf("expected 0 mutating calls in create dry-run, got %d", fake.MutatingCallCount)
 	}
-	if !strings.Contains(out.String(), "[dry-run] Plan to create front-end resources") {
-		t.Errorf("expected plan output in create dry-run")
+	if fake.CallCount == 0 {
+		t.Errorf("expected read calls in create dry-run, got 0")
+	}
+	if !strings.Contains(out.String(), "=== Dry Run Plan Complete ===") {
+		t.Errorf("expected plan output in create dry-run, got: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "[create] Would create") {
+		t.Errorf("expected [create] in plan output, got: %s", out.String())
 	}
 
 	out.Reset()
-	deleted, err := DeleteFrontend(context.Background(), fake, cfg, &out)
+	deleted, err := DeleteFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("DeleteFrontend dry-run failed: %v", err)
 	}
 	if len(deleted) != 0 {
-		t.Errorf("expected 0 deleted in delete dry-run, got %d", len(deleted))
+		t.Errorf("expected 0 deleted in delete dry-run from empty, got %d", len(deleted))
 	}
-	if fake.CallCount != 0 {
-		t.Errorf("expected 0 calls to client in delete dry-run, got %d", fake.CallCount)
+	if fake.MutatingCallCount != 0 {
+		t.Errorf("expected 0 mutating calls in delete dry-run, got %d", fake.MutatingCallCount)
 	}
-	if !strings.Contains(out.String(), "[dry-run] Plan to delete front-end resources") {
-		t.Errorf("expected plan output in delete dry-run")
+	if !strings.Contains(out.String(), "=== Dry Run Teardown Plan Complete ===") {
+		t.Errorf("expected plan output in delete dry-run, got: %s", out.String())
 	}
 }
 
@@ -334,7 +388,7 @@ func TestNEGDescriptionsAndNaming(t *testing.T) {
 	fake := NewFakeAdminClient()
 	cfg := newTestConfig()
 
-	_, err := CreateFrontend(context.Background(), fake, cfg, nil)
+	_, err := CreateFrontend(t.Context(), fake, cfg, nil)
 	if err != nil {
 		t.Fatalf("CreateFrontend failed: %v", err)
 	}
@@ -369,7 +423,7 @@ func TestCredentialsAndTokensNeverLogged(t *testing.T) {
 	cfg := newTestConfig()
 
 	var out bytes.Buffer
-	_, err := CreateFrontend(context.Background(), fake, cfg, &out)
+	_, err := CreateFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("CreateFrontend failed: %v", err)
 	}
@@ -383,7 +437,7 @@ func TestCredentialsAndTokensNeverLogged(t *testing.T) {
 	}
 
 	out.Reset()
-	_, err = DeleteFrontend(context.Background(), fake, cfg, &out)
+	_, err = DeleteFrontend(t.Context(), fake, cfg, &out)
 	if err != nil {
 		t.Fatalf("DeleteFrontend failed: %v", err)
 	}
