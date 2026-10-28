@@ -631,13 +631,15 @@ type h2StreamConn struct {
 	mu            sync.Mutex
 	closed        bool
 	bodyQueued    bool
-	firstWriting  chan struct{}
 	reopenErr     error
 	readDeadline  time.Time
 	writeDeadline time.Time
 	readTimer     *time.Timer
 	writeTimer    *time.Timer
 	closeOnce     sync.Once
+
+	// Write-side first-byte state guarded by mu.
+	firstWriting chan struct{}
 
 	// Response-side state guarded by mu.
 	responseDelivered bool
@@ -761,9 +763,9 @@ func (c *h2StreamConn) waitFirstReadingLocked(deadline time.Time) error {
 	return nil
 }
 
-// isConnFailure reports whether err (or the connection's state) represents a
-// failure of the underlying HTTP/2 connection rather than a stream-level condition
-// such as clean EOF or stream reset (RST_STREAM).
+// isConnFailure reports whether the underlying HTTP/2 connection has failed
+// (or err is a GoAwayError) rather than a stream-level condition such as clean
+// EOF, stream reset (RST_STREAM), or a closed chunk queue.
 func isConnFailure(hc *h2Conn, err error) bool {
 	if err == nil {
 		return false
@@ -780,13 +782,6 @@ func isConnFailure(hc *h2Conn, err error) bool {
 	}
 	var ge http2.GoAwayError
 	if errors.As(err, &ge) {
-		return true
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		return true
-	}
-	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
 	return false
