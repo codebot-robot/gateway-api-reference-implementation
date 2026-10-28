@@ -51,7 +51,7 @@ To uphold least privilege, `gcpgateway` uses two distinct IAM roles:
      - `compute.backendServices.get` (also authorizes `getHealth`)
      - `compute.zoneOperations.get`
 2. **`gcpgatewayOperatorHelper` (Provisioning Helper Role)**:
-   Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py`.
+   Used by operators or CI/CD pipelines executing `gcpgatewayctl frontend create` and `gcpgatewayctl frontend delete`.
    - Permissions across addresses, health checks, NEGs, backend services, target TCP proxies, forwarding rules, and firewall rules.
 
 > **Note on IAM Conditions and Multi-Cluster Isolation**:
@@ -133,11 +133,11 @@ Verify the controller is running:
 kubectl rollout status deployment/gcpgateway-controller -n default
 ```
 
-### Step 3: Run the Front-end Provisioning Script
+### Step 3: Run the Front-end Provisioning Tool
 
-Run `create_frontend.py` to provision the Google Cloud load balancer, IP address, health check, and zonal NEGs:
+Run `gcpgatewayctl frontend create` to provision the Google Cloud load balancer, IP address, health check, and zonal NEGs:
 ```bash
-python3 gcpgateway/hack/create_frontend.py \
+go run ./gcpgateway/cmd/gcpgatewayctl frontend create \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
   --cluster-id="${CLUSTER_ID}" \
@@ -146,7 +146,7 @@ python3 gcpgateway/hack/create_frontend.py \
   --prefix="${PREFIX}"
 ```
 
-The script outputs the static IP address and the ready-to-apply ConfigMap and Gateway manifests.
+The tool outputs the static IP address and the ready-to-apply ConfigMap and Gateway manifests.
 
 ### Step 4: Apply Gateway and Parameters Manifests
 
@@ -295,7 +295,7 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 To delete all Google Cloud Load Balancer and NEG resources created for the Gateway:
 ```bash
-python3 gcpgateway/hack/teardown_frontend.py \
+go run ./gcpgateway/cmd/gcpgatewayctl frontend delete \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
   --cluster-id="${CLUSTER_ID}" \
@@ -304,4 +304,4 @@ python3 gcpgateway/hack/teardown_frontend.py \
   --prefix="${PREFIX}"
 ```
 
-The teardown script inspects resource description metadata and deletes only resources belonging to the specified cluster and Gateway.
+The teardown command inspects resource description metadata and deletes only resources belonging to the specified cluster and Gateway.
