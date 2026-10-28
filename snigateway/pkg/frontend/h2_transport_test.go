@@ -1056,6 +1056,115 @@ func TestH2Transport_ResponseBytesDelivered_DoesNotReopen(t *testing.T) {
 	}
 }
 
+func TestH2Transport_BufferedResponseDrainsAfterConnectionDies(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = w.Write([]byte("abcdef"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-buffered-response-drain"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Read one byte
+	buf := make([]byte, 1)
+	n, err := stream.Read(buf)
+	if err != nil {
+		t.Fatalf("first Read failed: %v", err)
+	}
+	if n != 1 || string(buf[:n]) != "a" {
+		t.Fatalf("first Read got %q (len %d), want %q", string(buf[:n]), n, "a")
+	}
+
+	// Kill c1 after the first byte was read. The remaining bytes "bcdef" are already buffered in the client response body.
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Second Read must return 'b', not ErrClosed
+	n, err = stream.Read(buf)
+	if err != nil {
+		t.Fatalf("second Read failed: %v", err)
+	}
+	if n != 1 || string(buf[:n]) != "b" {
+		t.Fatalf("second Read got %q (len %d), want %q", string(buf[:n]), n, "b")
+	}
+
+	// Remaining buffered bytes must drain completely
+	rest := make([]byte, 10)
+	n, err = io.ReadFull(stream, rest[:4])
+	if err != nil {
+		t.Fatalf("reading rest of buffered bytes failed: %v", err)
+	}
+	if string(rest[:n]) != "cdef" {
+		t.Fatalf("got %q, want %q", string(rest[:n]), "cdef")
+	}
+
+	// Once buffered data is drained, subsequent Read must surface the transport error
+	_, readErr := stream.Read(rest)
+	if readErr == nil {
+		t.Fatal("expected Read after draining buffer to return error, got nil")
+	}
+
+	// Verify c2 was not reopened
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c2 {
+			if load := c.Load(); load != 0 {
+				t.Fatalf("expected c2 load to be 0 (no reopen), got %d", load)
+			}
+		}
+	}
+}
+
 func TestH2Transport_ConcurrentFirstWriteAccepted_ReadDoesNotReopen(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {

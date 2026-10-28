@@ -581,13 +581,7 @@ func (a *streamAttempt) pollResult() (io.ReadCloser, error, bool) {
 	case <-a.done:
 		a.mu.Lock()
 		defer a.mu.Unlock()
-		if a.result != nil && a.result.err != nil {
-			return nil, a.result.err, true
-		}
-		if a.hc != nil && (a.hc.closed.Load() || a.hc.cc.State().Closed) {
-			return nil, net.ErrClosed, true
-		}
-		return a.resBody, nil, true
+		return a.resBody, a.result.err, true
 	default:
 		if a.hc != nil && (a.hc.closed.Load() || a.hc.cc.State().Closed) {
 			return nil, net.ErrClosed, true
@@ -634,17 +628,20 @@ type h2StreamConn struct {
 	reopen    func(ctx context.Context) (*h2StreamConn, error)
 	reopening chan struct{}
 
-	mu                sync.Mutex
-	closed            bool
-	bodyQueued        bool
+	mu            sync.Mutex
+	closed        bool
+	bodyQueued    bool
+	firstWriting  chan struct{}
+	reopenErr     error
+	readDeadline  time.Time
+	writeDeadline time.Time
+	readTimer     *time.Timer
+	writeTimer    *time.Timer
+	closeOnce     sync.Once
+
+	// Response-side state guarded by mu.
 	responseDelivered bool
-	firstWriting      chan struct{}
-	reopenErr         error
-	readDeadline      time.Time
-	writeDeadline     time.Time
-	readTimer         *time.Timer
-	writeTimer        *time.Timer
-	closeOnce         sync.Once
+	firstReading      chan struct{}
 }
 
 func newH2StreamConn(queue *api.H2ChunkQueue, streamCancel context.CancelFunc, localAddr, remoteAddr net.Addr, onClose func(), hc *h2Conn) *h2StreamConn {
@@ -664,7 +661,7 @@ func newH2StreamConn(queue *api.H2ChunkQueue, streamCancel context.CancelFunc, l
 	return sc
 }
 
-func (c *h2StreamConn) waitFirstWrite(waitCh chan struct{}, deadline time.Time) error {
+func (c *h2StreamConn) waitChannel(waitCh chan struct{}, deadline time.Time) error {
 	var deadlineCh <-chan time.Time
 	if !deadline.IsZero() {
 		dur := time.Until(deadline)
@@ -701,34 +698,25 @@ func (c *h2StreamConn) finishReopenLocked(reopeningCh chan struct{}, origErr, re
 	}
 }
 
-func (c *h2StreamConn) waitReopening(waitCh chan struct{}, deadline time.Time) error {
-	var deadlineCh <-chan time.Time
-	if !deadline.IsZero() {
-		dur := time.Until(deadline)
-		if dur <= 0 {
-			return os.ErrDeadlineExceeded
+// waitReopeningLocked waits for any active transparent reopen to complete.
+// It must be called with c.mu locked. On return, c.mu is still locked.
+func (c *h2StreamConn) waitReopeningLocked(deadline time.Time) error {
+	for c.reopening != nil {
+		waitCh := c.reopening
+		c.mu.Unlock()
+		if err := c.waitChannel(waitCh, deadline); err != nil {
+			c.mu.Lock()
+			return err
 		}
-		t := time.NewTimer(dur)
-		defer t.Stop()
-		deadlineCh = t.C
-	}
-
-	select {
-	case <-waitCh:
 		c.mu.Lock()
-		defer c.mu.Unlock()
 		if c.closed {
 			return net.ErrClosed
 		}
 		if c.reopenErr != nil {
 			return c.reopenErr
 		}
-		return nil
-	case <-c.closeCh:
-		return net.ErrClosed
-	case <-deadlineCh:
-		return os.ErrDeadlineExceeded
 	}
+	return nil
 }
 
 func (c *h2StreamConn) transparentReopen(deadline time.Time, origErr error, failedAtt *streamAttempt) error {
@@ -749,26 +737,9 @@ func (c *h2StreamConn) transparentReopen(deadline time.Time, origErr error, fail
 		return nil
 	}
 
-	for c.reopening != nil {
-		waitCh := c.reopening
+	if err := c.waitReopeningLocked(deadline); err != nil {
 		c.mu.Unlock()
-		if err := c.waitReopening(waitCh, deadline); err != nil {
-			return err
-		}
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return net.ErrClosed
-		}
-		if c.reopenErr != nil {
-			err := c.reopenErr
-			c.mu.Unlock()
-			return err
-		}
-		if failedAtt != nil && c.attempt.Load() != failedAtt {
-			c.mu.Unlock()
-			return nil
-		}
+		return err
 	}
 
 	if failedAtt != nil && c.attempt.Load() != failedAtt {
@@ -851,80 +822,66 @@ func (c *h2StreamConn) transparentReopen(deadline time.Time, origErr error, fail
 	return nil
 }
 
-func (c *h2StreamConn) awaitResponse() (io.ReadCloser, error) {
+func (c *h2StreamConn) awaitResponse() (*streamAttempt, io.ReadCloser, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, net.ErrClosed
+		return nil, nil, net.ErrClosed
 	}
 	if c.reopenErr != nil {
 		err := c.reopenErr
 		c.mu.Unlock()
-		return nil, err
+		return nil, nil, err
 	}
 
-	for c.reopening != nil {
-		waitCh := c.reopening
-		deadline := c.readDeadline
+	deadline := c.readDeadline
+	if err := c.waitReopeningLocked(deadline); err != nil {
 		c.mu.Unlock()
-		if err := c.waitReopening(waitCh, deadline); err != nil {
-			return nil, err
-		}
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, net.ErrClosed
-		}
-		if c.reopenErr != nil {
-			err := c.reopenErr
-			c.mu.Unlock()
-			return nil, err
-		}
+		return nil, nil, err
 	}
 
 	att := c.attempt.Load()
-	deadline := c.readDeadline
 	closeCh := c.closeCh
 	c.mu.Unlock()
 
 	rb, err := att.awaitResult(closeCh, deadline)
 	if err == nil {
-		return rb, nil
+		return att, rb, nil
 	}
 
 	var statusErr *connectStatusError
 	if errors.As(err, &statusErr) {
 		closeCloser(c)
-		return nil, err
+		return nil, nil, err
 	}
 
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, net.ErrClosed
+		return nil, nil, net.ErrClosed
 	}
 	if c.reopenErr != nil {
 		err := c.reopenErr
 		c.mu.Unlock()
-		return nil, err
+		return nil, nil, err
 	}
 
 	// If a first write is in progress, awaitResponse must not reopen until that write resolves.
 	for c.firstWriting != nil {
 		waitCh := c.firstWriting
 		c.mu.Unlock()
-		if werr := c.waitFirstWrite(waitCh, deadline); werr != nil {
-			return nil, werr
+		if werr := c.waitChannel(waitCh, deadline); werr != nil {
+			return nil, nil, werr
 		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
-			return nil, net.ErrClosed
+			return nil, nil, net.ErrClosed
 		}
 		if c.reopenErr != nil {
 			err := c.reopenErr
 			c.mu.Unlock()
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -934,13 +891,13 @@ func (c *h2StreamConn) awaitResponse() (io.ReadCloser, error) {
 	if canReopen {
 		if rerr := c.transparentReopen(deadline, err, att); rerr != nil {
 			closeCloser(c)
-			return nil, errors.Join(err, rerr)
+			return nil, nil, errors.Join(err, rerr)
 		}
 		return c.awaitResponse()
 	}
 
 	closeCloser(c)
-	return nil, err
+	return nil, nil, err
 }
 
 var h2SpliceBufPool = sync.Pool{
@@ -980,7 +937,7 @@ func (c *h2StreamConn) WriteTo(w io.Writer) (int64, error) {
 		return written, rerr
 	}
 
-	rb, err := c.awaitResponse()
+	_, rb, err := c.awaitResponse()
 	if err != nil {
 		return written, err
 	}
@@ -1085,11 +1042,27 @@ func (c *h2StreamConn) Read(b []byte) (int, error) {
 		return 0, os.ErrDeadlineExceeded
 	}
 
-	for c.reopening != nil {
-		waitCh := c.reopening
-		deadline := c.readDeadline
+	deadline := c.readDeadline
+	if err := c.waitReopeningLocked(deadline); err != nil {
 		c.mu.Unlock()
-		if err := c.waitReopening(waitCh, deadline); err != nil {
+		return 0, err
+	}
+	c.mu.Unlock()
+
+	att, rb, err := c.awaitResponse()
+	if err != nil {
+		return 0, err
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	for c.firstReading != nil {
+		waitCh := c.firstReading
+		c.mu.Unlock()
+		if err := c.waitChannel(waitCh, deadline); err != nil {
 			return 0, err
 		}
 		c.mu.Lock()
@@ -1103,19 +1076,32 @@ func (c *h2StreamConn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 	}
-	c.mu.Unlock()
 
-	rb, err := c.awaitResponse()
-	if err != nil {
-		return 0, err
+	if c.responseDelivered {
+		c.mu.Unlock()
+		return rb.Read(b)
 	}
 
-	att := c.attempt.Load()
-	n, rerr := rb.Read(b)
+	firstReadCh := make(chan struct{})
+	c.firstReading = firstReadCh
+	c.mu.Unlock()
+
+	var n int
+	var rerr error
+	func() {
+		defer func() {
+			c.mu.Lock()
+			c.firstReading = nil
+			if n > 0 {
+				c.responseDelivered = true
+			}
+			close(firstReadCh)
+			c.mu.Unlock()
+		}()
+		n, rerr = rb.Read(b)
+	}()
+
 	if n > 0 {
-		c.mu.Lock()
-		c.responseDelivered = true
-		c.mu.Unlock()
 		return n, rerr
 	}
 
@@ -1151,11 +1137,10 @@ func (c *h2StreamConn) Read(b []byte) (int, error) {
 	}
 
 	// If another first write is in progress, wait for it to resolve before deciding.
-	deadline := c.readDeadline
 	for c.firstWriting != nil {
 		waitCh := c.firstWriting
 		c.mu.Unlock()
-		if werr := c.waitFirstWrite(waitCh, deadline); werr != nil {
+		if werr := c.waitChannel(waitCh, deadline); werr != nil {
 			return 0, werr
 		}
 		c.mu.Lock()
@@ -1215,29 +1200,16 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 
 	deadline := c.writeDeadline
 
-	for c.reopening != nil {
-		waitCh := c.reopening
+	if err := c.waitReopeningLocked(deadline); err != nil {
 		c.mu.Unlock()
-		if err := c.waitReopening(waitCh, deadline); err != nil {
-			return 0, err
-		}
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return 0, net.ErrClosed
-		}
-		if c.reopenErr != nil {
-			err := c.reopenErr
-			c.mu.Unlock()
-			return 0, err
-		}
+		return 0, err
 	}
 
 	// If another first write is in progress, wait for it to resolve.
 	for c.firstWriting != nil {
 		waitCh := c.firstWriting
 		c.mu.Unlock()
-		if err := c.waitFirstWrite(waitCh, deadline); err != nil {
+		if err := c.waitChannel(waitCh, deadline); err != nil {
 			return 0, err
 		}
 		c.mu.Lock()
@@ -1257,13 +1229,48 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 	canReopen := !alreadyQueued && !c.responseDelivered
 
 	if canReopen {
-		if _, err, done := att.pollResult(); done && err != nil {
+		_, err, done := att.pollResult()
+		if !done || err == nil {
+			if att.hc != nil && (att.hc.closed.Load() || att.hc.cc.State().Closed) {
+				err = net.ErrClosed
+			}
+		}
+
+		if err != nil {
 			var statusErr *connectStatusError
 			if errors.As(err, &statusErr) {
 				c.mu.Unlock()
 				closeCloser(c)
 				return 0, err
 			}
+
+			// A transport error was detected while reopen is still possible.
+			// Before deciding to reopen, wait for any in-progress first read to resolve.
+			// This wait is bounded because the connection is already dead.
+			for c.firstReading != nil {
+				waitCh := c.firstReading
+				c.mu.Unlock()
+				if werr := c.waitChannel(waitCh, deadline); werr != nil {
+					return 0, werr
+				}
+				c.mu.Lock()
+				if c.closed {
+					c.mu.Unlock()
+					return 0, net.ErrClosed
+				}
+				if c.reopenErr != nil {
+					err := c.reopenErr
+					c.mu.Unlock()
+					return 0, err
+				}
+			}
+
+			// If the first read delivered bytes (n > 0), the stream is committed; do not reopen.
+			if c.responseDelivered || c.bodyQueued {
+				c.mu.Unlock()
+				return 0, err
+			}
+
 			c.mu.Unlock()
 			if rerr := c.transparentReopen(deadline, err, att); rerr != nil {
 				return 0, errors.Join(err, rerr)
@@ -1277,7 +1284,7 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 		c.mu.Unlock()
 
 		var n int
-		var err error
+		var werr error
 		func() {
 			defer func() {
 				c.mu.Lock()
@@ -1288,19 +1295,43 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 				close(firstWriteCh)
 				c.mu.Unlock()
 			}()
-			n, err = att.queue.Write(b)
+			n, werr = att.queue.Write(b)
 		}()
 
 		if n > 0 {
-			return n, err
+			return n, werr
 		}
 
-		// Zero bytes accepted into the queue (n == 0 && err != nil).
+		// Zero bytes accepted into the queue (n == 0 && werr != nil).
 		// Treat as not yet queued and attempt transparent reopen.
-		if rerr := c.transparentReopen(deadline, err, att); rerr == nil {
+		c.mu.Lock()
+		for c.firstReading != nil {
+			waitCh := c.firstReading
+			c.mu.Unlock()
+			if err := c.waitChannel(waitCh, deadline); err != nil {
+				return 0, err
+			}
+			c.mu.Lock()
+			if c.closed {
+				c.mu.Unlock()
+				return 0, net.ErrClosed
+			}
+			if c.reopenErr != nil {
+				err := c.reopenErr
+				c.mu.Unlock()
+				return 0, err
+			}
+		}
+		if c.responseDelivered || c.bodyQueued {
+			c.mu.Unlock()
+			return 0, werr
+		}
+		c.mu.Unlock()
+
+		if rerr := c.transparentReopen(deadline, werr, att); rerr == nil {
 			return c.Write(b)
 		} else {
-			return 0, errors.Join(err, rerr)
+			return 0, errors.Join(werr, rerr)
 		}
 	}
 
