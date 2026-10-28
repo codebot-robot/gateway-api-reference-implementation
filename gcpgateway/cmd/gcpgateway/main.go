@@ -33,6 +33,7 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 const (
@@ -172,12 +173,8 @@ func SetupDataplane(args []string) (gari.Options, error) {
 //   - otherwise compute.NewService(ctx) is called, returning an error on failure.
 func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
 	var (
-		clusterID           string
-		negPrefix           string
-		project             string
 		region              string
 		zonesStr            string
-		controllerName      string
 		dataplaneImg        string
 		drainSeconds        int
 		leaderElect         bool
@@ -200,15 +197,26 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		defaultImg = singlepod.DefaultDataplaneImage
 	}
 
+	reconcilerCfg := controller.GatewayReconcilerConfig{
+		ClusterID:          defaultClusterID,
+		NegPrefix:          defaultNegPrefix,
+		Project:            defaultProject,
+		ControllerName:     DefaultControllerName,
+		HealthPollInterval: controller.HealthPollInterval,
+		ResyncInterval:     controller.ResyncInterval,
+	}
+
 	fs := flag.NewFlagSet("controller", flag.ContinueOnError)
-	fs.StringVar(&clusterID, "cluster-id", defaultClusterID, "Unique Kubernetes cluster identifier")
-	fs.StringVar(&negPrefix, "neg-prefix", defaultNegPrefix, "Prefix for zonal NEG names")
-	fs.StringVar(&project, "project", defaultProject, "GCP Project ID")
+	fs.StringVar(&reconcilerCfg.ClusterID, "cluster-id", defaultClusterID, "Unique Kubernetes cluster identifier")
+	fs.StringVar(&reconcilerCfg.NegPrefix, "neg-prefix", defaultNegPrefix, "Prefix for zonal NEG names")
+	fs.StringVar(&reconcilerCfg.Project, "project", defaultProject, "GCP Project ID")
 	fs.StringVar(&region, "region", defaultRegion, "GCP Region")
 	fs.StringVar(&zonesStr, "zones", "", "Comma-separated list of GCP zones")
-	fs.StringVar(&controllerName, "controller-name", DefaultControllerName, "GatewayClass controller name")
+	fs.StringVar(&reconcilerCfg.ControllerName, "controller-name", DefaultControllerName, "GatewayClass controller name")
 	fs.StringVar(&dataplaneImg, "dataplane-image", defaultImg, "Data-plane container image")
 	fs.IntVar(&drainSeconds, "drain-seconds", DefaultDrainSeconds, "Seconds to drain connections during rolling updates")
+	fs.DurationVar(&reconcilerCfg.HealthPollInterval, "health-poll-interval", controller.HealthPollInterval, "Interval between load balancer health check polls")
+	fs.DurationVar(&reconcilerCfg.ResyncInterval, "resync-interval", controller.ResyncInterval, "Interval between full periodic resyncs")
 	fs.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election")
 	fs.BoolVar(&fakeCompute, "fake-compute", false, "Use in-memory fake Compute client for testing/offline mode")
 	fs.BoolVar(&debugErrorResponses, "debug-error-responses", false, "Include detailed error messages in unmatched responses")
@@ -231,7 +239,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	}
 
 	opts := gari.DefaultOptions()
-	opts.ControllerName = controllerName
+	opts.ControllerName = reconcilerCfg.ControllerName
 	opts.LeaderElection = leaderElect
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
@@ -268,34 +276,42 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		singlepod.WithDebugErrorResponses(debugErrorResponses),
 	)
 
-	var zoneList []string
 	if zonesStr != "" {
 		for _, z := range strings.Split(zonesStr, ",") {
 			if trimmed := strings.TrimSpace(z); trimmed != "" {
-				zoneList = append(zoneList, trimmed)
+				reconcilerCfg.Zones = append(reconcilerCfg.Zones, trimmed)
 			}
 		}
 	}
 
-	opts.SetupWithManager = func(mgr ctrl.Manager) error {
+	var rec *controller.GatewayReconciler
+	opts.GatewayStatusHook = func(ctx context.Context, gw *gatewayv1.Gateway, status *gatewayv1.GatewayStatus) error {
+		if rec != nil {
+			return rec.GatewayStatusHook(ctx, gw, status)
+		}
+		return nil
+	}
+
+	opts.SetupWithManager = func(mgr ctrl.Manager, s *gari.Server) error {
 		reg := registrar.NewRegistrar(mgr.GetClient(), gcpClient, registrar.Config{
-			ClusterID: clusterID,
-			NegPrefix: negPrefix,
-			Project:   project,
-			Zones:     zoneList,
+			ClusterID: reconcilerCfg.ClusterID,
+			NegPrefix: reconcilerCfg.NegPrefix,
+			Project:   reconcilerCfg.Project,
+			Zones:     reconcilerCfg.Zones,
 		})
 
-		rec := controller.NewGatewayReconciler(
+		cfg := reconcilerCfg
+		if s != nil {
+			cfg.EnqueueGateway = s.EnqueueGateway
+		}
+
+		rec = controller.NewGatewayReconciler(
 			mgr.GetClient(),
 			mgr.GetScheme(),
 			gcpClient,
 			reg,
-			clusterID,
-			negPrefix,
-			project,
+			cfg,
 		)
-		rec.ControllerName = controllerName
-		rec.Zones = zoneList
 
 		return rec.SetupWithManager(mgr)
 	}

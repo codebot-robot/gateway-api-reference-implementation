@@ -51,8 +51,8 @@ func setupScheme() *runtime.Scheme {
 	return s
 }
 
-func getCondition(gw *gatewayv1.Gateway, condType string) *metav1.Condition {
-	for _, c := range gw.Status.Conditions {
+func getConditionFromStatus(status *gatewayv1.GatewayStatus, condType string) *metav1.Condition {
+	for _, c := range status.Conditions {
 		if c.Type == condType {
 			return &c
 		}
@@ -179,8 +179,12 @@ func TestReadinessGate_SetOnlyAfterHealthy(t *testing.T) {
 		Zones:     []string{"us-central1-a"},
 	})
 
-	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
-	reconciler.Zones = []string{"us-central1-a"}
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
 
@@ -215,12 +219,18 @@ func TestReadinessGate_SetOnlyAfterHealthy(t *testing.T) {
 		t.Errorf("expected readiness gate to be False when UNHEALTHY, got %+v", gateCond)
 	}
 
-	// Verify Gateway condition is WaitingForEndpoints
-	var updatedGW gatewayv1.Gateway
-	_ = c.Get(t.Context(), req.NamespacedName, &updatedGW)
-	prog := getCondition(&updatedGW, string(gatewayv1.GatewayConditionProgrammed))
+	// Verify Gateway condition is WaitingForEndpoints in cache and via GatewayStatusHook
+	cached := reconciler.GetCachedStatus(req.NamespacedName)
+	if cached == nil || cached.Reason != ReasonWaitingForEndpoints {
+		t.Errorf("expected Programmed=False with Reason WaitingForEndpoints, got %+v", cached)
+	}
+	var gwStatus gatewayv1.GatewayStatus
+	var currentGW gatewayv1.Gateway
+	_ = c.Get(t.Context(), req.NamespacedName, &currentGW)
+	_ = reconciler.GatewayStatusHook(t.Context(), &currentGW, &gwStatus)
+	prog := getConditionFromStatus(&gwStatus, string(gatewayv1.GatewayConditionProgrammed))
 	if prog == nil || prog.Reason != ReasonWaitingForEndpoints {
-		t.Errorf("expected Programmed=False with Reason WaitingForEndpoints, got %+v", prog)
+		t.Errorf("expected hook to produce Reason WaitingForEndpoints, got %+v", prog)
 	}
 
 	// 2. Health check passes: getHealth reports HEALTHY
@@ -250,14 +260,19 @@ func TestReadinessGate_SetOnlyAfterHealthy(t *testing.T) {
 		t.Errorf("expected readiness gate to be True when HEALTHY, got %+v", gateCond)
 	}
 
-	// Verify Gateway condition is Programmed=True!
-	_ = c.Get(t.Context(), req.NamespacedName, &updatedGW)
-	prog = getCondition(&updatedGW, string(gatewayv1.GatewayConditionProgrammed))
-	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != ReasonProgrammed {
-		t.Errorf("expected Programmed=True with Reason Programmed, got %+v", prog)
+	// Verify Gateway condition is Programmed=True in cache and via GatewayStatusHook!
+	cached = reconciler.GetCachedStatus(req.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionTrue || cached.Reason != ReasonProgrammed {
+		t.Errorf("expected Programmed=True with Reason Programmed, got %+v", cached)
 	}
-	if len(updatedGW.Status.Addresses) != 1 || updatedGW.Status.Addresses[0].Value != "34.120.254.10" {
-		t.Errorf("expected Gateway address 34.120.254.10, got %+v", updatedGW.Status.Addresses)
+	if len(cached.Addresses) != 1 || cached.Addresses[0].Value != "34.120.254.10" {
+		t.Errorf("expected Gateway address 34.120.254.10, got %+v", cached.Addresses)
+	}
+	gwStatus = gatewayv1.GatewayStatus{}
+	_ = reconciler.GatewayStatusHook(t.Context(), &currentGW, &gwStatus)
+	prog = getConditionFromStatus(&gwStatus, string(gatewayv1.GatewayConditionProgrammed))
+	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != ReasonProgrammed {
+		t.Errorf("expected hook to produce Programmed=True, got %+v", prog)
 	}
 }
 
@@ -335,9 +350,13 @@ func TestRolloutStalled_ReportsConditionWhenUnhealthy(t *testing.T) {
 		Zones:     []string{"us-central1-a"},
 	})
 
-	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
-	reconciler.HealthTimeout = 1 * time.Millisecond
-	reconciler.Zones = []string{"us-central1-a"}
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:     "cluster-1",
+		NegPrefix:     "gcpgw",
+		Project:       "my-project",
+		Zones:         []string{"us-central1-a"},
+		HealthTimeout: 1 * time.Millisecond,
+	})
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
 
@@ -355,11 +374,9 @@ func TestRolloutStalled_ReportsConditionWhenUnhealthy(t *testing.T) {
 		t.Fatalf("second Reconcile failed: %v", err)
 	}
 
-	var updatedGW gatewayv1.Gateway
-	_ = c.Get(t.Context(), req.NamespacedName, &updatedGW)
-	prog := getCondition(&updatedGW, string(gatewayv1.GatewayConditionProgrammed))
-	if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != ReasonRolloutStalled {
-		t.Fatalf("expected Programmed=False with Reason RolloutStalled, got %+v", prog)
+	cached := reconciler.GetCachedStatus(req.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionFalse || cached.Reason != ReasonRolloutStalled {
+		t.Fatalf("expected Programmed=False with Reason RolloutStalled in cache, got %+v", cached)
 	}
 }
 
@@ -374,6 +391,7 @@ func TestGateway_ErrorConditions(t *testing.T) {
 		{"QuotaExceeded", gcp.ErrQuotaExceeded, ReasonQuotaExceeded},
 		{"NEGNotFound", gcp.ErrNEGNotFound, ReasonNEGNotFound},
 		{"InvalidIP", gcp.ErrInvalidIP, ReasonUnsupportedCluster},
+		{"OtherError", errors.New("backend error with random req-id-12345"), ReasonEndpointAttachmentFailed},
 	}
 
 	for _, tc := range tests {
@@ -435,8 +453,12 @@ func TestGateway_ErrorConditions(t *testing.T) {
 				Zones:     []string{"us-central1-a"},
 			})
 
-			reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
-			reconciler.Zones = []string{"us-central1-a"}
+			reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+				ClusterID: "cluster-1",
+				NegPrefix: "gcpgw",
+				Project:   "my-project",
+				Zones:     []string{"us-central1-a"},
+			})
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
 			_, err := reconciler.Reconcile(t.Context(), req)
@@ -444,11 +466,14 @@ func TestGateway_ErrorConditions(t *testing.T) {
 				t.Fatalf("unexpected controller crash on GCP error: %v", err)
 			}
 
-			var updatedGW gatewayv1.Gateway
-			_ = c.Get(t.Context(), req.NamespacedName, &updatedGW)
-			prog := getCondition(&updatedGW, string(gatewayv1.GatewayConditionProgrammed))
-			if prog == nil || prog.Status != metav1.ConditionFalse || prog.Reason != tc.expectedReason {
-				t.Errorf("expected condition Reason %q, got %+v", tc.expectedReason, prog)
+			cached := reconciler.GetCachedStatus(req.NamespacedName)
+			if cached == nil || cached.ProgrammedStatus != metav1.ConditionFalse || cached.Reason != tc.expectedReason {
+				t.Errorf("expected condition Reason %q, got %+v", tc.expectedReason, cached)
+			}
+			if tc.expectedReason == ReasonEndpointAttachmentFailed {
+				if cached.Message != "Failed to attach endpoints to zonal NEGs; see controller logs for details." {
+					t.Errorf("expected stable message for unclassified error, got %q", cached.Message)
+				}
 			}
 		})
 	}
@@ -519,7 +544,11 @@ func TestGateway_ConflictingGateways(t *testing.T) {
 		Project:   "my-project",
 	})
 
-	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+	})
 
 	// Reconcile gwNew
 	reqNew := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-new"}}
@@ -528,11 +557,16 @@ func TestGateway_ConflictingGateways(t *testing.T) {
 		t.Fatalf("Reconcile gw-new failed: %v", err)
 	}
 
-	var updatedNew gatewayv1.Gateway
-	_ = c.Get(t.Context(), reqNew.NamespacedName, &updatedNew)
-	acc := getCondition(&updatedNew, string(gatewayv1.GatewayConditionAccepted))
+	cached := reconciler.GetCachedStatus(reqNew.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionFalse || cached.AcceptedStatus != metav1.ConditionFalse || cached.Reason != ReasonConflictingParameters {
+		t.Errorf("expected gw-new to have Accepted=False and Programmed=False with ConflictingParameters in cache, got %+v", cached)
+	}
+
+	var gwStatus gatewayv1.GatewayStatus
+	_ = reconciler.GatewayStatusHook(t.Context(), gwNew, &gwStatus)
+	acc := getConditionFromStatus(&gwStatus, string(gatewayv1.GatewayConditionAccepted))
 	if acc == nil || acc.Status != metav1.ConditionFalse || acc.Reason != ReasonConflictingParameters {
-		t.Errorf("expected gw-new to have Accepted=False with ConflictingParameters, got %+v", acc)
+		t.Errorf("expected GatewayStatusHook to downgrade Accepted=False with ConflictingParameters, got %+v", acc)
 	}
 }
 
@@ -629,8 +663,12 @@ func TestController_ScopedPodStatusPatching(t *testing.T) {
 		Zones:     []string{"us-central1-a"},
 	})
 
-	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
-	reconciler.Zones = []string{"us-central1-a"}
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
 	_, err := reconciler.Reconcile(t.Context(), req)
@@ -768,8 +806,12 @@ func TestReadinessGate_PatchRetryOnFailure(t *testing.T) {
 		Zones:     []string{"us-central1-a"},
 	})
 
-	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
-	reconciler.Zones = []string{"us-central1-a"}
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
 
@@ -818,14 +860,10 @@ func TestReadinessGate_PatchRetryOnFailure(t *testing.T) {
 		t.Errorf("expected readiness gate to be True after successful retry, got %+v", gateCond)
 	}
 
-	// Verify Gateway condition Programmed=True
-	var updatedGW gatewayv1.Gateway
-	if err := baseClient.Get(t.Context(), req.NamespacedName, &updatedGW); err != nil {
-		t.Fatalf("failed to get gateway: %v", err)
-	}
-	prog := getCondition(&updatedGW, string(gatewayv1.GatewayConditionProgrammed))
-	if prog == nil || prog.Status != metav1.ConditionTrue || prog.Reason != ReasonProgrammed {
-		t.Errorf("expected Programmed=True after successful retry, got %+v", prog)
+	// Verify Gateway condition Programmed=True in cache
+	cached := reconciler.GetCachedStatus(req.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionTrue || cached.Reason != ReasonProgrammed {
+		t.Errorf("expected Programmed=True in cache after successful retry, got %+v", cached)
 	}
 }
 
@@ -952,11 +990,15 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		Zones:     []string{"us-central1-a"},
 	})
 
-	rec := NewGatewayReconciler(mgr.GetClient(), mgr.GetScheme(), fakeGCP, reg, "cluster-1", "gcpgw", "my-project")
-	rec.ControllerName = "example.com/gcpgateway"
-	rec.Zones = []string{"us-central1-a"}
-	rec.resyncInterval = 200 * time.Millisecond
-	rec.healthPollInterval = 200 * time.Millisecond
+	rec := NewGatewayReconciler(mgr.GetClient(), mgr.GetScheme(), fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:          "cluster-1",
+		NegPrefix:          "gcpgw",
+		Project:            "my-project",
+		ControllerName:     "example.com/gcpgateway",
+		Zones:              []string{"us-central1-a"},
+		ResyncInterval:     200 * time.Millisecond,
+		HealthPollInterval: 200 * time.Millisecond,
+	})
 
 	if err := rec.SetupWithManager(mgr); err != nil {
 		t.Fatalf("SetupWithManager failed: %v", err)
@@ -979,13 +1021,11 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 		}
 	})
 
-	// 1. Wait for steady state: pod endpoint attached to NEG and Gateway Programmed=True
+	// 1. Wait for steady state: pod endpoint attached to NEG and Gateway Programmed=True in cache
 	for start := time.Now(); time.Since(start) < 60*time.Second; time.Sleep(50 * time.Millisecond) {
 		eps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
-		var updatedGW gatewayv1.Gateway
-		_ = env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &updatedGW)
-		prog := getCondition(&updatedGW, string(gatewayv1.GatewayConditionProgrammed))
-		if len(eps) == 1 && prog != nil && prog.Status == metav1.ConditionTrue {
+		cached := rec.GetCachedStatus(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		if len(eps) == 1 && cached != nil && cached.ProgrammedStatus == metav1.ConditionTrue {
 			break
 		}
 	}

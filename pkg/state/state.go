@@ -310,6 +310,11 @@ func (s *State) GatewaySource() *EventSource {
 	return s.gatewaySource
 }
 
+// EnqueueGateway requests a reconcile of the given Gateway in the Gateway controller.
+func (s *State) EnqueueGateway(req types.NamespacedName) {
+	s.gatewaySource.Enqueue(ctrl.Request{NamespacedName: req})
+}
+
 func (s *State) HTTPRouteSource() *EventSource {
 	return s.httpRouteSource
 }
