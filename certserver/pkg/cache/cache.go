@@ -46,13 +46,14 @@ var (
 
 // Certificate represents a managed TLS certificate chain and its private key.
 type Certificate struct {
-	Hostnames    []string `json:"hostnames"`
-	HostnamesKey string   `json:"hostnames_key"`
-	CertPEM      []byte   `json:"cert_pem"`
-	KeyPEM       []byte   `json:"key_pem"`
-	leaf         *x509.Certificate
+	Hostnames    []string  `json:"hostnames"`
+	HostnamesKey string    `json:"hostnames_key"`
+	CertPEM      []byte    `json:"cert_pem"`
+	KeyPEM       []byte    `json:"key_pem"`
 	IssuedAt     time.Time `json:"issued_at"`
 	ExpiresAt    time.Time `json:"expires_at"`
+
+	leaf *x509.Certificate
 }
 
 // NewCertificate constructs a Certificate with a parsed leaf and metadata.

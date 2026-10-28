@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -315,11 +316,11 @@ func TestManager_Pebble_FailedValidation(t *testing.T) {
 
 type failRoundTripper struct {
 	base http.RoundTripper
-	fail bool
+	fail atomic.Bool
 }
 
 func (f *failRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if f.fail {
+	if f.fail.Load() {
 		return nil, errors.New("simulated ACME server downtime during renewal")
 	}
 	return f.base.RoundTrip(req)
@@ -338,8 +339,9 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 
 	tripper := &failRoundTripper{
 		base: pebble.HTTPClient.Transport,
-		fail: false,
 	}
+	tripper.fail.Store(false)
+
 	customHTTPClient := &http.Client{
 		Transport: tripper,
 	}
@@ -357,7 +359,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 
 	mgr := NewManager(acmeCli, diskCache, pebble.ChallengeStore, m, func(o *Options) {
 		o.Clock = clock
-		o.RenewalCheckInterval = 50 * time.Millisecond
+		o.RenewalCheckInterval = time.Hour // manual CheckRenewals control
 		o.InitialRetryBackoff = 100 * time.Millisecond
 		o.MaxRetryBackoff = 500 * time.Millisecond
 		o.RenewalJitterPercent = 0
@@ -377,7 +379,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	}
 
 	// 2. Simulate CA failure during renewal
-	tripper.fail = true
+	tripper.fail.Store(true)
 
 	// Advance clock into renewal window (45s of 60s)
 	clock.Advance(45 * time.Second)
@@ -402,7 +404,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	}
 
 	// 3. Recover CA: retry after backoff succeeds
-	tripper.fail = false
+	tripper.fail.Store(false)
 	clock.Advance(200 * time.Millisecond) // past 100ms backoff
 
 	if err := mgr.CheckRenewals(ctx); err != nil {
