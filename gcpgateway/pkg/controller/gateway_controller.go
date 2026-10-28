@@ -34,12 +34,17 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 const (
+	// FinalizerNEG is added to Gateways managed by gcpgateway to ensure data-plane
+	// endpoints are cleanly detached from zonal NEGs before the Gateway is deleted.
+	FinalizerNEG = "gcpgateway.gke-labs.io/neg-cleanup"
+
 	// DefaultHealthTimeout is the duration after which an unconfirmed endpoint triggers RolloutStalled.
 	DefaultHealthTimeout = 60 * time.Second
 
@@ -291,6 +296,30 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, err
 	}
 
+	// Handle deletion if DeletionTimestamp is set
+	if gw.DeletionTimestamp != nil {
+		if controllerutil.ContainsFinalizer(&gw, FinalizerNEG) {
+			if r.Registrar != nil {
+				if _, err := r.Registrar.DetachAll(ctx, &gw); err != nil {
+					return reconcile.Result{}, err
+				}
+			}
+			controllerutil.RemoveFinalizer(&gw, FinalizerNEG)
+			if err := r.Update(ctx, &gw); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+		r.statusMu.Lock()
+		delete(r.statusCache, req.NamespacedName)
+		r.statusMu.Unlock()
+		for k := range r.waitingSince {
+			if strings.HasPrefix(k, gw.Namespace+"/") {
+				delete(r.waitingSince, k)
+			}
+		}
+		return reconcile.Result{}, nil
+	}
+
 	// 1. Check GatewayClass match
 	var gc gatewayv1.GatewayClass
 	if err := r.Get(ctx, types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}, &gc); err != nil {
@@ -302,6 +331,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		delete(r.statusCache, req.NamespacedName)
 		r.statusMu.Unlock()
 		return reconcile.Result{}, nil
+	}
+
+	// Ensure finalizer is present on active Gateways of this class
+	if !controllerutil.ContainsFinalizer(&gw, FinalizerNEG) {
+		controllerutil.AddFinalizer(&gw, FinalizerNEG)
+		if err := r.Update(ctx, &gw); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	// 2. Resolve NEG conflicts deterministically across Gateways targeting identical NEGs
@@ -317,6 +354,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	var conflicting []*gatewayv1.Gateway
 	for i := range allGateways.Items {
 		candidate := &allGateways.Items[i]
+		if candidate.DeletionTimestamp != nil {
+			continue
+		}
 		if candidate.Spec.GatewayClassName == gw.Spec.GatewayClassName {
 			candKey, err := r.targetNEGKey(ctx, candidate)
 			if err != nil {

@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -1056,5 +1057,516 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 
 	if len(finalEps) != 1 || finalEps[0].IpAddress != "10.0.1.5" {
 		t.Errorf("expected orphaned endpoint to be pruned by periodic resync, remaining: %+v", finalEps)
+	}
+}
+
+// TestGateway_FinalizerManagement tests that the FinalizerNEG is added to active Gateways
+// of the managed controller class, but not to Gateways belonging to other classes.
+func TestGateway_FinalizerManagement(t *testing.T) {
+	scheme := setupScheme()
+
+	gcManaged := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "managed-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "gke-labs.io/gcpgateway"},
+	}
+	gcForeign := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "foreign-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "other.io/controller"},
+	}
+
+	ipAddrType := gatewayv1.IPAddressType
+	gwManaged := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "managed-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "managed-gc",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	gwForeign := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "foreign-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "foreign-gc",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.20"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gcManaged, gcForeign, gwManaged, gwForeign).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	rec := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:      "cluster-1",
+		NegPrefix:      "gcpgw",
+		Project:        "my-project",
+		ControllerName: "gke-labs.io/gcpgateway",
+		Zones:          []string{"us-central1-a"},
+	})
+
+	// 1. Reconcile foreign gateway -> no finalizer added
+	_, err := rec.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "foreign-gw"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile on foreign gateway failed: %v", err)
+	}
+	var checkForeign gatewayv1.Gateway
+	_ = c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "foreign-gw"}, &checkForeign)
+	if controllerutil.ContainsFinalizer(&checkForeign, FinalizerNEG) {
+		t.Errorf("expected no finalizer on foreign gateway, got %v", checkForeign.Finalizers)
+	}
+
+	// 2. Reconcile managed gateway -> FinalizerNEG is added
+	_, err = rec.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "managed-gw"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile on managed gateway failed: %v", err)
+	}
+	var checkManaged gatewayv1.Gateway
+	_ = c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "managed-gw"}, &checkManaged)
+	if !controllerutil.ContainsFinalizer(&checkManaged, FinalizerNEG) {
+		t.Errorf("expected FinalizerNEG on managed gateway, got %v", checkManaged.Finalizers)
+	}
+}
+
+// TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer verifies issue #871:
+// When a Gateway is being deleted (DeletionTimestamp != nil), the reconciler calls DetachAll
+// to cleanly detach all endpoints from all matched zonal NEGs, then removes the finalizer.
+func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
+	scheme := setupScheme()
+	now := metav1.Now()
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "del-gw",
+			Finalizers:        []string{FinalizerNEG},
+			DeletionTimestamp: &now,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+
+	desc8080, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "del-gw",
+		Port:        8080,
+	}).Encode()
+	desc8443, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "del-gw",
+		Port:        8443,
+	}).Encode()
+
+	neg8080 := metadata.ResourceName("gcpgw", "cluster-1", "default", "del-gw", "8080")
+	neg8443 := metadata.ResourceName("gcpgw", "cluster-1", "default", "del-gw", "8443")
+
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        neg8080,
+		Zone:        "us-central1-a",
+		Description: desc8080,
+	})
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        neg8443,
+		Zone:        "us-central1-a",
+		Description: desc8443,
+	})
+
+	// Pre-populate endpoints in both NEGs (as if the data plane had been running)
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8080, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.4.0.10", Port: 8080},
+	})
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.4.0.10", Port: 8443},
+	})
+
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	rec := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	// Populate status cache and waitingSince to verify they get cleaned up
+	rec.statusMu.Lock()
+	rec.statusCache[types.NamespacedName{Namespace: "default", Name: "del-gw"}] = &GatewayStatusResult{
+		ProgrammedStatus: metav1.ConditionTrue,
+		Reason:           ReasonProgrammed,
+	}
+	rec.statusMu.Unlock()
+	rec.waitingSince["default/dp-pod-1"] = time.Now()
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "del-gw"}}
+	res, err := rec.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile on deleting gateway failed: %v", err)
+	}
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Errorf("expected no requeue on successful deletion, got %+v", res)
+	}
+
+	// 1. Verify endpoints in both NEGs were detached
+	eps8080, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8080)
+	if len(eps8080) != 0 {
+		t.Errorf("expected 0 endpoints in 8080 NEG, got %d", len(eps8080))
+	}
+	eps8443, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443)
+	if len(eps8443) != 0 {
+		t.Errorf("expected 0 endpoints in 8443 NEG, got %d", len(eps8443))
+	}
+
+	// 2. Verify FinalizerNEG was removed from the Gateway
+	var updatedGW gatewayv1.Gateway
+	err = c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "del-gw"}, &updatedGW)
+	if err == nil {
+		if controllerutil.ContainsFinalizer(&updatedGW, FinalizerNEG) {
+			t.Errorf("expected FinalizerNEG to be removed from gateway, got %v", updatedGW.Finalizers)
+		}
+	}
+
+	// 3. Verify statusCache and waitingSince were cleared
+	if rec.GetCachedStatus(types.NamespacedName{Namespace: "default", Name: "del-gw"}) != nil {
+		t.Errorf("expected statusCache to be cleared for deleted gateway")
+	}
+	if _, exists := rec.waitingSince["default/dp-pod-1"]; exists {
+		t.Errorf("expected waitingSince entry to be cleaned up for deleted gateway")
+	}
+}
+
+// TestGateway_DeletingGatewayDoesNotBlockConflictWinner verifies that a Gateway with
+// DeletionTimestamp != nil is excluded from conflicting candidate sets and does not block
+// a newer active Gateway from winning the NEG.
+func TestGateway_DeletingGatewayDoesNotBlockConflictWinner(t *testing.T) {
+	scheme := setupScheme()
+	t0 := time.Now()
+	t1 := t0.Add(5 * time.Minute)
+	now := metav1.Now()
+
+	ipAddrType := gatewayv1.IPAddressType
+	// gwOld is older but has DeletionTimestamp set
+	gwOld := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "gw-old",
+			CreationTimestamp: metav1.NewTime(t0),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{FinalizerNEG},
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses:        []gatewayv1.GatewaySpecAddress{{Type: &ipAddrType, Value: "34.120.254.10"}},
+			Listeners:        []gatewayv1.Listener{{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType}},
+		},
+	}
+	// gwNew is newer and active
+	gwNew := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "gw-new",
+			CreationTimestamp: metav1.NewTime(t1),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses:        []gatewayv1.GatewaySpecAddress{{Type: &ipAddrType, Value: "34.120.254.10"}},
+			Listeners:        []gatewayv1.Listener{{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType}},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gwOld, gwNew, node).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	rec := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	// Reconcile gwNew: it must NOT be marked as ReasonConflictingParameters because gwOld is deleting
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-new"}}
+	_, err := rec.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile on gw-new failed: %v", err)
+	}
+
+	cached := rec.GetCachedStatus(req.NamespacedName)
+	if cached != nil && cached.Reason == ReasonConflictingParameters {
+		t.Errorf("expected active gw-new not to be blocked by deleting gw-old, but got ReasonConflictingParameters")
+	}
+}
+
+// TestGateway_DeleteDetachesEndpoints_EnvTest runs an end-to-end test against a real kube-apiserver
+// and manager: deploys a Gateway and pod, verifies endpoint attachment and finalizer addition,
+// deletes the Gateway, and confirms that endpoints are cleanly detached from the NEG and the Gateway is removed.
+func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
+	env := testenv.Start(t)
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gcpgateway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "example.com/gcpgateway"},
+	}
+	if err := env.Client.Create(t.Context(), gc); err != nil {
+		t.Fatalf("creating GatewayClass: %v", err)
+	}
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "delete-gw",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	if err := env.Client.Create(t.Context(), gw); err != nil {
+		t.Fatalf("creating Gateway: %v", err)
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+			Labels: map[string]string{
+				registrar.ZoneLabelStandard: "us-central1-a",
+			},
+		},
+		Spec: corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+	if err := env.Client.Create(t.Context(), node); err != nil {
+		t.Fatalf("creating Node: %v", err)
+	}
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	negDesc, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "delete-gw",
+		Port:        8443,
+	}).Encode()
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "delete-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+
+	bsName := metadata.ResourceName("gcpgw", "cluster-1", "default", "delete-gw", "bs-443")
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	ap := singlepod.NewAddressProvider(
+		env.Client,
+		singlepod.WithExtraReadinessGates(registrar.LoadBalancerReadyGate),
+		singlepod.WithTerminationGracePeriodSeconds(60),
+	)
+	_, _, err := ap.GatewayAddressesWithReadiness(t.Context(), gw, nil)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+
+	resName := singlepod.ResourceNameForGateway(gw.Name)
+	var deploy appsv1.Deployment
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: resName}, &deploy); err != nil {
+		t.Fatalf("failed to get Deployment: %v", err)
+	}
+
+	pod := testenv.BuildPodFromDeployment(
+		&deploy,
+		testenv.WithPodName("dp-pod-del"),
+		testenv.WithNodeName("node-1"),
+		testenv.WithPodIP("10.0.1.5"),
+		testenv.WithContainersReady(true),
+	)
+	if err := env.Client.Create(t.Context(), pod); err != nil {
+		t.Fatalf("creating pod: %v", err)
+	}
+	pod.Status.PodIP = "10.0.1.5"
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionTrue},
+	}
+	if err := env.Client.Status().Update(t.Context(), pod); err != nil {
+		t.Fatalf("updating pod status: %v", err)
+	}
+
+	skipNameValidation := true
+	mgr, err := ctrl.NewManager(env.Config, ctrl.Options{
+		Scheme:                 env.Scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		Controller: ctrlcfg.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating manager: %v", err)
+	}
+
+	reg := registrar.NewRegistrar(env.Client, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	rec := NewGatewayReconciler(mgr.GetClient(), mgr.GetScheme(), fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:          "cluster-1",
+		NegPrefix:          "gcpgw",
+		Project:            "my-project",
+		ControllerName:     "example.com/gcpgateway",
+		Zones:              []string{"us-central1-a"},
+		ResyncInterval:     200 * time.Millisecond,
+		HealthPollInterval: 200 * time.Millisecond,
+	})
+
+	if err := rec.SetupWithManager(mgr); err != nil {
+		t.Fatalf("SetupWithManager failed: %v", err)
+	}
+
+	mgrErrCh := make(chan error, 1)
+	mgrCtx, cancelMgr := context.WithCancel(t.Context())
+	go func() {
+		mgrErrCh <- mgr.Start(mgrCtx)
+	}()
+	t.Cleanup(func() {
+		cancelMgr()
+		select {
+		case err := <-mgrErrCh:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("manager stopped with unexpected error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("timed out waiting for manager to exit")
+		}
+	})
+
+	// 1. Wait for Gateway to be Programmed and endpoint attached
+	for start := time.Now(); time.Since(start) < 60*time.Second; time.Sleep(50 * time.Millisecond) {
+		eps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
+		cached := rec.GetCachedStatus(types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+		if len(eps) == 1 && cached != nil && cached.ProgrammedStatus == metav1.ConditionTrue {
+			break
+		}
+	}
+
+	// Verify FinalizerNEG was added to the Gateway
+	var currentGW gatewayv1.Gateway
+	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &currentGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&currentGW, FinalizerNEG) {
+		t.Fatalf("expected Gateway to have FinalizerNEG, got: %v", currentGW.Finalizers)
+	}
+
+	// 2. Delete the Gateway
+	if err := env.Client.Delete(t.Context(), &currentGW); err != nil {
+		t.Fatalf("failed to delete Gateway: %v", err)
+	}
+
+	// 3. Confirm that the Gateway is deleted from the API server and endpoints in the NEG are detached
+	deletedFromKube := false
+	negCleanedUp := false
+	for start := time.Now(); time.Since(start) < 60*time.Second; time.Sleep(50 * time.Millisecond) {
+		if !deletedFromKube {
+			var checkGW gatewayv1.Gateway
+			err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &checkGW)
+			if err != nil {
+				deletedFromKube = true
+			}
+		}
+		if !negCleanedUp {
+			eps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
+			if len(eps) == 0 {
+				negCleanedUp = true
+			}
+		}
+		if deletedFromKube && negCleanedUp {
+			break
+		}
+	}
+
+	if !negCleanedUp {
+		remainingEps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negName)
+		t.Errorf("expected NEG to be cleared of endpoints after Gateway deletion, still has %d: %+v", len(remainingEps), remainingEps)
+	}
+	if !deletedFromKube {
+		t.Errorf("expected Gateway to be finalized and removed from API server, but it still exists")
 	}
 }

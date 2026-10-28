@@ -103,8 +103,152 @@ type ReconcileResult struct {
 	SyncedNEGs    []*compute.NetworkEndpointGroup
 }
 
+type matchedNeg struct {
+	zone string
+	port int
+	neg  *compute.NetworkEndpointGroup
+}
+
+func (r *Registrar) discoverZones(ctx context.Context) ([]string, map[string]*corev1.Node, error) {
+	zonesMap := make(map[string]bool)
+	for _, z := range r.cfg.Zones {
+		if z != "" {
+			zonesMap[z] = true
+		}
+	}
+
+	var nodeList corev1.NodeList
+	if err := r.client.List(ctx, &nodeList); err != nil {
+		return nil, nil, fmt.Errorf("listing nodes: %w", err)
+	}
+	nodesByName := make(map[string]*corev1.Node)
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		nodesByName[node.Name] = node
+		if info, err := ResolveNodeInstance(node); err == nil && info.Zone != "" {
+			zonesMap[info.Zone] = true
+		}
+	}
+
+	var zones []string
+	for z := range zonesMap {
+		zones = append(zones, z)
+	}
+	sort.Strings(zones)
+	return zones, nodesByName, nil
+}
+
+func (r *Registrar) findNEGs(ctx context.Context, gw *gatewayv1.Gateway, zones []string, targetPorts map[int]bool) ([]matchedNeg, error) {
+	var matchedList []matchedNeg
+	for _, zone := range zones {
+		negs, err := r.gcpClient.ListNEGs(ctx, r.cfg.Project, zone, r.cfg.NegPrefix)
+		if err != nil {
+			return nil, fmt.Errorf("listing NEGs in zone %s: %w", zone, err)
+		}
+
+		for _, neg := range negs {
+			meta, err := metadata.Parse(neg.Description)
+			if err != nil {
+				klog.V(2).Infof("Skipping NEG %q in zone %q: unparseable metadata: %v", neg.Name, zone, err)
+				continue
+			}
+
+			if !meta.Matches(r.cfg.ClusterID, gw.Namespace, gw.Name, 0) {
+				klog.V(4).Infof("Skipping NEG %q in zone %q: foreign metadata %+v", neg.Name, zone, meta)
+				continue
+			}
+
+			if targetPorts != nil && !targetPorts[meta.Port] && meta.Port > 0 {
+				continue
+			}
+
+			matchedList = append(matchedList, matchedNeg{
+				zone: zone,
+				port: meta.Port,
+				neg:  neg,
+			})
+		}
+	}
+	return matchedList, nil
+}
+
+// DetachAll detaches all endpoints from all zonal NEGs belonging to the Gateway.
+func (r *Registrar) DetachAll(ctx context.Context, gw *gatewayv1.Gateway) (*ReconcileResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	result := &ReconcileResult{}
+
+	zones, _, err := r.discoverZones(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Match all NEGs belonging to this Gateway regardless of listener port configuration
+	matchedList, err := r.findNEGs(ctx, gw, zones, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	result.MatchedNEGs = len(matchedList)
+	for _, mn := range matchedList {
+		result.SyncedNEGs = append(result.SyncedNEGs, mn.neg)
+	}
+
+	if len(matchedList) == 0 {
+		return result, nil
+	}
+
+	for _, mn := range matchedList {
+		currentEndpoints, err := r.gcpClient.ListNetworkEndpoints(ctx, r.cfg.Project, mn.zone, mn.neg.Name)
+		if err != nil {
+			if gcp.IsNEGNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("listing endpoints in NEG %s: %w", mn.neg.Name, err)
+		}
+
+		if len(currentEndpoints) == 0 {
+			continue
+		}
+
+		for i := 0; i < len(currentEndpoints); i += MaxBatchSize {
+			end := i + MaxBatchSize
+			if end > len(currentEndpoints) {
+				end = len(currentEndpoints)
+			}
+			batch := currentEndpoints[i:end]
+			if err := r.gcpClient.DetachNetworkEndpoints(ctx, r.cfg.Project, mn.zone, mn.neg.Name, batch); err != nil {
+				if gcp.IsNEGNotFound(err) {
+					break
+				}
+				return nil, fmt.Errorf("detaching endpoints from NEG %s: %w", mn.neg.Name, err)
+			}
+			result.DetachedCount += len(batch)
+		}
+	}
+
+	var podList corev1.PodList
+	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+		klog.V(4).Infof("DetachAll: listing pods in namespace %s: %v", gw.Namespace, err)
+	} else {
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if pod.Labels[singlepod.LabelGatewayName] == gw.Name {
+				r.tracker.Clear(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // ReconcileEndpoints synchronizes data plane pods with the matched zonal NEGs for a Gateway.
 func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gateway) (*ReconcileResult, error) {
+	if gw.DeletionTimestamp != nil {
+		return r.DetachAll(ctx, gw)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -127,71 +271,20 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 	}
 
 	// 2. Discover zones from configured zones and active cluster nodes
-	zonesMap := make(map[string]bool)
-	for _, z := range r.cfg.Zones {
-		if z != "" {
-			zonesMap[z] = true
-		}
+	zones, nodesByName, err := r.discoverZones(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	var nodeList corev1.NodeList
-	if err := r.client.List(ctx, &nodeList); err != nil {
-		return nil, fmt.Errorf("listing nodes: %w", err)
-	}
-	nodesByName := make(map[string]*corev1.Node)
-	for i := range nodeList.Items {
-		node := &nodeList.Items[i]
-		nodesByName[node.Name] = node
-		if info, err := ResolveNodeInstance(node); err == nil && info.Zone != "" {
-			zonesMap[info.Zone] = true
-		}
-	}
-
-	var zones []string
-	for z := range zonesMap {
-		zones = append(zones, z)
-	}
-	sort.Strings(zones)
 
 	// 3. Find NEGs belonging to this Gateway by listing with prefix and matching metadata
-	type matchedNeg struct {
-		zone string
-		port int
-		neg  *compute.NetworkEndpointGroup
-	}
-	var matchedList []matchedNeg
-
-	for _, zone := range zones {
-		negs, err := r.gcpClient.ListNEGs(ctx, r.cfg.Project, zone, r.cfg.NegPrefix)
-		if err != nil {
-			return nil, fmt.Errorf("listing NEGs in zone %s: %w", zone, err)
-		}
-
-		for _, neg := range negs {
-			meta, err := metadata.Parse(neg.Description)
-			if err != nil {
-				klog.V(2).Infof("Skipping NEG %q in zone %q: unparseable metadata: %v", neg.Name, zone, err)
-				continue
-			}
-
-			if !meta.Matches(r.cfg.ClusterID, gw.Namespace, gw.Name, 0) {
-				klog.V(4).Infof("Skipping NEG %q in zone %q: foreign metadata %+v", neg.Name, zone, meta)
-				continue
-			}
-
-			if !targetPorts[meta.Port] && meta.Port > 0 {
-				continue
-			}
-
-			matchedList = append(matchedList, matchedNeg{
-				zone: zone,
-				port: meta.Port,
-				neg:  neg,
-			})
-			result.SyncedNEGs = append(result.SyncedNEGs, neg)
-		}
+	matchedList, err := r.findNEGs(ctx, gw, zones, targetPorts)
+	if err != nil {
+		return nil, err
 	}
 	result.MatchedNEGs = len(matchedList)
+	for _, mn := range matchedList {
+		result.SyncedNEGs = append(result.SyncedNEGs, mn.neg)
+	}
 
 	if len(matchedList) == 0 {
 		return result, nil
