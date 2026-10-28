@@ -1475,6 +1475,7 @@ func TestH2Transport_ConcurrentFirstWriteAccepted_ReadDoesNotReopen(t *testing.T
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
+		<-r.Context().Done()
 	})
 
 	ln, cleanup := startMockBackendH2(t, 250, handler)
