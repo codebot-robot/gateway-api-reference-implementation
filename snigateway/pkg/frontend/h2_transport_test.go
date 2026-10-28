@@ -604,7 +604,7 @@ func TestH2Transport_FailedReopenReturnsErrorAndDoesNotHang(t *testing.T) {
 	}
 
 	// Set a short read deadline so reopen fails fast (no other pooled conns exist)
-	_ = stream.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_ = stream.SetReadDeadline(time.Now().Add(25 * time.Millisecond))
 
 	buf := make([]byte, 10)
 	_, rerr := stream.Read(buf)
@@ -786,10 +786,11 @@ func TestH2Transport_QueueClosedBeforeFirstWrite_Reopens(t *testing.T) {
 	}
 	defer stream.Close()
 
-	// Simulate queue being closed/aborted right before the first queued write:
-	// zero bytes have been accepted into the queue
+	// Simulate queue being closed/aborted right before the first queued write
+	// when the connection has failed: zero bytes have been accepted into the queue
 	h2sc := stream.(*h2StreamConn)
 	att := h2sc.attempt.Load()
+	att.hc.closed.Store(true)
 	att.queue.Abort(net.ErrClosed)
 
 	// Write must recognize that 0 bytes were accepted and transparently reopen on c2
@@ -811,15 +812,27 @@ func TestH2Transport_QueueClosedBeforeFirstWrite_Reopens(t *testing.T) {
 	}
 }
 
-func TestH2Transport_ConcurrentFirstReadAndWrite_Failover(t *testing.T) {
+func testConcurrentFirstReadAndWriteFailover(t *testing.T, dieBefore200 bool) {
+	var c1Requests atomic.Int32
+	c1Gate := make(chan struct{})
+	c1Sent200 := make(chan struct{})
+
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
 			http.Error(w, "bad method", http.StatusMethodNotAllowed)
 			return
 		}
+		reqNum := c1Requests.Add(1)
+		if reqNum == 1 && dieBefore200 {
+			// Hold the response on c1 until c1 is killed
+			<-c1Gate
+		}
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
+		}
+		if reqNum == 1 && !dieBefore200 {
+			close(c1Sent200)
 		}
 		buf := make([]byte, 1024)
 		n, _ := r.Body.Read(buf)
@@ -837,7 +850,7 @@ func TestH2Transport_ConcurrentFirstReadAndWrite_Failover(t *testing.T) {
 	h2Tr := NewH2Transport()
 	defer h2Tr.Close()
 
-	sessID := "sess-concurrent-failover"
+	sessID := fmt.Sprintf("sess-concurrent-failover-%v", dieBefore200)
 	h2Tr.RegisterSession(sessID)
 
 	rawC1, err := net.Dial("tcp", ln.Addr().String())
@@ -868,8 +881,20 @@ func TestH2Transport_ConcurrentFirstReadAndWrite_Failover(t *testing.T) {
 	}
 	defer stream.Close()
 
+	h2sc := stream.(*h2StreamConn)
+	att := h2sc.attempt.Load()
+
+	if !dieBefore200 {
+		// Ordering 2: Gate to ensure the 200 arrives at client before c1 dies
+		<-c1Sent200
+		<-att.done
+	}
+
 	// Kill c1 before first byte
 	c1.triggerFailNow()
+	if dieBefore200 {
+		close(c1Gate)
+	}
 	<-c1.readErrSeen
 	for _, c := range h2Tr.SessionConns(sessID) {
 		if c.rawConn == c1 {
@@ -912,6 +937,531 @@ func TestH2Transport_ConcurrentFirstReadAndWrite_Failover(t *testing.T) {
 
 	if string(buf) != "ping" {
 		t.Fatalf("expected ping echo, got %s", string(buf))
+	}
+}
+
+func TestH2Transport_ConcurrentFirstReadAndWrite_Failover(t *testing.T) {
+	t.Run("DiesBefore200", func(t *testing.T) {
+		testConcurrentFirstReadAndWriteFailover(t, true)
+	})
+	t.Run("DiesAfter200BeforeBytes", func(t *testing.T) {
+		testConcurrentFirstReadAndWriteFailover(t, false)
+	})
+}
+
+func TestH2Transport_ResponseBytesDelivered_DoesNotReopen(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Server-first protocol: send greeting immediately
+		_, _ = w.Write([]byte("greeting"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-response-delivered-no-reopen"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	h2sc := stream.(*h2StreamConn)
+	att := h2sc.attempt.Load()
+
+	// Read greeting from server: delivers response bytes to caller
+	buf := make([]byte, 8)
+	n, err := io.ReadFull(stream, buf)
+	if err != nil {
+		t.Fatalf("initial ReadFull failed: %v", err)
+	}
+	if string(buf[:n]) != "greeting" {
+		t.Fatalf("got %q, want greeting", string(buf[:n]))
+	}
+
+	// Verify responseDelivered is set to true
+	h2sc.mu.Lock()
+	delivered := h2sc.responseDelivered
+	h2sc.mu.Unlock()
+	if !delivered {
+		t.Fatal("expected responseDelivered to be true after reading response bytes")
+	}
+
+	// Now fail c1's transport
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Subsequent Read or Write must fail and must NOT reopen on c2
+	readBuf := make([]byte, 10)
+	_, readErr := stream.Read(readBuf)
+	if readErr == nil {
+		t.Fatal("expected Read after connection failure to return error, got nil")
+	}
+
+	// Assert c2 has 0 load (no reopen was attempted)
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c2 {
+			if load := c.Load(); load != 0 {
+				t.Fatalf("expected c2 load to be 0 (no reopen), got %d", load)
+			}
+		}
+	}
+
+	// Assert the stream attempt is still att (not replaced!)
+	if h2sc.attempt.Load() != att {
+		t.Fatal("stream attempt was unexpectedly replaced; reopen occurred after response bytes were delivered")
+	}
+}
+
+func TestH2Transport_BufferedResponseDrainsAfterConnectionDies(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = w.Write([]byte("abcdef"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-buffered-response-drain"
+	h2Tr.RegisterSession(sessID)
+
+	rawC1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c1 failed: %v", err)
+	}
+	defer rawC1.Close()
+	c1 := newDelayedFailConn(rawC1)
+	if err := h2Tr.AddConn(sessID, c1); err != nil {
+		t.Fatalf("AddConn c1 failed: %v", err)
+	}
+
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial c2 failed: %v", err)
+	}
+	defer c2.Close()
+	if err := h2Tr.AddConn(sessID, c2); err != nil {
+		t.Fatalf("AddConn c2 failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	// Read one byte
+	buf := make([]byte, 1)
+	n, err := stream.Read(buf)
+	if err != nil {
+		t.Fatalf("first Read failed: %v", err)
+	}
+	if n != 1 || string(buf[:n]) != "a" {
+		t.Fatalf("first Read got %q (len %d), want %q", string(buf[:n]), n, "a")
+	}
+
+	// Kill c1 after the first byte was read. The remaining bytes "bcdef" are already buffered in the client response body.
+	c1.triggerFailNow()
+	<-c1.readErrSeen
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c1 {
+			for !c.cc.State().Closed {
+				runtime.Gosched()
+			}
+		}
+	}
+
+	// Second Read must return 'b', not ErrClosed
+	n, err = stream.Read(buf)
+	if err != nil {
+		t.Fatalf("second Read failed: %v", err)
+	}
+	if n != 1 || string(buf[:n]) != "b" {
+		t.Fatalf("second Read got %q (len %d), want %q", string(buf[:n]), n, "b")
+	}
+
+	// Remaining buffered bytes must drain completely
+	rest := make([]byte, 10)
+	n, err = io.ReadFull(stream, rest[:4])
+	if err != nil {
+		t.Fatalf("reading rest of buffered bytes failed: %v", err)
+	}
+	if string(rest[:n]) != "cdef" {
+		t.Fatalf("got %q, want %q", string(rest[:n]), "cdef")
+	}
+
+	// Once buffered data is drained, subsequent Read must surface the transport error
+	_, readErr := stream.Read(rest)
+	if readErr == nil {
+		t.Fatal("expected Read after draining buffer to return error, got nil")
+	}
+
+	// Verify c2 was not reopened
+	for _, c := range h2Tr.SessionConns(sessID) {
+		if c.rawConn == c2 {
+			if load := c.Load(); load != 0 {
+				t.Fatalf("expected c2 load to be 0 (no reopen), got %d", load)
+			}
+		}
+	}
+}
+
+func TestH2Transport_CleanEOF_DoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		connectCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Return immediately: clean EOF with 0 body bytes
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-clean-eof"
+	h2Tr.RegisterSession(sessID)
+
+	var rawConns1 []net.Conn
+	defer func() {
+		for _, c := range rawConns1 {
+			c.Close()
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial c%d failed: %v", i, err)
+		}
+		rawConns1 = append(rawConns1, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn c%d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	buf := make([]byte, 10)
+	n, rerr := stream.Read(buf)
+	if n != 0 {
+		t.Fatalf("expected 0 bytes read on EOF, got %d", n)
+	}
+	if !errors.Is(rerr, io.EOF) {
+		t.Fatalf("expected io.EOF error, got %v", rerr)
+	}
+
+	// Assert exactly 1 CONNECT was sent (no transparent reopen was attempted)
+	if cnt := connectCount.Load(); cnt != 1 {
+		t.Fatalf("expected 1 CONNECT request, got %d", cnt)
+	}
+
+	// Assert pool size is still 3 (no healthy connection was drained)
+	if poolSize := len(h2Tr.SessionConns(sessID)); poolSize != 3 {
+		t.Fatalf("expected pool size of 3, got %d", poolSize)
+	}
+}
+
+func TestH2Transport_StreamReset_DoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		connectCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Abort handler causes server to send RST_STREAM
+		panic(http.ErrAbortHandler)
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-stream-reset"
+	h2Tr.RegisterSession(sessID)
+
+	var rawConns2 []net.Conn
+	defer func() {
+		for _, c := range rawConns2 {
+			c.Close()
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial c%d failed: %v", i, err)
+		}
+		rawConns2 = append(rawConns2, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn c%d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	buf := make([]byte, 10)
+	n, rerr := stream.Read(buf)
+	if n != 0 {
+		t.Fatalf("expected 0 bytes read on stream reset, got %d", n)
+	}
+	var se http2.StreamError
+	if !errors.As(rerr, &se) {
+		t.Fatalf("expected http2.StreamError, got %v (%T)", rerr, rerr)
+	}
+
+	// Assert exactly 1 CONNECT was sent (no transparent reopen was attempted)
+	if cnt := connectCount.Load(); cnt != 1 {
+		t.Fatalf("expected 1 CONNECT request, got %d", cnt)
+	}
+
+	// Assert pool size is still 3 (no healthy connection was drained)
+	if poolSize := len(h2Tr.SessionConns(sessID)); poolSize != 3 {
+		t.Fatalf("expected pool size of 3, got %d", poolSize)
+	}
+}
+
+func TestH2Transport_CleanEOF_WriteFirst_DoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		connectCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Return immediately: clean EOF with 0 body bytes
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-clean-eof-write-first"
+	h2Tr.RegisterSession(sessID)
+
+	var rawConns []net.Conn
+	defer func() {
+		for _, c := range rawConns {
+			c.Close()
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial c%d failed: %v", i, err)
+		}
+		rawConns = append(rawConns, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn c%d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	h2sc := stream.(*h2StreamConn)
+	att := h2sc.attempt.Load()
+	<-att.done
+
+	// Wait for the real stream end to close the queue before the first write
+	for !att.queue.IsClosed() {
+		runtime.Gosched()
+	}
+
+	n, werr := stream.Write([]byte("ping"))
+	if n != 0 {
+		t.Fatalf("expected 0 bytes written on closed stream, got %d", n)
+	}
+	if werr == nil {
+		t.Fatal("expected error on write to closed stream, got nil")
+	}
+
+	// Assert exactly 1 CONNECT was sent (no transparent reopen was attempted)
+	if cnt := connectCount.Load(); cnt != 1 {
+		t.Fatalf("expected 1 CONNECT request, got %d", cnt)
+	}
+
+	// Assert pool size is still 3 (no healthy connection was drained)
+	if poolSize := len(h2Tr.SessionConns(sessID)); poolSize != 3 {
+		t.Fatalf("expected pool size of 3, got %d", poolSize)
+	}
+}
+
+func TestH2Transport_StreamReset_WriteFirst_DoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		connectCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Abort handler causes server to send RST_STREAM
+		panic(http.ErrAbortHandler)
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-stream-reset-write-first"
+	h2Tr.RegisterSession(sessID)
+
+	var rawConns []net.Conn
+	defer func() {
+		for _, c := range rawConns {
+			c.Close()
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial c%d failed: %v", i, err)
+		}
+		rawConns = append(rawConns, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn c%d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	h2sc := stream.(*h2StreamConn)
+	att := h2sc.attempt.Load()
+	<-att.done
+
+	// Wait for the real stream reset to close the queue before the first write
+	for !att.queue.IsClosed() {
+		runtime.Gosched()
+	}
+
+	n, werr := stream.Write([]byte("ping"))
+	if n != 0 {
+		t.Fatalf("expected 0 bytes written on reset stream, got %d", n)
+	}
+	if werr == nil {
+		t.Fatal("expected error on write to reset stream, got nil")
+	}
+
+	// Assert exactly 1 CONNECT was sent (no transparent reopen was attempted)
+	if cnt := connectCount.Load(); cnt != 1 {
+		t.Fatalf("expected 1 CONNECT request, got %d", cnt)
+	}
+
+	// Assert pool size is still 3 (no healthy connection was drained)
+	if poolSize := len(h2Tr.SessionConns(sessID)); poolSize != 3 {
+		t.Fatalf("expected pool size of 3, got %d", poolSize)
 	}
 }
 
