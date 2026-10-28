@@ -19,16 +19,16 @@ import (
 	"sync"
 )
 
-// Checkpointer coordinates non-blocking checkpoints between the buffer pool, heap file, and WAL.
+// Checkpointer coordinates non-blocking checkpoints between the block pool, heap file, and WAL.
 type Checkpointer struct {
-	bp       *BufferPool
+	bp       *BlockPool
 	heapFile File
 	wal      *WAL
 	mu       sync.Mutex
 }
 
 // NewCheckpointer creates a new Checkpointer.
-func NewCheckpointer(bp *BufferPool, heapFile File, wal *WAL) *Checkpointer {
+func NewCheckpointer(bp *BlockPool, heapFile File, wal *WAL) *Checkpointer {
 	return &Checkpointer{
 		bp:       bp,
 		heapFile: heapFile,

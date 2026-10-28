@@ -8,31 +8,16 @@ For benchmark results and performance measurements, see [diskstore-experiment.md
 The engine uses the following terms:
 
 - **Block.** The 4 KiB unit, sized to match the disk. A block lives on disk, in the heap file at a block number, and may also be resident in memory in the block pool. A heap block starts with a 32-byte header carrying the logical page number, LSN, its index within the page, the page's block count, and a CRC32C checksum.
-- **Block pool.** The fixed-size, pointer-free in-memory arena of blocks that the code currently calls the buffer pool (`BufferPool`). A resident page occupies one pool block per page block, and those pool blocks do not need to be adjacent.
+- **Block pool.** The fixed-size, pointer-free in-memory arena of blocks. A resident page occupies one pool block per page block, and those pool blocks do not need to be adjacent.
+- **Pool block.** One 4 KiB block in that arena.
 - **Page.** The logical unit, identified by a logical page number. It is either a slotted page (one block holding many small records, each in a record slot) or a multi-block page ($2^k$ blocks holding one large record). The engine writes pages out of place, so a logical page moves between block numbers over time.
 - **Block run.** A contiguous, aligned run of blocks allocated by the buddy allocator. A multi-block page always occupies one block run, and a flush batch writes several pages into one block run.
+- **Record slot.** An entry in a slotted page's directory. "Slot" is used only in this sense.
 - **WAL terms:**
   - **Segment.** An append-only log file named by its starting 64-bit LSN, formatted as a 20-digit zero-padded decimal number with a `.wal` extension. The engine appends records to the active segment. In accordance with invariant 4, once a 4 KiB block within a segment is fsynced to disk, the engine never rewrites that block.
   - **Record.** A single log entry recording an operation, such as a write, deletion, checkpoint, or progress token.
   - **LSN.** A 64-bit monotonically increasing Log Sequence Number.
   - **Durable LSN.** The highest LSN confirmed flushed and fsynced to disk.
-
-### Identifier Mapping
-
-The code contains legacy identifiers that will be renamed in separate work. The following table maps design terms to current code identifiers:
-
-| Design Term | Current Code Identifier | Description in Code |
-| :--- | :--- | :--- |
-| Block | `BlockSize`, `BlockHeader`, `PhysicalBlock`, `FlushedLoc`, `DurableLoc` | The 4 KiB unit on disk and in memory. |
-| Block pool | `BufferPool`, `NewBufferPool` | The in-memory pool managing resident memory blocks. |
-| Pool block | `FrameIDs`, `freeFrames`, `numFrames`, `NumFrames`, `DefaultBufferPoolFrames` | An in-memory 4 KiB block in the pool arena (currently named "frame"). |
-| Page | `PageDesc`, `PageHandle`, `LogicalPage`, `SlottedPage`, `MultiBlockPage` | The logical unit identified by a logical page number. |
-| Block run | `AllocateBatch`, `MaxBatchBlocks`, buddy allocations | An aligned, contiguous run of physical blocks allocated together (currently called "extent" or "batch"). |
-| Record slot | `SlottedPage` slot entries (`Offset`, `Length`), `Slot`, `KeyIndexEntry.Slot` | An entry in the slot directory of a slotted page pointing to a record payload. |
-| Segment | `segmentFileName`, `WAL.activeFile`, `*.wal` files | A WAL segment file named after its starting LSN. |
-| Record | `Record`, `EncodeRecord`, `DecodeRecord` | A WAL entry for an operation. |
-| LSN | `LSN`, `nextLSN`, `lastAppendedLSN`, `PageLSN`, `DirtyLSN` | The 64-bit monotonic sequence number. |
-| Durable LSN | `WAL.DurableLSN()`, `WAL.fsyncedLSN` | The maximum LSN confirmed written and fsynced to disk. |
 
 ## On-Disk Formats
 

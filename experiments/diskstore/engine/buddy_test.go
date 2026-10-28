@@ -215,7 +215,7 @@ func TestBuddyAllocator_AllocateBatch(t *testing.T) {
 	}
 	_ = alloc.Free(order3Blk)
 
-	// Test 4: Maximum extent batch (512 single-block pages = 1 << MaxOrder)
+	// Test 4: Maximum block run batch (512 single-block pages = 1 << MaxOrder)
 	maxBatchOrders := make([]int, 512)
 	maxLocs, err := alloc.AllocateBatch(maxBatchOrders)
 	if err != nil {
@@ -237,6 +237,6 @@ func TestBuddyAllocator_AllocateBatch(t *testing.T) {
 	oversizeOrders := make([]int, 513)
 	_, err = alloc.AllocateBatch(oversizeOrders)
 	if err == nil {
-		t.Fatalf("expected error for batch exceeding MaxOrder extent, got nil")
+		t.Fatalf("expected error for batch exceeding MaxOrder block run, got nil")
 	}
 }

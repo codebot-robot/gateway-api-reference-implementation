@@ -1,4 +1,4 @@
-# Experiment: Write-Ahead Log + Buffer Pool Disk Store for Informer Objects
+# Experiment: Write-Ahead Log + Block Pool Disk Store for Informer Objects
 
 ## Executive Summary
 
@@ -12,13 +12,13 @@ The new `DiskStore` architecture introduces:
 - A **heap file composed of self-describing 4 KiB blocks**, each protected by a 32-byte header with a Castagnoli CRC32C checksum.
 - An **out-of-place write strategy** enforcing the **Reuse Rule** (locations holding the newest durable copy of a page are never overwritten) and the **Write-Ahead Rule** (WAL is fsynced through a page's LSN before the page is written to disk).
 - A **buddy allocator** over 4 KiB blocks that prefers the lowest available location, enabling automatic tail truncation of the heap file.
-- A **fixed-size buffer pool** of 4 KiB frames allocated once as a single pointer-free byte arena with zero `mmap`, performing direct I/O via `O_DIRECT` on Linux (and `F_NOCACHE` on Darwin) through `unix.Preadv` and `unix.Pwritev`.
+- A **fixed-size block pool** of 4 KiB pool blocks allocated once as a single pointer-free byte arena with zero `mmap`, performing direct I/O via `O_DIRECT` on Linux (and `F_NOCACHE` on Darwin) through `unix.Preadv` and `unix.Pwritev`.
 - **Non-blocking checkpoints** with ARIES dirty page tracking and WAL segment truncation.
 - Full compatibility with `k8s.io/client-go/tools/cache.Indexer`.
 
 ### Key Empirical Results (Mixed Realistic Corpus: 10,000 Objects, 10 KB Payloads)
 
-*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-frame) buffer pool in isolated benchmark processes.*
+*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-block) block pool in isolated benchmark processes.*
 
 | Architecture | Heap In-Use | Process RSS | Heap File | WAL Size | Total Disk | Write Throughput | Recovery Time | Warm Recompute (10 refs) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -29,14 +29,14 @@ The new `DiskStore` architecture introduces:
 
 - **In-Memory Informer Baseline:** The standard in-memory cache retains all objects in RAM, consuming **115.70 MB Go heap** and **176.91 MB Process RSS** for 10,000 objects (~100 MB data).
 - **RSS Reduction:** `DiskStore (zstd)` consumes **48.11 MB Process RSS**, achieving a **72.8% reduction compared to In-Memory** (176.91 MB) and a **68.8% reduction compared to BBolt** (154.30 MB) by avoiding kernel page-cache amplification from `mmap`.
-- **Heap Footprint:** `DiskStore` holds only index structures and buffer pool pointers in heap, consuming **13.73 MB Go heap**, an **88.1% reduction** compared to In-Memory.
+- **Heap Footprint:** `DiskStore` holds only index structures and block pool pointers in heap, consuming **13.73 MB Go heap**, an **88.1% reduction** compared to In-Memory.
 - **Disk Footprint Reduction by Data Type:**
   - **Configuration text (JSON):** `zstd` reduces on-disk storage by **82.3%** (8.51 MB vs. 47.95 MB uncompressed; Heap file: 4.88 MB vs. 39.06 MB) and doubles write throughput (4,974 op/s vs. 2,549 op/s).
   - **TLS material (x509 PEM):** `zstd` reduces on-disk storage by **66.4%** (16.14 MB vs. 48.01 MB uncompressed; Heap file: 9.77 MB vs. 39.06 MB).
   - **Random bytes:** Incompressible data triggers the 10% threshold rule and stores raw without compression expansion (47.96 MB across all codecs).
   - **Mixed realistic corpus:** `zstd` reduces the physical heap file by **50.0%** (78.12 MB vs. 156.25 MB).
 - **Heap File vs. WAL Size Dynamics:** On the mixed corpus, the physical heap file size drops by half with zstd (78.12 MB vs. 156.25 MB uncompressed). The 14.50 MB WAL file reflects the unrolled active segment under the 16 MiB rollover threshold after 3 finished segments (48 MB) were truncated at checkpoint.
-- **Zero Mmap Overhead:** Because direct I/O bypasses the operating system page cache and buffer pool memory is bounded to a fixed arena, container memory accounting remains flat and predictable under load.
+- **Zero Mmap Overhead:** Because direct I/O bypasses the operating system page cache and block pool memory is bounded to a fixed arena, container memory accounting remains flat and predictable under load.
 - **Fast Startup & Recovery:** The sequential scan in physical block order reconstructs the store state across the mixed corpus in **340 ms**.
 
 ---
@@ -215,14 +215,14 @@ To conserve disk space and reduce multi-block power-of-two page allocation overh
 
 ---
 
-### 5. Buffer Pool and Direct I/O Engine
+### 5. Block Pool and Direct I/O Engine
 
 - **Fixed-Size Arena:** A single contiguous `[]byte` slice aligned to 4096 bytes without using `mmap`. Because Go slices of primitive types contain no pointers, the Go runtime garbage collector skips scanning the arena.
 - **Direct I/O:**
   - On Linux: opened with `O_DIRECT`. Reads and writes use `unix.Preadv` and `unix.Pwritev` via `SyscallConn.Control()`, ensuring zero kernel page-cache copying.
   - On macOS: opened with `F_NOCACHE` via `unix.FcntlInt` for test execution.
-- **Non-Adjacent Frames:** Multi-block pages in memory can occupy non-adjacent buffer frames. `DirectIO.Writev` and `DirectIO.Readv` transfer all frames in a single vectored system call.
-- **Background Cleaner:** A background goroutine flushes unpinned dirty pages under the write-ahead rule to keep clean frames available for foreground allocations.
+- **Non-Adjacent Pool Blocks:** Multi-block pages in memory can occupy non-adjacent pool blocks. `DirectIO.Writev` and `DirectIO.Readv` transfer all pool blocks in a single vectored system call.
+- **Background Cleaner:** A background goroutine flushes unpinned dirty pages under the write-ahead rule to keep clean pool blocks available for foreground allocations.
 
 ---
 
@@ -331,7 +331,7 @@ Recovery never trusts bytes that object payloads control:
 
 ### Detailed Benchmark Results Across Realistic Workloads
 
-*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-frame) buffer pool in isolated benchmark processes.*
+*Measured on Linux 6.6 amd64 with direct I/O enabled and an 8 MiB (2,048-block) block pool in isolated benchmark processes.*
 
 #### 1. Configuration Text (JSON) (2,500 objects, ~10 KB each)
 
@@ -432,15 +432,15 @@ Recompute Latency Comparison:
 ### Analysis of Trade-offs
 
 1. **Why Compression Accelerates Write Throughput:**
-   - Uncompressed storage writes 4 physical blocks for every 10 KB object. For 10,000 objects, that totals 40,000 blocks written through an 8 MiB (2,048-frame) buffer pool. The buffer pool experiences continuous frame eviction and dirty page writeback.
+   - Uncompressed storage writes 4 physical blocks for every 10 KB object. For 10,000 objects, that totals 40,000 blocks written through an 8 MiB (2,048-block) block pool. The block pool experiences continuous pool block eviction and dirty page writeback.
    - The engine issues one write call per WAL block, and one write call per page during flushes.
-   - When values compress, objects fit within single-block slotted pages or smaller multi-block allocations (e.g. 1 or 2 blocks). The reduced working set fits within the buffer pool without continuous eviction churn. Fewer pages and fewer blocks reduce the number of write system calls, which accelerates write throughput.
+   - When values compress, objects fit within single-block slotted pages or smaller multi-block allocations (e.g. 1 or 2 blocks). The reduced working set fits within the block pool without continuous eviction churn. Fewer pages and fewer blocks reduce the number of write system calls, which accelerates write throughput.
    - Batched writes would raise the uncompressed baseline; that architectural enhancement is tracked separately.
 
 2. **Heap Usage and Memory Isolation:**
    - When measured in isolated processes, the In-Memory Informer retains the full dataset in RAM, consuming **115.70 MB Go heap** and **176.91 MB Process RSS** for 10,000 objects.
-   - `DiskStore` holds only index keys and buffer pool frame descriptors in RAM, keeping Go heap at **13.73 MB** (an 88.1% reduction) and Process RSS at **48.11 MB** (a 72.8% reduction compared to In-Memory, and a 68.8% reduction compared to BBolt's 154.30 MB).
-   - Closing the engine signals its `Closed()` channel, which terminates the adapter's failure-watch goroutine. This releases references to the engine and its buffer-pool arena, preventing memory retention across engine lifecycles.
+   - `DiskStore` holds only index keys and block pool descriptors in RAM, keeping Go heap at **13.73 MB** (an 88.1% reduction) and Process RSS at **48.11 MB** (a 72.8% reduction compared to In-Memory, and a 68.8% reduction compared to BBolt's 154.30 MB).
+   - Closing the engine signals its `Closed()` channel, which terminates the adapter's failure-watch goroutine. This releases references to the engine and its block-pool arena, preventing memory retention across engine lifecycles.
 
 3. **Codec Selection: zstd as Default vs. Evaluation of S2 and Snappy:**
    - **Configuration Text (JSON):** `zstd` produces the smallest disk footprint (**8.51 MB**, an 82.3% reduction; Heap file: **4.88 MB** vs. **39.06 MB**). S2 (**16.23 MB**) and Snappy (**15.62 MB**) required almost double the storage. Because the WAL records exact compressed payloads, zstd log stream volume was **3.62 MB**, compared to **6.46 MB** for S2 and **5.85 MB** for Snappy.
@@ -454,7 +454,7 @@ Recompute Latency Comparison:
 
 5. **Process RSS & Container Memory Limits:**
    - `BBolt` resident set size reaches **154.30 MB** on the 10,000 mixed object workload because operating system page caching retains mmap pages in the container cgroup.
-   - `DiskStore` caps Process RSS at **48.11 MB** by using direct I/O and a fixed 8 MiB buffer pool arena, avoiding kernel page-cache amplification.
+   - `DiskStore` caps Process RSS at **48.11 MB** by using direct I/O and a fixed 8 MiB block pool arena, avoiding kernel page-cache amplification.
 
 6. **Crash Recovery Time:**
    - On compressible configuration text, `DiskStore (zstd)` recovers in **40 ms**, compared to **138 ms** uncompressed. On the 10,000 mixed corpus, recovery completes in **340 ms**, compared to **565 ms** uncompressed. Replaying WAL redo records copies compressed bytes directly into pages without decompression, minimizing recovery latency.
@@ -520,17 +520,17 @@ Recompute Latency Comparison:
    - **Trade-off Analysis:**
      1. **Disk Space vs. CPU Time:** Compressing every value reduces heap-file size by 52.2% and WAL size by 49.1% on the realistic 1–4 KB corpus, with higher write stream duration (112.5 ms vs 50.2 ms, or 11.2 µs vs 5.0 µs per write). The delta (~6.2 µs per write) corresponds to the CPU time spent in `compressValue`.
      2. **Small Objects Pay Compression Overhead:** For tiny payloads (such as 100 B), compression adds ~3.3 µs per write (+291% latency) for little space benefit. When payloads cannot compress by at least 10%, the 10% savings rule falls back to raw storage, but still incurs ~0.7 µs of compression attempt overhead.
-     3. **Slotted Page Density and Block Pool Residency:** On the 10,000-object corpus, compression increases average record density from 1.78 to 3.73 records per slotted page, reducing allocated slotted pages from 5,610 to 2,679 (-52.2%). In an engine configured with the default 4,096-block arena (`DefaultBufferPoolFrames = 4096`), all 2,679 compressed slotted pages reside simultaneously in the block pool, whereas the 5,610 uncompressed pages exceed the 4,096-block capacity during ingestion.
+     3. **Slotted Page Density and Block Pool Residency:** On the 10,000-object corpus, compression increases average record density from 1.78 to 3.73 records per slotted page, reducing allocated slotted pages from 5,610 to 2,679 (-52.2%). In an engine configured with the default 4,096-block arena (`DefaultBlockPoolBlocks = 4096`), all 2,679 compressed slotted pages reside simultaneously in the block pool, whereas the 5,610 uncompressed pages exceed the 4,096-block capacity during ingestion.
      4. **No New Threshold Needed:** The 10% savings rule prevents incompressible or tiny values from expanding on disk without introducing an arbitrary threshold.
 
 ---
 
 ## Conclusion
 
-The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file, value compression, and fixed-size direct I/O buffer pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
+The `DiskStore` prototype proves that a write-ahead log combined with a self-describing 4 KiB block heap file, value compression, and fixed-size direct I/O block pool successfully resolves the `mmap` and durability flaws of `bbolt`. It provides:
 - **82.3% lower disk usage** on configuration text (JSON) and **66.4% lower disk usage** on TLS material with zstd value compression.
 - **72.8% lower memory footprint (RSS)** than In-Memory Informer and **68.8% lower RSS** than BBolt on mixed realistic workloads.
-- **2x higher write throughput** on configuration text through reduced buffer pool eviction churn.
+- **2x higher write throughput** on configuration text through reduced block pool eviction churn.
 - **Strict crash consistency** with out-of-place writes and the Reuse Rule.
 - **Automatic detection and wipe of legacy unversioned stores** via `meta.db` store format versioning.
 - **Resilience against untrusted payload forgery and corrupt decompression inputs**.

@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	// DefaultBufferPoolFrames is 1024 frames = 4 MiB.
-	DefaultBufferPoolFrames = 1024
+	// DefaultBlockPoolBlocks is 1024 blocks = 4 MiB.
+	DefaultBlockPoolBlocks = 1024
 
 	// MaxBatchBlocks is the maximum number of blocks in a flush batch (512 blocks = 2 MiB = 1 << MaxOrder).
 	MaxBatchBlocks = 1 << MaxOrder
@@ -36,18 +36,18 @@ const (
 )
 
 var (
-	// ErrBufferPoolFull is returned when all frames are pinned and cannot be evicted.
-	ErrBufferPoolFull = errors.New("buffer pool is full of pinned pages")
+	// ErrBlockPoolFull is returned when all pool blocks are pinned and cannot be evicted.
+	ErrBlockPoolFull = errors.New("block pool is full of pinned pages")
 
 	// ErrPageNotFound indicates the page is neither in memory nor has a location on disk.
 	ErrPageNotFound = errors.New("page not found")
 )
 
-// PageDesc holds metadata and frame mappings for a logical page in the buffer pool.
+// PageDesc holds metadata and pool block mappings for a logical page in the block pool.
 type PageDesc struct {
 	LogicalPage uint64
 	NumBlocks   int
-	FrameIDs    []int // Non-adjacent frames in the arena
+	PoolBlocks  []int // Non-adjacent pool blocks in the arena
 
 	PinCount   atomic.Int32
 	Dirty      bool
@@ -63,20 +63,20 @@ type PageDesc struct {
 
 	InFlight bool // true when a direct I/O flush is active for this page
 
-	Mu sync.RWMutex // Per-page latch for safe read/write access to frame data
+	Mu sync.RWMutex // Per-page latch for safe read/write access to pool block data
 }
 
 // PageHandle is held by callers while accessing a pinned page.
 type PageHandle struct {
-	pool *BufferPool
+	pool *BlockPool
 	Desc *PageDesc
 }
 
 // Blocks returns byte slices for each block in this page.
 func (h *PageHandle) Blocks() [][]byte {
-	blocks := make([][]byte, len(h.Desc.FrameIDs))
-	for i, fID := range h.Desc.FrameIDs {
-		start := fID * BlockSize
+	blocks := make([][]byte, len(h.Desc.PoolBlocks))
+	for i, pbID := range h.Desc.PoolBlocks {
+		start := pbID * BlockSize
 		blocks[i] = h.pool.arena[start : start+BlockSize]
 	}
 	return blocks
@@ -84,8 +84,8 @@ func (h *PageHandle) Blocks() [][]byte {
 
 // Block returns the byte slice for a specific block index.
 func (h *PageHandle) Block(i int) []byte {
-	fID := h.Desc.FrameIDs[i]
-	start := fID * BlockSize
+	pbID := h.Desc.PoolBlocks[i]
+	start := pbID * BlockSize
 	return h.pool.arena[start : start+BlockSize]
 }
 
@@ -98,10 +98,10 @@ func (h *PageHandle) Unpin() {
 	}
 }
 
-// BufferPool manages a fixed-size arena of 4 KiB frames with direct I/O, out-of-place writes,
+// BlockPool manages a fixed-size arena of 4 KiB pool blocks with direct I/O, out-of-place writes,
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
-type BufferPool struct {
+type BlockPool struct {
 	file     File
 	wal      *WAL
 	buddy    *BuddyAllocator
@@ -109,10 +109,10 @@ type BufferPool struct {
 	cipher   Cipher
 	dbID     [16]byte
 
-	numFrames int
-	arena     []byte // Pointer-free byte arena aligned to 4096 bytes
+	numPoolBlocks int
+	arena         []byte // Pointer-free byte arena aligned to 4096 bytes
 
-	// mu guards freeFrames, pageTable, and onFailure.
+	// mu guards freePoolBlocks, pageTable, and onFailure.
 	mu sync.Mutex
 
 	// cond uses mu. It is broadcast when an in-flight flush completes or when
@@ -121,9 +121,9 @@ type BufferPool struct {
 	// released all pins (PinCount == 0).
 	cond *sync.Cond
 
-	freeFrames []int
-	pageTable  map[uint64]*PageDesc // logicalPage -> PageDesc
-	onFailure  func(error)
+	freePoolBlocks []int
+	pageTable      map[uint64]*PageDesc // logicalPage -> PageDesc
+	onFailure      func(error)
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
@@ -132,56 +132,56 @@ type BufferPool struct {
 	bgDone chan struct{}
 }
 
-// BufferPoolOptions configures the BufferPool.
-type BufferPoolOptions struct {
-	NumFrames int
-	Cipher    Cipher
-	OnFailure func(error)
+// BlockPoolOptions configures the BlockPool.
+type BlockPoolOptions struct {
+	NumPoolBlocks int
+	Cipher        Cipher
+	OnFailure     func(error)
 }
 
-// NewBufferPool initializes a fixed-size buffer pool backed by a single pointer-free byte arena.
-func NewBufferPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opts ...BufferPoolOptions) *BufferPool {
-	numFrames := DefaultBufferPoolFrames
+// NewBlockPool initializes a fixed-size block pool backed by a single pointer-free byte arena.
+func NewBlockPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, opts ...BlockPoolOptions) *BlockPool {
+	numPoolBlocks := DefaultBlockPoolBlocks
 	var cipher Cipher
 	var onFailure func(error)
 	if len(opts) > 0 {
-		if opts[0].NumFrames > 0 {
-			numFrames = opts[0].NumFrames
+		if opts[0].NumPoolBlocks > 0 {
+			numPoolBlocks = opts[0].NumPoolBlocks
 		}
 		cipher = opts[0].Cipher
 		onFailure = opts[0].OnFailure
 	}
 
 	// Allocate pointer-free byte arena aligned to 4096 bytes without mmap
-	totalBytes := numFrames * BlockSize
+	totalBytes := numPoolBlocks * BlockSize
 	raw := make([]byte, totalBytes+BlockSize)
 	rawPtr := uintptr(unsafe.Pointer(&raw[0]))
 	alignedPtr := (rawPtr + uintptr(BlockSize-1)) &^ uintptr(BlockSize-1)
 	offset := int(alignedPtr - rawPtr)
 	arena := raw[offset : offset+totalBytes]
 
-	freeFrames := make([]int, numFrames)
-	for i := 0; i < numFrames; i++ {
-		freeFrames[i] = i
+	freePoolBlocks := make([]int, numPoolBlocks)
+	for i := 0; i < numPoolBlocks; i++ {
+		freePoolBlocks[i] = i
 	}
 
 	stagingBuf := AllocateAlignedBlock(MaxBatchBlocks * BlockSize)
 
-	bp := &BufferPool{
-		file:       file,
-		wal:        wal,
-		buddy:      buddy,
-		directIO:   NewDirectIO(),
-		cipher:     cipher,
-		dbID:       dbID,
-		numFrames:  numFrames,
-		arena:      arena,
-		freeFrames: freeFrames,
-		stagingBuf: stagingBuf,
-		pageTable:  make(map[uint64]*PageDesc),
-		onFailure:  onFailure,
-		bgStop:     make(chan struct{}),
-		bgDone:     make(chan struct{}),
+	bp := &BlockPool{
+		file:           file,
+		wal:            wal,
+		buddy:          buddy,
+		directIO:       NewDirectIO(),
+		cipher:         cipher,
+		dbID:           dbID,
+		numPoolBlocks:  numPoolBlocks,
+		arena:          arena,
+		freePoolBlocks: freePoolBlocks,
+		stagingBuf:     stagingBuf,
+		pageTable:      make(map[uint64]*PageDesc),
+		onFailure:      onFailure,
+		bgStop:         make(chan struct{}),
+		bgDone:         make(chan struct{}),
 	}
 	bp.cond = sync.NewCond(&bp.mu)
 
@@ -189,13 +189,13 @@ func NewBufferPool(file File, wal *WAL, buddy *BuddyAllocator, dbID [16]byte, op
 	return bp
 }
 
-func (bp *BufferPool) SetOnFailure(fn func(error)) {
+func (bp *BlockPool) SetOnFailure(fn func(error)) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	bp.onFailure = fn
 }
 
-func (bp *BufferPool) fail(err error) {
+func (bp *BlockPool) fail(err error) {
 	if bp.onFailure != nil {
 		bp.onFailure(err)
 	}
@@ -203,7 +203,7 @@ func (bp *BufferPool) fail(err error) {
 
 // backgroundIdleSweep sweeps pages that have been dirty and idle for > 1 minute.
 // Runs every 10 seconds (no 20ms busy flushing).
-func (bp *BufferPool) backgroundIdleSweep() {
+func (bp *BlockPool) backgroundIdleSweep() {
 	defer close(bp.bgDone)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -218,14 +218,14 @@ func (bp *BufferPool) backgroundIdleSweep() {
 	}
 }
 
-func (bp *BufferPool) sweepIdleDirtyPages() {
+func (bp *BlockPool) sweepIdleDirtyPages() {
 	bp.mu.Lock()
 	now := time.Now()
-	lowWatermark := bp.numFrames / 5
+	lowWatermark := bp.numPoolBlocks / 5
 	var toFlush []*PageDesc
 	for _, desc := range bp.pageTable {
-		if desc.Dirty && desc.PinCount.Load() == 0 && !desc.InFlight && len(desc.FrameIDs) > 0 {
-			if now.Sub(desc.DirtyTime) >= time.Minute || len(bp.freeFrames) < lowWatermark {
+		if desc.Dirty && desc.PinCount.Load() == 0 && !desc.InFlight && len(desc.PoolBlocks) > 0 {
+			if now.Sub(desc.DirtyTime) >= time.Minute || len(bp.freePoolBlocks) < lowWatermark {
 				toFlush = append(toFlush, desc)
 				if len(toFlush) >= 16 {
 					break
@@ -252,8 +252,8 @@ func (bp *BufferPool) sweepIdleDirtyPages() {
 	}
 }
 
-// PinPage pins an existing page in the buffer pool, loading it from disk if necessary.
-func (bp *BufferPool) PinPage(logicalPage uint64) (*PageHandle, error) {
+// PinPage pins an existing page in the block pool, loading it from disk if necessary.
+func (bp *BlockPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 	bp.mu.Lock()
 	desc, exists := bp.pageTable[logicalPage]
 	if !exists {
@@ -261,14 +261,14 @@ func (bp *BufferPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 		return nil, ErrPageNotFound
 	}
 
-	if len(desc.FrameIDs) > 0 {
+	if len(desc.PoolBlocks) > 0 {
 		desc.PinCount.Add(1)
 		desc.LastAccess = time.Now()
 		bp.mu.Unlock()
 		return &PageHandle{pool: bp, Desc: desc}, nil
 	}
 
-	// Page was evicted from memory frames; reload from disk
+	// Page was evicted from memory pool blocks; reload from disk
 	readBlock := desc.PhysicalBlock
 	if readBlock == NoBlock {
 		readBlock = desc.DurableLoc
@@ -278,25 +278,25 @@ func (bp *BufferPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 		return nil, ErrPageNotFound
 	}
 
-	frameIDs, err := bp.acquireFramesLocked(desc.NumBlocks)
+	poolBlocks, err := bp.acquirePoolBlocksLocked(desc.NumBlocks)
 	if err != nil {
 		bp.mu.Unlock()
 		return nil, err
 	}
 
-	desc.FrameIDs = frameIDs
+	desc.PoolBlocks = poolBlocks
 	desc.PinCount.Store(1)
 	desc.LastAccess = time.Now()
 
 	iov := make([][]byte, desc.NumBlocks)
-	for i, fID := range frameIDs {
-		start := fID * BlockSize
+	for i, pbID := range poolBlocks {
+		start := pbID * BlockSize
 		iov[i] = bp.arena[start : start+BlockSize]
 	}
 
 	if err := bp.directIO.Readv(bp.file, int64(readBlock*BlockSize), iov); err != nil {
-		bp.freeFrames = append(bp.freeFrames, frameIDs...)
-		desc.FrameIDs = nil
+		bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
+		desc.PoolBlocks = nil
 		desc.PinCount.Store(0)
 		bp.mu.Unlock()
 		return nil, fmt.Errorf("failed to read page %d from disk block %d: %w", logicalPage, readBlock, err)
@@ -306,8 +306,8 @@ func (bp *BufferPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 	for i := 0; i < desc.NumBlocks; i++ {
 		hdr, err := DecodeBlockHeader(iov[i])
 		if err != nil || hdr.LogicalPage != logicalPage || hdr.BlockIndex != uint32(i) {
-			bp.freeFrames = append(bp.freeFrames, frameIDs...)
-			desc.FrameIDs = nil
+			bp.freePoolBlocks = append(bp.freePoolBlocks, poolBlocks...)
+			desc.PoolBlocks = nil
 			desc.PinCount.Store(0)
 			bp.mu.Unlock()
 			return nil, fmt.Errorf("corrupt block in page %d", logicalPage)
@@ -320,7 +320,7 @@ func (bp *BufferPool) PinPage(logicalPage uint64) (*PageHandle, error) {
 }
 
 // LoadPageDescs registers recovered page descriptors into the page table.
-func (bp *BufferPool) LoadPageDescs(descs map[uint64]*PageDesc) {
+func (bp *BlockPool) LoadPageDescs(descs map[uint64]*PageDesc) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	for k, v := range descs {
@@ -329,7 +329,7 @@ func (bp *BufferPool) LoadPageDescs(descs map[uint64]*PageDesc) {
 }
 
 // PinPageWithLocation pins a page, loading from disk at physicalBlock if not currently in memory.
-func (bp *BufferPool) PinPageWithLocation(logicalPage uint64, physicalBlock uint64, numBlocks int) (*PageHandle, error) {
+func (bp *BlockPool) PinPageWithLocation(logicalPage uint64, physicalBlock uint64, numBlocks int) (*PageHandle, error) {
 	bp.mu.Lock()
 	desc, exists := bp.pageTable[logicalPage]
 	if !exists {
@@ -348,8 +348,8 @@ func (bp *BufferPool) PinPageWithLocation(logicalPage uint64, physicalBlock uint
 	return bp.PinPage(logicalPage)
 }
 
-// AllocateNewPage creates a new page in the buffer pool with freshly acquired frames.
-func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint64) (*PageHandle, error) {
+// AllocateNewPage creates a new page in the block pool with freshly acquired pool blocks.
+func (bp *BlockPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uint64) (*PageHandle, error) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
@@ -365,13 +365,13 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 		bp.cond.Wait()
 	}
 
-	frameIDs, err := bp.acquireFramesLocked(numBlocks)
+	poolBlocks, err := bp.acquirePoolBlocksLocked(numBlocks)
 	if err != nil {
 		return nil, err
 	}
 
-	// Re-check idleness because acquireFramesLocked may have temporarily released bp.mu
-	// to flush dirty pages. Loop on cond.Wait() while keeping the acquired frames until
+	// Re-check idleness because acquirePoolBlocksLocked may have temporarily released bp.mu
+	// to flush dirty pages. Loop on cond.Wait() while keeping the acquired pool blocks until
 	// the old descriptor is idle, and hold bp.mu without releasing it through the teardown.
 	for {
 		oldDesc := bp.pageTable[logicalPage]
@@ -389,9 +389,9 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	var oldFlushedLoc uint64 = NoBlock
 
 	if oldDesc := bp.pageTable[logicalPage]; oldDesc != nil {
-		if len(oldDesc.FrameIDs) > 0 {
-			bp.freeFrames = append(bp.freeFrames, oldDesc.FrameIDs...)
-			oldDesc.FrameIDs = nil
+		if len(oldDesc.PoolBlocks) > 0 {
+			bp.freePoolBlocks = append(bp.freePoolBlocks, oldDesc.PoolBlocks...)
+			oldDesc.PoolBlocks = nil
 		}
 
 		// Defer freeing the old durable location until the new copy is promoted to durable,
@@ -410,7 +410,7 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	desc := &PageDesc{
 		LogicalPage:       logicalPage,
 		NumBlocks:         numBlocks,
-		FrameIDs:          frameIDs,
+		PoolBlocks:        poolBlocks,
 		Dirty:             true,
 		DirtyLSN:          lsn,
 		DirtyTime:         now,
@@ -423,9 +423,9 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	desc.PageLSN.Store(lsn)
 	desc.PinCount.Store(1)
 
-	// Clear frames and encode initial block headers
-	for i, fID := range frameIDs {
-		start := fID * BlockSize
+	// Clear pool blocks and encode initial block headers
+	for i, pbID := range poolBlocks {
+		start := pbID * BlockSize
 		blk := bp.arena[start : start+BlockSize]
 		clearBytes(blk)
 		hdr := BlockHeader{
@@ -441,8 +441,8 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	return &PageHandle{pool: bp, Desc: desc}, nil
 }
 
-// FreePage releases the frames and disk locations for a discarded or cleared logical page.
-func (bp *BufferPool) FreePage(logicalPage uint64) {
+// FreePage releases the pool blocks and disk locations for a discarded or cleared logical page.
+func (bp *BlockPool) FreePage(logicalPage uint64) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
@@ -452,9 +452,9 @@ func (bp *BufferPool) FreePage(logicalPage uint64) {
 			return
 		}
 		if !desc.InFlight && desc.PinCount.Load() == 0 {
-			if len(desc.FrameIDs) > 0 {
-				bp.freeFrames = append(bp.freeFrames, desc.FrameIDs...)
-				desc.FrameIDs = nil
+			if len(desc.PoolBlocks) > 0 {
+				bp.freePoolBlocks = append(bp.freePoolBlocks, desc.PoolBlocks...)
+				desc.PoolBlocks = nil
 			}
 			if desc.DurableLoc != NoBlock {
 				if err := bp.buddy.Free(desc.DurableLoc); err != nil && bp.onFailure != nil {
@@ -481,57 +481,57 @@ func (bp *BufferPool) FreePage(logicalPage uint64) {
 	}
 }
 
-// acquireFramesLocked acquires count frames, evicting clean pages first by LRU, then flushing dirty pages.
-func (bp *BufferPool) acquireFramesLocked(count int) ([]int, error) {
-	for len(bp.freeFrames) < count {
+// acquirePoolBlocksLocked acquires count pool blocks, evicting clean pages first by LRU, then flushing dirty pages.
+func (bp *BlockPool) acquirePoolBlocksLocked(count int) ([]int, error) {
+	for len(bp.freePoolBlocks) < count {
 		// Pass 1: Evict clean, unpinned pages first by oldest LastAccess (zero disk I/O)
 		var bestClean *PageDesc
 		for _, desc := range bp.pageTable {
-			if len(desc.FrameIDs) > 0 && desc.PinCount.Load() == 0 && !desc.Dirty && !desc.InFlight {
+			if len(desc.PoolBlocks) > 0 && desc.PinCount.Load() == 0 && !desc.Dirty && !desc.InFlight {
 				if bestClean == nil || desc.LastAccess.Before(bestClean.LastAccess) {
 					bestClean = desc
 				}
 			}
 		}
 		if bestClean != nil {
-			bp.freeFrames = append(bp.freeFrames, bestClean.FrameIDs...)
-			bestClean.FrameIDs = nil
+			bp.freePoolBlocks = append(bp.freePoolBlocks, bestClean.PoolBlocks...)
+			bestClean.PoolBlocks = nil
 			continue
 		}
 
 		// Pass 2: Flush unpinned dirty pages in a batch outside lock (routine cleaning should batch)
-		lowWatermark := bp.numFrames / 5
-		targetFrames := count - len(bp.freeFrames)
-		if replenish := lowWatermark - len(bp.freeFrames); replenish > targetFrames {
-			targetFrames = replenish
+		lowWatermark := bp.numPoolBlocks / 5
+		targetPoolBlocks := count - len(bp.freePoolBlocks)
+		if replenish := lowWatermark - len(bp.freePoolBlocks); replenish > targetPoolBlocks {
+			targetPoolBlocks = replenish
 		}
-		if targetFrames > 64 {
-			targetFrames = 64
+		if targetPoolBlocks > 64 {
+			targetPoolBlocks = 64
 		}
-		if targetFrames < 1 {
-			targetFrames = 1
+		if targetPoolBlocks < 1 {
+			targetPoolBlocks = 1
 		}
 
 		var candidates []*PageDesc
 		for _, desc := range bp.pageTable {
-			if len(desc.FrameIDs) > 0 && desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
+			if len(desc.PoolBlocks) > 0 && desc.PinCount.Load() == 0 && desc.Dirty && !desc.InFlight {
 				candidates = append(candidates, desc)
 			}
 		}
 		if len(candidates) == 0 {
-			return nil, ErrBufferPoolFull
+			return nil, ErrBlockPoolFull
 		}
 
 		sort.Slice(candidates, func(i, j int) bool {
 			return candidates[i].LastAccess.Before(candidates[j].LastAccess)
 		})
 
-		batchFrames := 0
+		batchPoolBlocks := 0
 		var toEvict []*PageDesc
 		for _, desc := range candidates {
 			toEvict = append(toEvict, desc)
-			batchFrames += len(desc.FrameIDs)
-			if batchFrames >= targetFrames {
+			batchPoolBlocks += len(desc.PoolBlocks)
+			if batchPoolBlocks >= targetPoolBlocks {
 				break
 			}
 		}
@@ -546,26 +546,26 @@ func (bp *BufferPool) acquireFramesLocked(count int) ([]int, error) {
 			return nil, flushErr
 		}
 
-		// Immediately evict frames of the newly cleaned pages
+		// Immediately evict pool blocks of the newly cleaned pages
 		for _, desc := range toEvict {
-			if !desc.Dirty && desc.PinCount.Load() == 0 && !desc.InFlight && len(desc.FrameIDs) > 0 {
-				bp.freeFrames = append(bp.freeFrames, desc.FrameIDs...)
-				desc.FrameIDs = nil
+			if !desc.Dirty && desc.PinCount.Load() == 0 && !desc.InFlight && len(desc.PoolBlocks) > 0 {
+				bp.freePoolBlocks = append(bp.freePoolBlocks, desc.PoolBlocks...)
+				desc.PoolBlocks = nil
 			}
 		}
 	}
 
 	allocated := make([]int, count)
 	for i := 0; i < count; i++ {
-		allocated[i] = bp.freeFrames[len(bp.freeFrames)-1]
-		bp.freeFrames = bp.freeFrames[:len(bp.freeFrames)-1]
+		allocated[i] = bp.freePoolBlocks[len(bp.freePoolBlocks)-1]
+		bp.freePoolBlocks = bp.freePoolBlocks[:len(bp.freePoolBlocks)-1]
 	}
 	return allocated, nil
 }
 
 // MarkDirty flags a page as modified with the given LSN.
 // Lock hierarchy: called outside desc.Mu or after desc.Mu is released.
-func (bp *BufferPool) MarkDirty(logicalPage uint64, lsn uint64) {
+func (bp *BlockPool) MarkDirty(logicalPage uint64, lsn uint64) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	if desc, exists := bp.pageTable[logicalPage]; exists {
@@ -579,12 +579,12 @@ func (bp *BufferPool) MarkDirty(logicalPage uint64, lsn uint64) {
 }
 
 // FlushPageLocked flushes desc to disk while holding bp.mu.
-func (bp *BufferPool) FlushPageLocked(desc *PageDesc) error {
+func (bp *BlockPool) FlushPageLocked(desc *PageDesc) error {
 	return bp.flushPageUnlocked(desc)
 }
 
 // FlushPage flushes a dirty page to disk under the write-ahead rule and out-of-place write rule.
-func (bp *BufferPool) FlushPage(logicalPage uint64) error {
+func (bp *BlockPool) FlushPage(logicalPage uint64) error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 	desc, exists := bp.pageTable[logicalPage]
@@ -596,20 +596,20 @@ func (bp *BufferPool) FlushPage(logicalPage uint64) error {
 
 // flushPageUnlocked flushes desc to disk, releasing bp.mu during direct I/O.
 // Must be called with bp.mu held; returns with bp.mu held.
-func (bp *BufferPool) flushPageUnlocked(desc *PageDesc) error {
-	if !desc.Dirty || desc.InFlight || len(desc.FrameIDs) == 0 {
+func (bp *BlockPool) flushPageUnlocked(desc *PageDesc) error {
+	if !desc.Dirty || desc.InFlight || len(desc.PoolBlocks) == 0 {
 		return nil
 	}
-	return bp.flushSingleExtentBatchUnlocked([]*PageDesc{desc})
+	return bp.flushBlockRunUnlocked([]*PageDesc{desc})
 }
 
-// flushBatchUnlocked flushes a batch of pages to disk in contiguous extents with a single direct write per extent,
+// flushBatchUnlocked flushes a batch of pages to disk in contiguous block runs with a single direct write per block run,
 // releasing bp.mu during direct I/O and WAL sync.
 // Must be called with bp.mu held; returns with bp.mu held.
-func (bp *BufferPool) flushBatchUnlocked(batch []*PageDesc) error {
+func (bp *BlockPool) flushBatchUnlocked(batch []*PageDesc) error {
 	var valid []*PageDesc
 	for _, desc := range batch {
-		if desc.Dirty && !desc.InFlight && len(desc.FrameIDs) > 0 {
+		if desc.Dirty && !desc.InFlight && len(desc.PoolBlocks) > 0 {
 			valid = append(valid, desc)
 		}
 	}
@@ -617,7 +617,7 @@ func (bp *BufferPool) flushBatchUnlocked(batch []*PageDesc) error {
 		return nil
 	}
 
-	// Chunk the batch so each extent is at most MaxBatchBlocks (512 blocks = 1 << MaxOrder)
+	// Chunk the batch so each block run is at most MaxBatchBlocks (512 blocks = 1 << MaxOrder)
 	for len(valid) > 0 {
 		chunkTotalBlocks := 0
 		chunkEnd := 0
@@ -633,14 +633,14 @@ func (bp *BufferPool) flushBatchUnlocked(batch []*PageDesc) error {
 		chunk := valid[:chunkEnd]
 		valid = valid[chunkEnd:]
 
-		if err := bp.flushSingleExtentBatchUnlocked(chunk); err != nil {
+		if err := bp.flushBlockRunUnlocked(chunk); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
+func (bp *BlockPool) flushBlockRunUnlocked(chunk []*PageDesc) error {
 	orders := make([]int, len(chunk))
 	pageLSNs := make([]uint64, len(chunk))
 	var maxLSN uint64
@@ -660,7 +660,7 @@ func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
 		totalBlocks += 1 << order
 	}
 
-	// Allocate contiguous extent from buddy allocator under bp.mu
+	// Allocate contiguous block run from buddy allocator under bp.mu
 	locs, err := bp.buddy.AllocateBatch(orders)
 	if err != nil {
 		return fmt.Errorf("failed to allocate contiguous disk blocks for batch of %d pages: %w", len(chunk), err)
@@ -688,8 +688,8 @@ func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
 	for i, desc := range chunk {
 		desc.Mu.Lock()
 		blockOffset := locs[i] - startBlock
-		for j, fID := range desc.FrameIDs {
-			srcStart := fID * BlockSize
+		for j, pbID := range desc.PoolBlocks {
+			srcStart := pbID * BlockSize
 			blk := bp.arena[srcStart : srcStart+BlockSize]
 			hdr := BlockHeader{
 				LogicalPage: desc.LogicalPage,
@@ -712,7 +712,7 @@ func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
 		syncErr = bp.wal.SyncThrough(maxLSN)
 	}
 
-	// Single direct I/O write for the entire contiguous extent
+	// Single direct I/O write for the entire contiguous block run
 	var writeErr error
 	if syncErr == nil {
 		totalBytes := int64(totalBlocks * BlockSize)
@@ -768,14 +768,14 @@ func (bp *BufferPool) flushSingleExtentBatchUnlocked(chunk []*PageDesc) error {
 	return nil
 }
 
-// FlushAllDirty flushes all dirty pages currently in the buffer pool.
-func (bp *BufferPool) FlushAllDirty() error {
+// FlushAllDirty flushes all dirty pages currently in the block pool.
+func (bp *BlockPool) FlushAllDirty() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
 	var toFlush []*PageDesc
 	for _, desc := range bp.pageTable {
-		if desc.Dirty && len(desc.FrameIDs) > 0 && !desc.InFlight {
+		if desc.Dirty && len(desc.PoolBlocks) > 0 && !desc.InFlight {
 			toFlush = append(toFlush, desc)
 		}
 	}
@@ -785,7 +785,7 @@ func (bp *BufferPool) FlushAllDirty() error {
 
 // SnapshotFlushedForSync records all currently flushed locations before a heap fsync starts.
 // This fulfills the Reuse Rule: only locations written before the fsync began may be promoted to durable.
-func (bp *BufferPool) SnapshotFlushedForSync() {
+func (bp *BlockPool) SnapshotFlushedForSync() {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
@@ -798,7 +798,7 @@ func (bp *BufferPool) SnapshotFlushedForSync() {
 
 // PromoteFlushedToDurable promotes only locations that were flushed before the heap fsync began.
 // Frees any superseded durable locations to the buddy allocator according to the Reuse Rule.
-func (bp *BufferPool) PromoteFlushedToDurable() error {
+func (bp *BlockPool) PromoteFlushedToDurable() error {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
@@ -822,7 +822,7 @@ func (bp *BufferPool) PromoteFlushedToDurable() error {
 }
 
 // DirtyPageTableAndLSN returns a map of logicalPage -> dirtyLSN and the current max LSN at snapshot time.
-func (bp *BufferPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
+func (bp *BlockPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
@@ -840,7 +840,7 @@ func (bp *BufferPool) DirtyPageTableAndLSN() (map[uint64]uint64, uint64) {
 }
 
 // Close stops the background writer and flushes dirty pages.
-func (bp *BufferPool) Close() error {
+func (bp *BlockPool) Close() error {
 	close(bp.bgStop)
 	<-bp.bgDone
 

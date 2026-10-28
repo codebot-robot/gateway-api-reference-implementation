@@ -43,7 +43,7 @@ func TestCheckpointer_BasicCheckpoint(t *testing.T) {
 	defer heapFile.Close()
 
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
 	checkpointer := NewCheckpointer(bp, heapFile, wal)
@@ -172,7 +172,7 @@ func runCountingCheckpointTest(t *testing.T, numPages int, expectedWrites int64)
 		buddyCapacity = 512
 	}
 	buddy := NewBuddyAllocator(buddyCapacity)
-	bp := NewBufferPool(countingHeap, wal, buddy, dbID, BufferPoolOptions{NumFrames: numPages + 10})
+	bp := NewBlockPool(countingHeap, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: numPages + 10})
 	defer bp.Close()
 
 	checkpointer := NewCheckpointer(bp, countingHeap, wal)
