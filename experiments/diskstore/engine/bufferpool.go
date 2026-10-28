@@ -370,6 +370,20 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 		return nil, err
 	}
 
+	// Re-check idleness because acquireFramesLocked may have temporarily released bp.mu
+	// to flush dirty pages. Loop on cond.Wait() while keeping the acquired frames until
+	// the old descriptor is idle, and hold bp.mu without releasing it through the teardown.
+	for {
+		oldDesc := bp.pageTable[logicalPage]
+		if oldDesc == nil {
+			break
+		}
+		if !oldDesc.InFlight && oldDesc.PinCount.Load() == 0 {
+			break
+		}
+		bp.cond.Wait()
+	}
+
 	var oldDurableLoc uint64 = NoBlock
 	var oldFlushedBeforeSync uint64 = NoBlock
 	var oldFlushedLoc uint64 = NoBlock
