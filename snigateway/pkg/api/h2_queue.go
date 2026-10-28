@@ -329,3 +329,10 @@ func (q *H2ChunkQueue) QueuedBytes() int {
 	defer q.mu.Unlock()
 	return q.queuedBytes
 }
+
+// IsClosed reports whether the queue has been closed or aborted.
+func (q *H2ChunkQueue) IsClosed() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.closed
+}

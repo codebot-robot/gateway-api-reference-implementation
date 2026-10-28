@@ -1362,10 +1362,9 @@ func TestH2Transport_CleanEOF_WriteFirst_DoesNotDrainOrReopen(t *testing.T) {
 	att := h2sc.attempt.Load()
 	<-att.done
 
-	// Wait until the stream end has closed the queue before the first write
-	for {
-		att.queue.Close()
-		break
+	// Wait for the real stream end to close the queue before the first write
+	for !att.queue.IsClosed() {
+		runtime.Gosched()
 	}
 
 	n, werr := stream.Write([]byte("ping"))
@@ -1442,8 +1441,10 @@ func TestH2Transport_StreamReset_WriteFirst_DoesNotDrainOrReopen(t *testing.T) {
 	att := h2sc.attempt.Load()
 	<-att.done
 
-	// The stream reset before the first write closes the request queue
-	att.queue.Abort(net.ErrClosed)
+	// Wait for the real stream reset to close the queue before the first write
+	for !att.queue.IsClosed() {
+		runtime.Gosched()
+	}
 
 	n, werr := stream.Write([]byte("ping"))
 	if n != 0 {
