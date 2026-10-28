@@ -230,13 +230,12 @@ func (r *Registrar) DetachAll(ctx context.Context, gw *gatewayv1.Gateway) (*Reco
 
 	var podList corev1.PodList
 	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
-		klog.V(4).Infof("DetachAll: listing pods in namespace %s: %v", gw.Namespace, err)
-	} else {
-		for i := range podList.Items {
-			pod := &podList.Items[i]
-			if pod.Labels[singlepod.LabelGatewayName] == gw.Name {
-				r.tracker.Clear(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
-			}
+		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
+	}
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Labels[singlepod.LabelGatewayName] == gw.Name {
+			r.tracker.Clear(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name))
 		}
 	}
 

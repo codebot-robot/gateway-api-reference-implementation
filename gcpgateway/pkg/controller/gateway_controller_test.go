@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1247,7 +1248,14 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 		Reason:           ReasonProgrammed,
 	}
 	rec.statusMu.Unlock()
-	rec.waitingSince["default/dp-pod-1"] = time.Now()
+
+	delDeployName := singlepod.ResourceNameForGateway("del-gw")
+	otherDeployName := singlepod.ResourceNameForGateway("other-gw")
+	delPodKey := fmt.Sprintf("default/%s-pod-1", delDeployName)
+	otherPodKey := fmt.Sprintf("default/%s-pod-1", otherDeployName)
+
+	rec.waitingSince[delPodKey] = time.Now()
+	rec.waitingSince[otherPodKey] = time.Now()
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "del-gw"}}
 	res, err := rec.Reconcile(t.Context(), req)
@@ -1277,12 +1285,15 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 		}
 	}
 
-	// 3. Verify statusCache and waitingSince were cleared
+	// 3. Verify statusCache was cleared, del-gw waitingSince cleared, and other-gw waitingSince preserved
 	if rec.GetCachedStatus(types.NamespacedName{Namespace: "default", Name: "del-gw"}) != nil {
 		t.Errorf("expected statusCache to be cleared for deleted gateway")
 	}
-	if _, exists := rec.waitingSince["default/dp-pod-1"]; exists {
+	if _, exists := rec.waitingSince[delPodKey]; exists {
 		t.Errorf("expected waitingSince entry to be cleaned up for deleted gateway")
+	}
+	if _, exists := rec.waitingSince[otherPodKey]; !exists {
+		t.Errorf("expected waitingSince entry for other gateway in same namespace to be preserved")
 	}
 }
 
@@ -1568,5 +1579,350 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 	}
 	if !deletedFromKube {
 		t.Errorf("expected Gateway to be finalized and removed from API server, but it still exists")
+	}
+}
+
+// TestGateway_Delete_GCPErrorKeepsFinalizer verifies that a GCP error during endpoint
+// detachment returns an error and keeps the FinalizerNEG on the Gateway.
+func TestGateway_Delete_GCPErrorKeepsFinalizer(t *testing.T) {
+	scheme := setupScheme()
+	now := metav1.Now()
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "err-gw",
+			Finalizers:        []string{FinalizerNEG},
+			DeletionTimestamp: &now,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	desc8443, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "err-gw",
+		Port:        8443,
+	}).Encode()
+
+	neg8443 := metadata.ResourceName("gcpgw", "cluster-1", "default", "err-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        neg8443,
+		Zone:        "us-central1-a",
+		Description: desc8443,
+	})
+
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.4.0.10", Port: 8443},
+	})
+
+	// Inject error on detach
+	fakeGCP.InjectDetachError = errors.New("simulated GCP detach failure")
+
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	rec := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "err-gw"}}
+	_, err := rec.Reconcile(t.Context(), req)
+	if err == nil {
+		t.Fatalf("expected error from Reconcile when GCP detach fails, got nil")
+	}
+
+	// Verify FinalizerNEG is still present on the Gateway
+	var updatedGW gatewayv1.Gateway
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "err-gw"}, &updatedGW); err != nil {
+		t.Fatalf("getting gateway: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&updatedGW, FinalizerNEG) {
+		t.Errorf("expected FinalizerNEG to be retained on detach error, got %v", updatedGW.Finalizers)
+	}
+
+	// Verify endpoint was not detached
+	eps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443)
+	if len(eps) != 1 {
+		t.Errorf("expected 1 endpoint remaining in NEG, got %d", len(eps))
+	}
+}
+
+// TestGateway_Delete_ForeignNEGsUntouched verifies that deleting a Gateway only detaches
+// endpoints from NEGs matching its cluster ID, namespace, and Gateway name, leaving NEGs
+// belonging to other Gateways or other cluster IDs untouched.
+func TestGateway_Delete_ForeignNEGsUntouched(t *testing.T) {
+	scheme := setupScheme()
+	now := metav1.Now()
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "default",
+			Name:              "target-gw",
+			Finalizers:        []string{FinalizerNEG},
+			DeletionTimestamp: &now,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+
+	// 1. Target NEG (same cluster-1, default, target-gw)
+	descTarget, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "target-gw",
+		Port:        8443,
+	}).Encode()
+	negTarget := metadata.ResourceName("gcpgw", "cluster-1", "default", "target-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negTarget,
+		Zone:        "us-central1-a",
+		Description: descTarget,
+	})
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negTarget, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.0.1.10", Port: 8443},
+	})
+
+	// 2. Foreign Gateway NEG (same cluster-1, default, other-gw)
+	descOtherGW, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "other-gw",
+		Port:        8443,
+	}).Encode()
+	negOtherGW := metadata.ResourceName("gcpgw", "cluster-1", "default", "other-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negOtherGW,
+		Zone:        "us-central1-a",
+		Description: descOtherGW,
+	})
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negOtherGW, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.0.1.20", Port: 8443},
+	})
+
+	// 3. Foreign Cluster NEG (other cluster-2, default, target-gw)
+	descOtherCluster, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-2",
+		Namespace:   "default",
+		GatewayName: "target-gw",
+		Port:        8443,
+	}).Encode()
+	negOtherCluster := metadata.ResourceName("gcpgw", "cluster-2", "default", "target-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negOtherCluster,
+		Zone:        "us-central1-a",
+		Description: descOtherCluster,
+	})
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negOtherCluster, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.0.1.30", Port: 8443},
+	})
+
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	rec := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "target-gw"}}
+	_, err := rec.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile on target-gw failed: %v", err)
+	}
+
+	// 1. Target NEG must have 0 endpoints
+	epsTarget, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negTarget)
+	if len(epsTarget) != 0 {
+		t.Errorf("expected 0 endpoints in target NEG, got %d", len(epsTarget))
+	}
+
+	// 2. Foreign Gateway NEG must still have its endpoint
+	epsOtherGW, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negOtherGW)
+	if len(epsOtherGW) != 1 || epsOtherGW[0].IpAddress != "10.0.1.20" {
+		t.Errorf("expected other-gw NEG to be untouched, got: %+v", epsOtherGW)
+	}
+
+	// 3. Foreign Cluster NEG must still have its endpoint
+	epsOtherCluster, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", negOtherCluster)
+	if len(epsOtherCluster) != 1 || epsOtherCluster[0].IpAddress != "10.0.1.30" {
+		t.Errorf("expected other-cluster NEG to be untouched, got: %+v", epsOtherCluster)
+	}
+}
+
+// TestGateway_ControllerRestartWithNoDeletionDetachesNothing verifies that when the controller
+// restarts with a fresh in-memory state, reconciling an existing active Gateway does not detach
+// any endpoints from the NEGs.
+func TestGateway_ControllerRestartWithNoDeletionDetachesNothing(t *testing.T) {
+	scheme := setupScheme()
+
+	gc := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gcpgateway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "gke-labs.io/gcpgateway"},
+	}
+
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "default",
+			Name:       "restart-gw",
+			Finalizers: []string{FinalizerNEG},
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	deployName := singlepod.ResourceNameForGateway("restart-gw")
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      fmt.Sprintf("%s-pod-1", deployName),
+			Labels: map[string]string{
+				singlepod.LabelAppName:     singlepod.AppNameValue,
+				singlepod.LabelGatewayName: "restart-gw",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+		},
+		Status: corev1.PodStatus{
+			PodIP: "10.0.1.5",
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionTrue},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gc, gw, node, pod).
+		Build()
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	desc8443, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "restart-gw",
+		Port:        8443,
+	}).Encode()
+
+	neg8443 := metadata.ResourceName("gcpgw", "cluster-1", "default", "restart-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        neg8443,
+		Zone:        "us-central1-a",
+		Description: desc8443,
+	})
+
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443},
+	})
+
+	bsName := metadata.ResourceName("gcpgw", "cluster-1", "default", "restart-gw", "bs-443")
+	negURL := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/my-project/zones/us-central1-a/networkEndpointGroups/%s", neg8443)
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negURL, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	// Pre-condition: detach calls is 0
+	if len(fakeGCP.DetachCalls) != 0 {
+		t.Fatalf("expected 0 detach calls initially, got %d", len(fakeGCP.DetachCalls))
+	}
+
+	// Create a new controller instance, simulating controller restart with fresh in-memory state
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+	restartedRec := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:      "cluster-1",
+		NegPrefix:      "gcpgw",
+		Project:        "my-project",
+		ControllerName: "gke-labs.io/gcpgateway",
+		Zones:          []string{"us-central1-a"},
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "restart-gw"}}
+	_, err := restartedRec.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("reconcile after restart failed: %v", err)
+	}
+
+	// Verify no detach calls were made during controller restart
+	if len(fakeGCP.DetachCalls) != 0 {
+		t.Errorf("expected 0 detach calls on restart with active gateway, got %d: %+v", len(fakeGCP.DetachCalls), fakeGCP.DetachCalls)
+	}
+
+	// Verify endpoint is still in NEG
+	eps, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443)
+	if len(eps) != 1 || eps[0].IpAddress != "10.0.1.5" {
+		t.Errorf("expected endpoint to remain attached, got: %+v", eps)
 	}
 }

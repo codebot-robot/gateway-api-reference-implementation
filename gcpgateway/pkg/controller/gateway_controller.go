@@ -304,16 +304,30 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 					return reconcile.Result{}, err
 				}
 			}
+			patch := client.MergeFrom(gw.DeepCopy())
 			controllerutil.RemoveFinalizer(&gw, FinalizerNEG)
-			if err := r.Update(ctx, &gw); err != nil {
+			if err := r.Patch(ctx, &gw, patch); err != nil {
 				return reconcile.Result{}, err
 			}
 		}
 		r.statusMu.Lock()
 		delete(r.statusCache, req.NamespacedName)
 		r.statusMu.Unlock()
+
+		gatewayPodNames := make(map[string]bool)
+		var podList corev1.PodList
+		if err := r.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+			klog.Errorf("listing pods for deleting gateway %s/%s: %v", gw.Namespace, gw.Name, err)
+		} else {
+			for i := range podList.Items {
+				pod := &podList.Items[i]
+				if pod.Labels[singlepod.LabelGatewayName] == gw.Name {
+					gatewayPodNames[fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)] = true
+				}
+			}
+		}
 		for k := range r.waitingSince {
-			if strings.HasPrefix(k, gw.Namespace+"/") {
+			if r.podBelongsToGateway(k, gw.Namespace, gw.Name, gatewayPodNames) {
 				delete(r.waitingSince, k)
 			}
 		}
@@ -335,8 +349,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	// Ensure finalizer is present on active Gateways of this class
 	if !controllerutil.ContainsFinalizer(&gw, FinalizerNEG) {
+		patch := client.MergeFrom(gw.DeepCopy())
 		controllerutil.AddFinalizer(&gw, FinalizerNEG)
-		if err := r.Update(ctx, &gw); err != nil {
+		if err := r.Patch(ctx, &gw, patch); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
@@ -420,6 +435,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	waitingForHealth := false
 	now := time.Now()
 	activePodKeys := make(map[string]bool)
+	thisGatewayPodKeys := make(map[string]bool)
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -429,6 +445,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		if pod.Labels[singlepod.LabelGatewayName] != gw.Name {
 			continue
 		}
+		thisGatewayPodKeys[fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)] = true
 		dataplanePodCount++
 
 		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" || !registrar.IsContainersReady(pod) || pod.DeletionTimestamp != nil {
@@ -493,7 +510,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	for k := range r.waitingSince {
-		if !activePodKeys[k] {
+		if r.podBelongsToGateway(k, gw.Namespace, gw.Name, thisGatewayPodKeys) && !activePodKeys[k] {
 			delete(r.waitingSince, k)
 		}
 	}
@@ -752,4 +769,19 @@ func (r *GatewayReconciler) updatePodReadinessGate(ctx context.Context, pod *cor
 		LastTransitionTime: metav1.Now(),
 	})
 	return r.Status().Update(ctx, pod)
+}
+
+// podBelongsToGateway checks if a podKey (namespace/name) belongs to the given Gateway,
+// matching known pods in the cluster or the singlepod Deployment naming convention.
+func (r *GatewayReconciler) podBelongsToGateway(podKey, namespace, gatewayName string, gatewayPodKeys map[string]bool) bool {
+	if gatewayPodKeys[podKey] {
+		return true
+	}
+	parts := strings.SplitN(podKey, "/", 2)
+	if len(parts) != 2 || parts[0] != namespace {
+		return false
+	}
+	deployName := singlepod.ResourceNameForGateway(gatewayName)
+	podName := parts[1]
+	return podName == deployName || strings.HasPrefix(podName, deployName+"-")
 }

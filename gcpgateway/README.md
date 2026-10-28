@@ -295,6 +295,20 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 When a Gateway is deleted (`kubectl delete gateway`), the controller uses the finalizer `gcpgateway.gke-labs.io/neg-cleanup` to cleanly detach all data-plane endpoints from the zonal NEGs before allowing Kubernetes to finalize and delete the Gateway resource.
 
+### Manual Finalizer Removal
+
+If the `gcpgateway` controller is uninstalled or stopped before its Gateways are deleted, Kubernetes keeps the deleting Gateways in the `Terminating` state waiting for the finalizer to be removed. Remove the finalizer manually with `kubectl patch`:
+
+```bash
+kubectl patch gateway <gateway-name> -n <namespace> \
+  --type=merge \
+  -p '{"metadata":{"finalizers":null}}'
+```
+
+After removing the finalizer, delete any remaining Google Cloud front-end resources using `teardown_frontend.py`.
+
+### Front-End Resource Deletion
+
 To delete all Google Cloud Load Balancer and NEG resources created for the Gateway:
 ```bash
 python3 gcpgateway/hack/teardown_frontend.py \
