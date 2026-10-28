@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -529,3 +530,76 @@ func TestBufferPool_ConcurrentReuseWhilePinned(t *testing.T) {
 	h2.Unpin()
 }
 
+// TestBufferPool_UnpinStress stresses concurrent Unpin against a waiting AllocateNewPage
+// across multiple concurrent pages to ensure no lost wakeups occur when PinCount drops to zero.
+func TestBufferPool_UnpinStress(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("bp-test-unpin---"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 32})
+	defer bp.Close()
+
+	const numWorkers = 4
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			pageID := uint64(workerID + 1)
+			for i := 0; i < iterations; i++ {
+				lsn1 := uint64((workerID*iterations+i)*2 + 10)
+				lsn2 := lsn1 + 1
+				_ = wal.Append(Record{Type: RecordTypePut, LSN: lsn1, Key: "k", Payload: []byte("v1")})
+				_ = wal.Append(Record{Type: RecordTypePut, LSN: lsn2, Key: "k", Payload: []byte("v2")})
+
+				h1, err := bp.AllocateNewPage(pageID, 1, lsn1)
+				if err != nil {
+					t.Errorf("worker %d iter %d: AllocateNewPage h1 failed: %v", workerID, i, err)
+					return
+				}
+
+				done := make(chan struct{})
+				var h2 *PageHandle
+				var allocErr error
+				go func() {
+					h2, allocErr = bp.AllocateNewPage(pageID, 1, lsn2)
+					close(done)
+				}()
+
+				time.Sleep(time.Duration(i%5) * 50 * time.Microsecond)
+				h1.Unpin()
+
+				select {
+				case <-done:
+					if allocErr != nil {
+						t.Errorf("worker %d iter %d: AllocateNewPage h2 failed: %v", workerID, i, allocErr)
+						return
+					}
+					h2.Unpin()
+				case <-time.After(2 * time.Second):
+					t.Errorf("worker %d iter %d: lost wakeup: AllocateNewPage hung waiting for Unpin broadcast", workerID, i)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+}

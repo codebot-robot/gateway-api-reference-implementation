@@ -92,7 +92,9 @@ func (h *PageHandle) Block(i int) []byte {
 // Unpin releases the caller's pin on the page.
 func (h *PageHandle) Unpin() {
 	if h.Desc.PinCount.Add(-1) == 0 && h.pool != nil && h.pool.cond != nil {
+		h.pool.mu.Lock()
 		h.pool.cond.Broadcast()
+		h.pool.mu.Unlock()
 	}
 }
 
@@ -100,24 +102,31 @@ func (h *PageHandle) Unpin() {
 // and write-ahead rule enforcement.
 // Lock hierarchy: bp.mu (pool-wide mutex) -> desc.Mu (per-page latch). Never acquire bp.mu while holding desc.Mu.
 type BufferPool struct {
-	file      File
-	wal       *WAL
-	buddy     *BuddyAllocator
-	directIO  DirectIO
-	cipher    Cipher
-	dbID      [16]byte
-	mu        sync.Mutex
-	cond      *sync.Cond
-	onFailure func(error)
+	file     File
+	wal      *WAL
+	buddy    *BuddyAllocator
+	directIO DirectIO
+	cipher   Cipher
+	dbID     [16]byte
 
-	numFrames  int
-	arena      []byte // Pointer-free byte arena aligned to 4096 bytes
+	numFrames int
+	arena     []byte // Pointer-free byte arena aligned to 4096 bytes
+
+	// mu guards freeFrames, pageTable, and onFailure.
+	mu sync.Mutex
+
+	// cond uses mu. It is broadcast when an in-flight flush completes or when
+	// a page handle's pin count drops to zero. Waiters re-check whether the
+	// target page descriptor has finished flushing (InFlight == false) and has
+	// released all pins (PinCount == 0).
+	cond *sync.Cond
+
 	freeFrames []int
+	pageTable  map[uint64]*PageDesc // logicalPage -> PageDesc
+	onFailure  func(error)
 
 	stagingBuf []byte     // Pointer-free aligned 2 MiB staging buffer for direct I/O flushes
 	flushMu    sync.Mutex // Serializes staging buffer usage and direct I/O heap writes
-
-	pageTable map[uint64]*PageDesc // logicalPage -> PageDesc
 
 	bgStop chan struct{}
 	bgDone chan struct{}
@@ -344,34 +353,13 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
 
-	var oldDurableLoc uint64 = NoBlock
-	var oldFlushedBeforeSync uint64 = NoBlock
-	var oldFlushedLoc uint64 = NoBlock
-	var oldDesc *PageDesc
-
-	// If reusing an existing logical page, do not release frames or mutate descriptor
-	// while a flush is in flight or the page is pinned.
+	// Wait until any in-flight flush finishes and all pins are released on the existing descriptor.
 	for {
-		oldDesc = bp.pageTable[logicalPage]
+		oldDesc := bp.pageTable[logicalPage]
 		if oldDesc == nil {
 			break
 		}
 		if !oldDesc.InFlight && oldDesc.PinCount.Load() == 0 {
-			if len(oldDesc.FrameIDs) > 0 {
-				bp.freeFrames = append(bp.freeFrames, oldDesc.FrameIDs...)
-				oldDesc.FrameIDs = nil
-			}
-
-			// Defer freeing the old durable location until the new copy is promoted to durable,
-			// fulfilling the Reuse Rule.
-			oldDurableLoc = oldDesc.DurableLoc
-			oldFlushedBeforeSync = oldDesc.FlushedBeforeSync
-			oldFlushedLoc = oldDesc.FlushedLoc
-
-			oldDesc.DurableLoc = NoBlock
-			oldDesc.FlushedBeforeSync = NoBlock
-			oldDesc.FlushedLoc = NoBlock
-			oldDesc.PhysicalBlock = NoBlock
 			break
 		}
 		bp.cond.Wait()
@@ -379,12 +367,29 @@ func (bp *BufferPool) AllocateNewPage(logicalPage uint64, numBlocks int, lsn uin
 
 	frameIDs, err := bp.acquireFramesLocked(numBlocks)
 	if err != nil {
-		if oldDesc != nil {
-			oldDesc.DurableLoc = oldDurableLoc
-			oldDesc.FlushedBeforeSync = oldFlushedBeforeSync
-			oldDesc.FlushedLoc = oldFlushedLoc
-		}
 		return nil, err
+	}
+
+	var oldDurableLoc uint64 = NoBlock
+	var oldFlushedBeforeSync uint64 = NoBlock
+	var oldFlushedLoc uint64 = NoBlock
+
+	if oldDesc := bp.pageTable[logicalPage]; oldDesc != nil {
+		if len(oldDesc.FrameIDs) > 0 {
+			bp.freeFrames = append(bp.freeFrames, oldDesc.FrameIDs...)
+			oldDesc.FrameIDs = nil
+		}
+
+		// Defer freeing the old durable location until the new copy is promoted to durable,
+		// fulfilling the Reuse Rule.
+		oldDurableLoc = oldDesc.DurableLoc
+		oldFlushedBeforeSync = oldDesc.FlushedBeforeSync
+		oldFlushedLoc = oldDesc.FlushedLoc
+
+		oldDesc.DurableLoc = NoBlock
+		oldDesc.FlushedBeforeSync = NoBlock
+		oldDesc.FlushedLoc = NoBlock
+		oldDesc.PhysicalBlock = NoBlock
 	}
 
 	now := time.Now()
