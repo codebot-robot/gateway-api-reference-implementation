@@ -1165,6 +1165,148 @@ func TestH2Transport_BufferedResponseDrainsAfterConnectionDies(t *testing.T) {
 	}
 }
 
+func TestH2Transport_CleanEOF_DoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		connectCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Return immediately: clean EOF with 0 body bytes
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-clean-eof"
+	h2Tr.RegisterSession(sessID)
+
+	var rawConns1 []net.Conn
+	defer func() {
+		for _, c := range rawConns1 {
+			c.Close()
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial c%d failed: %v", i, err)
+		}
+		rawConns1 = append(rawConns1, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn c%d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	buf := make([]byte, 10)
+	n, rerr := stream.Read(buf)
+	if n != 0 {
+		t.Fatalf("expected 0 bytes read on EOF, got %d", n)
+	}
+	if !errors.Is(rerr, io.EOF) {
+		t.Fatalf("expected io.EOF error, got %v", rerr)
+	}
+
+	// Assert exactly 1 CONNECT was sent (no transparent reopen was attempted)
+	if cnt := connectCount.Load(); cnt != 1 {
+		t.Fatalf("expected 1 CONNECT request, got %d", cnt)
+	}
+
+	// Assert pool size is still 3 (no healthy connection was drained)
+	if poolSize := len(h2Tr.SessionConns(sessID)); poolSize != 3 {
+		t.Fatalf("expected pool size of 3, got %d", poolSize)
+	}
+}
+
+func TestH2Transport_StreamReset_DoesNotDrainOrReopen(t *testing.T) {
+	var connectCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		connectCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Abort handler causes server to send RST_STREAM
+		panic(http.ErrAbortHandler)
+	})
+
+	ln, cleanup := startMockBackendH2(t, 250, handler)
+	defer cleanup()
+
+	h2Tr := NewH2Transport()
+	defer h2Tr.Close()
+
+	sessID := "sess-stream-reset"
+	h2Tr.RegisterSession(sessID)
+
+	var rawConns2 []net.Conn
+	defer func() {
+		for _, c := range rawConns2 {
+			c.Close()
+		}
+	}()
+	for i := 1; i <= 3; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("Dial c%d failed: %v", i, err)
+		}
+		rawConns2 = append(rawConns2, c)
+		if err := h2Tr.AddConn(sessID, c); err != nil {
+			t.Fatalf("AddConn c%d failed: %v", i, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	stream, err := h2Tr.GetConn(ctx, sessID)
+	if err != nil {
+		t.Fatalf("GetConn failed: %v", err)
+	}
+	defer stream.Close()
+
+	buf := make([]byte, 10)
+	n, rerr := stream.Read(buf)
+	if n != 0 {
+		t.Fatalf("expected 0 bytes read on stream reset, got %d", n)
+	}
+	var se http2.StreamError
+	if !errors.As(rerr, &se) {
+		t.Fatalf("expected http2.StreamError, got %v (%T)", rerr, rerr)
+	}
+
+	// Assert exactly 1 CONNECT was sent (no transparent reopen was attempted)
+	if cnt := connectCount.Load(); cnt != 1 {
+		t.Fatalf("expected 1 CONNECT request, got %d", cnt)
+	}
+
+	// Assert pool size is still 3 (no healthy connection was drained)
+	if poolSize := len(h2Tr.SessionConns(sessID)); poolSize != 3 {
+		t.Fatalf("expected pool size of 3, got %d", poolSize)
+	}
+}
+
 func TestH2Transport_ConcurrentFirstWriteAccepted_ReadDoesNotReopen(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
