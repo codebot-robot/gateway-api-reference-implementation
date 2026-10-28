@@ -572,3 +572,160 @@ func CalculateOrder(numBlocks int) int {
 	}
 	return order
 }
+
+// TestCrash_ReuseEmptiedLogicalPage tests that reusing an emptied logical page does not
+// violate the reuse rule or resurrect deleted keys after a crash.
+func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	dir := "test_crash_reuse_emptied_page"
+	store, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Step 1: Occupy block 0
+	_ = store.Put("ConfigMap", "dummy-0", bytes.Repeat([]byte("0"), 3000), "1")
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint dummy 0 failed: %v", err)
+	}
+
+	// Step 2: Occupy block 1
+	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("1"), 3000), "2")
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint dummy 1 failed: %v", err)
+	}
+
+	// Step 3: Put key1 v1 (small payload) -> goes to page 3, gets block 2
+	if err := store.Put("ConfigMap", "key1", []byte("val1-v1"), "3"); err != nil {
+		t.Fatalf("Put key1 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint key1 v1 failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	entryK1 := store.keyIndex[qualifyKey("ConfigMap", "key1")]
+	v1Loc := store.bp.pageTable[entryK1.LogicalPage].DurableLoc
+	store.bp.mu.Unlock()
+	t.Logf("key1 v1 on page %d has DurableLoc %d", entryK1.LogicalPage, v1Loc)
+
+	// Step 4: Occupy block 3
+	_ = store.Put("ConfigMap", "dummy-3", bytes.Repeat([]byte("3"), 3000), "4")
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint dummy 3 failed: %v", err)
+	}
+
+	// Step 5: Update key1 v2 (small payload, fits in same page 3).
+	// When checkpointed, page 3 is written to block 4. Block 2 is freed!
+	if err := store.Put("ConfigMap", "key1", []byte("val1-v2"), "5"); err != nil {
+		t.Fatalf("Put key1 v2 failed: %v", err)
+	}
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint key1 v2 failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	v2Loc := store.bp.pageTable[entryK1.LogicalPage].DurableLoc
+	store.bp.mu.Unlock()
+	t.Logf("key1 v2 on page %d has DurableLoc %d", entryK1.LogicalPage, v2Loc)
+
+	// Step 6: Free block 1 by updating dummy-1 so block 1 is the lowest free block
+	_ = store.Put("ConfigMap", "dummy-1", bytes.Repeat([]byte("x"), 3000), "6")
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint dummy-1 v2 failed: %v", err)
+	}
+
+	// Step 7: Delete key1. The empty page is flushed into the lowest free block (block 1)!
+	if err := store.Delete("ConfigMap", "key1"); err != nil {
+		t.Fatalf("Delete key1 failed: %v", err)
+	}
+
+	// Roll segment so the segment containing key1 and its delete is completed and eligible for truncation
+	store.wal.mu.Lock()
+	_ = store.wal.createSegmentLocked(store.wal.nextLSN)
+	store.wal.mu.Unlock()
+
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint delete failed: %v", err)
+	}
+	// Second checkpoint with clean buffer pool advances redoStartLSN and truncates completed segment 1
+	if _, err := store.Checkpoint(); err != nil {
+		t.Fatalf("Checkpoint 2 delete failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	durLoc := store.bp.pageTable[entryK1.LogicalPage].DurableLoc
+	store.bp.mu.Unlock()
+	t.Logf("empty page %d has DurableLoc %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
+
+	// Step 8: Reuse the emptied logical page in the buffer pool
+	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 50, Key: "new-key", Payload: []byte("new-val")})
+	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, 50)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	hNew.Unpin()
+
+	// Step 9: Allocate a new page (filler) and flush it to disk.
+	// On main, AllocateNewPage freed durLoc (block 1), so filler page gets block 1 and overwrites it.
+	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 51, Key: "filler", Payload: []byte("filler-val")})
+	hFiller, err := store.bp.AllocateNewPage(99, 1, 51)
+	if err != nil {
+		t.Fatalf("AllocateNewPage 99 failed: %v", err)
+	}
+	spFiller, err := WrapSlottedPage(hFiller.Block(0))
+	if err != nil {
+		t.Fatalf("WrapSlottedPage failed: %v", err)
+	}
+	_, _ = spFiller.Put("filler", []byte("filler-val"), 51)
+	spFiller.Finalize()
+	hFiller.Unpin()
+	store.bp.MarkDirty(99, 51)
+	if err := store.bp.FlushPage(99); err != nil {
+		t.Fatalf("FlushPage(99) failed: %v", err)
+	}
+
+	store.bp.mu.Lock()
+	fillerLoc := store.bp.pageTable[99].PhysicalBlock
+	store.bp.mu.Unlock()
+	t.Logf("filler page 99 was written to block %d (empty page was at %d)", fillerLoc, durLoc)
+
+	// Under the Reuse Rule, the block holding the newest durable copy of page 2 (durLoc)
+	// must NOT be reallocated before a newer copy is confirmed durable.
+	if fillerLoc == durLoc {
+		t.Fatalf("reuse rule violation: durLoc %d was reallocated to filler page before new copy became durable", durLoc)
+	}
+
+	// Sync heap so filler write is durable
+	_ = store.heapFile.Sync()
+
+	// Step 10: Simulate crash BEFORE the page's new incarnation is flushed/fsynced
+	close(store.bp.bgStop)
+	<-store.bp.bgDone
+	_ = store.heapFile.Close()
+	_ = store.wal.Close()
+
+	// Step 11: Reopen store after crash
+	store2, err := Open(WithFS(faultFS), WithDir(dir), WithCompressionCodec(CodecNone))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer store2.Close()
+
+	store2.keyMu.RLock()
+	for k, entry := range store2.keyIndex {
+		t.Logf("Recovered key: %s (page=%d, slot=%d, LSN=%d)", k, entry.LogicalPage, entry.Slot, entry.LSN)
+	}
+	store2.keyMu.RUnlock()
+
+	// Deleted key1 must NOT resurrect!
+	val, exists, err := store2.Get("ConfigMap", "key1")
+	if err != nil {
+		t.Fatalf("Get key1 error: %v", err)
+	}
+	if exists {
+		t.Fatalf("deleted key1 resurrected after crash recovery! val=%q", string(val))
+	}
+}

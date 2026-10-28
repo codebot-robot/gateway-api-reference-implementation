@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBufferPool_PinAndEviction(t *testing.T) {
@@ -355,3 +356,176 @@ func TestBufferPool_BatchedEviction(t *testing.T) {
 		t.Fatalf("reloaded page 1 data mismatch: got %q, want %q", string(actualData), string(expectedData))
 	}
 }
+
+// TestBufferPool_ConcurrentReuseWhileFlushing tests that AllocateNewPage does not tear down
+// or release pool blocks for a page descriptor while a flush is in flight.
+func TestBufferPool_ConcurrentReuseWhileFlushing(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("bp-test-reuse---"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	defer bp.Close()
+
+	// 1. Allocate page 1 and write incarnation 1 data
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("val1")})
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	incarnation1Data := []byte("incarnation-1-data")
+	copy(h1.Block(0)[BlockHeaderSize:], incarnation1Data)
+	h1.Unpin()
+	bp.MarkDirty(1, 10)
+
+	// 2. Hold flushMu so the flush pauses after setting InFlight = true and unlocking bp.mu
+	bp.flushMu.Lock()
+	flushMuLocked := true
+	defer func() {
+		if flushMuLocked {
+			bp.flushMu.Unlock()
+		}
+	}()
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- bp.FlushPage(1)
+	}()
+
+	// Wait until page 1 is in-flight
+	for {
+		bp.mu.Lock()
+		d := bp.pageTable[1]
+		inFlight := d != nil && d.InFlight
+		bp.mu.Unlock()
+		if inFlight {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// 3. Concurrently reuse page 1 via AllocateNewPage in a separate goroutine
+	reuseDone := make(chan struct{})
+	var h2 *PageHandle
+	var allocErr error
+	go func() {
+		_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k1", Payload: []byte("val2")})
+		h2, allocErr = bp.AllocateNewPage(1, 1, 20)
+		close(reuseDone)
+	}()
+
+	// Give AllocateNewPage a moment to run.
+	// AllocateNewPage must NOT return while the flush is in flight.
+	var returnedEarly bool
+	select {
+	case <-reuseDone:
+		returnedEarly = true
+	case <-time.After(50 * time.Millisecond):
+		// Correct behavior: AllocateNewPage is waiting for flush to complete
+	}
+
+	// 4. Release flushMu to let flush complete
+	flushMuLocked = false
+	bp.flushMu.Unlock()
+
+	if err := <-flushDone; err != nil {
+		t.Fatalf("FlushPage failed: %v", err)
+	}
+
+	<-reuseDone
+	if allocErr != nil {
+		t.Fatalf("AllocateNewPage failed: %v", allocErr)
+	}
+	defer h2.Unpin()
+
+	if returnedEarly {
+		t.Fatalf("AllocateNewPage returned while flush was in flight; must block until in-flight flush completes")
+	}
+
+	// 5. Verify the block written by the flusher contains incarnation 1's data
+	flushedLoc := h2.Desc.FlushedLoc
+	if flushedLoc == NoBlock {
+		t.Fatalf("expected page 1 to retain FlushedLoc after flush completed")
+	}
+	buf := make([]byte, BlockSize)
+	if _, err := heapFile.ReadAt(buf, int64(flushedLoc*BlockSize)); err != nil {
+		t.Fatalf("failed to read flushed block at %d: %v", flushedLoc, err)
+	}
+	gotData := buf[BlockHeaderSize : BlockHeaderSize+len(incarnation1Data)]
+	if !bytes.Equal(gotData, incarnation1Data) {
+		t.Fatalf("flushed block data mismatch: got %q, want %q", string(gotData), string(incarnation1Data))
+	}
+}
+
+// TestBufferPool_ConcurrentReuseWhilePinned tests that AllocateNewPage blocks
+// and does not tear down frames while a page handle is actively pinned.
+func TestBufferPool_ConcurrentReuseWhilePinned(t *testing.T) {
+	memFS := NewMemFS()
+	faultFS := NewFaultFS(memFS)
+
+	var dbID [16]byte
+	copy(dbID[:], []byte("bp-test-reuse2--"))
+
+	wal, err := OpenWAL(faultFS, "wal_dir", dbID, 0)
+	if err != nil {
+		t.Fatalf("OpenWAL failed: %v", err)
+	}
+	defer wal.Close()
+
+	heapFile, err := faultFS.Create("heap.db")
+	if err != nil {
+		t.Fatalf("Create heap file failed: %v", err)
+	}
+	defer heapFile.Close()
+
+	buddy := NewBuddyAllocator(512)
+	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	defer bp.Close()
+
+	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("val1")})
+	h1, err := bp.AllocateNewPage(1, 1, 10)
+	if err != nil {
+		t.Fatalf("AllocateNewPage failed: %v", err)
+	}
+	// Keep h1 pinned (PinCount = 1)
+
+	reuseDone := make(chan struct{})
+	var h2 *PageHandle
+	var allocErr error
+	go func() {
+		_ = wal.Append(Record{Type: RecordTypePut, LSN: 20, Key: "k1", Payload: []byte("val2")})
+		h2, allocErr = bp.AllocateNewPage(1, 1, 20)
+		close(reuseDone)
+	}()
+
+	select {
+	case <-reuseDone:
+		t.Fatalf("AllocateNewPage returned while page was pinned")
+	case <-time.After(50 * time.Millisecond):
+		// Correct behavior: waiting for unpin
+	}
+
+	h1.Unpin()
+
+	<-reuseDone
+	if allocErr != nil {
+		t.Fatalf("AllocateNewPage failed: %v", allocErr)
+	}
+	h2.Unpin()
+}
+
