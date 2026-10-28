@@ -77,7 +77,7 @@ To preserve GARI's core principle of zero cloud-provider SDK dependencies in the
 The `gcpgateway` controller runs under its own Kubernetes ServiceAccount (KSA), e.g., `gcpgateway-controller`.
 - Permissions to interact with the Compute Engine API are granted via Google Cloud **Workload Identity Federation for GKE** (or instance metadata / service account keys for non-GKE clusters) split across two least-privilege custom IAM roles:
   - `gcpgatewayNegRegistrar` (Runtime Controller Role): Used by the controller in the cluster to inspect NEGs and backend services, attach/detach endpoints, and query health.
-  - `gcpgatewayOperatorHelper` (Provisioning Helper Role): Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py` with full load balancer management permissions.
+  - `gcpgatewayOperatorHelper` (Provisioning Helper Role): Used by operators or CI/CD pipelines executing `gcpgatewayctl frontend create` and `gcpgatewayctl frontend delete` with full load balancer management permissions.
 - Only the controller communicates with the Google Cloud Compute API; data-plane pods run completely unprivileged without cloud credentials.
 
 ### 3. Layer 4 Only; GARI Decrypts TLS
@@ -96,16 +96,17 @@ Because the Google Target TCP Proxy terminates client TCP connections and initia
   2. `proxyProtocolTrustedCIDRs`: PROXY headers are strictly parsed only from trusted GFE CIDRs (`35.191.0.0/16, 130.211.0.0/22`), preventing client IP spoofing.
 - This is configured per Gateway via the existing `parametersRef` ConfigMap mechanism.
 
-### 5. Operator-Owned Infrastructure via Python Script
-Infrastructure setup and teardown are performed by robust operator scripts written in Python (`gcpgateway/hack/create_frontend.py` and `teardown_frontend.py`):
+### 5. Operator-Owned Infrastructure via gcpgatewayctl
+Infrastructure setup and teardown are performed by the Go admin tool `gcpgatewayctl` (`gcpgateway/cmd/gcpgatewayctl`):
 - Reserves a global static IPv4 address.
 - Creates an HTTP health check on port **8999** with a unique, distinctive request path **`/_gari/readyz`** (preventing false positives from other services).
-- Creates zonal NEGs (`GCE_VM_IP_PORT`) in each zone of the cluster's region using a unified naming scheme `{prefix}-{cluster_id}-{namespace}-{gateway_name}-{port}` (truncated and hashed to strictly guarantee <= 63 characters).
-- Creates the backend service(s) with `CONNECTION` balancing mode and attaches the zonal NEGs.
+- Creates zonal NEGs (`GCE_VM_IP_PORT`) in each zone of the cluster's region using a unified naming scheme `{prefix}-{hash}-{port}` (strictly guaranteeing <= 63 characters).
+- Creates the backend service(s) with `CONNECTION` balancing mode, connection draining, and attaches the zonal NEGs.
 - Creates the Target TCP Proxy with `--proxy-header=PROXY_V1`.
 - Creates the global forwarding rule(s) binding the static IP to the Target TCP Proxy.
 - Creates VPC ingress firewall rules admitting traffic from `35.191.0.0/16` and `130.211.0.0/22` to pod ports `8443`, `8080`, and `8999`.
-- The script is idempotent and prints the parameters required for the Gateway's `parametersRef` ConfigMap.
+- The tool is idempotent and prints the parameters required for the Gateway's `parametersRef` ConfigMap.
+- Teardown is performed in exact reverse dependency order via `gcpgatewayctl frontend delete`, verifying metadata ownership before deleting each resource.
 
 ### 6. Controller Attaches and Detaches Endpoints Only
 The `gcpgateway` controller does not create, modify, or delete Google Cloud Load Balancer resources, forwarding rules, backend services, or NEGs.
@@ -316,7 +317,7 @@ NEGs in Google Cloud do not support resource labels. Therefore, **identity lives
 - **The controller lists by prefix and matches by metadata**: It lists every NEG with the configured prefix and manages only those whose metadata matches its own cluster ID and the Gateway being reconciled.
 - The controller **never infers ownership from the resource name**.
 - Any NEG with the prefix but missing, unparseable, or foreign metadata is logged and **never mutated, attached, detached, or pruned**.
-- The Python provisioning scripts write this identical metadata, and the teardown script deletes only resources whose metadata matches.
+- The `gcpgatewayctl frontend create` command writes this identical metadata, and `gcpgatewayctl frontend delete` deletes only resources whose metadata matches.
 
 ### Deterministic Conflict Resolution (Gateway API Conventions)
 
@@ -721,7 +722,7 @@ To uphold least privilege, `gcpgateway` cleanly separates permissions into **two
 1. **`gcpgatewayNegRegistrar` (Runtime Controller Role)**:
    Used by the controller in the cluster. It can **only** inspect NEGs and backend services, attach/detach endpoints, and query health. It cannot create or destroy infrastructure.
 2. **`gcpgatewayOperatorHelper` (Provisioning Helper Role)**:
-   Used by operators or CI/CD pipelines executing `create_frontend.py` and `teardown_frontend.py`.
+   Used by operators or CI/CD pipelines executing `gcpgatewayctl frontend create` and `gcpgatewayctl frontend delete`.
    Permissions across addresses, health checks, NEGs, backend services, target TCP proxies, forwarding rules, and firewall rules.
 
 Splitting runtime registration from infrastructure provisioning ensures that in-cluster controller credentials cannot modify or delete cloud load balancing infrastructure (addresses, health checks, forwarding rules, firewalls, etc.).
@@ -787,286 +788,48 @@ For non-GKE clusters running on Google Compute Engine:
 
 ---
 
-## Front-End Creation Script Specification
+## Front-End Administration Tool Specification (`gcpgatewayctl`)
 
-Operator scripts for infrastructure setup and teardown are implemented in Python under `gcpgateway/hack/`:
-- `create_frontend.py`: Idempotent setup of the layer-4 load balancer and zonal NEGs.
-- `teardown_frontend.py`: Clean teardown of all provisioned Google Cloud resources.
+Administrative tasks for infrastructure setup and teardown are performed by `gcpgatewayctl`, a Go command-line tool implemented in `gcpgateway/cmd/gcpgatewayctl`:
+- `gcpgatewayctl frontend create`: Idempotent setup of the layer-4 load balancer, health checks, firewall rules, and zonal NEGs.
+- `gcpgatewayctl frontend delete`: Clean teardown of all provisioned Google Cloud resources in reverse dependency order.
 
-Writing these tools in Python provides robust structured argument parsing, native JSON handling with `gcloud` / Compute REST APIs, resilient error checking, and clean output formatting.
+### Why Go
 
-### Deterministic Resource Naming in Python
+1. **Code Reuse**: Directly reuses the controller's Go packages (`gcpgateway/pkg/metadata`) for deterministic 63-character naming hashes and JSON metadata descriptions.
+2. **Type Safety & Stable API**: Uses the typed Google Compute Engine API (`google.golang.org/api/compute/v1`) with Application Default Credentials (ADC), eliminating fragile CLI argument parsing and `gcloud` dependency.
+3. **Least Privilege & Testability**: Defines a dedicated `AdminClient` interface (`gcpgateway/pkg/admin`) separate from the controller's runtime `ComputeClient`, backed by an in-memory test fake (`FakeAdminClient`).
 
-Both scripts utilize the `make_resource_name` utility function to ensure names never exceed 63 characters and avoid collisions across namespaces:
+### Command-Line Arguments & Flags
 
-```python
-import hashlib
+Both `frontend create` and `frontend delete` bind flags directly to `FrontendConfig`:
+- `--project`: Google Cloud project ID (required).
+- `--region`: Compute region (required).
+- `--network`: VPC Network name (default: `default`).
+- `--subnet`: VPC Subnet name (default: `default`).
+- `--cluster-id`: Kubernetes cluster identifier (default: `cluster-1`).
+- `--namespace`: Gateway namespace (default: `default`).
+- `--gateway-name`: Gateway resource name (default: `my-gateway`).
+- `--prefix`: Resource name prefix (default: `gcpgw`).
+- `--zones`: Comma-separated list of zones in the region (defaults to querying region zones).
+- `--draining-timeout`: Connection draining timeout in seconds (default: `35`).
+- `--dry-run`: Prints the planned operations without making any Compute API calls.
 
-def make_resource_name(cluster_id: str, namespace: str, gateway_name: str, suffix: str, prefix: str = "gcpgw") -> str:
-    """Generates an RFC-1035 compliant GCP resource name guaranteed to be <= 63 characters."""
-    full_id = f"{cluster_id}/{namespace}/{gateway_name}"
-    digest = hashlib.sha256(full_id.encode("utf-8")).hexdigest()[:8]
-    candidate = f"{prefix}-{cluster_id}-{namespace}-{gateway_name}-{suffix}".lower()
-    if len(candidate) <= 63:
-        return candidate
-    # Truncate base prefix to fit {truncated}-{digest}-{suffix} within 63 characters
-    max_base_len = 63 - len(digest) - len(suffix) - 2
-    truncated_base = f"{prefix}-{cluster_id}-{namespace}-{gateway_name}"[:max_base_len].rstrip("-")
-    return f"{truncated_base}-{digest}-{suffix}".lower()
-```
+### `gcpgatewayctl frontend create` Workflow
 
-### `create_frontend.py` Workflow
+1. **Resolve Zones**: Uses `--zones` if provided, otherwise queries `compute.Zones.List` for the region.
+2. **Global Static IP**: Reserves a global external IPv4 address named `{prefix}-{hash}-ip`.
+3. **HTTP Health Check**: Creates a global HTTP health check named `{prefix}-{hash}-hc` on port 8999 with request path `/_gari/readyz`.
+4. **Ingress Firewall Rule**: Creates an ingress rule named `{prefix}-{hash}-allow-gfe` allowing TCP ports 8443, 8080, and 8999 from Google Front End (GFE) proxy CIDRs (`35.191.0.0/16, 130.211.0.0/22`).
+5. **Zonal NEGs**: Creates one `GCE_VM_IP_PORT` NEG per zone per port (8443 and 8080) with JSON description metadata encoding cluster ID, namespace, gateway name, and port.
+6. **Backend Services**: Creates global TCP backend services (`EXTERNAL_MANAGED`) with connection draining, attaches health check, and attaches all zonal NEGs as backends.
+7. **Target TCP Proxies**: Creates target TCP proxies with `PROXY_V1` header enabled.
+8. **Forwarding Rules**: Creates global forwarding rules on ports 443 and 80 routing to the target proxies.
+9. **Manifest Generation**: Prints the static IP address and ready-to-apply ConfigMap and Gateway manifests.
 
-```python
-#!/usr/bin/env python3
-"""
-create_frontend.py: Idempotently creates Google Cloud L4 Load Balancing
-resources and zonal NEGs for gcpgateway.
-"""
+### `gcpgatewayctl frontend delete` Workflow
 
-import argparse
-import hashlib
-import json
-import subprocess
-import sys
-from typing import Any, Dict, List, Optional
-
-
-def run_gcloud(args: List[str], check: bool = True) -> Optional[Dict[str, Any]]:
-    cmd = ["gcloud"] + args + ["--format=json"]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        if check:
-            raise RuntimeError(f"Command {' '.join(cmd)} failed:\n{res.stderr}")
-        return None
-    if res.stdout.strip():
-        return json.loads(res.stdout)
-    return {}
-
-
-def make_resource_name(cluster_id: str, namespace: str, gateway_name: str, suffix: str, prefix: str = "gcpgw") -> str:
-    full_id = f"{cluster_id}/{namespace}/{gateway_name}"
-    digest = hashlib.sha256(full_id.encode("utf-8")).hexdigest()[:8]
-    if suffix:
-        return f"{prefix}-{digest}-{suffix}"
-    return f"{prefix}-{digest}"
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Create gcpgateway front-end infrastructure")
-    parser.add_argument("--project", required=True, help="Google Cloud project ID")
-    parser.add_argument("--region", default="us-central1", help="Compute region")
-    parser.add_argument("--network", default="default", help="VPC Network name")
-    parser.add_argument("--subnet", default="default", help="VPC Subnet name")
-    parser.add_argument("--cluster-id", default="cluster-1", help="Kubernetes cluster identifier")
-    parser.add_argument("--namespace", default="default", help="Gateway namespace")
-    parser.add_argument("--gateway-name", required=True, help="Gateway resource name")
-    parser.add_argument("--prefix", default="gcpgw", help="Resource prefix (default: gcpgw)")
-    parser.add_argument("--draining-timeout", type=int, default=30, help="Connection draining timeout in seconds")
-    args = parser.parse_args()
-
-    project = args.project
-    region = args.region
-    cid = args.cluster_id
-    ns = args.namespace
-    gw = args.gateway_name
-    pfx = args.prefix
-
-    # 1. Discover all zones in the specified region
-    zones_data = run_gcloud(["compute", "zones", "list", f"--filter=region:{region}", f"--project={project}"])
-    zones = [z["name"] for z in zones_data]
-    if not zones:
-        sys.exit(f"No zones found for region {region}")
-
-    # 2. Reserve Global Static IPv4 Address
-    ip_name = make_resource_name(cid, ns, gw, "ip", pfx)
-    ip_info = run_gcloud(["compute", "addresses", "describe", ip_name, "--global", f"--project={project}"], check=False)
-    if not ip_info:
-        print(f"Creating global static IP address {ip_name}...")
-        run_gcloud(["compute", "addresses", "create", ip_name, "--global", "--ip-version=IPV4", f"--project={project}"])
-        ip_info = run_gcloud(["compute", "addresses", "describe", ip_name, "--global", f"--project={project}"])
-    ip_address = ip_info["address"]
-    print(f"Using Global Static IP: {ip_address}")
-
-    # 3. Create HTTP Health Check on Port 8999 with path /_gari/readyz
-    hc_name = make_resource_name(cid, ns, gw, "hc", pfx)
-    if not run_gcloud(["compute", "health-checks", "describe", hc_name, "--global", f"--project={project}"], check=False):
-        print(f"Creating health check {hc_name}...")
-        run_gcloud([
-            "compute", "health-checks", "create", "http", hc_name,
-            "--global",
-            "--port=8999",
-            "--request-path=/_gari/readyz",
-            "--check-interval=5s",
-            "--timeout=5s",
-            "--healthy-threshold=2",
-            "--unhealthy-threshold=2",
-            f"--project={project}",
-        ])
-
-    # 4. Create Zonal NEGs in each zone of the region
-    for port in [8443, 8080]:
-        neg_name = make_resource_name(cid, ns, gw, str(port), pfx)
-        for zone in zones:
-            if not run_gcloud(["compute", "network-endpoint-groups", "describe", neg_name, f"--zone={zone}", f"--project={project}"], check=False):
-                print(f"Creating zonal NEG {neg_name} in {zone}...")
-                run_gcloud([
-                    "compute", "network-endpoint-groups", "create", neg_name,
-                    f"--zone={zone}",
-                    "--network-endpoint-type=GCE_VM_IP_PORT",
-                    f"--network={args.network}",
-                    f"--subnet={args.subnet}",
-                    f"--default-port={port}",
-                    f"--project={project}",
-                ])
-
-    # 5. Create Backend Services (CONNECTION balancing mode) and attach NEGs
-    port_map = {443: 8443, 80: 8080}
-    for fe_port, be_port in port_map.items():
-        bs_name = make_resource_name(cid, ns, gw, f"bs-{fe_port}", pfx)
-        bs_info = run_gcloud(["compute", "backend-services", "describe", bs_name, "--global", f"--project={project}"], check=False)
-        if not bs_info:
-            print(f"Creating backend service {bs_name}...")
-            run_gcloud([
-                "compute", "backend-services", "create", bs_name,
-                "--global",
-                "--load-balancing-scheme=EXTERNAL_MANAGED",
-                "--protocol=TCP",
-                f"--health-checks={hc_name}",
-                f"--timeout={args.draining_timeout}s",
-                f"--draining-timeout={args.draining_timeout}s",
-                f"--project={project}",
-            ])
-
-        # Attach all Zonal NEGs for this port
-        neg_name = make_resource_name(cid, ns, gw, str(be_port), pfx)
-        existing_backends = {b.get("group") for b in (bs_info.get("backends", []) if bs_info else [])}
-        for zone in zones:
-            neg_url_suffix = f"zones/{zone}/networkEndpointGroups/{neg_name}"
-            if not any(neg_url_suffix in b for b in existing_backends):
-                print(f"Attaching NEG {neg_name} in {zone} to {bs_name}...")
-                run_gcloud([
-                    "compute", "backend-services", "add-backend", bs_name,
-                    "--global",
-                    f"--network-endpoint-group={neg_name}",
-                    f"--network-endpoint-group-zone={zone}",
-                    "--balancing-mode=CONNECTION",
-                    "--max-connections=1000",
-                    f"--project={project}",
-                ])
-
-    # 6. Create Target TCP Proxies (--proxy-header=PROXY_V1)
-    for fe_port in [443, 80]:
-        proxy_name = make_resource_name(cid, ns, gw, f"proxy-{fe_port}", pfx)
-        bs_name = make_resource_name(cid, ns, gw, f"bs-{fe_port}", pfx)
-        if not run_gcloud(["compute", "target-tcp-proxies", "describe", proxy_name, "--global", f"--project={project}"], check=False):
-            print(f"Creating target TCP proxy {proxy_name}...")
-            run_gcloud([
-                "compute", "target-tcp-proxies", "create", proxy_name,
-                "--global",
-                f"--backend-service={bs_name}",
-                "--proxy-header=PROXY_V1",
-                f"--project={project}",
-            ])
-
-    # 7. Create Global Forwarding Rules
-    for fe_port in [443, 80]:
-        fr_name = make_resource_name(cid, ns, gw, f"fr-{fe_port}", pfx)
-        proxy_name = make_resource_name(cid, ns, gw, f"proxy-{fe_port}", pfx)
-        if not run_gcloud(["compute", "forwarding-rules", "describe", fr_name, "--global", f"--project={project}"], check=False):
-            print(f"Creating forwarding rule {fr_name} on port {fe_port}...")
-            run_gcloud([
-                "compute", "forwarding-rules", "create", fr_name,
-                "--global",
-                f"--target-tcp-proxy={proxy_name}",
-                f"--ports={fe_port}",
-                f"--address={ip_name}",
-                "--load-balancing-scheme=EXTERNAL_MANAGED",
-                f"--project={project}",
-            ])
-
-    # 8. Create Ingress Firewall Rule for GFE Proxy & Health Checks
-    fw_name = make_resource_name(cid, ns, gw, "allow-gfe", pfx)
-    if not run_gcloud(["compute", "firewall-rules", "describe", fw_name, f"--project={project}"], check=False):
-        print(f"Creating firewall rule {fw_name}...")
-        run_gcloud([
-            "compute", "firewall-rules", "create", fw_name,
-            f"--network={args.network}",
-            "--action=ALLOW",
-            "--direction=INGRESS",
-            "--source-ranges=35.191.0.0/16,130.211.0.0/22",
-            "--rules=tcp:8443,tcp:8080,tcp:8999",
-            f"--project={project}",
-        ])
-
-    print("\n=== Setup Complete ===")
-    print(f"Front-end Static IP: {ip_address}")
-    print("\nApply the following ConfigMap and Gateway resources to your cluster:\n")
-    print_manifests(ip_address, cid, ns, gw, pfx)
-
-
-def print_manifests(ip_address: str, cluster_id: str, namespace: str, gateway_name: str, prefix: str):
-    neg_8443 = make_resource_name(cluster_id, namespace, gateway_name, "8443", prefix)
-    neg_8080 = make_resource_name(cluster_id, namespace, gateway_name, "8080", prefix)
-    manifest = f"""apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: gcpgateway-params-{gateway_name}
-  namespace: {namespace}
-data:
-  serviceType: ClusterIP
-  allowedSourceCIDRs: "35.191.0.0/16,130.211.0.0/22"
-  proxyProtocol: "enabled"
-  proxyProtocolTrustedCIDRs: "35.191.0.0/16,130.211.0.0/22"
-  externalIP: "{ip_address}"
-  clusterId: "{cluster_id}"
-  gatewayNamespace: "{namespace}"
-  gatewayName: "{gateway_name}"
-  negHTTPS: "{neg_8443}"
-  negHTTP: "{neg_8080}"
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: {gateway_name}
-  namespace: {namespace}
-spec:
-  gatewayClassName: gcpgateway
-  addresses:
-  - type: IPAddress
-    value: "{ip_address}"
-  listeners:
-  - name: https
-    protocol: HTTPS
-    port: 443
-    tls:
-      mode: Terminate
-      certificateRefs:
-      - name: {gateway_name}-cert
-    allowedRoutes:
-      namespaces:
-        from: Same
-  - name: http
-    protocol: HTTP
-    port: 80
-    allowedRoutes:
-      namespaces:
-        from: Same
-  infrastructure:
-    parametersRef:
-      group: ""
-      kind: ConfigMap
-      name: gcpgateway-params-{gateway_name}
-"""
-    print(manifest)
-
-
-if __name__ == "__main__":
-    main()
-```
-
-### `teardown_frontend.py` Workflow
-`teardown_frontend.py` takes the same arguments (`--cluster-id`, `--namespace`, `--gateway-name`) and cleanly deletes resources using `make_resource_name` in reverse dependency order:
+Deletes resources in exact reverse dependency order:
 1. Global Forwarding Rules (`fr-443`, `fr-80`).
 2. Target TCP Proxies (`proxy-443`, `proxy-80`).
 3. Backend Services (`bs-443`, `bs-80`).
@@ -1074,6 +837,8 @@ if __name__ == "__main__":
 5. Health Check (`hc`).
 6. Firewall Rule (`allow-gfe`).
 7. Static IP reservation (`ip`).
+
+Before deleting any resource, `gcpgatewayctl` inspects its description metadata to verify ownership (`cluster-id`, `namespace`, `gateway-name`). If metadata does not match or is absent, the resource is skipped to protect foreign infrastructure. Resources that are already gone are tolerated cleanly.
 
 ---
 
@@ -1107,8 +872,8 @@ Below is the proposed breakdown of work into small, focused, incremental issues.
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
-│ Issue 5: Front-End Provisioning & Teardown (Python)    │
-│ (create_frontend.py, teardown_frontend.py, 63-char hash│
+│ Issue 5: Front-End Provisioning & Teardown Go Admin    │
+│ (gcpgatewayctl frontend create/delete, AdminClient)    │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
@@ -1204,19 +969,18 @@ Below is the proposed breakdown of work into small, focused, incremental issues.
 
 ---
 
-### Issue 5: Front-end provisioning and teardown Python scripts
+### Issue 5: Front-end provisioning and teardown Go admin tool (`gcpgatewayctl`)
 
-- **Scope**: `gcpgateway/hack/create_frontend.py` and `gcpgateway/hack/teardown_frontend.py`.
+- **Scope**: `gcpgateway/cmd/gcpgatewayctl/` and `gcpgateway/pkg/admin/`.
 - **Tasks**:
-  1. Write `create_frontend.py` in Python 3 to provision static IP, health check on 8999 with path `/_gari/readyz`, zonal NEGs across all regional zones with 63-character-safe deterministic naming (`make_resource_name`), backend services with `CONNECTION` mode, target TCP proxies with `PROXY_V1`, forwarding rules, and firewall rules.
-  2. Ensure complete idempotency (can be re-run safely without error).
-  3. Write `teardown_frontend.py` to cleanly delete all provisioned cloud resources in reverse dependency order using the identical naming scheme.
-  4. Print ready-to-apply ConfigMap and Gateway YAML snippets with `allowedSourceCIDRs`, `proxyProtocolTrustedCIDRs`, and discrete NEG names.
+  1. Implement `gcpgatewayctl frontend create` in Go to provision static IP, health check on 8999 with path `/_gari/readyz`, zonal NEGs across all regional zones with 63-character-safe deterministic naming (`metadata.ResourceName`), backend services with `CONNECTION` mode and connection draining, target TCP proxies with `PROXY_V1`, forwarding rules, and firewall rules using the typed Compute API and ADC.
+  2. Ensure complete idempotency (describe first, create only missing, report existing).
+  3. Implement `gcpgatewayctl frontend delete` to cleanly delete all provisioned cloud resources in reverse dependency order, validating description metadata ownership.
+  4. Print ready-to-apply ConfigMap and Gateway YAML manifests with `allowedSourceCIDRs`, `proxyProtocolTrustedCIDRs`, and discrete NEG names.
 - **Acceptance Criteria**:
-  - Python scripts pass linting (`flake8` / `black` style).
-  - Handles command-line arguments and environment defaults properly.
-  - Tests verify names never exceed 63 characters and hash collision resistance across long namespaces/names.
-  - Dry-run validation against mock Google Cloud CLI or live project.
+  - Unit tests with `FakeAdminClient` validating create from empty, idempotent create, create with partial resources, delete, delete with missing resources, error handling, and dry-run making no calls.
+  - Tests verify names and NEG descriptions match controller `pkg/metadata` conventions.
+  - Passes `go vet` and `go test -race`.
 
 ---
 
