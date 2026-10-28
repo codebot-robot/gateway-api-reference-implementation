@@ -34,7 +34,7 @@ func TestRecovery_TornMultiBlockPage(t *testing.T) {
 	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 
 	// 1. Write Version 1 of a multi-block page (LSN 10) and make it durable
 	payloadV1 := bytes.Repeat([]byte("v1-payload-"), 1000) // ~11 KB -> 4 blocks
@@ -137,7 +137,7 @@ func TestRecovery_NoResurrection(t *testing.T) {
 	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	cp := NewCheckpointer(bp, heapFile, wal)
 
 	// Add key-1, checkpoint, then delete key-1 and checkpoint again
@@ -190,7 +190,7 @@ func TestRecovery_ForgedHeaders(t *testing.T) {
 	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 
 	// Construct an untrusted payload that contains forged block headers with valid CRCs,
 	// high LSN (9999), and target logical page placed at EVERY offset.
@@ -525,7 +525,7 @@ func TestRegression_Item4_HighestLSNKeySelection(t *testing.T) {
 	wal, _ := OpenWAL(faultFS, "wal_dir", dbID, 0)
 	heapFile, _ := faultFS.Create("heap.db")
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 
 	// Page 1: holds key at LSN 10
 	h1, _ := bp.AllocateNewPage(1, 1, 10)
@@ -650,7 +650,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint delete failed: %v", err)
 	}
-	// Second checkpoint with clean buffer pool advances redoStartLSN and truncates completed segment 1
+	// Second checkpoint with clean block pool advances redoStartLSN and truncates completed segment 1
 	if _, err := store.Checkpoint(); err != nil {
 		t.Fatalf("Checkpoint 2 delete failed: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestCrash_ReuseEmptiedLogicalPage(t *testing.T) {
 	store.bp.mu.Unlock()
 	t.Logf("empty page %d has DurableLoc %d (v1 was at %d, v2 was at %d)", entryK1.LogicalPage, durLoc, v1Loc, v2Loc)
 
-	// Step 8: Reuse the emptied logical page in the buffer pool
+	// Step 8: Reuse the emptied logical page in the block pool
 	_ = store.wal.Append(Record{Type: RecordTypePut, LSN: 50, Key: "new-key", Payload: []byte("new-val")})
 	hNew, err := store.bp.AllocateNewPage(entryK1.LogicalPage, 1, 50)
 	if err != nil {

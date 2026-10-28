@@ -65,12 +65,12 @@ func unqualifyKey(qualified string) (string, string) {
 
 // Options configures an Engine instance.
 type Options struct {
-	Dir        string
-	FS         FS
-	Cipher     Cipher
-	NumFrames  int
-	AutoDelete bool
-	Clock      Clock
+	Dir           string
+	FS            FS
+	Cipher        Cipher
+	NumPoolBlocks int
+	AutoDelete    bool
+	Clock         Clock
 
 	CompressionCodec CompressionCodec
 	MaxObjectSize    int
@@ -124,21 +124,21 @@ func WithCipher(cipher Cipher) Option {
 	}
 }
 
-// WithNumFrames sets the buffer pool frame count.
-func WithNumFrames(n int) Option {
+// WithNumPoolBlocks sets the block pool block count.
+func WithNumPoolBlocks(n int) Option {
 	return func(o *Options) {
-		o.NumFrames = n
+		o.NumPoolBlocks = n
 	}
 }
 
-// WithBufferPoolSize sets the buffer pool size in bytes (rounded to 4096-byte frames).
-func WithBufferPoolSize(bytes int) Option {
+// WithBlockPoolSize sets the block pool size in bytes (rounded to 4096-byte blocks).
+func WithBlockPoolSize(bytes int) Option {
 	return func(o *Options) {
-		frames := bytes / 4096
-		if frames < 16 {
-			frames = 16
+		blocks := bytes / 4096
+		if blocks < 16 {
+			blocks = 16
 		}
-		o.NumFrames = frames
+		o.NumPoolBlocks = blocks
 	}
 }
 
@@ -192,7 +192,7 @@ func (t *emptyPageTracker) Pages() []uint64 {
 	return t.pages
 }
 
-// Engine coordinates the write-ahead log, heap file, buffer pool, buddy allocator,
+// Engine coordinates the write-ahead log, heap file, block pool, buddy allocator,
 // in-memory index, payload encryption, and crash consistency mechanisms.
 type Engine struct {
 	fs         FS
@@ -208,7 +208,7 @@ type Engine struct {
 	heapFile File
 	wal      *WAL
 	buddy    *BuddyAllocator
-	bp       *BufferPool
+	bp       *BlockPool
 	cp       *Checkpointer
 
 	writerMu sync.RWMutex // Single writer: serializes Put, Delete; RLock for point-in-time Scan/List
@@ -314,7 +314,7 @@ func Open(opts ...Option) (*Engine, error) {
 	options := Options{
 		FS:               NewOSFS(),
 		Cipher:           NoopCipher{},
-		NumFrames:        DefaultBufferPoolFrames,
+		NumPoolBlocks:    DefaultBlockPoolBlocks,
 		AutoDelete:       false,
 		CompressionCodec: CodecZstd,
 		MaxObjectSize:    DefaultMaxObjectSize,
@@ -535,10 +535,10 @@ func Open(opts ...Option) (*Engine, error) {
 		}
 		s.wal = wal
 		s.buddy = NewBuddyAllocator(512)
-		s.bp = NewBufferPool(heapFile, wal, s.buddy, dbID, BufferPoolOptions{
-			NumFrames: options.NumFrames,
-			Cipher:    options.Cipher,
-			OnFailure: s.setFailed,
+		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
+			NumPoolBlocks: options.NumPoolBlocks,
+			Cipher:        options.Cipher,
+			OnFailure:     s.setFailed,
 		})
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)
 	} else {
@@ -572,10 +572,10 @@ func Open(opts ...Option) (*Engine, error) {
 		}
 		s.wal = wal
 
-		s.bp = NewBufferPool(heapFile, wal, s.buddy, dbID, BufferPoolOptions{
-			NumFrames: options.NumFrames,
-			Cipher:    options.Cipher,
-			OnFailure: s.setFailed,
+		s.bp = NewBlockPool(heapFile, wal, s.buddy, dbID, BlockPoolOptions{
+			NumPoolBlocks: options.NumPoolBlocks,
+			Cipher:        options.Cipher,
+			OnFailure:     s.setFailed,
 		})
 		s.bp.LoadPageDescs(recoveryRes.PageDescs)
 		s.cp = NewCheckpointer(s.bp, heapFile, wal)

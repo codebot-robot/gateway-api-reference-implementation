@@ -168,14 +168,14 @@ func TestDiskStore_StaleReadDetection(t *testing.T) {
 	// Put version 2 (LSN increments to 3)
 	_ = store.Put("ConfigMap", "default/cm-stale", []byte("val-v2"), "2")
 
-	// Evict page from memory frames by unloading frames
+	// Evict page from memory pool blocks by unloading pool blocks
 	store.bp.mu.Lock()
 	desc := store.bp.pageTable[entryV1.LogicalPage]
-	desc.FrameIDs = nil // force reload from disk
+	desc.PoolBlocks = nil // force reload from disk
 	desc.PhysicalBlock = locV1
 	store.bp.mu.Unlock()
 
-	// Substitute older valid page copy underneath the buffer pool on disk
+	// Substitute older valid page copy underneath the block pool on disk
 	faultFS.SetAssertReuseRule(false)
 	_, _ = store.heapFile.WriteAt(v1Block, int64(locV1*BlockSize))
 
@@ -500,12 +500,12 @@ func TestRegression_Round2_Item3_OversizeLongNameAndTornFiles(t *testing.T) {
 }
 
 // TestRegression_Round2_Item4_LogicalPageReuseNoLeak asserts that 200 put/delete cycles
-// of a 20 KB object do not leak buffer pool frames or buddy allocator disk blocks.
+// of a 20 KB object do not leak block pool blocks or buddy allocator disk blocks.
 func TestRegression_Round2_Item4_LogicalPageReuseNoLeak(t *testing.T) {
 	memFS := NewMemFS()
 	dir := "test_page_reuse_no_leak"
 
-	store, err := Open(WithFS(memFS), WithDir(dir), WithNumFrames(64))
+	store, err := Open(WithFS(memFS), WithDir(dir), WithNumPoolBlocks(64))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -1305,7 +1305,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 	numAllocated := len(store3.buddy.allocated)
 	store3.buddy.mu.Unlock()
 	if numAllocated != 1 {
-		t.Fatalf("expected exactly 1 allocated buddy extent, got %d", numAllocated)
+		t.Fatalf("expected exactly 1 allocated buddy block run, got %d", numAllocated)
 	}
 
 	got, found, err := store3.Get(bucket, key)
@@ -1315,7 +1315,7 @@ func TestRecovery_MultiBlockRedoIdempotency(t *testing.T) {
 }
 
 func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
-	const numFrames = 256
+	const numPoolBlocks = 256
 	const objectCount = 2000
 	payload := make([]byte, 2048)
 	for i := range payload {
@@ -1328,7 +1328,7 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
 		dir := b.TempDir()
-		store, err := Open(WithDir(dir), WithNumFrames(numFrames))
+		store, err := Open(WithDir(dir), WithNumPoolBlocks(numPoolBlocks))
 		if err != nil {
 			b.Fatalf("Open failed: %v", err)
 		}

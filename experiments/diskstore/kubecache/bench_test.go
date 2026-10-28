@@ -620,7 +620,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		diskStore, err := engine.Open(
 			engine.WithDir(diskDir),
 			engine.WithCipher(cipherDisk),
-			engine.WithNumFrames(2048), // 8 MiB buffer pool
+			engine.WithNumPoolBlocks(2048), // 8 MiB block pool
 			engine.WithCompressionCodec(codec),
 		)
 		if err != nil {
@@ -661,7 +661,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 		recoveredStore, err := engine.Open(
 			engine.WithDir(diskDir),
 			engine.WithCipher(cipherDisk),
-			engine.WithNumFrames(2048),
+			engine.WithNumPoolBlocks(2048),
 			engine.WithCompressionCodec(codec),
 		)
 		if err != nil {

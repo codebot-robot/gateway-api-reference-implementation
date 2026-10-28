@@ -232,7 +232,7 @@ func (b *BuddyAllocator) Free(block uint64) error {
 	return nil
 }
 
-// AllocateBatch reserves a contiguous extent of physical blocks for a batch of pages,
+// AllocateBatch reserves a contiguous block run of physical blocks for a batch of pages,
 // recording each individual page allocation in the allocator.
 // It sorts orders internally (largest first) so all pages are naturally aligned,
 // and returns the allocated starting block for each page in the caller's original input order.
@@ -248,7 +248,7 @@ func (b *BuddyAllocator) AllocateBatch(orders []int) ([]uint64, error) {
 		totalBlocks += 1 << o
 	}
 	if totalBlocks > (1 << MaxOrder) {
-		return nil, fmt.Errorf("batch total blocks %d exceeds maximum extent size %d", totalBlocks, 1<<MaxOrder)
+		return nil, fmt.Errorf("batch total blocks %d exceeds maximum block run size %d", totalBlocks, 1<<MaxOrder)
 	}
 
 	b.mu.Lock()
@@ -290,8 +290,8 @@ func (b *BuddyAllocator) allocateBatchLocked(orders []int, totalBlocks int) ([]u
 
 	startBlock := b.freeLists[targetOrder][0]
 	b.removeFree(targetOrder, startBlock)
-	extentSize := uint64(1 << targetOrder)
-	if rem := extentSize - uint64(totalBlocks); rem > 0 {
+	runBlocks := uint64(1 << targetOrder)
+	if rem := runBlocks - uint64(totalBlocks); rem > 0 {
 		b.returnFreeRangeLocked(startBlock+uint64(totalBlocks), rem)
 	}
 

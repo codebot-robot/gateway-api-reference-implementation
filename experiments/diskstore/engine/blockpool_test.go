@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-func TestBufferPool_PinAndEviction(t *testing.T) {
+func TestBlockPool_PinAndEviction(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -44,8 +44,8 @@ func TestBufferPool_PinAndEviction(t *testing.T) {
 
 	buddy := NewBuddyAllocator(512)
 
-	// Small buffer pool of 4 frames to test frame eviction under pressure
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 4})
+	// Small block pool of 4 pool blocks to test pool block eviction under pressure
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 4})
 	defer bp.Close()
 
 	// Append WAL record for LSN 10
@@ -72,7 +72,7 @@ func TestBufferPool_PinAndEviction(t *testing.T) {
 		t.Fatalf("PromoteFlushedToDurable failed: %v", err)
 	}
 
-	// Allocate 4 new pages (pages 2, 3, 4, 5) to force eviction of page 1 from the 4-frame pool
+	// Allocate 4 new pages (pages 2, 3, 4, 5) to force eviction of page 1 from the 4-block pool
 	for i := uint64(2); i <= 5; i++ {
 		_ = wal.Append(Record{Type: RecordTypePut, LSN: 10 + i, Key: "k", Payload: []byte("v")})
 		h, err := bp.AllocateNewPage(i, 1, 10+i)
@@ -95,7 +95,7 @@ func TestBufferPool_PinAndEviction(t *testing.T) {
 	}
 }
 
-func TestBufferPool_MultiBlockPageNonAdjacentFrames(t *testing.T) {
+func TestBlockPool_MultiBlockPageNonAdjacentPoolBlocks(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -110,11 +110,11 @@ func TestBufferPool_MultiBlockPageNonAdjacentFrames(t *testing.T) {
 
 	buddy := NewBuddyAllocator(512)
 
-	// Buffer pool of 16 frames
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	// Block pool of 16 pool blocks
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
-	// Allocate some single block pages first, then free some to create non-adjacent free frames
+	// Allocate some single block pages first, then free some to create non-adjacent free pool blocks
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 50, Key: "k", Payload: []byte("v")})
 	hA, _ := bp.AllocateNewPage(10, 1, 50)
 	hB, _ := bp.AllocateNewPage(11, 1, 50)
@@ -144,9 +144,9 @@ func TestBufferPool_MultiBlockPageNonAdjacentFrames(t *testing.T) {
 	}
 }
 
-// TestBufferPool_InFlightWriteNotPromoted asserts that in-flight page writes are not promoted
+// TestBlockPool_InFlightWriteNotPromoted asserts that in-flight page writes are not promoted
 // during a checkpoint, satisfying the Reuse Rule.
-func TestBufferPool_InFlightWriteNotPromoted(t *testing.T) {
+func TestBlockPool_InFlightWriteNotPromoted(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 	// Reuse rule assertion stays enabled
@@ -168,7 +168,7 @@ func TestBufferPool_InFlightWriteNotPromoted(t *testing.T) {
 	defer heapFile.Close()
 
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
 	// Initial write of page 1 at LSN 10
@@ -280,7 +280,7 @@ func TestBufferPool_InFlightWriteNotPromoted(t *testing.T) {
 	bp.mu.Unlock()
 }
 
-func TestBufferPool_BatchedEviction(t *testing.T) {
+func TestBlockPool_BatchedEviction(t *testing.T) {
 	dir := t.TempDir()
 	fs := NewOSFS()
 
@@ -302,8 +302,8 @@ func TestBufferPool_BatchedEviction(t *testing.T) {
 	countingHeap := &countingFileWrapper{File: rawHeap}
 	buddy := NewBuddyAllocator(512)
 
-	// Buffer pool of 32 frames
-	bp := NewBufferPool(countingHeap, wal, buddy, dbID, BufferPoolOptions{NumFrames: 32})
+	// Block pool of 32 pool blocks
+	bp := NewBlockPool(countingHeap, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 32})
 	defer bp.Close()
 
 	// Fill pool with 32 dirty pages
@@ -321,8 +321,8 @@ func TestBufferPool_BatchedEviction(t *testing.T) {
 	// Reset write count before triggering eviction
 	countingHeap.writeCalls.Store(0)
 
-	// Allocate page 33: requires evicting pages because pool has 0 free frames.
-	// acquireFramesLocked will batch-flush candidate dirty pages in ONE write call.
+	// Allocate page 33: requires evicting pages because pool has 0 free pool blocks.
+	// acquirePoolBlocksLocked will batch-flush candidate dirty pages in ONE write call.
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 330, Key: "k33", Payload: []byte("val")})
 	h33, err := bp.AllocateNewPage(33, 1, 330)
 	if err != nil {
@@ -358,9 +358,9 @@ func TestBufferPool_BatchedEviction(t *testing.T) {
 	}
 }
 
-// TestBufferPool_ConcurrentReuseWhileFlushing tests that AllocateNewPage does not tear down
+// TestBlockPool_ConcurrentReuseWhileFlushing tests that AllocateNewPage does not tear down
 // or release pool blocks for a page descriptor while a flush is in flight.
-func TestBufferPool_ConcurrentReuseWhileFlushing(t *testing.T) {
+func TestBlockPool_ConcurrentReuseWhileFlushing(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -380,7 +380,7 @@ func TestBufferPool_ConcurrentReuseWhileFlushing(t *testing.T) {
 	defer heapFile.Close()
 
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
 	// 1. Allocate page 1 and write incarnation 1 data
@@ -473,9 +473,9 @@ func TestBufferPool_ConcurrentReuseWhileFlushing(t *testing.T) {
 	}
 }
 
-// TestBufferPool_ConcurrentReuseWhilePinned tests that AllocateNewPage blocks
-// and does not tear down frames while a page handle is actively pinned.
-func TestBufferPool_ConcurrentReuseWhilePinned(t *testing.T) {
+// TestBlockPool_ConcurrentReuseWhilePinned tests that AllocateNewPage blocks
+// and does not tear down pool blocks while a page handle is actively pinned.
+func TestBlockPool_ConcurrentReuseWhilePinned(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -495,7 +495,7 @@ func TestBufferPool_ConcurrentReuseWhilePinned(t *testing.T) {
 	defer heapFile.Close()
 
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 16})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 16})
 	defer bp.Close()
 
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("val1")})
@@ -530,9 +530,9 @@ func TestBufferPool_ConcurrentReuseWhilePinned(t *testing.T) {
 	h2.Unpin()
 }
 
-// TestBufferPool_UnpinStress stresses concurrent Unpin against a waiting AllocateNewPage
+// TestBlockPool_UnpinStress stresses concurrent Unpin against a waiting AllocateNewPage
 // across multiple concurrent pages to ensure no lost wakeups occur when PinCount drops to zero.
-func TestBufferPool_UnpinStress(t *testing.T) {
+func TestBlockPool_UnpinStress(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -552,7 +552,7 @@ func TestBufferPool_UnpinStress(t *testing.T) {
 	defer heapFile.Close()
 
 	buddy := NewBuddyAllocator(512)
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 32})
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 32})
 	defer bp.Close()
 
 	const numWorkers = 4
@@ -604,9 +604,9 @@ func TestBufferPool_UnpinStress(t *testing.T) {
 	wg.Wait()
 }
 
-// TestBufferPool_ConcurrentReusePinnedDuringEvictionFlush tests that AllocateNewPage
-// re-checks page idleness after acquireFramesLocked temporarily releases bp.mu to flush dirty pages.
-func TestBufferPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
+// TestBlockPool_ConcurrentReusePinnedDuringEvictionFlush tests that AllocateNewPage
+// re-checks page idleness after acquirePoolBlocksLocked temporarily releases bp.mu to flush dirty pages.
+func TestBlockPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 	memFS := NewMemFS()
 	faultFS := NewFaultFS(memFS)
 
@@ -626,11 +626,11 @@ func TestBufferPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 	defer heapFile.Close()
 
 	buddy := NewBuddyAllocator(512)
-	// Buffer pool with exactly 2 frames
-	bp := NewBufferPool(heapFile, wal, buddy, dbID, BufferPoolOptions{NumFrames: 2})
+	// Block pool with exactly 2 pool blocks
+	bp := NewBlockPool(heapFile, wal, buddy, dbID, BlockPoolOptions{NumPoolBlocks: 2})
 	defer bp.Close()
 
-	// 1. Allocate page 1 (occupies frame 0)
+	// 1. Allocate page 1 (occupies pool block 0)
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 10, Key: "k1", Payload: []byte("val1")})
 	h1, err := bp.AllocateNewPage(1, 1, 10)
 	if err != nil {
@@ -641,7 +641,7 @@ func TestBufferPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 	h1.Unpin()
 	bp.MarkDirty(1, 10)
 
-	// 2. Allocate page 2 (occupies frame 1). Pool is now full of dirty pages.
+	// 2. Allocate page 2 (occupies pool block 1). Pool is now full of dirty pages.
 	_ = wal.Append(Record{Type: RecordTypePut, LSN: 11, Key: "k2", Payload: []byte("val2")})
 	h2, err := bp.AllocateNewPage(2, 1, 11)
 	if err != nil {
@@ -651,7 +651,7 @@ func TestBufferPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 	h2.Unpin()
 	bp.MarkDirty(2, 11)
 
-	// 3. Set up hook on heap write: when acquireFramesLocked flushes a dirty page,
+	// 3. Set up hook on heap write: when acquirePoolBlocksLocked flushes a dirty page,
 	// bp.mu is released during WriteAt. In that window, pin page 1.
 	var h1Pinned *PageHandle
 	pinDone := make(chan struct{})
@@ -670,7 +670,7 @@ func TestBufferPool_ConcurrentReusePinnedDuringEvictionFlush(t *testing.T) {
 	})
 
 	// 4. Call AllocateNewPage for page 1 in a separate goroutine.
-	// acquireFramesLocked will flush to free a frame, triggering the hook which pins page 1.
+	// acquirePoolBlocksLocked will flush to free a pool block, triggering the hook which pins page 1.
 	allocDone := make(chan struct{})
 	var hNew *PageHandle
 	var allocErr error
