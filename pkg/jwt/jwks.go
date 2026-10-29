@@ -56,6 +56,7 @@ type KeyProvider interface {
 // IssuerConfig defines configuration for a trusted JWT issuer.
 type IssuerConfig struct {
 	IssuerURL string // HTTPS URL for OIDC discovery
+	JWKSURL   string // Direct JWKS URI (optional, bypasses OIDC discovery)
 	JWKSFile  string // Path to static JWKS file (alternative to public OIDC discovery)
 }
 
@@ -183,10 +184,14 @@ func NewJWKSCache(configs []IssuerConfig, opts ...JWKSCacheOption) (*JWKSCache, 
 				return nil, fmt.Errorf("issuer URL must use HTTPS: %q", cfg.IssuerURL)
 			}
 		}
+		if cfg.JWKSURL != "" && !strings.HasPrefix(cfg.JWKSURL, "https://") {
+			return nil, fmt.Errorf("JWKS URL must use HTTPS: %q", cfg.JWKSURL)
+		}
 
 		state := &issuerState{
 			issuerURL: cfg.IssuerURL,
 			jwksFile:  cfg.JWKSFile,
+			jwksURI:   cfg.JWKSURL,
 			keys:      make(map[string]crypto.PublicKey),
 		}
 		cache.issuers[normIss] = state
