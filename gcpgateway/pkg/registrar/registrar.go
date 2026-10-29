@@ -65,9 +65,17 @@ func GCPErrorReasonAndMessage(err error) (string, string) {
 	} else if gcp.IsInvalidIP(err) {
 		return ReasonUnsupportedCluster, "Pod IP is not a valid VPC alias IP."
 	}
-	klog.Errorf("Endpoint attachment failed: %v", err)
 	return ReasonEndpointAttachmentFailed, "Failed to attach endpoints to zonal NEGs; see controller logs for details."
 }
+
+// Clock provides time abstraction for deterministic testing.
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
 
 // Config configures the NEG registrar.
 type Config struct {
@@ -79,6 +87,7 @@ type Config struct {
 	MinBackoff       time.Duration
 	MaxBackoff       time.Duration
 	Recorder         record.EventRecorder
+	Clock            Clock
 }
 
 // Registrar reconciles Kubernetes data plane pods into Google Cloud zonal NEGs.
@@ -89,6 +98,7 @@ type Registrar struct {
 	tracker   *HysteresisTracker
 	backoff   *BackoffTracker
 	recorder  record.EventRecorder
+	clock     Clock
 	mu        sync.Mutex
 }
 
@@ -97,6 +107,10 @@ func NewRegistrar(c client.Client, gcpClient gcp.ComputeClient, cfg Config) *Reg
 	if cfg.NegPrefix == "" {
 		cfg.NegPrefix = "gcpgw"
 	}
+	clock := cfg.Clock
+	if clock == nil {
+		clock = realClock{}
+	}
 	return &Registrar{
 		client:    c,
 		gcpClient: gcpClient,
@@ -104,7 +118,15 @@ func NewRegistrar(c client.Client, gcpClient gcp.ComputeClient, cfg Config) *Reg
 		tracker:   NewHysteresisTracker(cfg.HysteresisWindow),
 		backoff:   NewBackoffTracker(cfg.MinBackoff, cfg.MaxBackoff),
 		recorder:  cfg.Recorder,
+		clock:     clock,
 	}
+}
+
+func (r *Registrar) now() time.Time {
+	if r.clock != nil {
+		return r.clock.Now()
+	}
+	return time.Now()
 }
 
 // IsContainersReady returns true only if the pod has ContainersReady condition set to ConditionTrue.
@@ -291,22 +313,26 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	now := time.Now()
+	now := r.now()
 	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
 
-	if remaining, lastErr := r.backoff.Remaining(gwKey, now); remaining > 0 {
-		var podList corev1.PodList
+	// Fetch data plane pods for this Gateway once, checking the error to prevent dropped errors
+	var podList corev1.PodList
+	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
+	}
+
+	if remaining := r.backoff.Remaining(gwKey, now); remaining > 0 {
 		hasTerminatingPods := false
-		if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err == nil {
-			for i := range podList.Items {
-				pod := &podList.Items[i]
-				if pod.Labels[singlepod.LabelGatewayName] == gw.Name && pod.DeletionTimestamp != nil {
-					hasTerminatingPods = true
-					break
-				}
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if pod.Labels[singlepod.LabelGatewayName] == gw.Name && pod.DeletionTimestamp != nil {
+				hasTerminatingPods = true
+				break
 			}
 		}
 		if !hasTerminatingPods {
+			lastErr := r.backoff.LastError(gwKey)
 			klog.V(4).Infof("Skipping NEG reconciliation for Gateway %s: backing off for %v (last error: %v)", gwKey, remaining, lastErr)
 			return nil, fmt.Errorf("attaching endpoints for gateway %s: %w", gwKey, lastErr)
 		}
@@ -350,13 +376,7 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 		return result, nil
 	}
 
-	// 4. List data plane pods for this Gateway
-	var podList corev1.PodList
-	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
-		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
-	}
-
-	// Filter pods belonging to this Gateway
+	// 4. Filter data plane pods belonging to this Gateway
 	var activePods []desiredPod
 
 	for i := range podList.Items {
@@ -453,7 +473,8 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 			}
 			batch := toAttach[i:end]
 
-			if remaining, lastErr := r.backoff.Remaining(gwKey, now); remaining > 0 {
+			if remaining := r.backoff.Remaining(gwKey, now); remaining > 0 {
+				lastErr := r.backoff.LastError(gwKey)
 				klog.V(4).Infof("Skipping attach for NEG %s in zone %s: backing off for %v (last error: %v)", mn.neg.Name, mn.zone, remaining, lastErr)
 				return nil, fmt.Errorf("attaching endpoints to NEG %s: %w", mn.neg.Name, lastErr)
 			}
@@ -508,17 +529,12 @@ func (r *Registrar) BackoffRemaining(gw *gatewayv1.Gateway) time.Duration {
 	if gw == nil {
 		return 0
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
-	rem, _ := r.backoff.Remaining(gwKey, time.Now())
-	return rem
+	return r.backoff.Remaining(gwKey, r.now())
 }
 
 // ClearBackoff removes the backoff state for the given Gateway key.
 func (r *Registrar) ClearBackoff(gwKey string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.backoff.Clear(gwKey)
 }
 

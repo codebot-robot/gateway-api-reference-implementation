@@ -15,6 +15,7 @@
 package registrar
 
 import (
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -29,16 +30,18 @@ const (
 
 // BackoffTracker manages exponential backoff per key (such as Gateway namespace/name).
 type BackoffTracker struct {
+	// mu guards states and rand.
 	mu         sync.Mutex
 	minBackoff time.Duration
 	maxBackoff time.Duration
+	rand       *rand.Rand
 	states     map[string]*backoffState
 }
 
 type backoffState struct {
-	currentDuration time.Duration
-	retryAfter      time.Time
-	lastErr         error
+	baseDuration time.Duration
+	retryAfter   time.Time
+	lastErr      error
 }
 
 // NewBackoffTracker creates a new BackoffTracker with the given min and max backoff durations.
@@ -55,49 +58,58 @@ func NewBackoffTracker(minBackoff, maxBackoff time.Duration) *BackoffTracker {
 	return &BackoffTracker{
 		minBackoff: minBackoff,
 		maxBackoff: maxBackoff,
+		rand:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		states:     make(map[string]*backoffState),
 	}
 }
 
-// Remaining returns the duration remaining in backoff and the last error if key is in backoff at time now.
-// If not in backoff or backoff has elapsed, it returns 0 and nil.
-func (b *BackoffTracker) Remaining(key string, now time.Time) (time.Duration, error) {
+// Remaining returns the duration remaining in backoff if key is in backoff at time now.
+// If not in backoff or backoff has elapsed, it returns 0.
+func (b *BackoffTracker) Remaining(key string, now time.Time) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	st, exists := b.states[key]
 	if !exists {
-		return 0, nil
+		return 0
 	}
 	if now.Before(st.retryAfter) {
-		return st.retryAfter.Sub(now), st.lastErr
+		return st.retryAfter.Sub(now)
 	}
-	return 0, nil
+	return 0
 }
 
 // RecordFailure updates the backoff state for key after a failure, doubling the backoff
-// duration up to maxBackoff, and returns the new backoff duration.
+// duration up to maxBackoff with ±10% jitter, and returns the new backoff duration.
 func (b *BackoffTracker) RecordFailure(key string, err error, now time.Time) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	st, exists := b.states[key]
-	var duration time.Duration
-	if !exists {
-		duration = b.minBackoff
-		b.states[key] = &backoffState{
-			currentDuration: duration,
-			retryAfter:      now.Add(duration),
-			lastErr:         err,
-		}
-		return duration
+	if b.rand == nil {
+		b.rand = rand.New(rand.NewSource(now.UnixNano()))
 	}
 
-	duration = st.currentDuration * 2
+	st, exists := b.states[key]
+	var base time.Duration
+	if !exists {
+		base = b.minBackoff
+		st = &backoffState{baseDuration: base}
+		b.states[key] = st
+	} else {
+		base = st.baseDuration * 2
+		if base > b.maxBackoff {
+			base = b.maxBackoff
+		}
+		st.baseDuration = base
+	}
+
+	// Apply ±10% jitter: factor between 0.9 and 1.1
+	jitterFactor := 0.9 + 0.2*b.rand.Float64()
+	duration := time.Duration(float64(base) * jitterFactor)
 	if duration > b.maxBackoff {
 		duration = b.maxBackoff
 	}
-	st.currentDuration = duration
+
 	st.retryAfter = now.Add(duration)
 	st.lastErr = err
 	return duration
@@ -117,7 +129,7 @@ func (b *BackoffTracker) Clear(key string) {
 	delete(b.states, key)
 }
 
-// LastError returns the most recent error recorded for key.
+// LastError returns the most recent error recorded for key, if any.
 func (b *BackoffTracker) LastError(key string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

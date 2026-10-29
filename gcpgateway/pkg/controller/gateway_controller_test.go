@@ -772,9 +772,9 @@ func TestGateway_BackoffRequeueAndMessage(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// RequeueAfter should match the backoff duration (<= 200ms)
-	if res.RequeueAfter <= 0 || res.RequeueAfter > 200*time.Millisecond {
-		t.Errorf("expected RequeueAfter to reflect minBackoff (<=200ms), got %v", res.RequeueAfter)
+	// RequeueAfter should match the backoff duration (200ms with ±10% jitter => [180ms, 220ms])
+	if res.RequeueAfter < 180*time.Millisecond || res.RequeueAfter > 220*time.Millisecond {
+		t.Errorf("expected RequeueAfter in [180ms, 220ms], got %v", res.RequeueAfter)
 	}
 
 	cached := reconciler.GetCachedStatus(req.NamespacedName)
