@@ -38,7 +38,7 @@ import (
 
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/jwt"
 )
 
 // Helper to sign RS256 token
