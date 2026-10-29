@@ -564,3 +564,117 @@ func TestRegistrar_ErrorHandling(t *testing.T) {
 		})
 	}
 }
+
+// TestRegistrar_DetachAll tests that DetachAll and ReconcileEndpoints on a deleting Gateway
+// cleanly detach all endpoints from all matched zonal NEGs across all ports and zones.
+func TestRegistrar_DetachAll(t *testing.T) {
+	scheme := setupTestScheme()
+	gw := makeTestGateway("default", "del-gw", time.Now())
+	nodeA := makeTestNode("node-a", "us-central1-a", "gke-node-a")
+	nodeB := makeTestNode("node-b", "us-central1-b", "gke-node-b")
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, nodeA, nodeB).
+		Build()
+
+	makeTestPod(t, k8sClient, gw, "dp-pod-a", "node-a", "10.0.1.5", true, true, false)
+	makeTestPod(t, k8sClient, gw, "dp-pod-b", "node-b", "10.0.2.6", true, true, false)
+
+	fakeGCP := gcp.NewFakeComputeClient()
+
+	desc8080, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "del-gw",
+		Port:        8080,
+	}).Encode()
+	desc8443, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "del-gw",
+		Port:        8443,
+	}).Encode()
+
+	neg8080A := metadata.ResourceName("gcpgw", "cluster-1", "default", "del-gw", "8080")
+	neg8443A := metadata.ResourceName("gcpgw", "cluster-1", "default", "del-gw", "8443")
+	neg8443B := metadata.ResourceName("gcpgw", "cluster-1", "default", "del-gw", "8443")
+
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        neg8080A,
+		Zone:        "us-central1-a",
+		Description: desc8080,
+	})
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        neg8443A,
+		Zone:        "us-central1-a",
+		Description: desc8443,
+	})
+	fakeGCP.AddNEG("my-project", "us-central1-b", &compute.NetworkEndpointGroup{
+		Name:        neg8443B,
+		Zone:        "us-central1-b",
+		Description: desc8443,
+	})
+
+	// Pre-populate endpoints in all NEGs
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8080A, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-a", IpAddress: "10.0.1.5", Port: 8080},
+	})
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443A, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-a", IpAddress: "10.0.1.5", Port: 8443},
+	})
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-b", neg8443B, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-b", IpAddress: "10.0.2.6", Port: 8443},
+	})
+
+	reg := NewRegistrar(k8sClient, fakeGCP, Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a", "us-central1-b"},
+	})
+
+	// 1. Explicit DetachAll call
+	res, err := reg.DetachAll(t.Context(), gw)
+	if err != nil {
+		t.Fatalf("DetachAll failed: %v", err)
+	}
+	if res.DetachedCount != 3 {
+		t.Errorf("expected 3 detached endpoints, got %d", res.DetachedCount)
+	}
+
+	for _, tc := range []struct {
+		zone, neg string
+	}{
+		{"us-central1-a", neg8080A},
+		{"us-central1-a", neg8443A},
+		{"us-central1-b", neg8443B},
+	} {
+		eps, err := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", tc.zone, tc.neg)
+		if err != nil {
+			t.Fatalf("listing endpoints for %s/%s: %v", tc.zone, tc.neg, err)
+		}
+		if len(eps) != 0 {
+			t.Errorf("expected 0 endpoints in %s/%s, got %d", tc.zone, tc.neg, len(eps))
+		}
+	}
+
+	// 2. ReconcileEndpoints on deleting Gateway (gw.DeletionTimestamp != nil)
+	_ = fakeGCP.AttachNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443A, []*compute.NetworkEndpoint{
+		{Instance: "gke-node-a", IpAddress: "10.0.1.5", Port: 8443},
+	})
+	now := metav1.Now()
+	gw.DeletionTimestamp = &now
+	res2, err := reg.ReconcileEndpoints(t.Context(), gw)
+	if err != nil {
+		t.Fatalf("ReconcileEndpoints on deleting gateway failed: %v", err)
+	}
+	if res2.DetachedCount != 1 {
+		t.Errorf("expected 1 detached endpoint, got %d", res2.DetachedCount)
+	}
+	epsAfter, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443A)
+	if len(epsAfter) != 0 {
+		t.Errorf("expected 0 endpoints remaining, got %d", len(epsAfter))
+	}
+}
