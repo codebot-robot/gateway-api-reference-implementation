@@ -1,0 +1,52 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package certserver.v1;
+
+option go_package = "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1;certserverv1";
+
+// CertificateService provides TLS certificate retrieval for GARI controllers.
+service CertificateService {
+  // GetCertificate retrieves a certificate chain (and private key in release mode)
+  // for the specified hostnames and Gateway. If not already cached, issuance is
+  // started asynchronously and a retryable status (Unavailable) is returned.
+  rpc GetCertificate(GetCertificateRequest) returns (GetCertificateResponse);
+}
+
+message GetCertificateRequest {
+  // The hostnames requested for the certificate.
+  repeated string hostnames = 1;
+
+  // The Gateway resource identity in "namespace/name" format.
+  string gateway = 2;
+
+  // The service account of the data plane that will serve this Gateway.
+  string data_plane_service_account = 3;
+
+  // Optional explicit cluster ID. If omitted, derived from the caller's verified token issuer.
+  string cluster_id = 4;
+
+  // Optional bearer token if not passed in gRPC Authorization metadata.
+  string token = 5;
+}
+
+message GetCertificateResponse {
+  // PEM-encoded certificate chain (leaf certificate followed by intermediate CA certificates).
+  bytes certificate_chain = 1;
+
+  // PEM-encoded private key for the leaf certificate (present only in release mode).
+  bytes private_key = 2;
+}
