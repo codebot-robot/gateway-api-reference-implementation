@@ -447,7 +447,7 @@ func TestBuildGatewayDataplaneConfig_Scoping(t *testing.T) {
 		t.Fatalf("expected compiled gateway for gw-a")
 	}
 
-	cfgA, err := BuildGatewayDataplaneConfig(cgA, secrets, nil)
+	cfgA, err := BuildGatewayDataplaneConfig(cgA)
 	if err != nil {
 		t.Fatalf("BuildGatewayDataplaneConfig failed: %v", err)
 	}

@@ -25,7 +25,6 @@ import (
 	"sort"
 	"sync"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -276,17 +275,13 @@ func (cfg *DataplaneConfig) ExtractBackendClientCertificate() (*tls.Certificate,
 }
 
 // BuildGatewayDataplaneConfig builds a DataplaneConfig for a single compiled Gateway.
-func BuildGatewayDataplaneConfig(
-	cg *CompiledGateway,
-	secrets map[types.NamespacedName]*corev1.Secret,
-	refValidator ReferenceGrantValidator,
-) (*DataplaneConfig, error) {
+func BuildGatewayDataplaneConfig(cg *CompiledGateway) (*DataplaneConfig, error) {
 	if cg == nil || cg.Gateway == nil {
 		return nil, nil
 	}
 	gwKey := types.NamespacedName{Namespace: cg.Gateway.Namespace, Name: cg.Gateway.Name}
 	listeners, routes := BuildProxyConfig([]*CompiledGateway{cg})
-	certsMap, defaultCert := ExtractCertificates([]*CompiledGateway{cg}, secrets, refValidator)
+	certsMap, defaultCert := ExtractCertificates([]*CompiledGateway{cg})
 	backendClientCert := cg.BackendClientCert
 
 	cfg, err := BuildDataplaneConfig(gwKey, listeners, routes, certsMap, defaultCert, backendClientCert)

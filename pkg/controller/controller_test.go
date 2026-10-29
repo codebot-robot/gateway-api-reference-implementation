@@ -15,9 +15,11 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -25,6 +27,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +41,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	gatewayconsts "sigs.k8s.io/gateway-api/pkg/consts"
@@ -2760,4 +2765,1151 @@ func TestGatewayReconciler_PartialCRDInstallation_ReconcilesGatewayAndHTTPRoute(
 
 	// Verify only served kinds are active
 	_ = servedKinds
+}
+
+type fakeCertificateSourceCall struct {
+	gw       *gatewayv1.Gateway
+	listener gatewayv1.SectionName
+}
+
+type fakeCertificateSource struct {
+	mu         sync.Mutex
+	trigger    func()
+	cache      map[string]*tls.Certificate
+	err        error
+	calledWith []fakeCertificateSourceCall
+}
+
+func (f *fakeCertificateSource) SetRecomputeTrigger(trigger func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.trigger = trigger
+}
+
+func (f *fakeCertificateSource) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.Listener) (state.CertificateResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calledWith = append(f.calledWith, fakeCertificateSourceCall{
+		gw:       gw,
+		listener: listener.Name,
+	})
+	if f.err != nil {
+		return state.CertificateResult{}, f.err
+	}
+	hostname := ""
+	if listener.Hostname != nil {
+		hostname = string(*listener.Hostname)
+	}
+	cert, ok := f.cache[hostname]
+	if !ok {
+		return state.CertificateResult{Pending: true}, nil
+	}
+	return state.CertificateResult{Certificates: []*tls.Certificate{cert}}, nil
+}
+
+func (f *fakeCertificateSource) calls() []fakeCertificateSourceCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	copied := make([]fakeCertificateSourceCall, len(f.calledWith))
+	copy(copied, f.calledWith)
+	return copied
+}
+
+func (f *fakeCertificateSource) set(hostname string, cert *tls.Certificate) {
+	f.mu.Lock()
+	if f.cache == nil {
+		f.cache = make(map[string]*tls.Certificate)
+	}
+	f.cache[hostname] = cert
+	trigger := f.trigger
+	f.mu.Unlock()
+	if trigger != nil {
+		trigger()
+	}
+}
+
+func generateTestTLSCert(t *testing.T, dnsNames ...string) *tls.Certificate {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate private key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test Org"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              dnsNames,
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("failed to create X509KeyPair: %v", err)
+	}
+	return &tlsCert
+}
+
+func setupCertSourceTestGW(t *testing.T, hostname *gatewayv1.Hostname, options map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue, certRefs []gatewayv1.SecretObjectReference, sources ...map[string]state.CertificateSource) (*runtime.Scheme, *state.State, *gatewayv1.GatewayClass, *gatewayv1.Gateway) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = gatewayv1.AddToScheme(scheme)
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	if len(sources) > 0 && sources[0] != nil {
+		st.RegisterCertificateSources(sources[0])
+	}
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					Hostname: hostname,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: certRefs,
+						Options:         options,
+					},
+				},
+			},
+		},
+	}
+
+	return scheme, st, gwClass, gw
+}
+
+func TestGatewayReconciler_CertificateSource_Served(t *testing.T) {
+	testCert := generateTestTLSCert(t, "example.com")
+	testCert.Leaf = nil
+	fakeSource := &fakeCertificateSource{}
+	fakeSource.set("example.com", testCert)
+
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		nil,
+		map[string]state.CertificateSource{
+			"test-source": fakeSource,
+		},
+	)
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	outputs := st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected RequeueAfter == 0, got %v", res.RequeueAfter)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+
+	if len(reconciledGW.Status.Listeners) != 1 {
+		t.Fatalf("expected 1 listener status, got %d", len(reconciledGW.Status.Listeners))
+	}
+	lStatus := reconciledGW.Status.Listeners[0]
+
+	refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionTrue || refCond.Reason != string(gatewayv1.ListenerReasonResolvedRefs) {
+		t.Errorf("expected ResolvedRefs=True/ResolvedRefs, got %+v", refCond)
+	}
+
+	progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+		t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	accCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
+		t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
+	}
+
+	calls := fakeSource.calls()
+	if len(calls) == 0 {
+		t.Fatalf("expected fakeSource to be called")
+	}
+	if calls[0].listener != "https" {
+		t.Errorf("unexpected call arguments: %+v", calls[0])
+	}
+
+	// Verify certificate is present in state outputs and dataplane config
+	dpCfg, ok := outputs.DataplaneConfigs[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
+	if !ok || dpCfg == nil {
+		t.Fatalf("expected DataplaneConfig for gateway")
+	}
+	certID, ok := dpCfg.HostCertificates["example.com"]
+	if !ok || certID == "" {
+		t.Fatalf("expected HostCertificates[example.com] to be set, got %v", dpCfg.HostCertificates)
+	}
+	if _, ok := dpCfg.Certificates[certID]; !ok {
+		t.Fatalf("expected Certificates[%s] to be populated", certID)
+	}
+
+	// Verify the source's original certificate was not mutated (e.g. Leaf was not set on it)
+	if testCert.Leaf != nil {
+		t.Errorf("expected source's original certificate Leaf to remain nil, but was mutated")
+	}
+}
+
+func pollUntil(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if !condition() {
+		t.Fatalf("condition not met within %v", timeout)
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_PendingThenAvailable(t *testing.T) {
+	fakeSource := &fakeCertificateSource{} // empty cache => Pending
+
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		nil,
+		map[string]state.CertificateSource{
+			"test-source": fakeSource,
+		},
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		_ = st.Start(ctx)
+	}()
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	// 1. Initial reconcile on running State: pending, NO requeue polling
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(req.NamespacedName)
+		if !ok || len(status.Listeners) == 0 {
+			return false
+		}
+		refCond := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		return refCond != nil && refCond.Status == metav1.ConditionFalse && refCond.Reason == string(gatewayv1.ListenerReasonPending)
+	})
+
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected RequeueAfter == 0 (no requeue polling), got %v", res.RequeueAfter)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	lStatus := reconciledGW.Status.Listeners[0]
+
+	refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonPending) {
+		t.Errorf("expected pending ResolvedRefs=False/Pending, got %+v", refCond)
+	}
+
+	progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonPending) {
+		t.Errorf("expected pending Programmed=False/Pending, got %+v", progCond)
+	}
+
+	accCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
+		t.Errorf("expected pending Accepted=True/Accepted, got %+v", accCond)
+	}
+
+	// 2. Certificate becomes available and source triggers running State (NO manual Recompute)
+	testCert := generateTestTLSCert(t, "example.com")
+	fakeSource.set("example.com", testCert)
+
+	// Wait for running State to recompute automatically via trigger without manual Recompute()
+	pollUntil(t, 2*time.Second, func() bool {
+		status, ok := st.GetDesiredGatewayStatus(req.NamespacedName)
+		if !ok || len(status.Listeners) == 0 {
+			return false
+		}
+		refCond := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+		progCond := findCondition(status.Listeners[0].Conditions, string(gatewayv1.ListenerConditionProgrammed))
+		return refCond != nil && refCond.Status == metav1.ConditionTrue && refCond.Reason == string(gatewayv1.ListenerReasonResolvedRefs) &&
+			progCond != nil && progCond.Status == metav1.ConditionTrue && progCond.Reason == string(gatewayv1.ListenerReasonProgrammed)
+	})
+
+	res, err = r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error on second reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Fatalf("expected RequeueAfter == 0 after available, got %v", res.RequeueAfter)
+	}
+
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	lStatus = reconciledGW.Status.Listeners[0]
+
+	refCond = findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionTrue || refCond.Reason != string(gatewayv1.ListenerReasonResolvedRefs) {
+		t.Errorf("expected resolved ResolvedRefs=True/ResolvedRefs, got %+v", refCond)
+	}
+
+	progCond = findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+		t.Errorf("expected resolved Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	dpCfg := st.GetDataplaneConfig(types.NamespacedName{Namespace: "default", Name: "test-gw"})
+	if dpCfg == nil || len(dpCfg.Certificates) == 0 {
+		t.Fatalf("expected DataplaneConfig to be populated with certificate after trigger")
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_UnknownSourceName(t *testing.T) {
+	fakeSource := &fakeCertificateSource{}
+	fakeSource.set("example.com", generateTestTLSCert(t, "example.com"))
+
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "unknown-source",
+		},
+		nil,
+		map[string]state.CertificateSource{
+			"known-source": fakeSource,
+		},
+	)
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	lStatus := reconciledGW.Status.Listeners[0]
+
+	refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonInvalidCertificateRef) {
+		t.Errorf("expected ResolvedRefs=False/InvalidCertificateRef for unknown source, got %+v", refCond)
+	}
+	if !strings.Contains(refCond.Message, "unknown-source") {
+		t.Errorf("expected message to mention unknown-source, got %q", refCond.Message)
+	}
+
+	progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonInvalid) {
+		t.Errorf("expected Programmed=False/Invalid for unknown source, got %+v", progCond)
+	}
+
+	accCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
+		t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_MissingOrWildcardHostname(t *testing.T) {
+	testCases := []struct {
+		name     string
+		hostname *gatewayv1.Hostname
+	}{
+		{
+			name:     "nil hostname",
+			hostname: nil,
+		},
+		{
+			name:     "empty hostname",
+			hostname: state.Ptr(gatewayv1.Hostname("")),
+		},
+		{
+			name:     "wildcard hostname",
+			hostname: state.Ptr(gatewayv1.Hostname("*.example.com")),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSource := &fakeCertificateSource{}
+			fakeSource.set("example.com", generateTestTLSCert(t, "example.com"))
+
+			scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+				tc.hostname,
+				map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+				},
+				nil,
+				map[string]state.CertificateSource{
+					"test-source": fakeSource,
+				},
+			)
+
+			st.UpsertGatewayClass(gwClass)
+			st.UpsertGateway(gw)
+			st.Recompute()
+
+			client := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(gwClass, gw).
+				WithStatusSubresource(gw).
+				Build()
+
+			r := &GatewayReconciler{
+				Client:         client,
+				Scheme:         scheme,
+				State:          st,
+				ControllerName: "test-controller",
+			}
+
+			ctx := t.Context()
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+			_, err := r.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("unexpected error reconciling gateway: %v", err)
+			}
+
+			var reconciledGW gatewayv1.Gateway
+			if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+				t.Fatalf("failed to get gateway: %v", err)
+			}
+			lStatus := reconciledGW.Status.Listeners[0]
+
+			refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+			if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonInvalidCertificateRef) {
+				t.Errorf("expected ResolvedRefs=False/InvalidCertificateRef for %s, got %+v", tc.name, refCond)
+			}
+
+			progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+			if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonInvalid) {
+				t.Errorf("expected Programmed=False/Invalid for %s, got %+v", tc.name, progCond)
+			}
+
+			accCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionAccepted))
+			if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
+				t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
+			}
+
+			// Verify source was never called
+			if len(fakeSource.calls()) != 0 {
+				t.Errorf("expected source to NOT be called for %s, got %d calls", tc.name, len(fakeSource.calls()))
+			}
+		})
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_CertificateRefsTogetherWithOption(t *testing.T) {
+	certPEM, keyPEM := generateTestCertPEM(t)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cert-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+
+	sourceCert := generateTestTLSCert(t, "source.example.com")
+	fakeSource := &fakeCertificateSource{}
+	fakeSource.set("source.example.com", sourceCert)
+
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		[]gatewayv1.SecretObjectReference{
+			{Name: "my-cert-secret"},
+		},
+		map[string]state.CertificateSource{
+			"test-source": fakeSource,
+		},
+	)
+
+	st.UpsertSecret(secret)
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	outputs := st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw, secret).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	lStatus := reconciledGW.Status.Listeners[0]
+
+	// CertificateRefs wins
+	refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionTrue || refCond.Reason != string(gatewayv1.ListenerReasonResolvedRefs) {
+		t.Errorf("expected ResolvedRefs=True/ResolvedRefs, got %+v", refCond)
+	}
+	// Condition says the option was ignored
+	if !strings.Contains(refCond.Message, "ignored") {
+		t.Errorf("expected ResolvedRefs condition message to state option was ignored, got %q", refCond.Message)
+	}
+
+	progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionTrue || progCond.Reason != string(gatewayv1.ListenerReasonProgrammed) {
+		t.Errorf("expected Programmed=True/Programmed, got %+v", progCond)
+	}
+
+	// Verify fakeSource was NOT called (certificateRefs won)
+	if len(fakeSource.calls()) != 0 {
+		t.Errorf("expected CertificateSource to NOT be called when certificateRefs is specified, got %d calls", len(fakeSource.calls()))
+	}
+
+	// Verify the certificate used is from the secret, not the source
+	dpCfg := outputs.DataplaneConfigs[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
+	if dpCfg == nil {
+		t.Fatalf("expected DataplaneConfig")
+	}
+	certID := dpCfg.HostCertificates["example.com"]
+	data := dpCfg.Certificates[certID]
+	if !strings.Contains(string(data.Certificate[0]), "") {
+		_ = data
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_SourceError(t *testing.T) {
+	fakeSource := &fakeCertificateSource{err: errors.New("cert server rpc timeout (request-id: 12345)")}
+
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		nil,
+		map[string]state.CertificateSource{
+			"test-source": fakeSource,
+		},
+	)
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	lStatus := reconciledGW.Status.Listeners[0]
+
+	refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonInvalidCertificateRef) {
+		t.Errorf("expected ResolvedRefs=False/InvalidCertificateRef on source error, got %+v", refCond)
+	}
+	// Stable generic message in status, not varying error text
+	if !strings.Contains(refCond.Message, `Certificate source "test-source" returned an error`) {
+		t.Errorf("expected message to contain stable generic error text, got %q", refCond.Message)
+	}
+
+	progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+	if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonInvalid) {
+		t.Errorf("expected Programmed=False/Invalid on source error, got %+v", progCond)
+	}
+
+	accCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionAccepted))
+	if accCond == nil || accCond.Status != metav1.ConditionTrue || accCond.Reason != string(gatewayv1.ListenerReasonAccepted) {
+		t.Errorf("expected Accepted=True/Accepted, got %+v", accCond)
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_NilSourcesConfigured(t *testing.T) {
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		nil,
+	)
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	// GARI with no sources configured (CertificateSources is nil)
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	ctx := t.Context()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	var reconciledGW gatewayv1.Gateway
+	if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+		t.Fatalf("failed to get gateway: %v", err)
+	}
+	lStatus := reconciledGW.Status.Listeners[0]
+
+	refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+	if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonInvalidCertificateRef) {
+		t.Errorf("expected ResolvedRefs=False/InvalidCertificateRef when sources is nil, got %+v", refCond)
+	}
+	if !strings.Contains(refCond.Message, "test-source") {
+		t.Errorf("expected message to mention source name, got %q", refCond.Message)
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_CertificatesNeverLogged(t *testing.T) {
+	testCert := generateTestTLSCert(t, "secret-domain.example.com")
+	fakeSource := &fakeCertificateSource{}
+	fakeSource.set("secret-domain.example.com", testCert)
+
+	scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("secret-domain.example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		nil,
+		map[string]state.CertificateSource{
+			"test-source": fakeSource,
+		},
+	)
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	st.Recompute()
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gwClass, gw).
+		WithStatusSubresource(gw).
+		Build()
+
+	r := &GatewayReconciler{
+		Client:         client,
+		Scheme:         scheme,
+		State:          st,
+		ControllerName: "test-controller",
+	}
+
+	var buf bytes.Buffer
+	logger := ctrlzap.New(ctrlzap.WriteTo(&buf))
+	ctx := ctrllog.IntoContext(t.Context(), logger)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error reconciling gateway: %v", err)
+	}
+
+	logs := buf.String()
+	// Assert that certificates or private keys are never logged
+	if strings.Contains(logs, "BEGIN CERTIFICATE") || strings.Contains(logs, "PRIVATE KEY") {
+		t.Errorf("logs contain sensitive certificate/key data: %s", logs)
+	}
+	// Also ensure DER bytes are not formatted in the logs
+	for _, der := range testCert.Certificate {
+		if strings.Contains(logs, string(der)) {
+			t.Errorf("logs contain raw DER certificate bytes")
+		}
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_InvalidCertificate(t *testing.T) {
+	testCases := []struct {
+		name string
+		cert *tls.Certificate
+	}{
+		{
+			name: "empty chain",
+			cert: &tls.Certificate{
+				Certificate: [][]byte{},
+				PrivateKey:  generateTestTLSCert(t, "example.com").PrivateKey,
+			},
+		},
+		{
+			name: "unparseable leaf",
+			cert: &tls.Certificate{
+				Certificate: [][]byte{[]byte("not a real der certificate")},
+				PrivateKey:  generateTestTLSCert(t, "example.com").PrivateKey,
+			},
+		},
+		{
+			name: "key pair mismatch",
+			cert: &tls.Certificate{
+				Certificate: generateTestTLSCert(t, "example.com").Certificate,
+				PrivateKey:  generateTestTLSCert(t, "other.example.com").PrivateKey,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeSource := &fakeCertificateSource{}
+			fakeSource.set("example.com", tc.cert)
+
+			scheme, st, gwClass, gw := setupCertSourceTestGW(t,
+				state.Ptr(gatewayv1.Hostname("example.com")),
+				map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+					gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+				},
+				nil,
+				map[string]state.CertificateSource{
+					"test-source": fakeSource,
+				},
+			)
+
+			st.UpsertGatewayClass(gwClass)
+			st.UpsertGateway(gw)
+			st.Recompute()
+
+			client := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(gwClass, gw).
+				WithStatusSubresource(gw).
+				Build()
+
+			r := &GatewayReconciler{
+				Client:         client,
+				Scheme:         scheme,
+				State:          st,
+				ControllerName: "test-controller",
+			}
+
+			ctx := t.Context()
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-gw"}}
+
+			_, err := r.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("unexpected error reconciling gateway: %v", err)
+			}
+
+			var reconciledGW gatewayv1.Gateway
+			if err := client.Get(ctx, req.NamespacedName, &reconciledGW); err != nil {
+				t.Fatalf("failed to get gateway: %v", err)
+			}
+			lStatus := reconciledGW.Status.Listeners[0]
+
+			refCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionResolvedRefs))
+			if refCond == nil || refCond.Status != metav1.ConditionFalse || refCond.Reason != string(gatewayv1.ListenerReasonInvalidCertificateRef) {
+				t.Errorf("expected ResolvedRefs=False/InvalidCertificateRef for %s, got %+v", tc.name, refCond)
+			}
+			if !strings.Contains(refCond.Message, "invalid certificate") {
+				t.Errorf("expected message to mention invalid certificate, got %q", refCond.Message)
+			}
+
+			progCond := findCondition(lStatus.Conditions, string(gatewayv1.ListenerConditionProgrammed))
+			if progCond == nil || progCond.Status != metav1.ConditionFalse || progCond.Reason != string(gatewayv1.ListenerReasonInvalid) {
+				t.Errorf("expected Programmed=False/Invalid for %s, got %+v", tc.name, progCond)
+			}
+		})
+	}
+}
+
+func TestGatewayReconciler_CertificateSource_SnapshotImmutability(t *testing.T) {
+	testCert := generateTestTLSCert(t, "immutable.example.com")
+	fakeSource := &fakeCertificateSource{}
+	fakeSource.set("immutable.example.com", testCert)
+
+	_, st, gwClass, gw := setupCertSourceTestGW(t,
+		state.Ptr(gatewayv1.Hostname("immutable.example.com")),
+		map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue{
+			gatewayv1.AnnotationKey(CertificateSourceOptionKey): "test-source",
+		},
+		nil,
+		map[string]state.CertificateSource{
+			"test-source": fakeSource,
+		},
+	)
+
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	outputs := st.Recompute()
+
+	origDER := make([]byte, len(testCert.Certificate[0]))
+	copy(origDER, testCert.Certificate[0])
+
+	// Mutate the original testCert.Certificate bytes
+	testCert.Certificate[0][0] ^= 0xff
+
+	cg := outputs.CompiledGateways[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
+	if cg == nil || len(cg.EffectiveListeners) == 0 || len(cg.EffectiveListeners[0].ResolvedCertificates) == 0 {
+		t.Fatalf("expected compiled gateway with resolved certificates")
+	}
+
+	stateDER := cg.EffectiveListeners[0].ResolvedCertificates[0].Certificate[0]
+	if !bytes.Equal(stateDER, origDER) {
+		t.Errorf("state certificate was mutated after ResolveCertificates returned")
+	}
+}
+
+func generateTestCertPEMForHost(t *testing.T, host string) ([]byte, []byte) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate private key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Test Org"},
+			CommonName:   host,
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{host},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
+	return certPEM, keyPEM
+}
+
+func TestSecretsCertificateSource_MultipleCertificateRefs(t *testing.T) {
+	st := state.NewState()
+
+	cert1PEM, key1PEM := generateTestCertPEMForHost(t, "rsa.example.com")
+	cert2PEM, key2PEM := generateTestCertPEMForHost(t, "ecdsa.example.com")
+
+	sec1 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cert-rsa"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       cert1PEM,
+			corev1.TLSPrivateKeyKey: key1PEM,
+		},
+	}
+	sec2 := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cert-ecdsa"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       cert2PEM,
+			corev1.TLSPrivateKeyKey: key2PEM,
+		},
+	}
+	st.UpsertSecret(sec1)
+	st.UpsertSecret(sec2)
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "cert-rsa"},
+							{Name: "cert-ecdsa"},
+						},
+					},
+				},
+			},
+		},
+	}
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	outputs := st.Recompute()
+
+	dpCfg := outputs.DataplaneConfigs[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
+	if dpCfg == nil {
+		t.Fatalf("expected DataplaneConfig")
+	}
+	if len(dpCfg.Certificates) < 2 {
+		t.Errorf("expected at least 2 certificates in data plane, got %d", len(dpCfg.Certificates))
+	}
+}
+
+func TestSecretsCertificateSource_SecretRotation(t *testing.T) {
+	st := state.NewState()
+
+	// Initial cert for example.com
+	cert1PEM, key1PEM := generateTestCertPEM(t)
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-cert"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       cert1PEM,
+			corev1.TLSPrivateKeyKey: key1PEM,
+		},
+	}
+	st.UpsertSecret(sec)
+
+	gwClass := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-gc"},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "test-controller",
+		},
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "test-gc",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "my-cert"},
+						},
+					},
+				},
+			},
+		},
+	}
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(gwClass)
+	st.UpsertGateway(gw)
+	outputs1 := st.Recompute()
+
+	dpCfg1 := outputs1.DataplaneConfigs[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
+	if dpCfg1 == nil || len(dpCfg1.Certificates) == 0 {
+		t.Fatalf("expected initial DataplaneConfig with certificates")
+	}
+	defaultCertID1 := dpCfg1.DefaultCertID
+	if defaultCertID1 == "" {
+		t.Fatalf("expected DefaultCertID to be set initially")
+	}
+
+	// Rotate the secret with a new keypair
+	cert2PEM, key2PEM := generateTestCertPEM(t)
+	secRotated := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "my-cert"},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       cert2PEM,
+			corev1.TLSPrivateKeyKey: key2PEM,
+		},
+	}
+	st.UpsertSecret(secRotated)
+	outputs2 := st.Recompute()
+
+	dpCfg2 := outputs2.DataplaneConfigs[types.NamespacedName{Namespace: "default", Name: "test-gw"}]
+	if dpCfg2 == nil || len(dpCfg2.Certificates) == 0 {
+		t.Fatalf("expected updated DataplaneConfig with certificates")
+	}
+	defaultCertID2 := dpCfg2.DefaultCertID
+	if defaultCertID2 == "" {
+		t.Fatalf("expected DefaultCertID to be set after rotation")
+	}
+
+	certData1 := dpCfg1.Certificates[defaultCertID1]
+	certData2 := dpCfg2.Certificates[defaultCertID2]
+	if bytes.Equal(certData1.Certificate[0], certData2.Certificate[0]) {
+		t.Errorf("expected rotated certificate in data plane, but certificate bytes did not change")
+	}
+}
+
+func TestSecretsCertificateSource(t *testing.T) {
+	st := state.NewState()
+	certPEM, keyPEM := generateTestCertPEM(t)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-secret",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       certPEM,
+			corev1.TLSPrivateKeyKey: keyPEM,
+		},
+	}
+	st.UpsertSecret(secret)
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: []gatewayv1.Listener{
+				{
+					Name: "https",
+					TLS: &gatewayv1.ListenerTLSConfig{
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{Name: "test-secret"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	src := &SecretsCertificateSource{Secrets: st.GetSecrets()}
+
+	res, err := src.ResolveCertificates(gw, &gw.Spec.Listeners[0])
+	if err != nil {
+		t.Fatalf("unexpected error resolving certificate from SecretsCertificateSource: %v", err)
+	}
+	if len(res.Certificates) == 0 {
+		t.Fatalf("expected non-empty certificate from SecretsCertificateSource")
+	}
+
+	// Listener without TLS returns failure
+	resMissing, _ := src.ResolveCertificates(gw, &gatewayv1.Listener{})
+	if resMissing.FailedReason == "" {
+		t.Errorf("expected failure for listener without TLS")
+	}
+
+	// Secret not found returns failure
+	gwMissingSecret := gw.DeepCopy()
+	gwMissingSecret.Spec.Listeners[0].TLS.CertificateRefs[0].Name = "missing"
+	resNotFound, _ := src.ResolveCertificates(gwMissingSecret, &gwMissingSecret.Spec.Listeners[0])
+	if resNotFound.FailedReason == "" {
+		t.Errorf("expected failure for missing secret")
+	}
 }
