@@ -16,7 +16,6 @@ package registry
 
 import (
 	"bytes"
-	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -195,7 +194,7 @@ func TestTokenVerification(t *testing.T) {
 	}
 	defer reg.Close()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 
 	// 1. Valid token

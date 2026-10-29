@@ -58,6 +58,12 @@ func NormalizeHostnames(hostnames []string, maxHostnames, maxLen int) ([]string,
 			return nil, "", fmt.Errorf("%w: empty hostname in list", ErrInvalidHostname)
 		}
 
+		// Normalize trailing dot
+		h = strings.TrimSuffix(h, ".")
+		if h == "" {
+			return nil, "", fmt.Errorf("%w: empty hostname in list", ErrInvalidHostname)
+		}
+
 		if strings.Contains(h, "*") {
 			return nil, "", fmt.Errorf("%w: %q", ErrWildcardNotSupported, h)
 		}
@@ -66,8 +72,8 @@ func NormalizeHostnames(hostnames []string, maxHostnames, maxLen int) ([]string,
 			return nil, "", fmt.Errorf("%w: %q has length %d (max %d)", ErrHostnameTooLong, h, len(h), maxLen)
 		}
 
-		// Disallow leading or trailing dots, and consecutive dots
-		if strings.HasPrefix(h, ".") || strings.HasSuffix(h, ".") || strings.Contains(h, "..") {
+		// Disallow leading dots or consecutive dots
+		if strings.HasPrefix(h, ".") || strings.Contains(h, "..") {
 			return nil, "", fmt.Errorf("%w: %q contains invalid dots", ErrInvalidHostname, h)
 		}
 

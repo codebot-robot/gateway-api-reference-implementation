@@ -136,7 +136,7 @@ func TestManager_Pebble_Issuance(t *testing.T) {
 
 	// Verify file permissions
 	hKey := "api.example.com,web.example.com"
-	cached, err := mgr.Cache().Get(hKey)
+	cached, err := mgr.cache.Get(hKey)
 	if err != nil {
 		t.Fatalf("Cache.Get failed: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestManager_Pebble_Renewal(t *testing.T) {
 	}
 
 	// Verify new certificate was issued and cached
-	cert2, err := mgr.Cache().Get("renew.example.com")
+	cert2, err := mgr.cache.Get("renew.example.com")
 	if err != nil {
 		t.Fatalf("Cache.Get failed: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestManager_Pebble_FailedValidation(t *testing.T) {
 	}
 
 	// Verify no certificate in cache
-	_, err = mgr.Cache().Get("fail-validation.example.com")
+	_, err = mgr.cache.Get("fail-validation.example.com")
 	if !errors.Is(err, cache.ErrNotFound) {
 		t.Fatalf("expected cache.ErrNotFound, got %v", err)
 	}
@@ -789,4 +789,88 @@ func (b *brokenChallengeStore) ResolveChallenge(ctx context.Context, caller, hos
 		return "", challenge.ErrNotFound
 	}
 	return b.store.ResolveChallenge(ctx, caller, host, token)
+}
+
+func TestManager_GetCertificate_And_EnsureIssuance(t *testing.T) {
+	ctx := t.Context()
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{
+		ValidityPeriod: 86400,
+	})
+
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	mgr, _ := createTestManager(t, pebble, cacheDir, nil)
+
+	hostnames := []string{"ensure.example.com"}
+	_, key, err := NormalizeHostnames(hostnames, 10, 253)
+	if err != nil {
+		t.Fatalf("NormalizeHostnames failed: %v", err)
+	}
+
+	// 1. Initially GetCertificate returns ErrNotFound
+	data, err := mgr.GetCertificate(key, true)
+	if !errors.Is(err, cache.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got: %v", err)
+	}
+	if data != nil {
+		t.Fatalf("expected nil data")
+	}
+
+	// 2. EnsureIssuance starts issuance (returns true)
+	started, err := mgr.EnsureIssuance(ctx, hostnames)
+	if err != nil {
+		t.Fatalf("EnsureIssuance failed: %v", err)
+	}
+	if !started {
+		t.Fatalf("expected issuance to start")
+	}
+
+	// 3. Second call while in flight returns false (no duplicate flight)
+	startedSecond, err := mgr.EnsureIssuance(ctx, hostnames)
+	if err != nil {
+		t.Fatalf("EnsureIssuance second call failed: %v", err)
+	}
+	if startedSecond {
+		t.Fatalf("expected second call while in flight to return false")
+	}
+
+	// 4. Wait for issuance to complete
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+		data, err = mgr.GetCertificate(key, true)
+		if err == nil && data != nil {
+			break
+		}
+	}
+	if data == nil {
+		t.Fatalf("issuance did not complete within deadline")
+	}
+
+	if len(data.CertificateChain) == 0 {
+		t.Errorf("expected certificate chain")
+	}
+	if len(data.PrivateKey) == 0 {
+		t.Errorf("expected private key in release mode")
+	}
+
+	// 5. In non-release mode, private key is omitted
+	nonReleaseData, err := mgr.GetCertificate(key, false)
+	if err != nil {
+		t.Fatalf("GetCertificate non-release failed: %v", err)
+	}
+	if len(nonReleaseData.CertificateChain) == 0 {
+		t.Errorf("expected certificate chain")
+	}
+	if len(nonReleaseData.PrivateKey) != 0 {
+		t.Errorf("expected private key to be omitted in non-release mode")
+	}
+
+	// 6. EnsureIssuance on already-cached cert returns false
+	startedAfterCached, err := mgr.EnsureIssuance(ctx, hostnames)
+	if err != nil {
+		t.Fatalf("EnsureIssuance after cached failed: %v", err)
+	}
+	if startedAfterCached {
+		t.Fatalf("expected EnsureIssuance on cached cert to return false")
+	}
 }
