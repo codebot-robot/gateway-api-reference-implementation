@@ -68,15 +68,6 @@ func GCPErrorReasonAndMessage(err error) (string, string) {
 	return ReasonEndpointAttachmentFailed, "Failed to attach endpoints to zonal NEGs; see controller logs for details."
 }
 
-// Clock provides time abstraction for deterministic testing.
-type Clock interface {
-	Now() time.Time
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
 // Config configures the NEG registrar.
 type Config struct {
 	ClusterID        string
@@ -84,10 +75,7 @@ type Config struct {
 	Project          string
 	Zones            []string
 	HysteresisWindow time.Duration
-	MinBackoff       time.Duration
-	MaxBackoff       time.Duration
 	Recorder         record.EventRecorder
-	Clock            Clock
 }
 
 // Registrar reconciles Kubernetes data plane pods into Google Cloud zonal NEGs.
@@ -96,9 +84,7 @@ type Registrar struct {
 	gcpClient gcp.ComputeClient
 	cfg       Config
 	tracker   *HysteresisTracker
-	backoff   *BackoffTracker
 	recorder  record.EventRecorder
-	clock     Clock
 	mu        sync.Mutex
 }
 
@@ -107,26 +93,13 @@ func NewRegistrar(c client.Client, gcpClient gcp.ComputeClient, cfg Config) *Reg
 	if cfg.NegPrefix == "" {
 		cfg.NegPrefix = "gcpgw"
 	}
-	clock := cfg.Clock
-	if clock == nil {
-		clock = realClock{}
-	}
 	return &Registrar{
 		client:    c,
 		gcpClient: gcpClient,
 		cfg:       cfg,
 		tracker:   NewHysteresisTracker(cfg.HysteresisWindow),
-		backoff:   NewBackoffTracker(cfg.MinBackoff, cfg.MaxBackoff),
 		recorder:  cfg.Recorder,
-		clock:     clock,
 	}
-}
-
-func (r *Registrar) now() time.Time {
-	if r.clock != nil {
-		return r.clock.Now()
-	}
-	return time.Now()
 }
 
 // IsContainersReady returns true only if the pod has ContainersReady condition set to ConditionTrue.
@@ -298,9 +271,6 @@ func (r *Registrar) DetachAll(ctx context.Context, gw *gatewayv1.Gateway) (*Reco
 		}
 	}
 
-	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
-	r.backoff.Clear(gwKey)
-
 	return result, nil
 }
 
@@ -312,31 +282,6 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	now := r.now()
-	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
-
-	// Fetch data plane pods for this Gateway once, checking the error to prevent dropped errors
-	var podList corev1.PodList
-	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
-		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
-	}
-
-	if remaining := r.backoff.Remaining(gwKey, now); remaining > 0 {
-		hasTerminatingPods := false
-		for i := range podList.Items {
-			pod := &podList.Items[i]
-			if pod.Labels[singlepod.LabelGatewayName] == gw.Name && pod.DeletionTimestamp != nil {
-				hasTerminatingPods = true
-				break
-			}
-		}
-		if !hasTerminatingPods {
-			lastErr := r.backoff.LastError(gwKey)
-			klog.V(4).Infof("Skipping NEG reconciliation for Gateway %s: backing off for %v (last error: %v)", gwKey, remaining, lastErr)
-			return nil, fmt.Errorf("attaching endpoints for gateway %s: %w", gwKey, lastErr)
-		}
-	}
 
 	result := &ReconcileResult{}
 
@@ -376,7 +321,14 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 		return result, nil
 	}
 
-	// 4. Filter data plane pods belonging to this Gateway
+	// 4. List data plane pods for this Gateway
+	var podList corev1.PodList
+	if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing pods in namespace %s: %w", gw.Namespace, err)
+	}
+
+	// Filter pods belonging to this Gateway
+	now := time.Now()
 	var activePods []desiredPod
 
 	for i := range podList.Items {
@@ -473,15 +425,7 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 			}
 			batch := toAttach[i:end]
 
-			if remaining := r.backoff.Remaining(gwKey, now); remaining > 0 {
-				lastErr := r.backoff.LastError(gwKey)
-				klog.V(4).Infof("Skipping attach for NEG %s in zone %s: backing off for %v (last error: %v)", mn.neg.Name, mn.zone, remaining, lastErr)
-				return nil, fmt.Errorf("attaching endpoints to NEG %s: %w", mn.neg.Name, lastErr)
-			}
-
 			if err := r.gcpClient.AttachNetworkEndpoints(ctx, r.cfg.Project, mn.zone, mn.neg.Name, batch); err != nil {
-				dur := r.backoff.RecordFailure(gwKey, err, now)
-				klog.Errorf("Failed to attach endpoints to NEG %s in zone %s: %v. Backing off for %v.", mn.neg.Name, mn.zone, err, dur)
 				r.emitAttachFailureEvents(gw, mn.neg.Name, mn.zone, batch, activePods, err)
 				return nil, fmt.Errorf("attaching endpoints to NEG %s: %w", mn.neg.Name, err)
 			}
@@ -502,7 +446,6 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 		}
 	}
 
-	r.backoff.RecordSuccess(gwKey)
 	return result, nil
 }
 
@@ -522,20 +465,6 @@ func (r *Registrar) emitAttachFailureEvents(gw *gatewayv1.Gateway, negName, zone
 			r.recorder.Eventf(dp.pod, corev1.EventTypeWarning, reason, "Failed to attach endpoint to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
 		}
 	}
-}
-
-// BackoffRemaining returns the remaining backoff duration for the given Gateway.
-func (r *Registrar) BackoffRemaining(gw *gatewayv1.Gateway) time.Duration {
-	if gw == nil {
-		return 0
-	}
-	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
-	return r.backoff.Remaining(gwKey, r.now())
-}
-
-// ClearBackoff removes the backoff state for the given Gateway key.
-func (r *Registrar) ClearBackoff(gwKey string) {
-	r.backoff.Clear(gwKey)
 }
 
 // ResolveNEGConflict deterministically resolves conflicts between Gateways targeting identical NEGs.

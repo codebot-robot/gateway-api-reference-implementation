@@ -296,9 +296,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			delete(r.statusCache, req.NamespacedName)
 			r.statusMu.Unlock()
 			delete(r.waitingSince, req.NamespacedName)
-			if r.Registrar != nil {
-				r.Registrar.ClearBackoff(req.NamespacedName.String())
-			}
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -403,13 +400,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			Reason:           reason,
 			Message:          msg,
 		})
-		requeueAfter := pollInterval
-		if r.Registrar != nil {
-			if remaining := r.Registrar.BackoffRemaining(&gw); remaining > 0 {
-				requeueAfter = remaining
-			}
-		}
-		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+		return reconcile.Result{}, err
 	}
 
 	if externalIP == "" {

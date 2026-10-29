@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -682,36 +681,12 @@ func TestRegistrar_DetachAll(t *testing.T) {
 	}
 }
 
-type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func newFakeClock(t0 time.Time) *fakeClock {
-	return &fakeClock{now: t0}
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
-}
-
-// TestRegistrar_AttachBackoffAndEvents verifies that failing attachNetworkEndpoints calls
-// back off exponentially, do not spam the Compute API during the backoff window,
-// emit Warning events on the Gateway and affected data-plane pods, and reset on recovery.
-func TestRegistrar_AttachBackoffAndEvents(t *testing.T) {
+// TestRegistrar_AttachErrorAndEvents verifies that failing attachNetworkEndpoints calls
+// return an error, emit Warning events on the Gateway and affected data-plane pods,
+// and succeed when the underlying error is cleared.
+func TestRegistrar_AttachErrorAndEvents(t *testing.T) {
 	scheme := setupTestScheme()
-	t0 := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
-	clk := newFakeClock(t0)
-
-	gw := makeTestGateway("default", "my-gw", t0)
+	gw := makeTestGateway("default", "my-gw", time.Now())
 	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
 
 	k8sClient := fake.NewClientBuilder().
@@ -740,17 +715,14 @@ func TestRegistrar_AttachBackoffAndEvents(t *testing.T) {
 
 	fakeRecorder := record.NewFakeRecorder(100)
 	reg := NewRegistrar(k8sClient, fakeGCP, Config{
-		ClusterID:  "cluster-1",
-		NegPrefix:  "gcpgw",
-		Project:    "my-project",
-		Zones:      []string{"us-central1-a"},
-		MinBackoff: 50 * time.Millisecond,
-		MaxBackoff: 200 * time.Millisecond,
-		Recorder:   fakeRecorder,
-		Clock:      clk,
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+		Recorder:  fakeRecorder,
 	})
 
-	// 1. Initial attempt fails and triggers backoff + events
+	// 1. Initial attempt fails and emits warning events on Gateway and Pod
 	_, err := reg.ReconcileEndpoints(t.Context(), gw)
 	if err == nil || !gcp.IsPermissionDenied(err) {
 		t.Fatalf("expected permission denied error, got: %v", err)
@@ -773,147 +745,10 @@ func TestRegistrar_AttachBackoffAndEvents(t *testing.T) {
 		}
 	}
 
-	// Verify registrar reports remaining backoff (50ms base with ±10% jitter => [45ms, 55ms])
-	rem := reg.BackoffRemaining(gw)
-	if rem < 45*time.Millisecond || rem > 55*time.Millisecond {
-		t.Errorf("expected remaining backoff in [45ms, 55ms], got %v", rem)
-	}
-
-	// 2. Second attempt immediately during backoff window is skipped: zero additional Compute API calls!
-	_, err = reg.ReconcileEndpoints(t.Context(), gw)
-	if err == nil || !gcp.IsPermissionDenied(err) {
-		t.Fatalf("expected cached permission denied error during backoff, got: %v", err)
-	}
-	if len(fakeGCP.AttachCalls) != 1 {
-		t.Errorf("expected attachNetworkEndpoints NOT to be called during backoff, got %d calls", len(fakeGCP.AttachCalls))
-	}
-	// No additional events emitted while skipping during backoff
-	if len(fakeRecorder.Events) != 0 {
-		t.Errorf("expected 0 events while skipping in backoff, got %d", len(fakeRecorder.Events))
-	}
-
-	// 3. Advance clock past 55ms (max possible 1st backoff)
-	clk.Advance(60 * time.Millisecond)
-
-	// 4. Third attempt retries Compute API, fails, and doubles backoff duration (100ms base with ±10% jitter => [90ms, 110ms])
-	_, err = reg.ReconcileEndpoints(t.Context(), gw)
-	if err == nil || !gcp.IsPermissionDenied(err) {
-		t.Fatalf("expected permission denied error on retry, got: %v", err)
-	}
-	if len(fakeGCP.AttachCalls) != 2 {
-		t.Errorf("expected 2 Attach calls after backoff expired, got %d", len(fakeGCP.AttachCalls))
-	}
-	rem2 := reg.BackoffRemaining(gw)
-	if rem2 < 90*time.Millisecond || rem2 > 110*time.Millisecond {
-		t.Errorf("expected doubled backoff in [90ms, 110ms], got %v", rem2)
-	}
-
-	// Drain events from the second failed attempt
-	for len(fakeRecorder.Events) > 0 {
-		<-fakeRecorder.Events
-	}
-
-	// 5. Clear error (e.g. IAM permission restored)
+	// 2. Clear error (IAM permission granted)
 	fakeGCP.InjectAttachError = nil
 
-	// Advance clock past 110ms (max possible 2nd backoff)
-	clk.Advance(115 * time.Millisecond)
-
-	// 6. Next attempt succeeds, clears backoff, and attaches endpoints
-	res, err := reg.ReconcileEndpoints(t.Context(), gw)
-	if err != nil {
-		t.Fatalf("expected successful reconcile after IAM restored, got: %v", err)
-	}
-	if res.AttachedCount != 1 {
-		t.Errorf("expected 1 attached endpoint, got %d", res.AttachedCount)
-	}
-	if len(fakeGCP.AttachCalls) != 3 {
-		t.Errorf("expected 3 total Attach calls, got %d", len(fakeGCP.AttachCalls))
-	}
-	if remAfter := reg.BackoffRemaining(gw); remAfter != 0 {
-		t.Errorf("expected 0 remaining backoff after success, got %v", remAfter)
-	}
-}
-
-// TestRegistrar_RepeatedFailuresBoundedCallsOverSimulatedTime reproduces the issue #866 scenario:
-// a Gateway whose attachNetworkEndpoints permanently fails with 403 is reconciled every 0.5s
-// for 10 minutes (1200 reconciliation attempts over 600 seconds).
-// It verifies that:
-// 1. Backoff grows exponentially up to the 60s cap.
-// 2. The number of Compute API attachNetworkEndpoints calls is bounded (around 13-17 calls, not 1200).
-// 3. When the permission is restored, the next reconcile succeeds and resets the backoff.
-// 4. A subsequent failure starts backoff at minBackoff again, proving the reset.
-func TestRegistrar_RepeatedFailuresBoundedCallsOverSimulatedTime(t *testing.T) {
-	scheme := setupTestScheme()
-	t0 := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
-	clk := newFakeClock(t0)
-
-	gw := makeTestGateway("default", "my-gw", t0)
-	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
-
-	k8sClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(gw, node).
-		Build()
-
-	makeTestPod(t, k8sClient, gw, "dp-pod-1", "node-1", "10.0.1.5", true, true, false)
-
-	negDesc, _ := (&metadata.NegMetadata{
-		ClusterID:   "cluster-1",
-		Namespace:   "default",
-		GatewayName: "my-gw",
-		Port:        8443,
-	}).Encode()
-
-	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
-
-	fakeGCP := gcp.NewFakeComputeClient()
-	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
-		Name:        negName,
-		Zone:        "us-central1-a",
-		Description: negDesc,
-	})
-	fakeGCP.InjectAttachError = gcp.ErrPermissionDenied
-
-	reg := NewRegistrar(k8sClient, fakeGCP, Config{
-		ClusterID:  "cluster-1",
-		NegPrefix:  "gcpgw",
-		Project:    "my-project",
-		Zones:      []string{"us-central1-a"},
-		MinBackoff: 1 * time.Second,
-		MaxBackoff: 60 * time.Second,
-		Clock:      clk,
-	})
-
-	// Simulate 10 minutes of reconcile attempts every 0.5s (1200 attempts)
-	// Without backoff, this would produce 1200 denied Compute API calls.
-	totalSteps := 1200
-	stepInterval := 500 * time.Millisecond
-	for i := 0; i < totalSteps; i++ {
-		_, _ = reg.ReconcileEndpoints(t.Context(), gw)
-		clk.Advance(stepInterval)
-	}
-
-	callCount := len(fakeGCP.AttachCalls)
-	// Over 600s, exponential backoff (1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s...) with ±10% jitter
-	// makes approximately 13 to 17 calls total.
-	if callCount > 20 || callCount < 10 {
-		t.Errorf("expected bounded attach calls between 10 and 20 over 10 minutes, got %d", callCount)
-	}
-
-	// Verify that the backoff reached the cap (<= 60s)
-	rem := reg.BackoffRemaining(gw)
-	if rem > 60*time.Second {
-		t.Errorf("expected remaining backoff <= 60s, got %v", rem)
-	}
-
-	// Now simulate permission restored (operator fixes IAM role)
-	fakeGCP.InjectAttachError = nil
-
-	// Advance clock past the remaining backoff duration
-	clk.Advance(65 * time.Second)
-
-	// Reconcile should now succeed
+	// 3. Subsequent reconcile succeeds and attaches endpoints
 	res, err := reg.ReconcileEndpoints(t.Context(), gw)
 	if err != nil {
 		t.Fatalf("expected successful reconcile after error cleared, got: %v", err)
@@ -921,23 +756,7 @@ func TestRegistrar_RepeatedFailuresBoundedCallsOverSimulatedTime(t *testing.T) {
 	if res.AttachedCount != 1 {
 		t.Errorf("expected 1 attached endpoint, got %d", res.AttachedCount)
 	}
-
-	// Backoff should be completely reset to 0
-	if remAfter := reg.BackoffRemaining(gw); remAfter != 0 {
-		t.Errorf("expected 0 remaining backoff after success, got %v", remAfter)
-	}
-
-	// Subsequent failure should start backoff from minBackoff (~1s), NOT from 60s
-	fakeGCP.InjectAttachError = gcp.ErrPermissionDenied
-	makeTestPod(t, k8sClient, gw, "dp-pod-2", "node-1", "10.0.1.6", true, true, false)
-
-	_, err = reg.ReconcileEndpoints(t.Context(), gw)
-	if err == nil {
-		t.Fatalf("expected error on re-injected failure, got nil")
-	}
-	newRem := reg.BackoffRemaining(gw)
-	// Should be around minBackoff (1s with ±10% jitter => [0.9s, 1.1s]), well below 5s
-	if newRem <= 0 || newRem > 1500*time.Millisecond {
-		t.Errorf("expected backoff reset to ~1s, got %v", newRem)
+	if len(fakeGCP.AttachCalls) != 2 {
+		t.Errorf("expected 2 total Attach calls, got %d", len(fakeGCP.AttachCalls))
 	}
 }
