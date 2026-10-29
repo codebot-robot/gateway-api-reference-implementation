@@ -45,9 +45,6 @@ const (
 	// endpoints and resources are cleanly detached and cleaned up before the Gateway is deleted.
 	FinalizerCleanup = "gcpgateway.gke-labs.io/cleanup"
 
-	// FinalizerNEG is an alias for FinalizerCleanup.
-	FinalizerNEG = FinalizerCleanup
-
 	// DefaultHealthTimeout is the duration after which an unconfirmed endpoint triggers RolloutStalled.
 	DefaultHealthTimeout = 60 * time.Second
 
