@@ -382,6 +382,221 @@ func TestRolloutStalled_ReportsConditionWhenUnhealthy(t *testing.T) {
 	}
 }
 
+// TestGateway_MultipleGateways_WaitingSinceIsolation verifies that alternating reconciles
+// between multiple Gateways with waiting pods do not reset each other's wait times,
+// that RolloutStalled fires for each after the configured timeout, and that deleting
+// a Gateway cleans up only its own waitingSince entries.
+func TestGateway_MultipleGateways_WaitingSinceIsolation(t *testing.T) {
+	scheme := setupScheme()
+	ipAddrType := gatewayv1.IPAddressType
+	gw1 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "gw",
+			UID:       types.UID("gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  &ipAddrType,
+					Value: "34.120.254.10",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+	gw2 := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "gw-2",
+			UID:       types.UID("gw-2-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{
+					Type:  &ipAddrType,
+					Value: "34.120.254.11",
+				},
+			},
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw1, gw2, node).
+		Build()
+
+	pod1 := makeTestPod(t, c, gw1, "gateway-gw-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+	})
+	pod2 := makeTestPod(t, c, gw2, "gateway-gw-2-pod-1", "node-1", "10.0.1.6", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionFalse},
+	})
+
+	fakeGCP := gcp.NewFakeComputeClient()
+
+	for _, gw := range []*gatewayv1.Gateway{gw1, gw2} {
+		negDesc, _ := (&metadata.NegMetadata{
+			ClusterID:   "cluster-1",
+			Namespace:   gw.Namespace,
+			GatewayName: gw.Name,
+			Port:        8443,
+		}).Encode()
+		negName := metadata.ResourceName("gcpgw", "cluster-1", gw.Namespace, gw.Name, "8443")
+		fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+			Name:        negName,
+			Zone:        "us-central1-a",
+			Description: negDesc,
+		})
+	}
+
+	bsName1 := metadata.ResourceName("gcpgw", "cluster-1", "default", "gw", "bs-443")
+	negName1 := metadata.ResourceName("gcpgw", "cluster-1", "default", "gw", "8443")
+	fakeGCP.SetBackendServiceHealth("my-project", bsName1, negName1, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "UNHEALTHY"},
+		},
+	})
+
+	bsName2 := metadata.ResourceName("gcpgw", "cluster-1", "default", "gw-2", "bs-443")
+	negName2 := metadata.ResourceName("gcpgw", "cluster-1", "default", "gw-2", "8443")
+	fakeGCP.SetBackendServiceHealth("my-project", bsName2, negName2, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.6", Port: 8443, HealthState: "UNHEALTHY"},
+		},
+	})
+
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	healthTimeout := 20 * time.Millisecond
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID:     "cluster-1",
+		NegPrefix:     "gcpgw",
+		Project:       "my-project",
+		Zones:         []string{"us-central1-a"},
+		HealthTimeout: healthTimeout,
+	})
+
+	req1 := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw"}}
+	req2 := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "gw-2"}}
+
+	// First reconcile of gw -> starts timer for gw
+	if _, err := reconciler.Reconcile(t.Context(), req1); err != nil {
+		t.Fatalf("first Reconcile gw failed: %v", err)
+	}
+
+	// First reconcile of gw-2 -> starts timer for gw-2, must not reset gw timer
+	if _, err := reconciler.Reconcile(t.Context(), req2); err != nil {
+		t.Fatalf("first Reconcile gw-2 failed: %v", err)
+	}
+
+	// Neither gateway should be RolloutStalled yet
+	cached1 := reconciler.GetCachedStatus(req1.NamespacedName)
+	if cached1 != nil && cached1.Reason == ReasonRolloutStalled {
+		t.Fatalf("gw prematurely marked RolloutStalled")
+	}
+	cached2 := reconciler.GetCachedStatus(req2.NamespacedName)
+	if cached2 != nil && cached2.Reason == ReasonRolloutStalled {
+		t.Fatalf("gw-2 prematurely marked RolloutStalled")
+	}
+
+	// Alternate reconciles again before timeout
+	if _, err := reconciler.Reconcile(t.Context(), req1); err != nil {
+		t.Fatalf("second Reconcile gw failed: %v", err)
+	}
+	if _, err := reconciler.Reconcile(t.Context(), req2); err != nil {
+		t.Fatalf("second Reconcile gw-2 failed: %v", err)
+	}
+
+	// Wait past healthTimeout
+	time.Sleep(healthTimeout + 5*time.Millisecond)
+
+	// Alternating reconciles after timeout: both should report RolloutStalled
+	if _, err := reconciler.Reconcile(t.Context(), req1); err != nil {
+		t.Fatalf("reconcile gw after timeout failed: %v", err)
+	}
+	cached1 = reconciler.GetCachedStatus(req1.NamespacedName)
+	if cached1 == nil || cached1.ProgrammedStatus != metav1.ConditionFalse || cached1.Reason != ReasonRolloutStalled {
+		t.Fatalf("expected gw Programmed=False with Reason RolloutStalled, got %+v", cached1)
+	}
+
+	if _, err := reconciler.Reconcile(t.Context(), req2); err != nil {
+		t.Fatalf("reconcile gw-2 after timeout failed: %v", err)
+	}
+	cached2 = reconciler.GetCachedStatus(req2.NamespacedName)
+	if cached2 == nil || cached2.ProgrammedStatus != metav1.ConditionFalse || cached2.Reason != ReasonRolloutStalled {
+		t.Fatalf("expected gw-2 Programmed=False with Reason RolloutStalled, got %+v", cached2)
+	}
+
+	// Verify both Gateways have waitingSince entries
+	pod1Key := fmt.Sprintf("%s/%s", pod1.Namespace, pod1.Name)
+	pod2Key := fmt.Sprintf("%s/%s", pod2.Namespace, pod2.Name)
+
+	if _, exists := reconciler.waitingSince[req1.NamespacedName][pod1Key]; !exists {
+		t.Errorf("expected gw waitingSince entry for pod1")
+	}
+	if _, exists := reconciler.waitingSince[req2.NamespacedName][pod2Key]; !exists {
+		t.Errorf("expected gw-2 waitingSince entry for pod2")
+	}
+
+	// Delete gw and reconcile its deletion
+	var gw1ToDel gatewayv1.Gateway
+	if err := c.Get(t.Context(), req1.NamespacedName, &gw1ToDel); err != nil {
+		t.Fatalf("getting gw: %v", err)
+	}
+	if err := c.Delete(t.Context(), &gw1ToDel); err != nil {
+		t.Fatalf("deleting gw: %v", err)
+	}
+
+	if _, err := reconciler.Reconcile(t.Context(), req1); err != nil {
+		t.Fatalf("reconcile gw deletion failed: %v", err)
+	}
+
+	// Deleting gw must remove ONLY gw's entries, preserving gw-2's entries
+	if _, exists := reconciler.waitingSince[req1.NamespacedName]; exists {
+		t.Errorf("expected gw waitingSince to be deleted after gateway deletion")
+	}
+	if _, exists := reconciler.waitingSince[req2.NamespacedName][pod2Key]; !exists {
+		t.Errorf("expected gw-2 waitingSince entry to be preserved after gw deletion")
+	}
+
+	// Reconciling a non-existent Gateway also does not affect gw-2
+	if _, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "non-existent"}}); err != nil {
+		t.Fatalf("reconcile non-existent gw failed: %v", err)
+	}
+	if _, exists := reconciler.waitingSince[req2.NamespacedName][pod2Key]; !exists {
+		t.Errorf("expected gw-2 waitingSince entry to be preserved after reconciling non-existent gateway")
+	}
+}
+
 // TestGateway_ErrorConditions verifies that Compute API errors produce expected condition reasons.
 func TestGateway_ErrorConditions(t *testing.T) {
 	tests := []struct {
@@ -1254,10 +1469,13 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 	delPodKey := fmt.Sprintf("default/%s-pod-1", delDeployName)
 	otherPodKey := fmt.Sprintf("default/%s-pod-1", otherDeployName)
 
-	rec.waitingSince[delPodKey] = time.Now()
-	rec.waitingSince[otherPodKey] = time.Now()
+	delGwKey := types.NamespacedName{Namespace: "default", Name: "del-gw"}
+	otherGwKey := types.NamespacedName{Namespace: "default", Name: "other-gw"}
 
-	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "del-gw"}}
+	rec.waitingSince[delGwKey] = map[string]time.Time{delPodKey: time.Now()}
+	rec.waitingSince[otherGwKey] = map[string]time.Time{otherPodKey: time.Now()}
+
+	req := reconcile.Request{NamespacedName: delGwKey}
 	res, err := rec.Reconcile(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Reconcile on deleting gateway failed: %v", err)
@@ -1286,14 +1504,16 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 	}
 
 	// 3. Verify statusCache was cleared, del-gw waitingSince cleared, and other-gw waitingSince preserved
-	if rec.GetCachedStatus(types.NamespacedName{Namespace: "default", Name: "del-gw"}) != nil {
+	if rec.GetCachedStatus(delGwKey) != nil {
 		t.Errorf("expected statusCache to be cleared for deleted gateway")
 	}
-	if _, exists := rec.waitingSince[delPodKey]; exists {
+	if _, exists := rec.waitingSince[delGwKey]; exists {
 		t.Errorf("expected waitingSince entry to be cleaned up for deleted gateway")
 	}
-	if _, exists := rec.waitingSince[otherPodKey]; !exists {
+	if _, exists := rec.waitingSince[otherGwKey]; !exists {
 		t.Errorf("expected waitingSince entry for other gateway in same namespace to be preserved")
+	} else if _, exists := rec.waitingSince[otherGwKey][otherPodKey]; !exists {
+		t.Errorf("expected waitingSince pod entry for other gateway to be preserved")
 	}
 }
 

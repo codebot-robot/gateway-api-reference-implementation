@@ -140,7 +140,7 @@ type GatewayReconciler struct {
 
 	// mu guards waitingSince.
 	mu           sync.Mutex
-	waitingSince map[string]time.Time
+	waitingSince map[types.NamespacedName]map[string]time.Time
 
 	// EnqueueGateway is an optional callback to trigger a GARI Gateway reconcile when state changes.
 	EnqueueGateway func(types.NamespacedName)
@@ -194,7 +194,7 @@ func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp
 		ResyncInterval:     resyncInterval,
 		EnqueueGateway:     cfg.EnqueueGateway,
 		Registrar:          reg,
-		waitingSince:       make(map[string]time.Time),
+		waitingSince:       make(map[types.NamespacedName]map[string]time.Time),
 		statusCache:        make(map[types.NamespacedName]*GatewayStatusResult),
 	}
 }
@@ -291,6 +291,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			r.statusMu.Lock()
 			delete(r.statusCache, req.NamespacedName)
 			r.statusMu.Unlock()
+			delete(r.waitingSince, req.NamespacedName)
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -313,24 +314,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		r.statusMu.Lock()
 		delete(r.statusCache, req.NamespacedName)
 		r.statusMu.Unlock()
-
-		gatewayPodNames := make(map[string]bool)
-		var podList corev1.PodList
-		if err := r.List(ctx, &podList, client.InNamespace(gw.Namespace)); err != nil {
-			klog.Errorf("listing pods for deleting gateway %s/%s: %v", gw.Namespace, gw.Name, err)
-		} else {
-			for i := range podList.Items {
-				pod := &podList.Items[i]
-				if pod.Labels[singlepod.LabelGatewayName] == gw.Name {
-					gatewayPodNames[fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)] = true
-				}
-			}
-		}
-		for k := range r.waitingSince {
-			if r.podBelongsToGateway(k, gw.Namespace, gw.Name, gatewayPodNames) {
-				delete(r.waitingSince, k)
-			}
-		}
+		delete(r.waitingSince, req.NamespacedName)
 		return reconcile.Result{}, nil
 	}
 
@@ -344,6 +328,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		r.statusMu.Lock()
 		delete(r.statusCache, req.NamespacedName)
 		r.statusMu.Unlock()
+		delete(r.waitingSince, req.NamespacedName)
 		return reconcile.Result{}, nil
 	}
 
@@ -435,7 +420,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	waitingForHealth := false
 	now := time.Now()
 	activePodKeys := make(map[string]bool)
-	thisGatewayPodKeys := make(map[string]bool)
+	gwWaiting := r.waitingSince[req.NamespacedName]
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -445,7 +430,6 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		if pod.Labels[singlepod.LabelGatewayName] != gw.Name {
 			continue
 		}
-		thisGatewayPodKeys[fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)] = true
 		dataplanePodCount++
 
 		if pod.Status.PodIP == "" || pod.Spec.NodeName == "" || !registrar.IsContainersReady(pod) || pod.DeletionTimestamp != nil {
@@ -490,15 +474,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		}
 
 		if isHealthy {
-			delete(r.waitingSince, podKey)
+			if gwWaiting != nil {
+				delete(gwWaiting, podKey)
+			}
 			hasHealthyReplica = true
 			if err := r.updatePodReadinessGate(ctx, pod, corev1.ConditionTrue, "LoadBalancerHealthy", "Endpoint is healthy on Google Cloud load balancer"); err != nil {
 				return reconcile.Result{}, fmt.Errorf("updating readiness gate for pod %s: %w", podKey, err)
 			}
 		} else {
-			since, exists := r.waitingSince[podKey]
+			if gwWaiting == nil {
+				gwWaiting = make(map[string]time.Time)
+				r.waitingSince[req.NamespacedName] = gwWaiting
+			}
+			since, exists := gwWaiting[podKey]
 			if !exists {
-				r.waitingSince[podKey] = now
+				gwWaiting[podKey] = now
 			} else if now.Sub(since) >= r.HealthTimeout {
 				isRolloutStalled = true
 			}
@@ -509,9 +499,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		}
 	}
 
-	for k := range r.waitingSince {
-		if r.podBelongsToGateway(k, gw.Namespace, gw.Name, thisGatewayPodKeys) && !activePodKeys[k] {
-			delete(r.waitingSince, k)
+	if gwWaiting != nil {
+		for k := range gwWaiting {
+			if !activePodKeys[k] {
+				delete(gwWaiting, k)
+			}
+		}
+		if len(gwWaiting) == 0 {
+			delete(r.waitingSince, req.NamespacedName)
 		}
 	}
 
@@ -769,19 +764,4 @@ func (r *GatewayReconciler) updatePodReadinessGate(ctx context.Context, pod *cor
 		LastTransitionTime: metav1.Now(),
 	})
 	return r.Status().Update(ctx, pod)
-}
-
-// podBelongsToGateway checks if a podKey (namespace/name) belongs to the given Gateway,
-// matching known pods in the cluster or the singlepod Deployment naming convention.
-func (r *GatewayReconciler) podBelongsToGateway(podKey, namespace, gatewayName string, gatewayPodKeys map[string]bool) bool {
-	if gatewayPodKeys[podKey] {
-		return true
-	}
-	parts := strings.SplitN(podKey, "/", 2)
-	if len(parts) != 2 || parts[0] != namespace {
-		return false
-	}
-	deployName := singlepod.ResourceNameForGateway(gatewayName)
-	podName := parts[1]
-	return podName == deployName || strings.HasPrefix(podName, deployName+"-")
 }
