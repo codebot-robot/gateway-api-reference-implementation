@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -693,6 +694,95 @@ func TestGateway_ErrorConditions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGateway_BackoffRequeueAndMessage verifies that Reconcile uses remaining backoff for RequeueAfter
+// and that PermissionDenied mentions compute.instances.use.
+func TestGateway_BackoffRequeueAndMessage(t *testing.T) {
+	scheme := setupScheme()
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+			UID:       types.UID("my-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
+		Build()
+
+	makeTestPod(t, c, gw, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+	})
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	negDesc, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "my-gw",
+		Port:        8443,
+	}).Encode()
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+	fakeGCP.InjectAttachError = gcp.ErrPermissionDenied
+
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID:  "cluster-1",
+		NegPrefix:  "gcpgw",
+		Project:    "my-project",
+		Zones:      []string{"us-central1-a"},
+		MinBackoff: 200 * time.Millisecond,
+		MaxBackoff: 800 * time.Millisecond,
+	})
+
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+	res, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// RequeueAfter should match the backoff duration (<= 200ms)
+	if res.RequeueAfter <= 0 || res.RequeueAfter > 200*time.Millisecond {
+		t.Errorf("expected RequeueAfter to reflect minBackoff (<=200ms), got %v", res.RequeueAfter)
+	}
+
+	cached := reconciler.GetCachedStatus(req.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionFalse || cached.Reason != ReasonPermissionDenied {
+		t.Fatalf("expected ReasonPermissionDenied, got %+v", cached)
+	}
+	if !strings.Contains(cached.Message, "compute.instances.use") {
+		t.Errorf("expected message to mention compute.instances.use, got %q", cached.Message)
 	}
 }
 

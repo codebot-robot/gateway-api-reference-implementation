@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -134,6 +135,7 @@ type GatewayReconciler struct {
 	ControllerName string
 	HealthTimeout  time.Duration
 	Registrar      *registrar.Registrar
+	Recorder       record.EventRecorder
 
 	HealthPollInterval time.Duration
 	ResyncInterval     time.Duration
@@ -161,6 +163,7 @@ type GatewayReconcilerConfig struct {
 	HealthPollInterval time.Duration
 	ResyncInterval     time.Duration
 	EnqueueGateway     func(types.NamespacedName)
+	Recorder           record.EventRecorder
 }
 
 // NewGatewayReconciler creates a new GatewayReconciler.
@@ -194,6 +197,7 @@ func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp
 		ResyncInterval:     resyncInterval,
 		EnqueueGateway:     cfg.EnqueueGateway,
 		Registrar:          reg,
+		Recorder:           cfg.Recorder,
 		waitingSince:       make(map[types.NamespacedName]map[string]time.Time),
 		statusCache:        make(map[types.NamespacedName]*GatewayStatusResult),
 	}
@@ -292,6 +296,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			delete(r.statusCache, req.NamespacedName)
 			r.statusMu.Unlock()
 			delete(r.waitingSince, req.NamespacedName)
+			if r.Registrar != nil {
+				r.Registrar.ClearBackoff(req.NamespacedName.String())
+			}
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -396,7 +403,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			Reason:           reason,
 			Message:          msg,
 		})
-		return reconcile.Result{RequeueAfter: pollInterval}, nil
+		requeueAfter := pollInterval
+		if r.Registrar != nil {
+			if remaining := r.Registrar.BackoffRemaining(&gw); remaining > 0 {
+				requeueAfter = remaining
+			}
+		}
+		return reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
 
 	if externalIP == "" {
@@ -659,17 +672,7 @@ func (r *GatewayReconciler) GatewayStatusHook(ctx context.Context, gw *gatewayv1
 }
 
 func (r *GatewayReconciler) gcpErrorReasonAndMessage(err error) (string, string) {
-	if gcp.IsPermissionDenied(err) {
-		return ReasonPermissionDenied, "GCP service account lacks compute.networkEndpointGroups.use or attach permission."
-	} else if gcp.IsQuotaExceeded(err) {
-		return ReasonQuotaExceeded, "Compute API quota exceeded when registering endpoints."
-	} else if gcp.IsNEGNotFound(err) {
-		return ReasonNEGNotFound, "One or more configured NEGs do not exist in the GCP project/zones."
-	} else if gcp.IsInvalidIP(err) {
-		return ReasonUnsupportedCluster, "Pod IP is not a valid VPC alias IP."
-	}
-	klog.Errorf("Endpoint attachment failed: %v", err)
-	return ReasonEndpointAttachmentFailed, "Failed to attach endpoints to zonal NEGs; see controller logs for details."
+	return registrar.GCPErrorReasonAndMessage(err)
 }
 
 func isPodReadinessGateTrue(pod *corev1.Pod) bool {

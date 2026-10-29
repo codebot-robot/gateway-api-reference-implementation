@@ -293,14 +293,17 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	}
 
 	opts.SetupWithManager = func(mgr ctrl.Manager, s *gari.Server) error {
+		recorder := mgr.GetEventRecorderFor("gcpgateway")
 		reg := registrar.NewRegistrar(mgr.GetClient(), gcpClient, registrar.Config{
 			ClusterID: reconcilerCfg.ClusterID,
 			NegPrefix: reconcilerCfg.NegPrefix,
 			Project:   reconcilerCfg.Project,
 			Zones:     reconcilerCfg.Zones,
+			Recorder:  recorder,
 		})
 
 		cfg := reconcilerCfg
+		cfg.Recorder = recorder
 		if s != nil {
 			cfg.EnqueueGateway = s.EnqueueGateway
 		}

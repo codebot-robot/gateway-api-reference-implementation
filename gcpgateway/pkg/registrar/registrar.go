@@ -27,6 +27,7 @@ import (
 	compute "google.golang.org/api/compute/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -44,7 +45,29 @@ const (
 
 	// LoadBalancerReadyGate is the readiness gate condition type added to data plane pods.
 	LoadBalancerReadyGate = "gcpgateway.gke-labs.io/load-balancer-ready"
+
+	// Condition reasons for GCP errors
+	ReasonPermissionDenied         = "PermissionDenied"
+	ReasonQuotaExceeded            = "QuotaExceeded"
+	ReasonNEGNotFound              = "NEGNotFound"
+	ReasonUnsupportedCluster       = "UnsupportedCluster"
+	ReasonEndpointAttachmentFailed = "EndpointAttachmentFailed"
 )
+
+// GCPErrorReasonAndMessage translates a GCP error into a standardized condition reason and message.
+func GCPErrorReasonAndMessage(err error) (string, string) {
+	if gcp.IsPermissionDenied(err) {
+		return ReasonPermissionDenied, "GCP service account lacks compute.networkEndpointGroups.use, compute.instances.use, or attach permission."
+	} else if gcp.IsQuotaExceeded(err) {
+		return ReasonQuotaExceeded, "Compute API quota exceeded when registering endpoints."
+	} else if gcp.IsNEGNotFound(err) {
+		return ReasonNEGNotFound, "One or more configured NEGs do not exist in the GCP project/zones."
+	} else if gcp.IsInvalidIP(err) {
+		return ReasonUnsupportedCluster, "Pod IP is not a valid VPC alias IP."
+	}
+	klog.Errorf("Endpoint attachment failed: %v", err)
+	return ReasonEndpointAttachmentFailed, "Failed to attach endpoints to zonal NEGs; see controller logs for details."
+}
 
 // Config configures the NEG registrar.
 type Config struct {
@@ -53,6 +76,9 @@ type Config struct {
 	Project          string
 	Zones            []string
 	HysteresisWindow time.Duration
+	MinBackoff       time.Duration
+	MaxBackoff       time.Duration
+	Recorder         record.EventRecorder
 }
 
 // Registrar reconciles Kubernetes data plane pods into Google Cloud zonal NEGs.
@@ -61,6 +87,8 @@ type Registrar struct {
 	gcpClient gcp.ComputeClient
 	cfg       Config
 	tracker   *HysteresisTracker
+	backoff   *BackoffTracker
+	recorder  record.EventRecorder
 	mu        sync.Mutex
 }
 
@@ -74,6 +102,8 @@ func NewRegistrar(c client.Client, gcpClient gcp.ComputeClient, cfg Config) *Reg
 		gcpClient: gcpClient,
 		cfg:       cfg,
 		tracker:   NewHysteresisTracker(cfg.HysteresisWindow),
+		backoff:   NewBackoffTracker(cfg.MinBackoff, cfg.MaxBackoff),
+		recorder:  cfg.Recorder,
 	}
 }
 
@@ -107,6 +137,13 @@ type matchedNeg struct {
 	zone string
 	port int
 	neg  *compute.NetworkEndpointGroup
+}
+
+type desiredPod struct {
+	instance string
+	zone     string
+	ip       string
+	pod      *corev1.Pod
 }
 
 func (r *Registrar) discoverZones(ctx context.Context) ([]string, map[string]*corev1.Node, error) {
@@ -239,6 +276,9 @@ func (r *Registrar) DetachAll(ctx context.Context, gw *gatewayv1.Gateway) (*Reco
 		}
 	}
 
+	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
+	r.backoff.Clear(gwKey)
+
 	return result, nil
 }
 
@@ -250,6 +290,27 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	now := time.Now()
+	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
+
+	if remaining, lastErr := r.backoff.Remaining(gwKey, now); remaining > 0 {
+		var podList corev1.PodList
+		hasTerminatingPods := false
+		if err := r.client.List(ctx, &podList, client.InNamespace(gw.Namespace)); err == nil {
+			for i := range podList.Items {
+				pod := &podList.Items[i]
+				if pod.Labels[singlepod.LabelGatewayName] == gw.Name && pod.DeletionTimestamp != nil {
+					hasTerminatingPods = true
+					break
+				}
+			}
+		}
+		if !hasTerminatingPods {
+			klog.V(4).Infof("Skipping NEG reconciliation for Gateway %s: backing off for %v (last error: %v)", gwKey, remaining, lastErr)
+			return nil, fmt.Errorf("attaching endpoints for gateway %s: %w", gwKey, lastErr)
+		}
+	}
 
 	result := &ReconcileResult{}
 
@@ -296,12 +357,6 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 	}
 
 	// Filter pods belonging to this Gateway
-	now := time.Now()
-	type desiredPod struct {
-		instance string
-		zone     string
-		ip       string
-	}
 	var activePods []desiredPod
 
 	for i := range podList.Items {
@@ -343,6 +398,7 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 				instance: nodeInfo.Instance,
 				zone:     nodeInfo.Zone,
 				ip:       pod.Status.PodIP,
+				pod:      pod,
 			})
 		}
 	}
@@ -396,7 +452,16 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 				end = len(toAttach)
 			}
 			batch := toAttach[i:end]
+
+			if remaining, lastErr := r.backoff.Remaining(gwKey, now); remaining > 0 {
+				klog.V(4).Infof("Skipping attach for NEG %s in zone %s: backing off for %v (last error: %v)", mn.neg.Name, mn.zone, remaining, lastErr)
+				return nil, fmt.Errorf("attaching endpoints to NEG %s: %w", mn.neg.Name, lastErr)
+			}
+
 			if err := r.gcpClient.AttachNetworkEndpoints(ctx, r.cfg.Project, mn.zone, mn.neg.Name, batch); err != nil {
+				dur := r.backoff.RecordFailure(gwKey, err, now)
+				klog.Errorf("Failed to attach endpoints to NEG %s in zone %s: %v. Backing off for %v.", mn.neg.Name, mn.zone, err, dur)
+				r.emitAttachFailureEvents(gw, mn.neg.Name, mn.zone, batch, activePods, err)
 				return nil, fmt.Errorf("attaching endpoints to NEG %s: %w", mn.neg.Name, err)
 			}
 			result.AttachedCount += len(batch)
@@ -416,7 +481,45 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 		}
 	}
 
+	r.backoff.RecordSuccess(gwKey)
 	return result, nil
+}
+
+func (r *Registrar) emitAttachFailureEvents(gw *gatewayv1.Gateway, negName, zone string, batch []*compute.NetworkEndpoint, pods []desiredPod, err error) {
+	if r.recorder == nil {
+		return
+	}
+	reason, msg := GCPErrorReasonAndMessage(err)
+	r.recorder.Eventf(gw, corev1.EventTypeWarning, reason, "Failed to attach endpoints to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
+
+	batchIPs := make(map[string]bool)
+	for _, ep := range batch {
+		batchIPs[ep.IpAddress] = true
+	}
+	for _, dp := range pods {
+		if batchIPs[dp.ip] && dp.pod != nil {
+			r.recorder.Eventf(dp.pod, corev1.EventTypeWarning, reason, "Failed to attach endpoint to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
+		}
+	}
+}
+
+// BackoffRemaining returns the remaining backoff duration for the given Gateway.
+func (r *Registrar) BackoffRemaining(gw *gatewayv1.Gateway) time.Duration {
+	if gw == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gwKey := fmt.Sprintf("%s/%s", gw.Namespace, gw.Name)
+	rem, _ := r.backoff.Remaining(gwKey, time.Now())
+	return rem
+}
+
+// ClearBackoff removes the backoff state for the given Gateway key.
+func (r *Registrar) ClearBackoff(gwKey string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.backoff.Clear(gwKey)
 }
 
 // ResolveNEGConflict deterministically resolves conflicts between Gateways targeting identical NEGs.

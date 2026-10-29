@@ -143,6 +143,13 @@ func (f *FakeComputeClient) AttachNetworkEndpoints(ctx context.Context, project,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.AttachCalls = append(f.AttachCalls, AttachCall{
+		Project:   project,
+		Zone:      zone,
+		NEGName:   negName,
+		Endpoints: endpoints,
+	})
+
 	if f.InjectAttachError != nil {
 		return f.InjectAttachError
 	}
@@ -151,13 +158,6 @@ func (f *FakeComputeClient) AttachNetworkEndpoints(ctx context.Context, project,
 	if _, exists := f.negs[key]; !exists {
 		return ErrNEGNotFound
 	}
-
-	f.AttachCalls = append(f.AttachCalls, AttachCall{
-		Project:   project,
-		Zone:      zone,
-		NEGName:   negName,
-		Endpoints: endpoints,
-	})
 
 	eps := f.endpoints[key]
 	if eps == nil {
@@ -174,6 +174,13 @@ func (f *FakeComputeClient) DetachNetworkEndpoints(ctx context.Context, project,
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.DetachCalls = append(f.DetachCalls, DetachCall{
+		Project:   project,
+		Zone:      zone,
+		NEGName:   negName,
+		Endpoints: endpoints,
+	})
+
 	if f.InjectDetachError != nil {
 		return f.InjectDetachError
 	}
@@ -182,13 +189,6 @@ func (f *FakeComputeClient) DetachNetworkEndpoints(ctx context.Context, project,
 	if _, exists := f.negs[key]; !exists {
 		return ErrNEGNotFound
 	}
-
-	f.DetachCalls = append(f.DetachCalls, DetachCall{
-		Project:   project,
-		Zone:      zone,
-		NEGName:   negName,
-		Endpoints: endpoints,
-	})
 
 	eps := f.endpoints[key]
 	if eps != nil {
