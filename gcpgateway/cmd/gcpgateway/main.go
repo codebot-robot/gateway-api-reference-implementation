@@ -303,7 +303,6 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		})
 
 		cfg := reconcilerCfg
-		cfg.Recorder = recorder
 		if s != nil {
 			cfg.EnqueueGateway = s.EnqueueGateway
 		}

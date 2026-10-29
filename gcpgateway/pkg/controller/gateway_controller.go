@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,11 +69,11 @@ const (
 	ReasonWaitingForEndpoints      = "WaitingForEndpoints"
 	ReasonRolloutStalled           = "RolloutStalled"
 	ReasonProgrammed               = "Programmed"
-	ReasonPermissionDenied         = "PermissionDenied"
-	ReasonQuotaExceeded            = "QuotaExceeded"
-	ReasonNEGNotFound              = "NEGNotFound"
-	ReasonUnsupportedCluster       = "UnsupportedCluster"
-	ReasonEndpointAttachmentFailed = "EndpointAttachmentFailed"
+	ReasonPermissionDenied         = registrar.ReasonPermissionDenied
+	ReasonQuotaExceeded            = registrar.ReasonQuotaExceeded
+	ReasonNEGNotFound              = registrar.ReasonNEGNotFound
+	ReasonUnsupportedCluster       = registrar.ReasonUnsupportedCluster
+	ReasonEndpointAttachmentFailed = registrar.ReasonEndpointAttachmentFailed
 )
 
 // GatewayStatusResult represents the cached status result for a Gateway.
@@ -135,7 +134,6 @@ type GatewayReconciler struct {
 	ControllerName string
 	HealthTimeout  time.Duration
 	Registrar      *registrar.Registrar
-	Recorder       record.EventRecorder
 
 	HealthPollInterval time.Duration
 	ResyncInterval     time.Duration
@@ -163,7 +161,6 @@ type GatewayReconcilerConfig struct {
 	HealthPollInterval time.Duration
 	ResyncInterval     time.Duration
 	EnqueueGateway     func(types.NamespacedName)
-	Recorder           record.EventRecorder
 }
 
 // NewGatewayReconciler creates a new GatewayReconciler.
@@ -197,7 +194,6 @@ func NewGatewayReconciler(c client.Client, scheme *runtime.Scheme, gcpClient gcp
 		ResyncInterval:     resyncInterval,
 		EnqueueGateway:     cfg.EnqueueGateway,
 		Registrar:          reg,
-		Recorder:           cfg.Recorder,
 		waitingSince:       make(map[types.NamespacedName]map[string]time.Time),
 		statusCache:        make(map[types.NamespacedName]*GatewayStatusResult),
 	}

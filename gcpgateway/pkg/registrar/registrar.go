@@ -84,7 +84,6 @@ type Registrar struct {
 	gcpClient gcp.ComputeClient
 	cfg       Config
 	tracker   *HysteresisTracker
-	recorder  record.EventRecorder
 	mu        sync.Mutex
 }
 
@@ -98,7 +97,6 @@ func NewRegistrar(c client.Client, gcpClient gcp.ComputeClient, cfg Config) *Reg
 		gcpClient: gcpClient,
 		cfg:       cfg,
 		tracker:   NewHysteresisTracker(cfg.HysteresisWindow),
-		recorder:  cfg.Recorder,
 	}
 }
 
@@ -450,11 +448,11 @@ func (r *Registrar) ReconcileEndpoints(ctx context.Context, gw *gatewayv1.Gatewa
 }
 
 func (r *Registrar) emitAttachFailureEvents(gw *gatewayv1.Gateway, negName, zone string, batch []*compute.NetworkEndpoint, pods []desiredPod, err error) {
-	if r.recorder == nil {
+	if r.cfg.Recorder == nil {
 		return
 	}
 	reason, msg := GCPErrorReasonAndMessage(err)
-	r.recorder.Eventf(gw, corev1.EventTypeWarning, reason, "Failed to attach endpoints to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
+	r.cfg.Recorder.Eventf(gw, corev1.EventTypeWarning, reason, "Failed to attach endpoints to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
 
 	batchIPs := make(map[string]bool)
 	for _, ep := range batch {
@@ -462,7 +460,7 @@ func (r *Registrar) emitAttachFailureEvents(gw *gatewayv1.Gateway, negName, zone
 	}
 	for _, dp := range pods {
 		if batchIPs[dp.ip] && dp.pod != nil {
-			r.recorder.Eventf(dp.pod, corev1.EventTypeWarning, reason, "Failed to attach endpoint to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
+			r.cfg.Recorder.Eventf(dp.pod, corev1.EventTypeWarning, reason, "Failed to attach endpoint to zonal NEG %s in %s: %s (%v)", negName, zone, msg, err)
 		}
 	}
 }
