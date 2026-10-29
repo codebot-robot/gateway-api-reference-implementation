@@ -241,6 +241,131 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 }
 
+func TestSetupDataplane_ProvisionerArgs_ACMEChallenge(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme failed: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("gatewayv1 AddToScheme failed: %v", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gcp-params",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			state.ParameterKeyServiceType:   "LoadBalancer",
+			state.ParameterKeyACMEChallenge: "enabled",
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("test-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "gcp-params",
+				},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     gatewayv1.SectionName("https"),
+			Port:     gatewayv1.PortNumber(8443),
+			Protocol: gatewayv1.HTTPSProtocolType,
+		},
+	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gcpgateway"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	})
+	st.UpsertGateway(gw)
+	st.UpsertConfigMap(cm)
+	st.Recompute()
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, cm).Build()
+	p := singlepod.NewAddressProvider(
+		c,
+		singlepod.WithState(st),
+		singlepod.WithACMEChallengeUpstreamURL("https://certserver.gcp.internal:8443"),
+		singlepod.WithACMEChallengeCABundlePath("/etc/ssl/certs/certserver-ca.crt"),
+		singlepod.WithACMEChallengeTokenPath("/var/run/secrets/tokens/certserver/token"),
+	)
+
+	// 1. Turned on via acmeChallenge: enabled in ConfigMap
+	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	if len(deploy.Spec.Template.Spec.Containers) == 0 {
+		t.Fatalf("expected at least 1 container in Deployment template, got 0")
+	}
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+
+	opts, err := SetupDataplane(args)
+	if err != nil {
+		t.Fatalf("SetupDataplane failed on provisioner-generated args %v: %v", args, err)
+	}
+
+	if opts.ACMEChallengeUpstreamURL != "https://certserver.gcp.internal:8443" {
+		t.Errorf("expected ACMEChallengeUpstreamURL='https://certserver.gcp.internal:8443', got %q", opts.ACMEChallengeUpstreamURL)
+	}
+	if opts.ACMEChallengeCABundlePath != "/etc/ssl/certs/certserver-ca.crt" {
+		t.Errorf("expected ACMEChallengeCABundlePath='/etc/ssl/certs/certserver-ca.crt', got %q", opts.ACMEChallengeCABundlePath)
+	}
+	if opts.ACMEChallengeTokenPath != "/var/run/secrets/tokens/certserver/token" {
+		t.Errorf("expected ACMEChallengeTokenPath='/var/run/secrets/tokens/certserver/token', got %q", opts.ACMEChallengeTokenPath)
+	}
+
+	// 2. Turned off via acmeChallenge: disabled
+	cm.Data[state.ParameterKeyACMEChallenge] = "disabled"
+	st.UpsertConfigMap(cm)
+	st.Recompute()
+
+	_, _, err = p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+		t.Fatalf("failed to get updated Deployment: %v", err)
+	}
+	offArgs := deploy.Spec.Template.Spec.Containers[0].Args
+	offOpts, err := SetupDataplane(offArgs)
+	if err != nil {
+		t.Fatalf("SetupDataplane failed on turned-off args %v: %v", offArgs, err)
+	}
+	if offOpts.ACMEChallengeUpstreamURL != "" {
+		t.Errorf("expected empty ACMEChallengeUpstreamURL when turned off, got %q", offOpts.ACMEChallengeUpstreamURL)
+	}
+}
+
 func TestSetupController_NoSilentFallback(t *testing.T) {
 	// Without --fake-compute, SetupController initializes the real Compute client.
 	// It must never silently substitute a FakeComputeClient.

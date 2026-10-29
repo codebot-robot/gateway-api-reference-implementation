@@ -127,6 +127,8 @@ func SetupDataplane(args []string) (gari.Options, error) {
 	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "HTTP proxy bind address")
 	fs.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "HTTPS proxy bind address")
 	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses")
+	fs.BoolVar(&opts.EnableH2C, "enable-h2c", opts.EnableH2C, "Enable H2C support on the proxy server")
+	fs.StringVar((*string)(&opts.ForwardedForMode), "forwarded-for-mode", string(opts.ForwardedForMode), "How to handle X-Forwarded-For: append (default) or replace")
 	// The singlepod provisioner passes the HTTP/3 flags to every data plane with an HTTPS listener, so the
 	// data-plane flag set must accept them (matching cmd/gateway-api-reference-implementation).
 	fs.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (defaults to the HTTPS bind address)")
@@ -209,6 +211,12 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		ResyncInterval:     controller.ResyncInterval,
 	}
 
+	opts := gari.DefaultOptions()
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.ProxyHTTP3Addr = ""
+	opts.DrainSentinelPath = DefaultSentinelPath
+
 	fs := flag.NewFlagSet("controller", flag.ContinueOnError)
 	fs.StringVar(&reconcilerCfg.ClusterID, "cluster-id", defaultClusterID, "Unique Kubernetes cluster identifier")
 	fs.StringVar(&reconcilerCfg.NegPrefix, "neg-prefix", defaultNegPrefix, "Prefix for zonal NEG names")
@@ -223,6 +231,9 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	fs.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election")
 	fs.BoolVar(&fakeCompute, "fake-compute", false, "Use in-memory fake Compute client for testing/offline mode")
 	fs.BoolVar(&debugErrorResponses, "debug-error-responses", false, "Include detailed error messages in unmatched responses")
+	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
+	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
+	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
 
 	if err := fs.Parse(args); err != nil {
 		return gari.Options{}, err
@@ -241,13 +252,8 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		}
 	}
 
-	opts := gari.DefaultOptions()
 	opts.ControllerName = reconcilerCfg.ControllerName
 	opts.LeaderElection = leaderElect
-	opts.ProxyAddr = ""
-	opts.ProxyHTTPSAddr = ""
-	opts.ProxyHTTP3Addr = ""
-	opts.DrainSentinelPath = DefaultSentinelPath
 	opts.DebugErrorResponses = debugErrorResponses
 
 	drainVol := corev1ac.Volume().
@@ -277,6 +283,9 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
 		singlepod.WithTerminationGracePeriodSeconds(gracePeriodSeconds),
 		singlepod.WithDebugErrorResponses(debugErrorResponses),
+		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
+		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
+		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
 	)
 
 	if zonesStr != "" {
