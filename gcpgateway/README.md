@@ -293,7 +293,7 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 ## Teardown
 
-When a Gateway is deleted (`kubectl delete gateway`), the controller uses the finalizer `gcpgateway.gke-labs.io/neg-cleanup` to cleanly detach all data-plane endpoints from the zonal NEGs before allowing Kubernetes to finalize and delete the Gateway resource.
+When a Gateway is deleted (`kubectl delete gateway`), the controller uses the finalizer `gcpgateway.gke-labs.io/cleanup` to cleanly detach all data-plane endpoints from the zonal NEGs before allowing Kubernetes to finalize and delete the Gateway resource.
 
 ### Manual Finalizer Removal
 

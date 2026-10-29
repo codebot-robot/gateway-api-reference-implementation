@@ -1061,7 +1061,7 @@ func TestGateway_PeriodicResyncPrunesOrphanedEndpoints(t *testing.T) {
 	}
 }
 
-// TestGateway_FinalizerManagement tests that the FinalizerNEG is added to active Gateways
+// TestGateway_FinalizerManagement tests that the FinalizerCleanup is added to active Gateways
 // of the managed controller class, but not to Gateways belonging to other classes.
 func TestGateway_FinalizerManagement(t *testing.T) {
 	scheme := setupScheme()
@@ -1137,11 +1137,11 @@ func TestGateway_FinalizerManagement(t *testing.T) {
 	}
 	var checkForeign gatewayv1.Gateway
 	_ = c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "foreign-gw"}, &checkForeign)
-	if controllerutil.ContainsFinalizer(&checkForeign, FinalizerNEG) {
+	if controllerutil.ContainsFinalizer(&checkForeign, FinalizerCleanup) {
 		t.Errorf("expected no finalizer on foreign gateway, got %v", checkForeign.Finalizers)
 	}
 
-	// 2. Reconcile managed gateway -> FinalizerNEG is added
+	// 2. Reconcile managed gateway -> FinalizerCleanup is added
 	_, err = rec.Reconcile(t.Context(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Namespace: "default", Name: "managed-gw"},
 	})
@@ -1150,8 +1150,8 @@ func TestGateway_FinalizerManagement(t *testing.T) {
 	}
 	var checkManaged gatewayv1.Gateway
 	_ = c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "managed-gw"}, &checkManaged)
-	if !controllerutil.ContainsFinalizer(&checkManaged, FinalizerNEG) {
-		t.Errorf("expected FinalizerNEG on managed gateway, got %v", checkManaged.Finalizers)
+	if !controllerutil.ContainsFinalizer(&checkManaged, FinalizerCleanup) {
+		t.Errorf("expected FinalizerCleanup on managed gateway, got %v", checkManaged.Finalizers)
 	}
 }
 
@@ -1167,7 +1167,7 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "default",
 			Name:              "del-gw",
-			Finalizers:        []string{FinalizerNEG},
+			Finalizers:        []string{FinalizerCleanup},
 			DeletionTimestamp: &now,
 		},
 		Spec: gatewayv1.GatewaySpec{
@@ -1276,12 +1276,12 @@ func TestGateway_DeleteDetachesEndpointsAndRemovesFinalizer(t *testing.T) {
 		t.Errorf("expected 0 endpoints in 8443 NEG, got %d", len(eps8443))
 	}
 
-	// 2. Verify FinalizerNEG was removed from the Gateway
+	// 2. Verify FinalizerCleanup was removed from the Gateway
 	var updatedGW gatewayv1.Gateway
 	err = c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "del-gw"}, &updatedGW)
 	if err == nil {
-		if controllerutil.ContainsFinalizer(&updatedGW, FinalizerNEG) {
-			t.Errorf("expected FinalizerNEG to be removed from gateway, got %v", updatedGW.Finalizers)
+		if controllerutil.ContainsFinalizer(&updatedGW, FinalizerCleanup) {
+			t.Errorf("expected FinalizerCleanup to be removed from gateway, got %v", updatedGW.Finalizers)
 		}
 	}
 
@@ -1314,7 +1314,7 @@ func TestGateway_DeletingGatewayDoesNotBlockConflictWinner(t *testing.T) {
 			Name:              "gw-old",
 			CreationTimestamp: metav1.NewTime(t0),
 			DeletionTimestamp: &now,
-			Finalizers:        []string{FinalizerNEG},
+			Finalizers:        []string{FinalizerCleanup},
 		},
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: "gcpgateway",
@@ -1537,13 +1537,13 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 		}
 	}
 
-	// Verify FinalizerNEG was added to the Gateway
+	// Verify FinalizerCleanup was added to the Gateway
 	var currentGW gatewayv1.Gateway
 	if err := env.Client.Get(t.Context(), types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, &currentGW); err != nil {
 		t.Fatalf("failed to get gateway: %v", err)
 	}
-	if !controllerutil.ContainsFinalizer(&currentGW, FinalizerNEG) {
-		t.Fatalf("expected Gateway to have FinalizerNEG, got: %v", currentGW.Finalizers)
+	if !controllerutil.ContainsFinalizer(&currentGW, FinalizerCleanup) {
+		t.Fatalf("expected Gateway to have FinalizerCleanup, got: %v", currentGW.Finalizers)
 	}
 
 	// 2. Delete the Gateway
@@ -1583,7 +1583,7 @@ func TestGateway_DeleteDetachesEndpoints_EnvTest(t *testing.T) {
 }
 
 // TestGateway_Delete_GCPErrorKeepsFinalizer verifies that a GCP error during endpoint
-// detachment returns an error and keeps the FinalizerNEG on the Gateway.
+// detachment returns an error and keeps the FinalizerCleanup on the Gateway.
 func TestGateway_Delete_GCPErrorKeepsFinalizer(t *testing.T) {
 	scheme := setupScheme()
 	now := metav1.Now()
@@ -1593,7 +1593,7 @@ func TestGateway_Delete_GCPErrorKeepsFinalizer(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "default",
 			Name:              "err-gw",
-			Finalizers:        []string{FinalizerNEG},
+			Finalizers:        []string{FinalizerCleanup},
 			DeletionTimestamp: &now,
 		},
 		Spec: gatewayv1.GatewaySpec{
@@ -1658,13 +1658,13 @@ func TestGateway_Delete_GCPErrorKeepsFinalizer(t *testing.T) {
 		t.Fatalf("expected error from Reconcile when GCP detach fails, got nil")
 	}
 
-	// Verify FinalizerNEG is still present on the Gateway
+	// Verify FinalizerCleanup is still present on the Gateway
 	var updatedGW gatewayv1.Gateway
 	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "err-gw"}, &updatedGW); err != nil {
 		t.Fatalf("getting gateway: %v", err)
 	}
-	if !controllerutil.ContainsFinalizer(&updatedGW, FinalizerNEG) {
-		t.Errorf("expected FinalizerNEG to be retained on detach error, got %v", updatedGW.Finalizers)
+	if !controllerutil.ContainsFinalizer(&updatedGW, FinalizerCleanup) {
+		t.Errorf("expected FinalizerCleanup to be retained on detach error, got %v", updatedGW.Finalizers)
 	}
 
 	// Verify endpoint was not detached
@@ -1686,7 +1686,7 @@ func TestGateway_Delete_ForeignNEGsUntouched(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         "default",
 			Name:              "target-gw",
-			Finalizers:        []string{FinalizerNEG},
+			Finalizers:        []string{FinalizerCleanup},
 			DeletionTimestamp: &now,
 		},
 		Spec: gatewayv1.GatewaySpec{
@@ -1817,7 +1817,7 @@ func TestGateway_ControllerRestartWithNoDeletionDetachesNothing(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:  "default",
 			Name:       "restart-gw",
-			Finalizers: []string{FinalizerNEG},
+			Finalizers: []string{FinalizerCleanup},
 		},
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: "gcpgateway",

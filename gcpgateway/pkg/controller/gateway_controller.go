@@ -41,9 +41,12 @@ import (
 )
 
 const (
-	// FinalizerNEG is added to Gateways managed by gcpgateway to ensure data-plane
-	// endpoints are cleanly detached from zonal NEGs before the Gateway is deleted.
-	FinalizerNEG = "gcpgateway.gke-labs.io/neg-cleanup"
+	// FinalizerCleanup is added to Gateways managed by gcpgateway to ensure data-plane
+	// endpoints and resources are cleanly detached and cleaned up before the Gateway is deleted.
+	FinalizerCleanup = "gcpgateway.gke-labs.io/cleanup"
+
+	// FinalizerNEG is an alias for FinalizerCleanup.
+	FinalizerNEG = FinalizerCleanup
 
 	// DefaultHealthTimeout is the duration after which an unconfirmed endpoint triggers RolloutStalled.
 	DefaultHealthTimeout = 60 * time.Second
@@ -298,14 +301,14 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 
 	// Handle deletion if DeletionTimestamp is set
 	if gw.DeletionTimestamp != nil {
-		if controllerutil.ContainsFinalizer(&gw, FinalizerNEG) {
+		if controllerutil.ContainsFinalizer(&gw, FinalizerCleanup) {
 			if r.Registrar != nil {
 				if _, err := r.Registrar.DetachAll(ctx, &gw); err != nil {
 					return reconcile.Result{}, err
 				}
 			}
 			patch := client.MergeFrom(gw.DeepCopy())
-			controllerutil.RemoveFinalizer(&gw, FinalizerNEG)
+			controllerutil.RemoveFinalizer(&gw, FinalizerCleanup)
 			if err := r.Patch(ctx, &gw, patch); err != nil {
 				return reconcile.Result{}, err
 			}
@@ -348,9 +351,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 	}
 
 	// Ensure finalizer is present on active Gateways of this class
-	if !controllerutil.ContainsFinalizer(&gw, FinalizerNEG) {
+	if !controllerutil.ContainsFinalizer(&gw, FinalizerCleanup) {
 		patch := client.MergeFrom(gw.DeepCopy())
-		controllerutil.AddFinalizer(&gw, FinalizerNEG)
+		controllerutil.AddFinalizer(&gw, FinalizerCleanup)
 		if err := r.Patch(ctx, &gw, patch); err != nil {
 			return reconcile.Result{}, err
 		}
