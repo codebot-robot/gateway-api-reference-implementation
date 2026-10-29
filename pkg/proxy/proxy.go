@@ -110,6 +110,16 @@ type Proxy struct {
 	transportsMu sync.Mutex
 	transports   map[string]http.RoundTripper
 
+	// acmeMu serializes updates to acmeConfig, acmeTokenSource, and acmeTimeout,
+	// and coordinates rebuilding the immutable acmeForwarder.
+	acmeMu sync.Mutex
+
+	acmeForwarder         atomic.Pointer[acmeForwarder]
+	acmeConfig            *ACMEChallengeConfig
+	acmeTokenSource       TokenSource
+	acmeTimeout           time.Duration
+	logForwarderErrorOnce sync.Once
+
 	closed bool
 }
 
@@ -254,6 +264,61 @@ func (p *Proxy) getForwardedForMode() ForwardedForMode {
 		return *m
 	}
 	return ForwardedForModeAppend
+}
+
+// UpdateACMEChallenge updates the proxy's ACME HTTP-01 challenge forwarder configuration.
+// If cfg is nil or UpstreamURL is empty, challenge forwarding is disabled.
+func (p *Proxy) UpdateACMEChallenge(cfg *ACMEChallengeConfig) {
+	p.acmeMu.Lock()
+	defer p.acmeMu.Unlock()
+	p.acmeConfig = cfg
+	p.logForwarderErrorOnce = sync.Once{}
+	p.rebuildACMEForwarderLocked()
+}
+
+// SetACMETokenSource sets a custom TokenSource for ACME challenge forwarding.
+func (p *Proxy) SetACMETokenSource(ts TokenSource) {
+	p.acmeMu.Lock()
+	defer p.acmeMu.Unlock()
+	p.acmeTokenSource = ts
+	p.rebuildACMEForwarderLocked()
+}
+
+// SetACMETimeout configures the timeout for ACME challenge upstream requests.
+func (p *Proxy) SetACMETimeout(d time.Duration) {
+	p.acmeMu.Lock()
+	defer p.acmeMu.Unlock()
+	p.acmeTimeout = d
+	p.rebuildACMEForwarderLocked()
+}
+
+func (p *Proxy) rebuildACMEForwarderLocked() {
+	oldForwarder := p.acmeForwarder.Swap(nil)
+	if oldForwarder != nil && oldForwarder.httpClient != nil {
+		if tr, ok := oldForwarder.httpClient.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+
+	cfg := p.acmeConfig
+	if cfg == nil || cfg.UpstreamURL == "" {
+		return
+	}
+
+	timeout := p.acmeTimeout
+	if timeout <= 0 {
+		timeout = defaultACMETimeout
+	}
+	ts := p.acmeTokenSource
+
+	f, err := newACMEForwarder(cfg, ts, timeout)
+	if err != nil {
+		p.logForwarderErrorOnce.Do(func() {
+			klog.Errorf("failed to configure ACME challenge forwarder: %v", err)
+		})
+		return
+	}
+	p.acmeForwarder.Store(f)
 }
 
 // SetDebugErrorResponses configures whether detailed error messages are included in unmatched responses.
@@ -768,6 +833,71 @@ func splitHostPort(hostPort string, defaultPort int32) (string, int32, bool) {
 	return h, int32(p), true
 }
 
+// matchHTTPListeners finds HTTP listeners matching the host header port (defaulting to 80) and host.
+func matchHTTPListeners(listeners []state.InternalListener, hostHeader string) ([]state.InternalListener, bool) {
+	reqHost, reqPort, _ := splitHostPort(hostHeader, 80)
+	reqHost = strings.ToLower(reqHost)
+
+	var httpListeners []state.InternalListener
+	for _, l := range listeners {
+		if l.Protocol == gatewayv1.HTTPProtocolType {
+			if l.Port == 0 || int32(l.Port) == reqPort {
+				httpListeners = append(httpListeners, l)
+			}
+		}
+	}
+
+	if len(httpListeners) == 0 {
+		return nil, false
+	}
+
+	matchedListeners, _ := state.MatchListeners(httpListeners, reqHost)
+	return matchedListeners, true
+}
+
+// maybeForwardACMEChallenge checks if a plain-HTTP request matches the ACME HTTP-01 challenge prefix,
+// and if forwarding is enabled on the matching listener and the upstream returns 200, relays the response and returns true.
+// For HTTPS requests, listeners without forwarding enabled, malformed tokens, 404, upstream errors, or timeouts,
+// it returns false to fall through to normal routing.
+func (p *Proxy) maybeForwardACMEChallenge(w http.ResponseWriter, r *http.Request, listeners []state.InternalListener) bool {
+	if r.TLS != nil {
+		return false
+	}
+	f := p.acmeForwarder.Load()
+	if f == nil {
+		return false
+	}
+
+	if len(listeners) > 0 {
+		matchedListeners, hasPortListeners := matchHTTPListeners(listeners, r.Host)
+		if !hasPortListeners || len(matchedListeners) == 0 {
+			return false
+		}
+		hasEnabledListener := false
+		for _, l := range matchedListeners {
+			if l.ACMEChallenge {
+				hasEnabledListener = true
+				break
+			}
+		}
+		if !hasEnabledListener {
+			return false
+		}
+	}
+
+	if !strings.HasPrefix(r.URL.Path, ACMEChallengePrefix) {
+		return false
+	}
+
+	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
+	if !isValidACMEToken(token) {
+		// Malformed tokens fall through to normal routing without contacting upstream
+		return false
+	}
+
+	return f.forward(w, r, token)
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Value(originalHostContextKey) == nil {
 		r = r.WithContext(context.WithValue(r.Context(), originalHostContextKey, r.Host))
@@ -776,6 +906,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	routes := p.routes
 	listeners := p.listeners
 	p.mu.RUnlock()
+
+	if p.maybeForwardACMEChallenge(w, r, listeners) {
+		return
+	}
 
 	if len(listeners) > 0 {
 		if r.TLS != nil {
@@ -872,20 +1006,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				routes = connRoutes
 			}
 		} else {
-			reqHost, reqPort, _ := splitHostPort(r.Host, 80)
-			reqHost = strings.ToLower(reqHost)
-
-			var httpListeners []state.InternalListener
-			for _, l := range listeners {
-				if l.Protocol == gatewayv1.HTTPProtocolType {
-					if l.Port == 0 || int32(l.Port) == reqPort {
-						httpListeners = append(httpListeners, l)
-					}
-				}
-			}
-
-			if len(httpListeners) > 0 {
-				reqHostListeners, _ := state.MatchListeners(httpListeners, reqHost)
+			reqHostListeners, hasPortListeners := matchHTTPListeners(listeners, r.Host)
+			if hasPortListeners {
 				if len(reqHostListeners) == 0 {
 					p.respondNotFound(w, r, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path))
 					return

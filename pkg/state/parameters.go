@@ -42,6 +42,7 @@ const (
 	ParameterKeyNEGHTTPS                  = "negHTTPS"
 	ParameterKeyNEGHTTP                   = "negHTTP"
 	ParameterKeyNEGPrefix                 = "negPrefix"
+	ParameterKeyACMEChallenge             = "acmeChallenge"
 )
 
 // Parameters represents configuration parsed from a ConfigMap for Gateway/GatewayClass.
@@ -59,6 +60,7 @@ type Parameters struct {
 	NEGHTTPS                  string
 	NEGHTTP                   string
 	NEGPrefix                 string
+	ACMEChallenge             string
 }
 
 // DefaultParameters returns default parameters (LoadBalancer, Cluster).
@@ -118,7 +120,8 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 			ParameterKeyGatewayName,
 			ParameterKeyNEGHTTPS,
 			ParameterKeyNEGHTTP,
-			ParameterKeyNEGPrefix:
+			ParameterKeyNEGPrefix,
+			ParameterKeyACMEChallenge:
 		default:
 			return nil, fmt.Errorf("unknown key %q in ConfigMap", k)
 		}
@@ -223,6 +226,14 @@ func ParseConfigMapParameters(cm *corev1.ConfigMap) (*Parameters, error) {
 
 	if val, ok := cm.Data[ParameterKeyNEGPrefix]; ok {
 		p.NEGPrefix = strings.TrimSpace(val)
+	}
+
+	if val, ok := cm.Data[ParameterKeyACMEChallenge]; ok && val != "" {
+		v := strings.ToLower(strings.TrimSpace(val))
+		if v != "enabled" && v != "disabled" {
+			return nil, fmt.Errorf("invalid value %q for %s: must be 'enabled' or 'disabled'", val, ParameterKeyACMEChallenge)
+		}
+		p.ACMEChallenge = v
 	}
 
 	return p, nil
@@ -333,6 +344,9 @@ func MergeParameters(gcParams, gwParams *Parameters) *Parameters {
 		if gcParams.NEGPrefix != "" {
 			res.NEGPrefix = gcParams.NEGPrefix
 		}
+		if gcParams.ACMEChallenge != "" {
+			res.ACMEChallenge = gcParams.ACMEChallenge
+		}
 	}
 
 	if gwParams != nil {
@@ -374,6 +388,9 @@ func MergeParameters(gcParams, gwParams *Parameters) *Parameters {
 		}
 		if gwParams.NEGPrefix != "" {
 			res.NEGPrefix = gwParams.NEGPrefix
+		}
+		if gwParams.ACMEChallenge != "" {
+			res.ACMEChallenge = gwParams.ACMEChallenge
 		}
 	}
 
@@ -424,5 +441,8 @@ func ParametersEqual(a, b *Parameters) bool {
 	if a.NEGHTTP != b.NEGHTTP {
 		return false
 	}
-	return a.NEGPrefix == b.NEGPrefix
+	if a.NEGPrefix != b.NEGPrefix {
+		return false
+	}
+	return a.ACMEChallenge == b.ACMEChallenge
 }
