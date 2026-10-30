@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin && 
 
 WORKDIR /app
 COPY go.mod go.sum ./
+COPY certserver/api/go.mod certserver/api/go.sum ./certserver/api/
 COPY localgateway/go.mod localgateway/go.sum localgateway/go.work ./localgateway/
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download

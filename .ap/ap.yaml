@@ -1,4 +1,4 @@
 version: latest
 generate:
   ignoreOrphans:
-    - "certserver/pkg/api/v1/*.pb.go"
+    - "certserver/api/v1/*.pb.go"

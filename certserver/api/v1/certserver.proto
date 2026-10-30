@@ -16,7 +16,7 @@ syntax = "proto3";
 
 package certserver.v1;
 
-option go_package = "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1;certserverv1";
+option go_package = "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1;certserverv1";
 
 // CertificateService provides TLS certificate retrieval for GARI controllers.
 service CertificateService {

@@ -35,7 +35,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"

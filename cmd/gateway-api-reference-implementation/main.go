@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/certserversource"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"k8s.io/klog/v2/textlogger"
@@ -30,6 +31,7 @@ var setupLog = ctrl.Log.WithName("setup")
 // Config holds non-Options command-line flag variables.
 type Config struct {
 	DataplaneImage string
+	Certserver     certserversource.Config
 }
 
 // DefaultConfig returns the default Config populated from environment variables.
@@ -40,6 +42,7 @@ func DefaultConfig() Config {
 	}
 	return Config{
 		DataplaneImage: defaultImg,
+		Certserver:     certserversource.DefaultConfig(),
 	}
 }
 
@@ -81,44 +84,14 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	fs.StringVar(&opts.ControllerName, "controller-name", opts.ControllerName, "The GatewayClass controller name.")
+	certserversource.BindFlags(fs, &cfg.Certserver)
 }
 
 func main() {
-	opts := gari.DefaultOptions()
-	cfg := DefaultConfig()
-	BindFlags(flag.CommandLine, &opts, &cfg)
-
-	logConfig := textlogger.NewConfig()
-	logConfig.AddFlags(flag.CommandLine)
-	flag.Parse()
-
-	ctrl.SetLogger(textlogger.NewLogger(logConfig))
-
-	if opts.DataplaneMode {
-		if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
-			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
-			os.Exit(1)
-		}
-		// Data-plane pods serve traffic for a single Gateway and do not perform
-		// status updates, run leader election, or manage an address provider.
-		opts.DisableStatusUpdates = true
-		opts.LeaderElection = false
-		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
-		opts.AddressProvider = nil
-	} else {
-		opts.ProxyAddr = ""
-		opts.ProxyHTTPSAddr = ""
-		opts.ProxyHTTP3Addr = ""
-		opts.AddressProvider = singlepod.NewAddressProvider(
-			nil,
-			singlepod.WithDataplaneImage(cfg.DataplaneImage),
-			singlepod.WithEnableH2C(opts.EnableH2C),
-			singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
-			singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
-			singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
-			singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
-			singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
-		)
+	opts, err := Setup(os.Args[1:])
+	if err != nil {
+		setupLog.Error(err, "invalid configuration")
+		os.Exit(1)
 	}
 
 	ctx := ctrl.SetupSignalHandler()
@@ -128,30 +101,81 @@ func main() {
 	}
 }
 
-// SetupDataplane parses args and builds the gari.Options for data-plane mode.
-func SetupDataplane(args []string) (gari.Options, error) {
+// Setup parses args once using flag.FlagSet and builds gari.Options for either
+// data-plane mode (when --dataplane-mode is set) or controller mode.
+func Setup(args []string) (gari.Options, error) {
 	opts := gari.DefaultOptions()
 	cfg := DefaultConfig()
-	fs := flag.NewFlagSet("dataplane", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gari", flag.ContinueOnError)
 	BindFlags(fs, &opts, &cfg)
+
+	logConfig := textlogger.NewConfig()
+	logConfig.AddFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
+	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
-		return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+	if opts.DataplaneMode {
+		if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
+			return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+		}
+		// Data-plane pods serve traffic for a single Gateway and do not perform
+		// status updates or run leader election.
+		opts.DisableStatusUpdates = true
+		opts.LeaderElection = false
+		// Default HTTP/3 bind address to HTTPS bind address for dataplane.
+		if opts.ProxyHTTP3Addr == "" && opts.ProxyHTTPSAddr != "" {
+			opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
+		}
+		return opts, nil
 	}
 
-	opts.DataplaneMode = true
-	// Data-plane pods serve traffic for a single Gateway and do not perform
-	// status updates or run leader election.
-	opts.DisableStatusUpdates = true
-	opts.LeaderElection = false
-	// Default HTTP/3 bind address to HTTPS bind address for dataplane.
-	if opts.ProxyHTTP3Addr == "" && opts.ProxyHTTPSAddr != "" {
-		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
+	if err := certserversource.Register(&opts, cfg.Certserver); err != nil {
+		return opts, err
 	}
+
+	opts.ProxyAddr = ""
+	opts.ProxyHTTPSAddr = ""
+	opts.ProxyHTTP3Addr = ""
+	opts.AddressProvider = singlepod.NewAddressProvider(
+		nil,
+		singlepod.WithDataplaneImage(cfg.DataplaneImage),
+		singlepod.WithEnableH2C(opts.EnableH2C),
+		singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
+		singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
+		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
+		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
+		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
+	)
 
 	return opts, nil
+}
+
+// SetupController parses args and builds the gari.Options for controller mode.
+func SetupController(args []string) (gari.Options, error) {
+	opts, err := Setup(args)
+	if err != nil {
+		return opts, err
+	}
+	if opts.DataplaneMode {
+		return opts, fmt.Errorf("unexpected --dataplane-mode in controller setup")
+	}
+	return opts, nil
+}
+
+// SetupDataplane parses args and builds the gari.Options for data-plane mode.
+func SetupDataplane(args []string) (gari.Options, error) {
+	hasDataplaneMode := false
+	for _, a := range args {
+		if a == "--dataplane-mode" || a == "-dataplane-mode" || a == "--dataplane-mode=true" || a == "-dataplane-mode=true" {
+			hasDataplaneMode = true
+			break
+		}
+	}
+	if !hasDataplaneMode {
+		args = append([]string{"--dataplane-mode"}, args...)
+	}
+	return Setup(args)
 }

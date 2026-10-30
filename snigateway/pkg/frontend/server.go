@@ -34,7 +34,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/sni"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
