@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1144,4 +1145,115 @@ func TestACMEChallenge_ConcurrencyNoDataRace(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+func TestNewACMEChallengeForwarder_Handler(t *testing.T) {
+	caPEM, tlsCert := generateTestACMECAAndCert(t, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")})
+
+	var lastAuthHeader string
+	var mu sync.Mutex
+	upstreamServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		lastAuthHeader = r.Header.Get("Authorization")
+		mu.Unlock()
+
+		token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
+		if token == "good-token" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("key-authorization-xyz"))
+			return
+		}
+		if token == "error-token" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	upstreamServer.TLS = &tls.Config{Certificates: []tls.Certificate{tlsCert}}
+	upstreamServer.StartTLS()
+	defer upstreamServer.Close()
+
+	tempDir := t.TempDir()
+	tokenFile := filepath.Join(tempDir, "token")
+	if err := os.WriteFile(tokenFile, []byte("file-token-123"), 0600); err != nil {
+		t.Fatalf("failed to write token: %v", err)
+	}
+
+	// 1. Empty UpstreamURL fails construction and does not return typed-nil handler
+	emptyHandler, err := NewACMEChallengeForwarder(ACMEChallengeConfig{}, nil)
+	if err == nil {
+		t.Errorf("expected error for empty upstream URL")
+	}
+	if emptyHandler != nil {
+		t.Errorf("expected nil http.Handler on error, got %v", emptyHandler)
+	}
+
+	// 2. Non-HTTPS upstream fails construction
+	_, err = NewACMEChallengeForwarder(ACMEChallengeConfig{
+		UpstreamURL: "http://example.com",
+		TokenPath:   tokenFile,
+	}, nil)
+	if err == nil {
+		t.Errorf("expected error for http upstream URL")
+	}
+
+	// 3. Successful construction with HTTPS upstream, CA bundle, and FileTokenSource
+	h, err := NewACMEChallengeForwarder(ACMEChallengeConfig{
+		UpstreamURL: upstreamServer.URL,
+		CABundlePEM: string(caPEM),
+		TokenPath:   tokenFile,
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error creating forwarder: %v", err)
+	}
+
+	// 3. Relays 200 on valid challenge
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/good-token", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+	if body := rec.Body.String(); body != "key-authorization-xyz" {
+		t.Errorf("expected body %q, got %q", "key-authorization-xyz", body)
+	}
+	mu.Lock()
+	auth := lastAuthHeader
+	mu.Unlock()
+	if auth != "Bearer file-token-123" {
+		t.Errorf("expected auth 'Bearer file-token-123', got %q", auth)
+	}
+
+	// 4. Non-ACME path falls through with 404
+	reqOther := httptest.NewRequest(http.MethodGet, "http://example.com/other-path", nil)
+	recOther := httptest.NewRecorder()
+	h.ServeHTTP(recOther, reqOther)
+	if recOther.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for non-ACME path, got %d", recOther.Code)
+	}
+
+	// 5. Malformed token falls through with 404
+	reqBad := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/bad$token", nil)
+	recBad := httptest.NewRecorder()
+	h.ServeHTTP(recBad, reqBad)
+	if recBad.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for malformed token, got %d", recBad.Code)
+	}
+
+	// 6. Upstream 404 falls through with 404
+	req404 := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/missing-token", nil)
+	rec404 := httptest.NewRecorder()
+	h.ServeHTTP(rec404, req404)
+	if rec404.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing upstream token, got %d", rec404.Code)
+	}
+
+	// 7. Upstream error falls through with 404
+	req500 := httptest.NewRequest(http.MethodGet, "http://example.com/.well-known/acme-challenge/error-token", nil)
+	rec500 := httptest.NewRecorder()
+	h.ServeHTTP(rec500, req500)
+	if rec500.Code != http.StatusNotFound {
+		t.Errorf("expected 404 on upstream error, got %d", rec500.Code)
+	}
 }
