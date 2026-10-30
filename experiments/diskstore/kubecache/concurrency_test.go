@@ -34,7 +34,19 @@ func TestConcurrency_ReadersWritersAndCheckpoints(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal)
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+		})
+	}
+	onFatal := func(err error) {
+		t.Errorf("kubecache fatal error: %v", err)
+		stop()
+	}
+
+	indexer, err := New(store, &corev1.ConfigMap{}, onFatal)
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -54,7 +66,6 @@ func TestConcurrency_ReadersWritersAndCheckpoints(t *testing.T) {
 		}
 	}
 
-	stopCh := make(chan struct{})
 	var wg sync.WaitGroup
 
 	// Writer goroutine
@@ -152,6 +163,6 @@ func TestConcurrency_ReadersWritersAndCheckpoints(t *testing.T) {
 
 	// Run concurrency test for 500ms under race detector
 	time.Sleep(500 * time.Millisecond)
-	close(stopCh)
+	stop()
 	wg.Wait()
 }

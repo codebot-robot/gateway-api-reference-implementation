@@ -17,6 +17,9 @@ package kubecache
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -396,5 +399,47 @@ func TestAdapterFailure_IndexFunctionError(t *testing.T) {
 	items, err := idx.ByIndex("namespace", "default")
 	if err == nil || len(items) != 0 {
 		t.Fatalf("expected error and empty ByIndex after index function failure")
+	}
+}
+
+// TestForcedFatalVisibility asserts that a forced fatal error in a kubecache test
+// shows up as a named test failure rather than a silent process exit via os.Exit.
+func TestForcedFatalVisibility(t *testing.T) {
+	if os.Getenv("TEST_KUBECACHE_FORCED_FATAL") == "1" {
+		memFS := engine.NewMemFS()
+		eng, err := engine.Open(engine.WithFS(memFS), engine.WithDir("forced_fatal_proc"))
+		if err != nil {
+			t.Fatalf("Open failed: %v", err)
+		}
+		defer eng.Close()
+
+		idx, err := New(eng, &corev1.ConfigMap{}, testOnFatal(t))
+		if err != nil {
+			t.Fatalf("New failed: %v", err)
+		}
+		defer idx.Close()
+
+		// Force a fatal error into the engine
+		engine.TestHookFail(eng, errors.New("simulated fatal disk failure"))
+
+		// Operation triggering the fatal error
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cm-fail"}}
+		_ = idx.Update(cm)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestForcedFatalVisibility$")
+	cmd.Env = append(os.Environ(), "TEST_KUBECACHE_FORCED_FATAL=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected subprocess to fail, but it exited successfully")
+	}
+
+	outStr := string(out)
+	if !strings.Contains(outStr, "--- FAIL: TestForcedFatalVisibility") {
+		t.Fatalf("expected named test failure '--- FAIL: TestForcedFatalVisibility' in output, got:\n%s", outStr)
+	}
+	if !strings.Contains(outStr, "kubecache fatal error: engine failed: simulated fatal disk failure") {
+		t.Fatalf("expected fatal error details in output, got:\n%s", outStr)
 	}
 }

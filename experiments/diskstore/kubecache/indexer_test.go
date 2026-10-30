@@ -29,6 +29,14 @@ import (
 	toolscache "k8s.io/client-go/tools/cache"
 )
 
+// testOnFatal returns an OnFatal callback that fails the test with t.Errorf,
+// ensuring fatal errors in tests are visible and name the failing test.
+func testOnFatal(t testing.TB) func(error) {
+	return func(err error) {
+		t.Errorf("kubecache fatal error: %v", err)
+	}
+}
+
 func TestIndexer_CRUD(t *testing.T) {
 	memFS := engine.NewMemFS()
 	store, err := engine.Open(engine.WithFS(memFS), engine.WithDir("idx_crud_store"))
@@ -37,7 +45,7 @@ func TestIndexer_CRUD(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal)
+	indexer, err := New(store, &corev1.ConfigMap{}, testOnFatal(t))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -124,7 +132,7 @@ func TestIndexer_SecondaryIndexing(t *testing.T) {
 		},
 	}
 
-	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal, WithIndexers(customIndexers))
+	indexer, err := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithIndexers(customIndexers))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -209,7 +217,7 @@ func TestIndexer_WithEncryption(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, err := New(store, &corev1.Secret{}, DefaultOnFatal)
+	indexer, err := New(store, &corev1.Secret{}, testOnFatal(t))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -287,7 +295,7 @@ func TestIndexer_ReplaceAndResourceVersion(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal)
+	indexer, err := New(store, &corev1.ConfigMap{}, testOnFatal(t))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -328,7 +336,7 @@ func TestRegression_Item20_SecondaryIndexesRebuiltOnReopen(t *testing.T) {
 	}
 
 	cmExample := &corev1.ConfigMap{}
-	indexer, err := New(store, cmExample, DefaultOnFatal,
+	indexer, err := New(store, cmExample, testOnFatal(t),
 		WithBucketName("ConfigMap"),
 		WithIndexers(toolscache.Indexers{
 			"namespace": toolscache.MetaNamespaceIndexFunc,
@@ -357,7 +365,7 @@ func TestRegression_Item20_SecondaryIndexesRebuiltOnReopen(t *testing.T) {
 	}
 	defer store2.Close()
 
-	indexer2, err := New(store2, cmExample, DefaultOnFatal,
+	indexer2, err := New(store2, cmExample, testOnFatal(t),
 		WithBucketName("ConfigMap"),
 		WithIndexers(toolscache.Indexers{
 			"namespace": toolscache.MetaNamespaceIndexFunc,
@@ -389,7 +397,7 @@ func TestRegression_Item21_ReplaceAsDiff(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, _ := New(store, &corev1.ConfigMap{}, DefaultOnFatal, WithBucketName("ConfigMap"))
+	indexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
 	defer indexer.Close()
 
 	cmA := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "a", ResourceVersion: "1"}}
@@ -441,7 +449,7 @@ func TestRegression_Round2_Item5_BookmarkNoFakeObject(t *testing.T) {
 	}
 	defer store.Close()
 
-	indexer, _ := New(store, &corev1.ConfigMap{}, DefaultOnFatal, WithBucketName("ConfigMap"))
+	indexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
 	defer indexer.Close()
 
 	// Record bookmark
@@ -484,8 +492,8 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	cmIndexer, _ := New(store, &corev1.ConfigMap{}, DefaultOnFatal, WithBucketName("ConfigMap"))
-	secretIndexer, _ := New(store, &corev1.Secret{}, DefaultOnFatal, WithBucketName("Secret"))
+	cmIndexer, _ := New(store, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	secretIndexer, _ := New(store, &corev1.Secret{}, testOnFatal(t), WithBucketName("Secret"))
 	defer cmIndexer.Close()
 	defer secretIndexer.Close()
 
@@ -507,8 +515,8 @@ func TestRegression_Round2_Item6_ResourceVersionPerBucket(t *testing.T) {
 	}
 	defer store2.Close()
 
-	cmIndexer2, _ := New(store2, &corev1.ConfigMap{}, DefaultOnFatal, WithBucketName("ConfigMap"))
-	secretIndexer2, _ := New(store2, &corev1.Secret{}, DefaultOnFatal, WithBucketName("Secret"))
+	cmIndexer2, _ := New(store2, &corev1.ConfigMap{}, testOnFatal(t), WithBucketName("ConfigMap"))
+	secretIndexer2, _ := New(store2, &corev1.Secret{}, testOnFatal(t), WithBucketName("Secret"))
 	defer cmIndexer2.Close()
 	defer secretIndexer2.Close()
 
@@ -539,7 +547,7 @@ func TestIndexer_NoGoroutineLeakOnEngineClose(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	indexer, err := New(store, &corev1.ConfigMap{}, DefaultOnFatal)
+	indexer, err := New(store, &corev1.ConfigMap{}, testOnFatal(t))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
