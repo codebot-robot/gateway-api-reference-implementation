@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
@@ -28,30 +27,35 @@ import (
 
 var setupLog = ctrl.Log.WithName("setup")
 
-// FlagVars holds non-Options command-line flag variables.
-type FlagVars struct {
-	DataplaneMode             bool
-	GatewayNamespace          string
-	GatewayName               string
-	DataplaneImage            string
-	AllowedSourceCIDRs        string
-	ProxyProtocolTrustedCIDRs string
+// Config holds non-Options command-line flag variables.
+type Config struct {
+	DataplaneImage string
 }
 
-// BindFlags registers all command-line flags on the given FlagSet.
-func BindFlags(fs *flag.FlagSet, opts *gari.Options, vars *FlagVars) {
+// DefaultConfig returns the default Config populated from environment variables.
+func DefaultConfig() Config {
 	defaultImg := os.Getenv("GARI_IMAGE")
 	if defaultImg == "" {
 		defaultImg = singlepod.DefaultDataplaneImage
 	}
+	return Config{
+		DataplaneImage: defaultImg,
+	}
+}
 
-	fs.BoolVar(&vars.DataplaneMode, "dataplane-mode", false, "Run in data-plane mode serving a single Gateway.")
-	fs.StringVar(&vars.GatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
-	fs.StringVar(&vars.GatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
-	fs.StringVar(&vars.DataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
-	fs.StringVar(&vars.AllowedSourceCIDRs, "allowed-source-cidrs", "", "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners.")
+// BindFlags registers all command-line flags on the given FlagSet.
+func BindFlags(fs *flag.FlagSet, opts *gari.Options, cfg *Config) {
+	if cfg.DataplaneImage == "" {
+		cfg.DataplaneImage = DefaultConfig().DataplaneImage
+	}
+
+	fs.BoolVar(&opts.DataplaneMode, "dataplane-mode", opts.DataplaneMode, "Run in data-plane mode serving a single Gateway.")
+	fs.StringVar(&opts.DataplaneGatewayNamespace, "gateway-namespace", opts.DataplaneGatewayNamespace, "The namespace of the Gateway to serve in data-plane mode.")
+	fs.StringVar(&opts.DataplaneGatewayName, "gateway-name", opts.DataplaneGatewayName, "The name of the Gateway to serve in data-plane mode.")
+	fs.StringVar(&cfg.DataplaneImage, "dataplane-image", cfg.DataplaneImage, "The container image to use for provisioned per-Gateway data-plane Deployments.")
+	fs.Var(gari.CommaSeparatedSlice(&opts.AllowedSourceCIDRs), "allowed-source-cidrs", "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners.")
 	fs.StringVar(&opts.ProxyProtocol, "proxy-protocol", opts.ProxyProtocol, "Enable PROXY protocol ('enabled').")
-	fs.StringVar(&vars.ProxyProtocolTrustedCIDRs, "proxy-protocol-trusted-cidrs", "", "Comma-separated list of trusted CIDRs for PROXY protocol.")
+	fs.Var(gari.CommaSeparatedSlice(&opts.ProxyProtocolTrustedCIDRs), "proxy-protocol-trusted-cidrs", "Comma-separated list of trusted CIDRs for PROXY protocol.")
 	fs.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", opts.DrainSentinelPath, "Path to the sentinel file that marks the pod as draining.")
 	fs.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
 	fs.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
@@ -81,38 +85,22 @@ func BindFlags(fs *flag.FlagSet, opts *gari.Options, vars *FlagVars) {
 
 func main() {
 	opts := gari.DefaultOptions()
-	var vars FlagVars
-	BindFlags(flag.CommandLine, &opts, &vars)
+	cfg := DefaultConfig()
+	BindFlags(flag.CommandLine, &opts, &cfg)
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
 	flag.Parse()
 
-	if vars.AllowedSourceCIDRs != "" {
-		for _, part := range strings.Split(vars.AllowedSourceCIDRs, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				opts.AllowedSourceCIDRs = append(opts.AllowedSourceCIDRs, trimmed)
-			}
-		}
-	}
-	if vars.ProxyProtocolTrustedCIDRs != "" {
-		for _, part := range strings.Split(vars.ProxyProtocolTrustedCIDRs, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				opts.ProxyProtocolTrustedCIDRs = append(opts.ProxyProtocolTrustedCIDRs, trimmed)
-			}
-		}
-	}
-
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	if vars.DataplaneMode {
-		if vars.GatewayNamespace == "" || vars.GatewayName == "" {
+	if opts.DataplaneMode {
+		if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
 			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
 			os.Exit(1)
 		}
-		opts.DataplaneMode = true
-		opts.DataplaneGatewayNamespace = vars.GatewayNamespace
-		opts.DataplaneGatewayName = vars.GatewayName
+		// Data-plane pods serve traffic for a single Gateway and do not perform
+		// status updates, run leader election, or manage an address provider.
 		opts.DisableStatusUpdates = true
 		opts.LeaderElection = false
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
@@ -123,7 +111,7 @@ func main() {
 		opts.ProxyHTTP3Addr = ""
 		opts.AddressProvider = singlepod.NewAddressProvider(
 			nil,
-			singlepod.WithDataplaneImage(vars.DataplaneImage),
+			singlepod.WithDataplaneImage(cfg.DataplaneImage),
 			singlepod.WithEnableH2C(opts.EnableH2C),
 			singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
 			singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
@@ -143,40 +131,26 @@ func main() {
 // SetupDataplane parses args and builds the gari.Options for data-plane mode.
 func SetupDataplane(args []string) (gari.Options, error) {
 	opts := gari.DefaultOptions()
-	var vars FlagVars
+	cfg := DefaultConfig()
 	fs := flag.NewFlagSet("dataplane", flag.ContinueOnError)
-	BindFlags(fs, &opts, &vars)
+	BindFlags(fs, &opts, &cfg)
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
 
-	if vars.GatewayNamespace == "" || vars.GatewayName == "" {
+	if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
 		return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
 	}
 
 	opts.DataplaneMode = true
-	opts.DataplaneGatewayNamespace = vars.GatewayNamespace
-	opts.DataplaneGatewayName = vars.GatewayName
+	// Data-plane pods serve traffic for a single Gateway and do not perform
+	// status updates or run leader election.
 	opts.DisableStatusUpdates = true
 	opts.LeaderElection = false
+	// Default HTTP/3 bind address to HTTPS bind address for dataplane.
 	if opts.ProxyHTTP3Addr == "" && opts.ProxyHTTPSAddr != "" {
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
-	}
-
-	if vars.AllowedSourceCIDRs != "" {
-		for _, part := range strings.Split(vars.AllowedSourceCIDRs, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				opts.AllowedSourceCIDRs = append(opts.AllowedSourceCIDRs, trimmed)
-			}
-		}
-	}
-	if vars.ProxyProtocolTrustedCIDRs != "" {
-		for _, part := range strings.Split(vars.ProxyProtocolTrustedCIDRs, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				opts.ProxyProtocolTrustedCIDRs = append(opts.ProxyProtocolTrustedCIDRs, trimmed)
-			}
-		}
 	}
 
 	return opts, nil

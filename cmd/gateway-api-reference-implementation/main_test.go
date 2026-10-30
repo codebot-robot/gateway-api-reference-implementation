@@ -15,8 +15,10 @@
 package main
 
 import (
+	"flag"
 	"testing"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 	appsv1 "k8s.io/api/apps/v1"
@@ -153,5 +155,66 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 	}
 	if opts.ACMEChallengeTokenPath != "/var/run/secrets/tokens/certserver/token" {
 		t.Errorf("expected ACMEChallengeTokenPath='/var/run/secrets/tokens/certserver/token', got %q", opts.ACMEChallengeTokenPath)
+	}
+}
+
+func TestFlagsGolden(t *testing.T) {
+	t.Setenv("GARI_IMAGE", "")
+
+	type flagInfo struct {
+		Name     string
+		DefValue string
+		Usage    string
+	}
+	golden := []flagInfo{
+		{Name: "acme-challenge-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify the upstream certificate server."},
+		{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity."},
+		{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to."},
+		{Name: "allowed-source-cidrs", DefValue: "", Usage: "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners."},
+		{Name: "controller-name", DefValue: "github.com/gke-labs/gateway-api-reference-implementation", Usage: "The GatewayClass controller name."},
+		{Name: "dataplane-image", DefValue: "gari-controller:latest", Usage: "The container image to use for provisioned per-Gateway data-plane Deployments."},
+		{Name: "dataplane-mode", DefValue: "false", Usage: "Run in data-plane mode serving a single Gateway."},
+		{Name: "debug-error-responses", DefValue: "false", Usage: "Include detailed error messages in unmatched responses."},
+		{Name: "drain-sentinel-path", DefValue: "", Usage: "Path to the sentinel file that marks the pod as draining."},
+		{Name: "enable-h2c", DefValue: "false", Usage: "Enable H2C support on the proxy server."},
+		{Name: "forwarded-for-mode", DefValue: "append", Usage: "How to handle X-Forwarded-For: append (default) or replace."},
+		{Name: "gateway-name", DefValue: "", Usage: "The name of the Gateway to serve in data-plane mode."},
+		{Name: "gateway-namespace", DefValue: "", Usage: "The namespace of the Gateway to serve in data-plane mode."},
+		{Name: "health-probe-bind-address", DefValue: ":8999", Usage: "The address the probe endpoint binds to."},
+		{Name: "idle-timeout", DefValue: "1m0s", Usage: "The maximum amount of time to wait for the next request when keep-alives are enabled."},
+		{Name: "leader-elect", DefValue: "false", Usage: "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager."},
+		{Name: "metrics-bind-address", DefValue: ":8999", Usage: "The address the metric endpoint binds to."},
+		{Name: "proxy-bind-address", DefValue: ":8080", Usage: "The address the proxy binds to for HTTP."},
+		{Name: "proxy-http3-advertised-port", DefValue: "0", Usage: "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address)."},
+		{Name: "proxy-http3-bind-address", DefValue: "", Usage: "The UDP address the proxy binds to for HTTP/3 (disabled by default)."},
+		{Name: "proxy-https-bind-address", DefValue: ":8443", Usage: "The address the proxy binds to for HTTPS."},
+		{Name: "proxy-protocol", DefValue: "", Usage: "Enable PROXY protocol ('enabled')."},
+		{Name: "proxy-protocol-trusted-cidrs", DefValue: "", Usage: "Comma-separated list of trusted CIDRs for PROXY protocol."},
+		{Name: "read-header-timeout", DefValue: "10s", Usage: "The amount of time allowed to read request headers on HTTP and HTTPS servers."},
+		{Name: "read-timeout", DefValue: "0s", Usage: "The maximum duration for reading the entire request, including the body (disabled by default)."},
+		{Name: "tcp-idle-timeout", DefValue: "0s", Usage: "The idle timeout for TCP connections on spliced listeners (disabled by default)."},
+		{Name: "tcp-max-connections", DefValue: "10000", Usage: "The maximum number of concurrent TCP connections per listener."},
+		{Name: "udp-idle-timeout", DefValue: "1m0s", Usage: "The idle timeout for UDP sessions."},
+		{Name: "udp-max-sessions", DefValue: "10000", Usage: "The maximum number of concurrent UDP sessions per listener."},
+		{Name: "write-timeout", DefValue: "0s", Usage: "The maximum duration before timing out writes of the response (disabled by default)."},
+	}
+
+	opts := gari.DefaultOptions()
+	cfg := DefaultConfig()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	BindFlags(fs, &opts, &cfg)
+
+	var got []flagInfo
+	fs.VisitAll(func(f *flag.Flag) {
+		got = append(got, flagInfo{Name: f.Name, DefValue: f.DefValue, Usage: f.Usage})
+	})
+
+	if len(got) != len(golden) {
+		t.Fatalf("got %d flags, want %d", len(got), len(golden))
+	}
+	for i := range golden {
+		if got[i] != golden[i] {
+			t.Errorf("flag %d mismatch:\ngot:  %+v\nwant: %+v", i, got[i], golden[i])
+		}
 	}
 }
