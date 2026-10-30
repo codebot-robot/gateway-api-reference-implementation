@@ -305,20 +305,20 @@ func (p *Proxy) rebuildACMEForwarderLocked() {
 		return
 	}
 
-	timeout := p.acmeTimeout
-	if timeout <= 0 {
-		timeout = defaultACMETimeout
+	forwarderCfg := *cfg
+	if p.acmeTimeout > 0 {
+		forwarderCfg.Timeout = p.acmeTimeout
 	}
 	ts := p.acmeTokenSource
 
-	f, err := newACMEForwarder(cfg, ts, timeout)
+	h, err := NewACMEChallengeForwarder(forwarderCfg, ts)
 	if err != nil {
 		p.logForwarderErrorOnce.Do(func() {
 			klog.Errorf("failed to configure ACME challenge forwarder: %v", err)
 		})
 		return
 	}
-	p.acmeForwarder.Store(f)
+	p.acmeForwarder.Store(h.(*acmeForwarder))
 }
 
 // SetDebugErrorResponses configures whether detailed error messages are included in unmatched responses.
@@ -885,17 +885,7 @@ func (p *Proxy) maybeForwardACMEChallenge(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	if !strings.HasPrefix(r.URL.Path, ACMEChallengePrefix) {
-		return false
-	}
-
-	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
-	if !isValidACMEToken(token) {
-		// Malformed tokens fall through to normal routing without contacting upstream
-		return false
-	}
-
-	return f.forward(w, r, token)
+	return f.tryForward(w, r)
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

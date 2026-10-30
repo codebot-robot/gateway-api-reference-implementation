@@ -326,6 +326,9 @@ func (c *Client) ResolveCertificates(gw *gatewayv1.Gateway, listener *gatewayv1.
 	gwKey := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
 	gwFormatted := gwKey.String()
 	dpSA := singlepod.ResourceNameForGateway(gw.Name)
+	if gw.Namespace != "" {
+		dpSA = fmt.Sprintf("%s/%s", gw.Namespace, dpSA)
+	}
 	key := cacheKey{
 		gateway:   gwKey,
 		hostnames: hostnamesKey,

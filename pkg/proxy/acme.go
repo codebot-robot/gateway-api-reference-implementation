@@ -128,6 +128,23 @@ type ACMEChallengeConfig struct {
 	CABundlePEM  string
 	CABundlePath string
 	TokenPath    string
+	Timeout      time.Duration
+}
+
+// NewACMEChallengeForwarder creates an http.Handler that forwards ACME HTTP-01 challenge
+// requests to an upstream certserver according to cfg and tokens.
+// If the token is invalid, the request is not GET/HEAD, or the upstream returns 404 or an error,
+// it falls through by responding with 404 Not Found.
+func NewACMEChallengeForwarder(cfg ACMEChallengeConfig, tokens TokenSource) (http.Handler, error) {
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = defaultACMETimeout
+	}
+	f, err := newACMEForwarder(&cfg, tokens, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // acmeForwarder manages forwarding ACME HTTP-01 challenge requests to an upstream certserver.
@@ -139,9 +156,38 @@ type acmeForwarder struct {
 	logLimiter  *rate.Limiter
 }
 
+// tryForward checks if the request matches the ACME HTTP-01 challenge prefix,
+// validates the token, and attempts to forward the challenge to the upstream certserver.
+// Returns true if the challenge was successfully relayed (200 OK from upstream),
+// or false if the path or token does not match, or the upstream returns 404, an error, or timeout.
+func (f *acmeForwarder) tryForward(w http.ResponseWriter, r *http.Request) bool {
+	if f == nil {
+		return false
+	}
+	if r.Context().Value(originalHostContextKey) == nil {
+		r = r.WithContext(context.WithValue(r.Context(), originalHostContextKey, r.Host))
+	}
+	if !strings.HasPrefix(r.URL.Path, ACMEChallengePrefix) {
+		return false
+	}
+	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
+	if !isValidACMEToken(token) {
+		return false
+	}
+	return f.forward(w, r, token)
+}
+
+// ServeHTTP implements http.Handler by invoking tryForward and responding with
+// 404 Not Found if forwarding returns false.
+func (f *acmeForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !f.tryForward(w, r) {
+		http.NotFound(w, r)
+	}
+}
+
 func newACMEForwarder(cfg *ACMEChallengeConfig, tokenSource TokenSource, timeout time.Duration) (*acmeForwarder, error) {
 	if cfg == nil || cfg.UpstreamURL == "" {
-		return nil, nil
+		return nil, fmt.Errorf("upstream URL is required")
 	}
 
 	u, err := url.Parse(cfg.UpstreamURL)

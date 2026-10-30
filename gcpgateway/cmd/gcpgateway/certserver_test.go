@@ -196,7 +196,7 @@ func TestSetupController_CertserverIntegration(t *testing.T) {
 	const hostname = "my-host.example.com"
 
 	expectedGateway := fmt.Sprintf("%s/%s", gwNamespace, gwName)
-	expectedDPSA := singlepod.ResourceNameForGateway(gwName)
+	expectedDPSA := fmt.Sprintf("%s/%s", gwNamespace, singlepod.ResourceNameForGateway(gwName))
 
 	// 1. Generate fake server TLS and leaf certificate
 	srvTLS, srvCertPEM, _, caBundlePEM := generateServerCert(t, "127.0.0.1")
