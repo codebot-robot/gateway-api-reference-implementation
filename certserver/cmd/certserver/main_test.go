@@ -47,6 +47,12 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	if cfg.MetricsListenAddr != ":9090" {
 		t.Errorf("unexpected metrics listen addr: %s", cfg.MetricsListenAddr)
 	}
+	if cfg.GRPCListenAddr != ":8443" {
+		t.Errorf("unexpected grpc listen addr: %s", cfg.GRPCListenAddr)
+	}
+	if !cfg.ReleaseMode {
+		t.Errorf("unexpected release mode: %v", cfg.ReleaseMode)
+	}
 
 	// 2. Custom
 	customArgs := []string{
@@ -56,6 +62,13 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 		"--cache-dir=/tmp/custom-cache",
 		"--challenge-listen-addr=:18080",
 		"--metrics-listen-addr=:19090",
+		"--grpc-listen-addr=:18443",
+		"--tls-cert-file=/tmp/tls.crt",
+		"--tls-key-file=/tmp/tls.key",
+		"--cluster-config-file=/tmp/clusters.yaml",
+		"--release-mode=false",
+		"--rate-limit-qps=5.5",
+		"--rate-limit-burst=15",
 		"--max-hostnames=20",
 		"--max-pending-orders=10",
 	}
@@ -82,6 +95,27 @@ func TestParseFlags_DefaultsAndCustom(t *testing.T) {
 	}
 	if cfg.MetricsListenAddr != ":19090" {
 		t.Errorf("unexpected custom metrics addr: %s", cfg.MetricsListenAddr)
+	}
+	if cfg.GRPCListenAddr != ":18443" {
+		t.Errorf("unexpected custom grpc addr: %s", cfg.GRPCListenAddr)
+	}
+	if cfg.TLSCertFile != "/tmp/tls.crt" {
+		t.Errorf("unexpected custom tls cert file: %s", cfg.TLSCertFile)
+	}
+	if cfg.TLSKeyFile != "/tmp/tls.key" {
+		t.Errorf("unexpected custom tls key file: %s", cfg.TLSKeyFile)
+	}
+	if cfg.ClusterConfigFile != "/tmp/clusters.yaml" {
+		t.Errorf("unexpected custom cluster config file: %s", cfg.ClusterConfigFile)
+	}
+	if cfg.ReleaseMode != false {
+		t.Errorf("unexpected custom release mode: %v", cfg.ReleaseMode)
+	}
+	if cfg.RateLimitQPS != 5.5 {
+		t.Errorf("unexpected custom rate limit qps: %f", cfg.RateLimitQPS)
+	}
+	if cfg.RateLimitBurst != 15 {
+		t.Errorf("unexpected custom rate limit burst: %d", cfg.RateLimitBurst)
 	}
 	if cfg.MaxHostnames != 20 {
 		t.Errorf("unexpected custom max hostnames: %d", cfg.MaxHostnames)

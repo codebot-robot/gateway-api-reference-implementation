@@ -28,10 +28,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/certs"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/frontend"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
 )
 
 type stringSliceFlag []string

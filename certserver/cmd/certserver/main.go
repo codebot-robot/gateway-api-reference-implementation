@@ -28,12 +28,15 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/time/rate"
 
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/server"
 )
 
 type Config struct {
@@ -43,6 +46,13 @@ type Config struct {
 	CacheDir            string
 	ChallengeListenAddr string
 	MetricsListenAddr   string
+	GRPCListenAddr      string
+	TLSCertFile         string
+	TLSKeyFile          string
+	ClusterConfigFile   string
+	ReleaseMode         bool
+	RateLimitQPS        float64
+	RateLimitBurst      int
 	MaxHostnames        int
 	MaxPendingOrders    int64
 	HTTPClient          *http.Client
@@ -58,6 +68,13 @@ func parseFlags(args []string) (*Config, error) {
 	fs.StringVar(&cfg.CacheDir, "cache-dir", "/var/cache/certserver", "Directory path for certificate and key disk cache")
 	fs.StringVar(&cfg.ChallengeListenAddr, "challenge-listen-addr", ":8080", "HTTP listen address for /.well-known/acme-challenge/")
 	fs.StringVar(&cfg.MetricsListenAddr, "metrics-listen-addr", ":9090", "HTTP listen address for Prometheus metrics")
+	fs.StringVar(&cfg.GRPCListenAddr, "grpc-listen-addr", ":8443", "gRPC listen address for GetCertificate API (TLS)")
+	fs.StringVar(&cfg.TLSCertFile, "tls-cert-file", "", "Path to TLS server certificate for gRPC endpoint")
+	fs.StringVar(&cfg.TLSKeyFile, "tls-key-file", "", "Path to TLS private key for gRPC endpoint")
+	fs.StringVar(&cfg.ClusterConfigFile, "cluster-config-file", "", "Path to cluster registry server configuration file (YAML/JSON)")
+	fs.BoolVar(&cfg.ReleaseMode, "release-mode", true, "Whether to release private keys to controllers (phase 1)")
+	fs.Float64Var(&cfg.RateLimitQPS, "rate-limit-qps", 10.0, "Per-identity rate limit (requests per second)")
+	fs.IntVar(&cfg.RateLimitBurst, "rate-limit-burst", 20, "Per-identity rate limit burst size")
 	fs.IntVar(&cfg.MaxHostnames, "max-hostnames", 100, "Maximum number of hostnames permitted per certificate set")
 	fs.Int64Var(&cfg.MaxPendingOrders, "max-pending-orders", 50, "Maximum number of concurrent pending ACME orders")
 
@@ -138,6 +155,47 @@ func run(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("failed to start certificate manager: %w", err)
 	}
 	defer mgr.Stop()
+
+	// Initialize and start gRPC server if cluster config is provided
+	var grpcSrv *server.Server
+	if cfg.ClusterConfigFile != "" {
+		serverCfg, err := registry.LoadServerConfigFile(cfg.ClusterConfigFile)
+		if err != nil {
+			return fmt.Errorf("failed to load cluster config file %s: %w", cfg.ClusterConfigFile, err)
+		}
+
+		clusterReg, err := registry.NewRegistry(serverCfg.Clusters)
+		if err != nil {
+			return fmt.Errorf("failed to initialize cluster registry: %w", err)
+		}
+		defer func() {
+			if err := clusterReg.Close(); err != nil {
+				logger.Printf("error closing cluster registry: %v", err)
+			}
+		}()
+
+		srvOpts := server.Options{
+			ListenAddr:        cfg.GRPCListenAddr,
+			TLSCertFile:       cfg.TLSCertFile,
+			TLSKeyFile:        cfg.TLSKeyFile,
+			ReleaseMode:       cfg.ReleaseMode,
+			MaxHostnames:      cfg.MaxHostnames,
+			MaxHostnameLength: 253,
+			RateLimitQPS:      rate.Limit(cfg.RateLimitQPS),
+			RateLimitBurst:    cfg.RateLimitBurst,
+		}
+
+		grpcSrv, err = server.NewServer(srvOpts, clusterReg, mgr, nil, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create gRPC server: %w", err)
+		}
+
+		if err := grpcSrv.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start gRPC server: %w", err)
+		}
+		defer grpcSrv.Stop()
+		logger.Printf("Serving gRPC GetCertificate API on %s", grpcSrv.Addr())
+	}
 
 	// Start HTTP servers in background
 	go func() {

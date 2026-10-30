@@ -3,11 +3,16 @@ module github.com/gke-labs/gateway-api-reference-implementation/certserver
 go 1.27.2
 
 require (
+	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
 	github.com/letsencrypt/pebble/v2 v2.10.1
 	github.com/miekg/dns v1.1.73
 	github.com/prometheus/client_golang v1.25.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.24.0
+	golang.org/x/time v0.15.0
+	google.golang.org/grpc v1.83.2
+	google.golang.org/protobuf v1.36.12
+	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
@@ -19,7 +24,11 @@ require (
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )
+
+replace github.com/gke-labs/gateway-api-reference-implementation => ../

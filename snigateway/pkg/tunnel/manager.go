@@ -35,9 +35,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/api"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/client"
-	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/jwt"
 	"github.com/gke-labs/gateway-api-reference-implementation/snigateway/pkg/proxyproto"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"

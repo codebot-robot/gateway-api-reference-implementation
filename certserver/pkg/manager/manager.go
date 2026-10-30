@@ -58,6 +58,10 @@ type Manager struct {
 	mu       sync.RWMutex
 	renewals map[string]*renewalItem
 
+	// inFlightMu guards inFlightIssuances.
+	inFlightMu        sync.Mutex
+	inFlightIssuances map[string]struct{}
+
 	cancelLoop context.CancelFunc
 	loopWg     sync.WaitGroup
 }
@@ -76,12 +80,13 @@ func NewManager(
 	}
 
 	return &Manager{
-		client:         client,
-		cache:          diskCache,
-		challengeStore: challengeStore,
-		metrics:        m,
-		opts:           opts,
-		renewals:       make(map[string]*renewalItem),
+		client:            client,
+		cache:             diskCache,
+		challengeStore:    challengeStore,
+		metrics:           m,
+		opts:              opts,
+		renewals:          make(map[string]*renewalItem),
+		inFlightIssuances: make(map[string]struct{}),
 	}
 }
 
@@ -115,9 +120,71 @@ func (m *Manager) Stop() {
 	m.loopWg.Wait()
 }
 
-// Cache returns the underlying disk cache.
-func (m *Manager) Cache() *cache.DiskCache {
-	return m.cache
+// CertificateData contains the certificate chain and, in release mode, the private key.
+type CertificateData struct {
+	CertificateChain []byte
+	PrivateKey       []byte
+}
+
+// GetCertificate returns cached certificate data for the given hostname set if present
+// and not expired. In release mode, the private key is included; otherwise it is omitted.
+// Returns cache.ErrNotFound if no valid cached certificate exists.
+func (m *Manager) GetCertificate(hostnamesKey string, releaseMode bool) (*CertificateData, error) {
+	cachedCert, err := m.cache.Get(hostnamesKey)
+	if err != nil {
+		return nil, err
+	}
+	if cachedCert == nil || cachedCert.IsExpired(m.opts.Clock.Now()) {
+		return nil, cache.ErrNotFound
+	}
+
+	data := &CertificateData{
+		CertificateChain: cachedCert.CertPEM,
+	}
+	if releaseMode {
+		data.PrivateKey = cachedCert.KeyPEM
+	}
+	return data, nil
+}
+
+// EnsureIssuance starts asynchronous certificate issuance for the given hostnames
+// if no issuance is already in flight for that hostname set.
+// It uses a detached context (via context.WithoutCancel) with a 10-minute timeout.
+// Returns true if a new issuance was started, false if an issuance is already in flight.
+func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string) (bool, error) {
+	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
+	if err != nil {
+		return false, err
+	}
+
+	// If already in cache and not expired, no need to issue
+	if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
+		return false, nil
+	}
+
+	m.inFlightMu.Lock()
+	if _, inFlight := m.inFlightIssuances[hostnamesKey]; inFlight {
+		m.inFlightMu.Unlock()
+		return false, nil
+	}
+	m.inFlightIssuances[hostnamesKey] = struct{}{}
+	m.inFlightMu.Unlock()
+
+	detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	go func() {
+		defer cancel()
+		defer func() {
+			m.inFlightMu.Lock()
+			delete(m.inFlightIssuances, hostnamesKey)
+			m.inFlightMu.Unlock()
+		}()
+
+		if _, err := m.Obtain(detachedCtx, normalized); err != nil {
+			log.Printf("certserver: async issuance failed for %s: %v", hostnamesKey, err)
+		}
+	}()
+
+	return true, nil
 }
 
 // Obtain creates or reuses a certificate order for the normalized hostname set.
@@ -384,7 +451,7 @@ func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string) err
 		return fmt.Errorf("failed to register challenge in store: %w", err)
 	}
 	defer func(token string) {
-		if rmErr := m.challengeStore.Remove(context.Background(), token); rmErr != nil && !errors.Is(rmErr, challenge.ErrNotFound) {
+		if rmErr := m.challengeStore.Remove(context.WithoutCancel(ctx), token); rmErr != nil && !errors.Is(rmErr, challenge.ErrNotFound) {
 			log.Printf("certserver: failed to remove challenge token %s: %v", token, rmErr)
 		}
 	}(chal.Token)
