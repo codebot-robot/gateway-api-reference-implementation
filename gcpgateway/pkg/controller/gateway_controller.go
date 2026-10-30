@@ -69,11 +69,11 @@ const (
 	ReasonWaitingForEndpoints      = "WaitingForEndpoints"
 	ReasonRolloutStalled           = "RolloutStalled"
 	ReasonProgrammed               = "Programmed"
-	ReasonPermissionDenied         = "PermissionDenied"
-	ReasonQuotaExceeded            = "QuotaExceeded"
-	ReasonNEGNotFound              = "NEGNotFound"
-	ReasonUnsupportedCluster       = "UnsupportedCluster"
-	ReasonEndpointAttachmentFailed = "EndpointAttachmentFailed"
+	ReasonPermissionDenied         = registrar.ReasonPermissionDenied
+	ReasonQuotaExceeded            = registrar.ReasonQuotaExceeded
+	ReasonNEGNotFound              = registrar.ReasonNEGNotFound
+	ReasonUnsupportedCluster       = registrar.ReasonUnsupportedCluster
+	ReasonEndpointAttachmentFailed = registrar.ReasonEndpointAttachmentFailed
 )
 
 // GatewayStatusResult represents the cached status result for a Gateway.
@@ -396,7 +396,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req reconcile.Request
 			Reason:           reason,
 			Message:          msg,
 		})
-		return reconcile.Result{RequeueAfter: pollInterval}, nil
+		return reconcile.Result{}, err
 	}
 
 	if externalIP == "" {
@@ -659,17 +659,7 @@ func (r *GatewayReconciler) GatewayStatusHook(ctx context.Context, gw *gatewayv1
 }
 
 func (r *GatewayReconciler) gcpErrorReasonAndMessage(err error) (string, string) {
-	if gcp.IsPermissionDenied(err) {
-		return ReasonPermissionDenied, "GCP service account lacks compute.networkEndpointGroups.use or attach permission."
-	} else if gcp.IsQuotaExceeded(err) {
-		return ReasonQuotaExceeded, "Compute API quota exceeded when registering endpoints."
-	} else if gcp.IsNEGNotFound(err) {
-		return ReasonNEGNotFound, "One or more configured NEGs do not exist in the GCP project/zones."
-	} else if gcp.IsInvalidIP(err) {
-		return ReasonUnsupportedCluster, "Pod IP is not a valid VPC alias IP."
-	}
-	klog.Errorf("Endpoint attachment failed: %v", err)
-	return ReasonEndpointAttachmentFailed, "Failed to attach endpoints to zonal NEGs; see controller logs for details."
+	return registrar.GCPErrorReasonAndMessage(err)
 }
 
 func isPodReadinessGateTrue(pod *corev1.Pod) bool {

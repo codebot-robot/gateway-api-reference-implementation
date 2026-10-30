@@ -17,6 +17,7 @@ package registrar
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -676,5 +678,85 @@ func TestRegistrar_DetachAll(t *testing.T) {
 	epsAfter, _ := fakeGCP.ListNetworkEndpoints(t.Context(), "my-project", "us-central1-a", neg8443A)
 	if len(epsAfter) != 0 {
 		t.Errorf("expected 0 endpoints remaining, got %d", len(epsAfter))
+	}
+}
+
+// TestRegistrar_AttachErrorAndEvents verifies that failing attachNetworkEndpoints calls
+// return an error, emit Warning events on the Gateway and affected data-plane pods,
+// and succeed when the underlying error is cleared.
+func TestRegistrar_AttachErrorAndEvents(t *testing.T) {
+	scheme := setupTestScheme()
+	gw := makeTestGateway("default", "my-gw", time.Now())
+	node := makeTestNode("node-1", "us-central1-a", "gke-node-1")
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(gw, node).
+		Build()
+
+	makeTestPod(t, k8sClient, gw, "dp-pod-1", "node-1", "10.0.1.5", true, true, false)
+
+	negDesc, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "my-gw",
+		Port:        8443,
+	}).Encode()
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+	fakeGCP.InjectAttachError = gcp.ErrPermissionDenied
+
+	fakeRecorder := record.NewFakeRecorder(100)
+	reg := NewRegistrar(k8sClient, fakeGCP, Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+		Recorder:  fakeRecorder,
+	})
+
+	// 1. Initial attempt fails and emits warning events on Gateway and Pod
+	_, err := reg.ReconcileEndpoints(t.Context(), gw)
+	if err == nil || !gcp.IsPermissionDenied(err) {
+		t.Fatalf("expected permission denied error, got: %v", err)
+	}
+	if len(fakeGCP.AttachCalls) != 1 {
+		t.Fatalf("expected exactly 1 Attach call, got %d", len(fakeGCP.AttachCalls))
+	}
+
+	// Verify events were emitted: one on Gateway and one on the data-plane pod
+	var events []string
+	for len(fakeRecorder.Events) > 0 {
+		events = append(events, <-fakeRecorder.Events)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 warning events (1 on GW, 1 on Pod), got %d: %v", len(events), events)
+	}
+	for _, ev := range events {
+		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, "PermissionDenied") {
+			t.Errorf("expected warning event with Reason PermissionDenied, got %q", ev)
+		}
+	}
+
+	// 2. Clear error (IAM permission granted)
+	fakeGCP.InjectAttachError = nil
+
+	// 3. Subsequent reconcile succeeds and attaches endpoints
+	res, err := reg.ReconcileEndpoints(t.Context(), gw)
+	if err != nil {
+		t.Fatalf("expected successful reconcile after error cleared, got: %v", err)
+	}
+	if res.AttachedCount != 1 {
+		t.Errorf("expected 1 attached endpoint, got %d", res.AttachedCount)
+	}
+	if len(fakeGCP.AttachCalls) != 2 {
+		t.Errorf("expected 2 total Attach calls, got %d", len(fakeGCP.AttachCalls))
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -679,13 +680,18 @@ func TestGateway_ErrorConditions(t *testing.T) {
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
 			_, err := reconciler.Reconcile(t.Context(), req)
-			if err != nil {
-				t.Fatalf("unexpected controller crash on GCP error: %v", err)
+			if err == nil {
+				t.Fatalf("expected error returned from Reconcile on GCP error, got nil")
 			}
 
 			cached := reconciler.GetCachedStatus(req.NamespacedName)
 			if cached == nil || cached.ProgrammedStatus != metav1.ConditionFalse || cached.Reason != tc.expectedReason {
 				t.Errorf("expected condition Reason %q, got %+v", tc.expectedReason, cached)
+			}
+			if tc.expectedReason == ReasonPermissionDenied {
+				if !strings.Contains(cached.Message, "compute.instances.use") {
+					t.Errorf("expected message to mention compute.instances.use, got %q", cached.Message)
+				}
 			}
 			if tc.expectedReason == ReasonEndpointAttachmentFailed {
 				if cached.Message != "Failed to attach endpoints to zonal NEGs; see controller logs for details." {
@@ -693,6 +699,231 @@ func TestGateway_ErrorConditions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGateway_AttachErrorRecoveryClearsCondition verifies that a failing attach returns an error
+// and sets a stable condition reason in cache, and a later success clears it to Programmed=True.
+func TestGateway_AttachErrorRecoveryClearsCondition(t *testing.T) {
+	scheme := setupScheme()
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+			UID:       types.UID("my-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
+		Build()
+
+	makeTestPod(t, c, gw, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+	})
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	negDesc, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "my-gw",
+		Port:        8443,
+	}).Encode()
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+	bsName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "bs-443")
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	fakeGCP.InjectAttachError = gcp.ErrPermissionDenied
+
+	reg := registrar.NewRegistrar(c, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	reconciler := NewGatewayReconciler(c, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+	// 1. Failing attach returns an error and sets cached PermissionDenied
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err == nil {
+		t.Fatalf("expected error from Reconcile when attach fails, got nil")
+	}
+
+	cached := reconciler.GetCachedStatus(req.NamespacedName)
+	if cached == nil || cached.ProgrammedStatus != metav1.ConditionFalse || cached.Reason != ReasonPermissionDenied {
+		t.Fatalf("expected ReasonPermissionDenied in cache, got %+v", cached)
+	}
+
+	// 2. Clear attach error (permission granted)
+	fakeGCP.InjectAttachError = nil
+
+	// 3. Next reconcile succeeds and clears failure condition to Programmed=True
+	_, err = reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("expected successful reconcile after attach error cleared, got: %v", err)
+	}
+
+	cachedAfter := reconciler.GetCachedStatus(req.NamespacedName)
+	if cachedAfter == nil || cachedAfter.ProgrammedStatus != metav1.ConditionTrue || cachedAfter.Reason != ReasonProgrammed {
+		t.Errorf("expected cached status to be cleared and set to Programmed=True, got %+v", cachedAfter)
+	}
+}
+
+type countingStatusWriter struct {
+	client.SubResourceWriter
+	podStatusUpdates *atomic.Int32
+}
+
+func (w *countingStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if _, isPod := obj.(*corev1.Pod); isPod {
+		w.podStatusUpdates.Add(1)
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func (w *countingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if _, isPod := obj.(*corev1.Pod); isPod {
+		w.podStatusUpdates.Add(1)
+	}
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
+
+type countingClient struct {
+	client.Client
+	writer *countingStatusWriter
+}
+
+func (c *countingClient) Status() client.SubResourceWriter {
+	return c.writer
+}
+
+// TestGateway_ReconcileUnchangedPod_PerformsNoWrite verifies that when data-plane pods
+// already have the desired readiness gate condition, Reconcile performs no status writes
+// on those pods, preventing self-triggered watch events from bypassing workqueue rate limiting.
+func TestGateway_ReconcileUnchangedPod_PerformsNoWrite(t *testing.T) {
+	scheme := setupScheme()
+	ipAddrType := gatewayv1.IPAddressType
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "my-gw",
+			UID:       types.UID("my-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gcpgateway",
+			Addresses: []gatewayv1.GatewaySpecAddress{
+				{Type: &ipAddrType, Value: "34.120.254.10"},
+			},
+			Listeners: []gatewayv1.Listener{
+				{Name: "https", Port: 8443, Protocol: gatewayv1.HTTPSProtocolType},
+			},
+		},
+	}
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec:       corev1.NodeSpec{ProviderID: "gce://my-project/us-central1-a/gke-node-1"},
+	}
+
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Pod{}, &gatewayv1.Gateway{}, &appsv1.Deployment{}).
+		WithObjects(gw, node).
+		Build()
+
+	// Pod already has ContainersReady=True AND LoadBalancerReadyGate=True (unchanged steady state)
+	makeTestPod(t, baseClient, gw, "dp-pod-1", "node-1", "10.0.1.5", []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodConditionType(registrar.LoadBalancerReadyGate), Status: corev1.ConditionTrue, Reason: "LoadBalancerHealthy"},
+	})
+
+	fakeGCP := gcp.NewFakeComputeClient()
+	negDesc, _ := (&metadata.NegMetadata{
+		ClusterID:   "cluster-1",
+		Namespace:   "default",
+		GatewayName: "my-gw",
+		Port:        8443,
+	}).Encode()
+
+	negName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "8443")
+	fakeGCP.AddNEG("my-project", "us-central1-a", &compute.NetworkEndpointGroup{
+		Name:        negName,
+		Zone:        "us-central1-a",
+		Description: negDesc,
+	})
+	bsName := metadata.ResourceName("gcpgw", "cluster-1", "default", "my-gw", "bs-443")
+	fakeGCP.SetBackendServiceHealth("my-project", bsName, negName, &compute.BackendServiceGroupHealth{
+		HealthStatus: []*compute.HealthStatus{
+			{Instance: "gke-node-1", IpAddress: "10.0.1.5", Port: 8443, HealthState: "HEALTHY"},
+		},
+	})
+
+	var updateCount atomic.Int32
+	trackedClient := &countingClient{
+		Client: baseClient,
+		writer: &countingStatusWriter{
+			SubResourceWriter: baseClient.Status(),
+			podStatusUpdates:  &updateCount,
+		},
+	}
+
+	reg := registrar.NewRegistrar(trackedClient, fakeGCP, registrar.Config{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	reconciler := NewGatewayReconciler(trackedClient, scheme, fakeGCP, reg, GatewayReconcilerConfig{
+		ClusterID: "cluster-1",
+		NegPrefix: "gcpgw",
+		Project:   "my-project",
+		Zones:     []string{"us-central1-a"},
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "my-gw"}}
+	_, err := reconciler.Reconcile(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// Verify that NO pod status writes were performed
+	if writes := updateCount.Load(); writes != 0 {
+		t.Errorf("expected 0 pod status writes for unchanged pod, got %d", writes)
 	}
 }
 
