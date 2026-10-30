@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/pkg/jwt"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/jwt"
 )
 
 const (

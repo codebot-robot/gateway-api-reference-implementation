@@ -3,4 +3,5 @@ go 1.27.2
 use (
 	.
 	..
+	../certserver/api
 )

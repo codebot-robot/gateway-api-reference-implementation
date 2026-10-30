@@ -40,8 +40,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
-	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"

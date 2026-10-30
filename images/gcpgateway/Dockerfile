@@ -20,6 +20,7 @@ ARG TARGETARCH
 WORKDIR /app
 
 COPY go.mod go.sum ./
+COPY certserver/api/go.mod certserver/api/go.sum ./certserver/api/
 COPY snigateway/go.mod snigateway/go.sum ./snigateway/
 COPY gcpgateway/go.mod gcpgateway/go.sum ./gcpgateway/
 COPY certserver/go.mod certserver/go.sum ./certserver/

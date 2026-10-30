@@ -15,6 +15,7 @@
 FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
+COPY certserver/api/go.mod certserver/api/go.sum ./certserver/api/
 COPY snigateway/go.mod snigateway/go.sum snigateway/go.work ./snigateway/
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download

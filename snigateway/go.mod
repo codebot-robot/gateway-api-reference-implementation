@@ -6,6 +6,7 @@ toolchain go1.27.3
 
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
+	github.com/gke-labs/gateway-api-reference-implementation/certserver/api v0.0.0-00010101000000-000000000000
 	github.com/quic-go/quic-go v0.64.1
 	golang.org/x/net v0.61.0
 	golang.org/x/sync v0.24.0
@@ -83,3 +84,5 @@ require (
 )
 
 replace github.com/gke-labs/gateway-api-reference-implementation => ../
+
+replace github.com/gke-labs/gateway-api-reference-implementation/certserver/api => ../certserver/api

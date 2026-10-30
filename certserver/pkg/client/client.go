@@ -34,7 +34,7 @@ import (
 	"k8s.io/klog/v2"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
+	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"

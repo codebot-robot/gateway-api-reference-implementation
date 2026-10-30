@@ -15,6 +15,7 @@
 FROM golang:1.27.3 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
+COPY certserver/api/go.mod certserver/api/go.sum ./certserver/api/
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o toolbox tests/toolbox/main.go

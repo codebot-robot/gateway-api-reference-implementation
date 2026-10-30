@@ -187,7 +187,7 @@ const file_certserver_proto_rawDesc = "" +
 	"\vprivate_key\x18\x02 \x01(\fR\n" +
 	"privateKey2s\n" +
 	"\x12CertificateService\x12]\n" +
-	"\x0eGetCertificate\x12$.certserver.v1.GetCertificateRequest\x1a%.certserver.v1.GetCertificateResponseB]Z[github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1;certserverv1b\x06proto3"
+	"\x0eGetCertificate\x12$.certserver.v1.GetCertificateRequest\x1a%.certserver.v1.GetCertificateResponseBYZWgithub.com/gke-labs/gateway-api-reference-implementation/certserver/api/v1;certserverv1b\x06proto3"
 
 var (
 	file_certserver_proto_rawDescOnce sync.Once

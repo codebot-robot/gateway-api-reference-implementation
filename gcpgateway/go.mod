@@ -5,6 +5,7 @@ go 1.27.2
 require (
 	github.com/gke-labs/gateway-api-reference-implementation v0.0.0-20261024134123-7373c0c33da0
 	github.com/gke-labs/gateway-api-reference-implementation/certserver v0.0.0-00010101000000-000000000000
+	github.com/gke-labs/gateway-api-reference-implementation/certserver/api v0.0.0
 	google.golang.org/api v0.308.0
 	google.golang.org/grpc v1.84.0
 	k8s.io/api v0.37.1
@@ -93,3 +94,5 @@ require (
 replace github.com/gke-labs/gateway-api-reference-implementation => ../
 
 replace github.com/gke-labs/gateway-api-reference-implementation/certserver => ../certserver
+
+replace github.com/gke-labs/gateway-api-reference-implementation/certserver/api => ../certserver/api
