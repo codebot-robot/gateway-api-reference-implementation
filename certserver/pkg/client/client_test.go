@@ -50,11 +50,13 @@ import (
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/server"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/testserver"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 )
 
 func generateSelfSignedCert(t *testing.T) (*tls.Config, []byte, []byte) {
@@ -190,12 +192,7 @@ func TestClient_RealCertServerWithPebble(t *testing.T) {
 	log.SetOutput(&logBuf)
 	defer log.SetOutput(origLogWriter)
 
-	// 1. Start Pebble ACME test server
-	pebble := testserver.StartPebble(t, testserver.ServerConfig{
-		ValidityPeriod: 86400,
-	})
-
-	// 2. Start mock cluster JWKS server
+	// 1. Start mock cluster JWKS server
 	clusterKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("failed to generate cluster key: %v", err)
@@ -208,7 +205,7 @@ func TestClient_RealCertServerWithPebble(t *testing.T) {
 	}))
 	defer jwksServer.Close()
 
-	// 3. Configure certserver cluster registry
+	// 2. Configure certserver cluster registry
 	const clusterID = "test-cluster"
 	issuerURL := jwksServer.URL
 
@@ -232,8 +229,54 @@ func TestClient_RealCertServerWithPebble(t *testing.T) {
 	}
 	defer reg.Close()
 
-	// 4. Initialize Manager with Pebble ACME client and temp cache
+	bindingStore := registry.NewMemoryBindingStore()
+	auditLogger := registry.NewAuditLogger(nil)
+	m := metrics.New(prometheus.NewRegistry())
+
+	challengeStore := challenge.NewMemoryStore()
+	challengeHandler := challenge.NewHandler(
+		challengeStore,
+		challenge.WithRegistry(reg),
+		challenge.WithBindingStore(bindingStore),
+		challenge.WithAuditLogger(auditLogger),
+		challenge.WithMetrics(m),
+	)
+
+	// Challenge server runs over HTTPS with test TLS certificate
+	challengeTLS, challengeCertPEM, _ := generateSelfSignedCert(t)
+	challengeSrv := httptest.NewUnstartedServer(challengeHandler)
+	challengeSrv.TLS = challengeTLS
+	challengeSrv.StartTLS()
+	defer challengeSrv.Close()
+
 	tempDir := t.TempDir()
+
+	// Data plane token written to projected token file on disk
+	dpToken := signControllerToken(t, issuerURL, "system:serviceaccount:default:test-gateway-gari", clusterKey, kid)
+	dpTokenFile := filepath.Join(tempDir, "dp-token")
+	if err := os.WriteFile(dpTokenFile, []byte(dpToken), 0600); err != nil {
+		t.Fatalf("failed to write data-plane token file: %v", err)
+	}
+
+	// Real GARI ACME challenge forwarder from pkg/proxy, reading token from file
+	// and verifying upstream certserver HTTPS connection with test CA bundle.
+	forwarder, err := proxy.NewACMEChallengeForwarder(proxy.ACMEChallengeConfig{
+		UpstreamURL: challengeSrv.URL,
+		CABundlePEM: string(challengeCertPEM),
+		TokenPath:   dpTokenFile,
+	}, proxy.NewFileTokenSource(dpTokenFile))
+	if err != nil {
+		t.Fatalf("failed to create ACME challenge forwarder: %v", err)
+	}
+
+	// 3. Start Pebble ACME test server pointed at real GARI forwarder
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{
+		ValidityPeriod:   86400,
+		ChallengeStore:   challengeStore,
+		ChallengeHandler: forwarder,
+	})
+
+	// 4. Initialize Manager with Pebble ACME client and temp cache
 	cacheDir := filepath.Join(tempDir, "cache")
 	diskCache, err := cache.NewDiskCache(cacheDir)
 	if err != nil {
@@ -254,8 +297,9 @@ func TestClient_RealCertServerWithPebble(t *testing.T) {
 		t.Fatalf("failed to create acme client: %v", err)
 	}
 
-	m := metrics.New(prometheus.NewRegistry())
-	mgr := manager.NewManager(acmeCli, diskCache, pebble.ChallengeStore, m)
+	mgr := manager.NewManager(acmeCli, diskCache, challengeStore, m, func(o *manager.Options) {
+		o.BindingStore = bindingStore
+	})
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("failed to start manager: %v", err)
 	}
@@ -269,9 +313,6 @@ func TestClient_RealCertServerWithPebble(t *testing.T) {
 		ReleaseMode:  true,
 		MaxHostnames: 10,
 	}
-
-	bindingStore := registry.NewMemoryBindingStore()
-	auditLogger := registry.NewAuditLogger(nil)
 
 	srv, err := server.NewServer(serverOpts, reg, mgr, bindingStore, auditLogger)
 	if err != nil {
@@ -493,6 +534,67 @@ type mockCertServiceClient struct {
 
 func (m *mockCertServiceClient) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest, opts ...grpc.CallOption) (*certserverv1.GetCertificateResponse, error) {
 	return m.getCertFunc(ctx, req, opts...)
+}
+
+func TestClient_NamespaceQualifiedDataPlaneServiceAccount(t *testing.T) {
+	tempDir := t.TempDir()
+	tokenFile := filepath.Join(tempDir, "token")
+	if err := os.WriteFile(tokenFile, []byte("valid-token"), 0600); err != nil {
+		t.Fatalf("failed to write token: %v", err)
+	}
+
+	reqCh := make(chan *certserverv1.GetCertificateRequest, 1)
+	mockGRPC := &mockCertServiceClient{
+		getCertFunc: func(ctx context.Context, req *certserverv1.GetCertificateRequest, opts ...grpc.CallOption) (*certserverv1.GetCertificateResponse, error) {
+			select {
+			case reqCh <- req:
+			default:
+			}
+			return nil, status.Errorf(codes.Unavailable, "issuance in progress")
+		},
+	}
+
+	cli, err := New(Config{
+		TokenPath:  tokenFile,
+		GRPCClient: mockGRPC,
+		MinBackoff: 10 * time.Millisecond,
+		MaxBackoff: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer cli.Stop()
+
+	host := gatewayv1.Hostname("app.example.com")
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "traffic-system",
+			Name:      "web-gateway",
+		},
+	}
+	listener := &gatewayv1.Listener{Hostname: &host}
+
+	_, err = cli.ResolveCertificates(gw, listener)
+	if err != nil {
+		t.Fatalf("unexpected error calling ResolveCertificates: %v", err)
+	}
+
+	var capturedReq *certserverv1.GetCertificateRequest
+	select {
+	case capturedReq = <-reqCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for GetCertificate request")
+	}
+
+	wantDPSA := "traffic-system/web-gateway-gari"
+	if got := capturedReq.GetDataPlaneServiceAccount(); got != wantDPSA {
+		t.Errorf("GetDataPlaneServiceAccount() = %q, want namespace-qualified %q", got, wantDPSA)
+	}
+
+	wantGateway := "traffic-system/web-gateway"
+	if got := capturedReq.GetGateway(); got != wantGateway {
+		t.Errorf("GetGateway() = %q, want %q", got, wantGateway)
+	}
 }
 
 func TestClient_NonRetryableError(t *testing.T) {
