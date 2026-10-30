@@ -31,6 +31,7 @@ import (
 	"golang.org/x/time/rate"
 
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
@@ -159,9 +160,14 @@ func run(ctx context.Context, cfg *Config) error {
 	}
 	challengeHandler := challenge.NewHandler(challengeStore, chalOpts...)
 
+	var challengeHTTPHandler http.Handler = challengeHandler
+	if auditLogger != nil {
+		challengeHTTPHandler = audit.WrapHTTP(auditLogger, challengeHandler)
+	}
+
 	challengeServer := &http.Server{
 		Addr:    cfg.ChallengeListenAddr,
-		Handler: challengeHandler,
+		Handler: challengeHTTPHandler,
 	}
 
 	// Initialize ACME Client

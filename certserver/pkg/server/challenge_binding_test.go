@@ -41,6 +41,7 @@ import (
 
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
@@ -151,7 +152,7 @@ func setupChallengeBindingHarness(t *testing.T) *testHarness {
 		challenge.WithAuditLogger(auditLogger),
 		challenge.WithMetrics(m),
 	)
-	challengeSrv := httptest.NewServer(challengeHandler)
+	challengeSrv := httptest.NewServer(audit.WrapHTTP(auditLogger, challengeHandler))
 
 	h := &testHarness{
 		reg:            reg,

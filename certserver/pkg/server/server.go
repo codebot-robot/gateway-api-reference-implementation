@@ -29,10 +29,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
@@ -144,8 +144,19 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.listener = lis
 
-	// 3. Create gRPC server and register service
-	s.grpcServer = grpc.NewServer(grpc.Creds(creds))
+	// 3. Create gRPC server with interceptors and register service
+	grpcOpts := []grpc.ServerOption{
+		grpc.Creds(creds),
+		grpc.ChainUnaryInterceptor(
+			AuditUnaryInterceptor(s.auditLogger),
+			AuthUnaryInterceptor(s.registry),
+		),
+		grpc.ChainStreamInterceptor(
+			AuditStreamInterceptor(s.auditLogger),
+			AuthStreamInterceptor(s.registry),
+		),
+	}
+	s.grpcServer = grpc.NewServer(grpcOpts...)
 	certserverv1.RegisterCertificateServiceServer(s.grpcServer, s)
 
 	go func() {
@@ -192,173 +203,68 @@ func (s *Server) BindingStore() registry.BindingStore {
 	return s.bindingStore
 }
 
-func (s *Server) logAudit(entry registry.AuditEntry) {
-	if err := s.auditLogger.Log(entry); err != nil {
-		log.Printf("certserver: failed to write audit log: %v", err)
-	}
-}
-
-// extractToken retrieves the bearer token from gRPC Authorization metadata or request field.
-func extractToken(ctx context.Context, reqToken string) string {
-	if strings.TrimSpace(reqToken) != "" {
-		return strings.TrimSpace(reqToken)
-	}
-
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
-	}
-
-	authHeaders := md.Get("authorization")
-	if len(authHeaders) == 0 {
-		authHeaders = md.Get("grpcgateway-authorization")
-	}
-	if len(authHeaders) == 0 {
-		return ""
-	}
-
-	raw := strings.TrimSpace(authHeaders[0])
-	const prefix = "bearer "
-	if strings.HasPrefix(strings.ToLower(raw), prefix) {
-		return strings.TrimSpace(raw[len(prefix):])
-	}
-	return raw
-}
-
-// extractClusterID retrieves optional cluster ID from request field or gRPC metadata.
-func extractClusterID(ctx context.Context, reqClusterID string) string {
-	if strings.TrimSpace(reqClusterID) != "" {
-		return strings.TrimSpace(reqClusterID)
-	}
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
-	}
-	for _, key := range []string{"cluster-id", "x-cluster-id"} {
-		vals := md.Get(key)
-		if len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
-			return strings.TrimSpace(vals[0])
-		}
-	}
-	return ""
-}
-
 // GetCertificate implements certserverv1.CertificateServiceServer.
 func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertificateRequest) (*certserverv1.GetCertificateResponse, error) {
 	gateway := strings.TrimSpace(req.GetGateway())
 	dataPlaneSA := strings.TrimSpace(req.GetDataPlaneServiceAccount())
 	rawHostnames := req.GetHostnames()
 
-	// 1. Extract Bearer token
-	token := extractToken(ctx, req.GetToken())
-	if token == "" {
-		s.logAudit(registry.AuditEntry{
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    "missing authorization token",
-		})
-		return nil, status.Errorf(codes.Unauthenticated, "missing authorization token")
+	// 1. Retrieve verified caller identity from context (placed by Auth interceptor)
+	identity, ok := CallerIdentityFromContext(ctx)
+	if !ok {
+		return nil, status.Errorf(codes.Unauthenticated, "unauthenticated")
 	}
 
-	// 2. Identify cluster ID if specified
-	targetClusterID := extractClusterID(ctx, req.GetClusterId())
-
-	// 3. Cryptographically verify token and extract caller identity
-	identity, cluster, err := s.registry.VerifyToken(ctx, token, targetClusterID)
-	if err != nil {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    fmt.Sprintf("token verification failed: %v", err),
-		})
-		return nil, status.Errorf(codes.Unauthenticated, "authentication failed")
+	cluster, ok := ClusterConfigFromContext(ctx)
+	if !ok || cluster == nil {
+		var found bool
+		cluster, found = s.registry.GetCluster(identity.ClusterID)
+		if !found || cluster == nil {
+			audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, fmt.Sprintf("cluster %q not found", identity.ClusterID))
+			return nil, status.Errorf(codes.PermissionDenied, "cluster %q not found", identity.ClusterID)
+		}
 	}
 
-	// 4. Enforce per-identity rate limits
+	// 2. Enforce per-identity rate limits
 	if !s.rateLimiter.Allow(identity) {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    "per-identity rate limit exceeded",
-		})
+		audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, "per-identity rate limit exceeded")
 		return nil, status.Errorf(codes.ResourceExhausted, "rate limit exceeded for identity %s", identity)
 	}
 
-	// 5. Authorize caller as the cluster's designated GARI controller
+	// 3. Authorize caller as the cluster's designated GARI controller
 	if !registry.IsAuthorizedController(cluster, identity) {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    fmt.Sprintf("caller %s is not an authorized controller for cluster %s", identity, cluster.ClusterID),
-		})
+		audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, fmt.Sprintf("caller %s is not an authorized controller for cluster %s", identity, cluster.ClusterID))
 		return nil, status.Errorf(codes.PermissionDenied, "caller %s is not an authorized controller for cluster %s", identity, cluster.ClusterID)
 	}
 
-	// 6. Validate Gateway, DataPlane SA, and hostnames arguments
+	// 4. Validate Gateway, DataPlane SA, and hostnames arguments
 	if gateway == "" {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    "gateway parameter is required",
-		})
+		audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, "gateway parameter is required")
 		return nil, status.Errorf(codes.InvalidArgument, "gateway parameter is required")
 	}
 	if dataPlaneSA == "" {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    "data_plane_service_account parameter is required",
-		})
+		audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, "data_plane_service_account parameter is required")
 		return nil, status.Errorf(codes.InvalidArgument, "data_plane_service_account parameter is required")
 	}
 	if len(rawHostnames) == 0 {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    "no hostnames provided",
-		})
+		audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, "no hostnames provided")
 		return nil, status.Errorf(codes.InvalidArgument, "no hostnames provided")
 	}
 
-	// 7. Normalize hostnames using the shared manager normaliser
+	// 5. Normalize hostnames using the shared manager normaliser
 	normalized, hostnamesKey, err := manager.NormalizeHostnames(rawHostnames, s.opts.MaxHostnames, s.opts.MaxHostnameLength)
 	if err != nil {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: rawHostnames,
-			Decision:  registry.DecisionRefused,
-			Reason:    fmt.Sprintf("hostname normalization failed: %v", err),
-		})
+		audit.FromContext(ctx).Set(gateway, rawHostnames, audit.DecisionRefused, fmt.Sprintf("hostname normalization failed: %v", err))
 		return nil, status.Errorf(codes.InvalidArgument, "invalid hostnames: %v", err)
 	}
 
-	// 8. Check per-cluster hostname policy (allow / deny lists)
+	// 6. Check per-cluster hostname policy (allow / deny lists)
 	if err := registry.CheckHostnamesPolicy(cluster, normalized); err != nil {
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: normalized,
-			Decision:  registry.DecisionRefused,
-			Reason:    fmt.Sprintf("policy refused: %v", err),
-		})
+		audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionRefused, fmt.Sprintf("policy refused: %v", err))
 		return nil, status.Errorf(codes.PermissionDenied, "hostname policy refused: %v", err)
 	}
 
-	// 9. Record Gateway binding mapping
+	// 7. Record Gateway binding mapping
 	requester := challenge.Requester{
 		ClusterID:               cluster.ClusterID,
 		Gateway:                 gateway,
@@ -374,19 +280,13 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		RecordedAt:              time.Now(),
 	})
 
-	// 10. Check certificate cache via manager interface
+	// 8. Check certificate cache via manager interface
 	now := time.Now()
 	certData, err := s.mgr.GetCertificate(hostnamesKey, s.opts.ReleaseMode)
 	if err == nil && certData != nil {
 		// Cache hit! Check if this Gateway has passed its own binding check for these hostnames
 		if s.bindingStore.HasValidatedBinding(cluster.ClusterID, gateway, hostnamesKey, now) {
-			s.logAudit(registry.AuditEntry{
-				Identity:  identity,
-				Gateway:   gateway,
-				Hostnames: normalized,
-				Decision:  registry.DecisionAllowed,
-				Reason:    "certificate returned from cache",
-			})
+			audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionAllowed, "certificate returned from cache")
 
 			return &certserverv1.GetCertificateResponse{
 				CertificateChain: certData.CertificateChain,
@@ -395,13 +295,7 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		}
 
 		// Second requester / unvalidated gateway attempting to access cached certificate
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: normalized,
-			Decision:  registry.DecisionRefused,
-			Reason:    "cached certificate requires binding validation for this gateway",
-		})
+		audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionRefused, "cached certificate requires binding validation for this gateway")
 
 		// Trigger revalidation for this requester to validate its domain control
 		if _, revalErr := s.mgr.EnsureRevalidation(ctx, normalized, requester); revalErr != nil {
@@ -413,28 +307,16 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 
 	if !errors.Is(err, cache.ErrNotFound) {
 		log.Printf("certserver: error reading certificate from cache for %s: %v", hostnamesKey, err)
-		s.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   gateway,
-			Hostnames: normalized,
-			Decision:  registry.DecisionRefused,
-			Reason:    fmt.Sprintf("failed to read certificate from cache: %v", err),
-		})
+		audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionRefused, fmt.Sprintf("failed to read certificate from cache: %v", err))
 		return nil, status.Errorf(codes.Internal, "internal error retrieving certificate")
 	}
 
-	// 11. Cache miss: start issuance only if none in flight, passing requester binding info
+	// 9. Cache miss: start issuance only if none in flight, passing requester binding info
 	if _, err := s.mgr.EnsureIssuance(ctx, normalized, requester); err != nil {
 		log.Printf("certserver: failed to initiate issuance for %s: %v", hostnamesKey, err)
 	}
 
-	s.logAudit(registry.AuditEntry{
-		Identity:  identity,
-		Gateway:   gateway,
-		Hostnames: normalized,
-		Decision:  registry.DecisionAllowed,
-		Reason:    "certificate issuance started; returning retryable status",
-	})
+	audit.FromContext(ctx).Set(gateway, normalized, audit.DecisionAllowed, "certificate issuance started; returning retryable status")
 
 	return nil, status.Errorf(codes.Unavailable, "certificate issuance in progress for %s; retry later", hostnamesKey)
 }

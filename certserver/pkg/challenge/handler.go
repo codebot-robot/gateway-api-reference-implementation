@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
@@ -140,14 +141,6 @@ func (h *Handler) now() time.Time {
 	return time.Now()
 }
 
-func (h *Handler) logAudit(entry registry.AuditEntry) {
-	if h.auditLogger != nil {
-		if err := h.auditLogger.Log(entry); err != nil {
-			log.Printf("certserver: failed to write audit log entry: %v", err)
-		}
-	}
-}
-
 func (h *Handler) recordMetric(status string) {
 	if h.metrics != nil {
 		h.metrics.RecordChallengeRequest(status)
@@ -157,22 +150,25 @@ func (h *Handler) recordMetric(status string) {
 // ServeHTTP handles requests for /.well-known/acme-challenge/<token>.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		audit.FromContext(r.Context()).Set("", nil, audit.DecisionRefused, "method not allowed")
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	normHost := NormalizeHost(r.Host)
+
 	if !strings.HasPrefix(r.URL.Path, ACMEChallengePrefix) {
+		audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, "invalid path prefix")
 		http.NotFound(w, r)
 		return
 	}
 
 	token := strings.TrimPrefix(r.URL.Path, ACMEChallengePrefix)
 	if !isValidToken(token) {
+		audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, "invalid challenge token format")
 		http.NotFound(w, r)
 		return
 	}
-
-	normHost := NormalizeHost(r.Host)
 
 	// If registry is configured, enforce data-plane service-account token verification and challenge binding.
 	if h.registry != nil {
@@ -184,11 +180,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if bearerToken == "" {
-			h.logAudit(registry.AuditEntry{
-				Hostnames: []string{normHost},
-				Decision:  registry.DecisionRefused,
-				Reason:    "missing authorization token",
-			})
+			audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, "missing authorization token")
 			h.recordMetric("unauthenticated")
 			http.NotFound(w, r)
 			return
@@ -196,30 +188,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		identity, _, err := h.registry.VerifyToken(r.Context(), bearerToken, "")
 		if err != nil {
-			h.logAudit(registry.AuditEntry{
-				Identity:  identity,
-				Hostnames: []string{normHost},
-				Decision:  registry.DecisionRefused,
-				Reason:    fmt.Sprintf("token verification failed: %v", err),
-			})
+			audit.FromContext(r.Context()).SetIdentity(identity)
+			audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, fmt.Sprintf("token verification failed: %v", err))
 			h.recordMetric("unauthenticated")
 			http.NotFound(w, r)
 			return
 		}
+		audit.FromContext(r.Context()).SetIdentity(identity)
 
 		if h.store == nil {
+			audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, "challenge store not configured")
 			http.NotFound(w, r)
 			return
 		}
 
 		item, err := h.store.Get(r.Context(), token)
 		if err != nil {
-			h.logAudit(registry.AuditEntry{
-				Identity:  identity,
-				Hostnames: []string{normHost},
-				Decision:  registry.DecisionRefused,
-				Reason:    "challenge token not found",
-			})
+			audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, "challenge token not found")
 			h.recordMetric("not_found")
 			http.NotFound(w, r)
 			return
@@ -227,13 +212,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// 1. Host match
 		if normHost != item.Identifier {
-			h.logAudit(registry.AuditEntry{
-				Identity:  identity,
-				Gateway:   item.Requester.Gateway,
-				Hostnames: []string{normHost},
-				Decision:  registry.DecisionRefused,
-				Reason:    "request host does not match challenge identifier",
-			})
+			audit.FromContext(r.Context()).Set(item.Requester.Gateway, []string{normHost}, audit.DecisionRefused, "request host does not match challenge identifier")
 			h.recordMetric("host_mismatch")
 			http.NotFound(w, r)
 			return
@@ -245,13 +224,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if rmErr := h.store.Remove(r.Context(), token); rmErr != nil && !errors.Is(rmErr, ErrNotFound) {
 				log.Printf("certserver: failed to remove expired challenge %s: %v", token, rmErr)
 			}
-			h.logAudit(registry.AuditEntry{
-				Identity:  identity,
-				Gateway:   item.Requester.Gateway,
-				Hostnames: []string{normHost},
-				Decision:  registry.DecisionRefused,
-				Reason:    "challenge authorization expired",
-			})
+			audit.FromContext(r.Context()).Set(item.Requester.Gateway, []string{normHost}, audit.DecisionRefused, "challenge authorization expired")
 			h.recordMetric("expired")
 			http.NotFound(w, r)
 			return
@@ -271,13 +244,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !authorized {
-			h.logAudit(registry.AuditEntry{
-				Identity:  identity,
-				Gateway:   item.Requester.Gateway,
-				Hostnames: []string{normHost},
-				Decision:  registry.DecisionRefused,
-				Reason:    fmt.Sprintf("forwarding identity %s is not authorized for requesting gateway %s in cluster %s", identity, item.Requester.Gateway, item.Requester.ClusterID),
-			})
+			audit.FromContext(r.Context()).Set(item.Requester.Gateway, []string{normHost}, audit.DecisionRefused, fmt.Sprintf("forwarding identity %s is not authorized for requesting gateway %s in cluster %s", identity, item.Requester.Gateway, item.Requester.ClusterID))
 			h.recordMetric("binding_refused")
 			http.NotFound(w, r)
 			return
@@ -302,13 +269,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 
-		h.logAudit(registry.AuditEntry{
-			Identity:  identity,
-			Gateway:   matchedReq.Gateway,
-			Hostnames: []string{normHost},
-			Decision:  registry.DecisionAllowed,
-			Reason:    "challenge validation succeeded",
-		})
+		audit.FromContext(r.Context()).Set(matchedReq.Gateway, []string{normHost}, audit.DecisionAllowed, "challenge validation succeeded")
 		h.recordMetric("success")
 
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -330,10 +291,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	keyAuth, err := h.resolver.ResolveChallenge(r.Context(), caller, r.Host, token)
 	if err != nil {
+		audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionRefused, "challenge resolution failed")
 		http.NotFound(w, r)
 		return
 	}
 
+	audit.FromContext(r.Context()).Set("", []string{normHost}, audit.DecisionAllowed, "challenge resolution succeeded")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
