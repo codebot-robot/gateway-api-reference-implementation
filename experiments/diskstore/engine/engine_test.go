@@ -19,10 +19,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	mathrand "math/rand"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestDiskStore_BasicCRUD(t *testing.T) {
@@ -1349,5 +1352,169 @@ func BenchmarkEngine_WriteThroughputLargeWorkingSet(b *testing.B) {
 		b.StopTimer()
 		_ = store.Close()
 		b.StartTimer()
+	}
+}
+
+// TestStress_ReadersWritersAndCheckpoints tests that many concurrent readers calling Get on
+// keys that writers rewrite continuously with checkpoints running complete with no read errors.
+func TestStress_ReadersWritersAndCheckpoints(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir("stress_store"), WithNumPoolBlocks(64))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	const numKeys = 10
+	bucket := "StressBucket"
+
+	// Seed keys
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("k-%d", i)
+		if err := store.Put(bucket, key, []byte("initial"), "0"); err != nil {
+			t.Fatalf("initial Put failed: %v", err)
+		}
+	}
+
+	stopCh := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writers
+	for w := 0; w < 3; w++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			step := 0
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					key := fmt.Sprintf("k-%d", step%numKeys)
+					val := fmt.Sprintf("w%d-%d", writerID, step)
+					_ = store.Put(bucket, key, []byte(val), fmt.Sprintf("%d", step))
+					step++
+				}
+			}
+		}(w)
+	}
+
+	// Checkpointer
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+				_, _ = store.Checkpoint()
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Readers
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					key := fmt.Sprintf("k-%d", mathrand.Intn(numKeys))
+					val, exists, err := store.Get(bucket, key)
+					if err != nil {
+						t.Errorf("concurrent Get failed: %v", err)
+						return
+					}
+					if !exists || len(val) == 0 {
+						t.Errorf("Get returned exists=%v, len(val)=%d", exists, len(val))
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	close(stopCh)
+	wg.Wait()
+}
+
+// TestGet_MissingOversizeObjectReturnsNotFound verifies that a missing oversize object
+// returns exists=false and does not cause a fatal corruption error.
+func TestGet_MissingOversizeObjectReturnsNotFound(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir("missing_oversize_test"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	bucket := "TestBucket"
+	key := "oversize-key"
+	payload := makeIncompressible(MaxPayloadCapacity + 1024)
+
+	if err := store.Put(bucket, key, payload, "0"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Remove from in-memory oversizeObjects map while leaving keyIndex entry
+	qKey := qualifyKey(bucket, key)
+	store.keyMu.Lock()
+	delete(store.oversizeObjects, qKey)
+	store.keyMu.Unlock()
+
+	// Get should return not found (exists=false, err=nil) without failing the engine
+	val, exists, err := store.Get(bucket, key)
+	if err != nil {
+		t.Fatalf("expected nil error on missing oversize object, got: %v", err)
+	}
+	if exists || val != nil {
+		t.Fatalf("expected exists=false, got exists=%v val=%v", exists, val)
+	}
+	if store.isFailed() {
+		t.Fatalf("engine unexpectedly transitioned to failed state")
+	}
+}
+
+// TestGet_PinPageFailurePreservesCause verifies that when PinPage fails under locked read,
+// the engine failure error includes the cause.
+func TestGet_PinPageFailurePreservesCause(t *testing.T) {
+	memFS := NewMemFS()
+	store, err := Open(WithFS(memFS), WithDir("pin_fail_test"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	bucket := "TestBucket"
+	key := "pin-fail-key"
+	if err := store.Put(bucket, key, []byte("val"), "0"); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	qKey := qualifyKey(bucket, key)
+	store.keyMu.RLock()
+	entry := store.keyIndex[qKey]
+	store.keyMu.RUnlock()
+
+	// Remove page descriptor from pageTable so PinPage fails with ErrPageNotFound
+	store.bp.mu.Lock()
+	delete(store.bp.pageTable, entry.LogicalPage)
+	store.bp.mu.Unlock()
+
+	_, _, err = store.Get(bucket, key)
+	if err == nil {
+		t.Fatalf("expected error when PinPage fails")
+	}
+	if !strings.Contains(err.Error(), "failed to pin page") {
+		t.Fatalf("expected error to contain 'failed to pin page', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), ErrPageNotFound.Error()) {
+		t.Fatalf("expected error to contain cause %q, got: %v", ErrPageNotFound.Error(), err)
 	}
 }
