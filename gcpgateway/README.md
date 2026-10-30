@@ -295,6 +295,8 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 `gcpgateway` integrates with `certserver` to automatically provision and renew TLS certificates for HTTPS listeners using GARI's pluggable certificate-source hook and certserver's authenticated `GetCertificate` gRPC API.
 
+For shared architecture, cluster registration, and certificate lifecycle details, see [docs/certserver.md](../docs/certserver.md).
+
 ### 1. Registering the Cluster's OIDC Issuer with certserver
 
 `certserver` verifies projected ServiceAccount tokens offline against the originating cluster's OIDC discovery endpoint and JSON Web Key Set (JWKS). Before `gcpgateway` can request certificates, register the cluster in `certserver`'s configuration:

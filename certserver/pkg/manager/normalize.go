@@ -15,80 +15,28 @@
 package manager
 
 import (
-	"errors"
-	"fmt"
-	"sort"
-	"strings"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/api/client"
 )
 
 var (
 	// ErrNoHostnames is returned when an empty hostname slice is provided.
-	ErrNoHostnames = errors.New("no hostnames provided")
+	ErrNoHostnames = client.ErrNoHostnames
 
 	// ErrWildcardNotSupported indicates wildcard hostnames are disallowed for HTTP-01.
-	ErrWildcardNotSupported = errors.New("wildcard hostnames are not supported for HTTP-01 issuance")
+	ErrWildcardNotSupported = client.ErrWildcardNotSupported
 
 	// ErrTooManyHostnames is returned when hostnames count exceeds the configured limit.
-	ErrTooManyHostnames = errors.New("too many hostnames in set")
+	ErrTooManyHostnames = client.ErrTooManyHostnames
 
 	// ErrHostnameTooLong is returned when an individual hostname exceeds the maximum length.
-	ErrHostnameTooLong = errors.New("hostname exceeds maximum allowed length")
+	ErrHostnameTooLong = client.ErrHostnameTooLong
 
 	// ErrInvalidHostname is returned when a hostname is empty or malformed.
-	ErrInvalidHostname = errors.New("invalid hostname format")
+	ErrInvalidHostname = client.ErrInvalidHostname
 )
 
 // NormalizeHostnames lower-cases, validates, deduplicates, and sorts a list of hostnames.
 // Returns the normalized slice and a deterministic comma-separated key.
 func NormalizeHostnames(hostnames []string, maxHostnames, maxLen int) ([]string, string, error) {
-	if len(hostnames) == 0 {
-		return nil, "", ErrNoHostnames
-	}
-
-	if maxHostnames > 0 && len(hostnames) > maxHostnames {
-		return nil, "", fmt.Errorf("%w: %d exceeds maximum of %d", ErrTooManyHostnames, len(hostnames), maxHostnames)
-	}
-
-	seen := make(map[string]struct{}, len(hostnames))
-	normalized := make([]string, 0, len(hostnames))
-
-	for _, raw := range hostnames {
-		h := strings.TrimSpace(raw)
-		if h == "" {
-			return nil, "", fmt.Errorf("%w: empty hostname in list", ErrInvalidHostname)
-		}
-
-		// Normalize trailing dot
-		h = strings.TrimSuffix(h, ".")
-		if h == "" {
-			return nil, "", fmt.Errorf("%w: empty hostname in list", ErrInvalidHostname)
-		}
-
-		if strings.Contains(h, "*") {
-			return nil, "", fmt.Errorf("%w: %q", ErrWildcardNotSupported, h)
-		}
-
-		if maxLen > 0 && len(h) > maxLen {
-			return nil, "", fmt.Errorf("%w: %q has length %d (max %d)", ErrHostnameTooLong, h, len(h), maxLen)
-		}
-
-		// Disallow leading dots or consecutive dots
-		if strings.HasPrefix(h, ".") || strings.Contains(h, "..") {
-			return nil, "", fmt.Errorf("%w: %q contains invalid dots", ErrInvalidHostname, h)
-		}
-
-		lower := strings.ToLower(h)
-		if _, exists := seen[lower]; !exists {
-			seen[lower] = struct{}{}
-			normalized = append(normalized, lower)
-		}
-	}
-
-	if len(normalized) == 0 {
-		return nil, "", ErrNoHostnames
-	}
-
-	sort.Strings(normalized)
-	key := strings.Join(normalized, ",")
-	return normalized, key, nil
+	return client.NormalizeHostnames(hostnames, maxHostnames, maxLen)
 }

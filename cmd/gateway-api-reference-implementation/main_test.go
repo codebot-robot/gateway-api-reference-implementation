@@ -16,6 +16,9 @@ package main
 
 import (
 	"flag"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
@@ -160,6 +163,9 @@ func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
 
 func TestFlagsGolden(t *testing.T) {
 	t.Setenv("GARI_IMAGE", "")
+	t.Setenv("CERTSERVER_ADDRESS", "")
+	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
+	t.Setenv("CERTSERVER_TOKEN_PATH", "")
 
 	type flagInfo struct {
 		Name     string
@@ -171,6 +177,9 @@ func TestFlagsGolden(t *testing.T) {
 		{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity."},
 		{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to."},
 		{Name: "allowed-source-cidrs", DefValue: "", Usage: "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners."},
+		{Name: "certserver-address", DefValue: "", Usage: "Address of the certserver gRPC service"},
+		{Name: "certserver-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify certserver TLS"},
+		{Name: "certserver-token-path", DefValue: "", Usage: "Path to the projected service-account token file for controller identity"},
 		{Name: "controller-name", DefValue: "github.com/gke-labs/gateway-api-reference-implementation", Usage: "The GatewayClass controller name."},
 		{Name: "dataplane-image", DefValue: "gari-controller:latest", Usage: "The container image to use for provisioned per-Gateway data-plane Deployments."},
 		{Name: "dataplane-mode", DefValue: "false", Usage: "Run in data-plane mode serving a single Gateway."},
@@ -216,5 +225,106 @@ func TestFlagsGolden(t *testing.T) {
 		if got[i] != golden[i] {
 			t.Errorf("flag %d mismatch:\ngot:  %+v\nwant: %+v", i, got[i], golden[i])
 		}
+	}
+}
+
+func TestSetupController_CertserverRegistered(t *testing.T) {
+	t.Setenv("CERTSERVER_ADDRESS", "")
+	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
+	t.Setenv("CERTSERVER_TOKEN_PATH", "")
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("tok"), 0600); err != nil {
+		t.Fatalf("failed to write token file: %v", err)
+	}
+
+	opts, err := SetupController([]string{
+		"--certserver-address=127.0.0.1:8443",
+		"--certserver-token-path=" + tokenFile,
+	})
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+
+	if opts.CertificateSources == nil {
+		t.Fatalf("expected CertificateSources to be initialized")
+	}
+	if opts.CertificateSources["certserver"] == nil {
+		t.Errorf("expected 'certserver' source to be registered")
+	}
+}
+
+func TestSetupController_CertserverUnregistered(t *testing.T) {
+	t.Setenv("CERTSERVER_ADDRESS", "")
+	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
+	t.Setenv("CERTSERVER_TOKEN_PATH", "")
+
+	opts, err := SetupController([]string{})
+	if err != nil {
+		t.Fatalf("SetupController failed: %v", err)
+	}
+
+	if opts.CertificateSources != nil && opts.CertificateSources["certserver"] != nil {
+		t.Errorf("expected certserver source NOT to be registered when flags are omitted")
+	}
+}
+
+func TestSetupController_CertserverValidationErrors(t *testing.T) {
+	t.Setenv("CERTSERVER_ADDRESS", "")
+	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
+	t.Setenv("CERTSERVER_TOKEN_PATH", "")
+
+	// 1. Missing token
+	_, err := SetupController([]string{
+		"--certserver-address=127.0.0.1:8443",
+	})
+	if err == nil {
+		t.Fatalf("expected error when token is missing")
+	}
+	if !strings.Contains(err.Error(), "--certserver-token-path is required") {
+		t.Errorf("expected error to mention --certserver-token-path, got %v", err)
+	}
+
+	// 2. Missing address
+	_, err = SetupController([]string{
+		"--certserver-token-path=/path/to/token",
+	})
+	if err == nil {
+		t.Fatalf("expected error when address is missing")
+	}
+	if !strings.Contains(err.Error(), "--certserver-address is required") {
+		t.Errorf("expected error to mention --certserver-address, got %v", err)
+	}
+}
+
+func TestSetup_ModeSelection(t *testing.T) {
+	// 1. Controller mode by default
+	optsCtrl, err := Setup([]string{})
+	if err != nil {
+		t.Fatalf("Setup failed for controller mode: %v", err)
+	}
+	if optsCtrl.DataplaneMode {
+		t.Errorf("expected DataplaneMode=false by default")
+	}
+
+	// 2. Explicit --dataplane-mode=false stays in controller mode
+	optsCtrlExplicit, err := Setup([]string{"--dataplane-mode=false"})
+	if err != nil {
+		t.Fatalf("Setup failed for --dataplane-mode=false: %v", err)
+	}
+	if optsCtrlExplicit.DataplaneMode {
+		t.Errorf("expected DataplaneMode=false for --dataplane-mode=false")
+	}
+
+	// 3. Dataplane mode selected via --dataplane-mode
+	optsDP, err := Setup([]string{"--dataplane-mode", "--gateway-namespace=ns", "--gateway-name=gw"})
+	if err != nil {
+		t.Fatalf("Setup failed for dataplane mode: %v", err)
+	}
+	if !optsDP.DataplaneMode {
+		t.Errorf("expected DataplaneMode=true")
+	}
+	if optsDP.DataplaneGatewayNamespace != "ns" || optsDP.DataplaneGatewayName != "gw" {
+		t.Errorf("expected gateway ns/gw, got %s/%s", optsDP.DataplaneGatewayNamespace, optsDP.DataplaneGatewayName)
 	}
 }

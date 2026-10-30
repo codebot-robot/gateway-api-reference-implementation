@@ -133,6 +133,19 @@ GARI tolerates partial Gateway API CRD installations (for example, on GKE standa
 - Listener `supportedKinds` excludes disabled kinds. A listener restricted (explicitly or by default) to only disabled route kinds reports `ResolvedRefs=False` with reason `InvalidRouteKinds`.
 - If a CRD is installed after the controller has started, restarting the controller is required to discover and enable support for the newly installed CRD.
 
+### Automatic TLS Certificates via certserver
+
+GARI integrates with `certserver` to automatically provision and renew TLS certificates for HTTPS listeners using GARI's pluggable certificate source mechanism and certserver's authenticated `GetCertificate` gRPC API.
+
+Controllers connect to `certserver` via CLI flags:
+- `--certserver-address`: The address of the certserver gRPC service (e.g. `certserver.gateway-system.svc:8443`).
+- `--certserver-ca-bundle-path`: Path to the CA bundle PEM file to verify the certserver TLS endpoint.
+- `--certserver-token-path`: Path to the projected service-account token file (audience `certserver`).
+
+To request certificates on Gateway listeners, set `gateway.gke-labs.io/certificate-source: certserver` under `tls.options`.
+
+For full details on cluster registration, manifests, and certificate lifecycle, see the [certserver documentation](docs/certserver.md).
+
 ## Contributing
 
 This project is licensed under the [Apache 2.0 License](LICENSE).

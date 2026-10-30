@@ -23,10 +23,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/certserversource"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
 	compute "google.golang.org/api/compute/v1"
@@ -34,7 +34,6 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -170,7 +169,7 @@ type ControllerConfig struct {
 	HealthPollInterval time.Duration
 	ResyncInterval     time.Duration
 	FakeCompute        bool
-	Certserver         client.Config
+	Certserver         certserversource.Config
 }
 
 // DefaultControllerConfig returns the default ControllerConfig populated from environment variables.
@@ -199,11 +198,7 @@ func DefaultControllerConfig() ControllerConfig {
 		DrainSeconds:       DefaultDrainSeconds,
 		HealthPollInterval: controller.HealthPollInterval,
 		ResyncInterval:     controller.ResyncInterval,
-		Certserver: client.Config{
-			ServerAddress: os.Getenv("CERTSERVER_ADDRESS"),
-			CABundlePath:  os.Getenv("CERTSERVER_CA_BUNDLE_PATH"),
-			TokenPath:     os.Getenv("CERTSERVER_TOKEN_PATH"),
-		},
+		Certserver:         certserversource.DefaultConfig(),
 	}
 }
 
@@ -225,9 +220,7 @@ func BindControllerFlags(fs *flag.FlagSet, opts *gari.Options, cfg *ControllerCo
 	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
 	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
 	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
-	fs.StringVar(&cfg.Certserver.ServerAddress, "certserver-address", cfg.Certserver.ServerAddress, "Address of the certserver gRPC service")
-	fs.StringVar(&cfg.Certserver.CABundlePath, "certserver-ca-bundle-path", cfg.Certserver.CABundlePath, "Path to the CA bundle PEM file to verify certserver TLS")
-	fs.StringVar(&cfg.Certserver.TokenPath, "certserver-token-path", cfg.Certserver.TokenPath, "Path to the projected service-account token file for controller identity")
+	certserversource.BindFlags(fs, &cfg.Certserver)
 }
 
 // SetupController parses args and builds the gari.Options for controller mode.
@@ -253,23 +246,8 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		return gari.Options{}, err
 	}
 
-	var certCli *client.Client
-	if cfg.Certserver.ServerAddress != "" || cfg.Certserver.TokenPath != "" || cfg.Certserver.CABundlePath != "" {
-		if cfg.Certserver.ServerAddress == "" {
-			return gari.Options{}, fmt.Errorf("--certserver-address is required when certserver flags are set")
-		}
-		if cfg.Certserver.TokenPath == "" {
-			return gari.Options{}, fmt.Errorf("--certserver-token-path is required when certserver flags are set")
-		}
-		var err error
-		certCli, err = client.New(cfg.Certserver)
-		if err != nil {
-			return gari.Options{}, fmt.Errorf("initializing certserver client: %w", err)
-		}
-		if opts.CertificateSources == nil {
-			opts.CertificateSources = make(map[string]gari.CertificateSource)
-		}
-		opts.CertificateSources["certserver"] = certCli
+	if err := certserversource.Register(&opts, cfg.Certserver); err != nil {
+		return gari.Options{}, err
 	}
 
 	gcpClient := computeClient
@@ -335,7 +313,13 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		return nil
 	}
 
+	prevSetup := opts.SetupWithManager
 	opts.SetupWithManager = func(mgr ctrl.Manager, s *gari.Server) error {
+		if prevSetup != nil {
+			if err := prevSetup(mgr, s); err != nil {
+				return err
+			}
+		}
 		recorder := mgr.GetEventRecorderFor("gcpgateway")
 		reg := registrar.NewRegistrar(mgr.GetClient(), gcpClient, registrar.Config{
 			ClusterID: reconcilerCfg.ClusterID,
@@ -357,14 +341,6 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 			reg,
 			rCfg,
 		)
-
-		if src, ok := opts.CertificateSources["certserver"]; ok && src != nil {
-			if r, ok := src.(manager.Runnable); ok {
-				if err := mgr.Add(r); err != nil {
-					return fmt.Errorf("registering certserver client with manager: %w", err)
-				}
-			}
-		}
 
 		return rec.SetupWithManager(mgr)
 	}
