@@ -36,12 +36,15 @@ const (
 // AuditEntry represents one structured audit log line per decision.
 // Notice: Audit entries NEVER contain sensitive credentials, tokens, or private keys.
 type AuditEntry struct {
-	Timestamp time.Time      `json:"timestamp"`
-	Identity  CallerIdentity `json:"identity"`
-	Gateway   string         `json:"gateway"`
-	Hostnames []string       `json:"hostnames"`
-	Decision  AuditDecision  `json:"decision"`
-	Reason    string         `json:"reason"`
+	Timestamp  time.Time      `json:"timestamp"`
+	Method     string         `json:"method,omitempty"`
+	Identity   CallerIdentity `json:"identity,omitempty"`
+	StatusCode string         `json:"status_code,omitempty"`
+	Duration   time.Duration  `json:"duration,omitempty"`
+	Gateway    string         `json:"gateway,omitempty"`
+	Hostnames  []string       `json:"hostnames,omitempty"`
+	Decision   AuditDecision  `json:"decision,omitempty"`
+	Reason     string         `json:"reason,omitempty"`
 }
 
 // AuditLogger writes structured audit log entries to an output writer.

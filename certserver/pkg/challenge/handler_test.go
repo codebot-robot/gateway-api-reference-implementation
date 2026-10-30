@@ -32,6 +32,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/audit"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
@@ -319,6 +320,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 		WithMetrics(m),
 		WithTimeNow(func() time.Time { return now }),
 	)
+	httpHandler := audit.WrapHTTP(auditLogger, handler)
 
 	// Register pending challenge for default/gw-1 in cluster-1 with dataPlaneSA "default/dp-sa-1"
 	const testToken = "tok-valid-binding"
@@ -339,7 +341,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+testToken, nil)
 	req.Host = testHost
 	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	httpHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for missing auth header, got %d", rr.Code)
 	}
@@ -349,7 +351,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 	req.Host = testHost
 	req.Header.Set("Authorization", "Bearer invalid-jwt")
 	rr = httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	httpHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for invalid token, got %d", rr.Code)
 	}
@@ -360,7 +362,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 	req.Host = testHost
 	req.Header.Set("Authorization", "Bearer "+wrongSAToken)
 	rr = httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	httpHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for wrong SA, got %d", rr.Code)
 	}
@@ -371,7 +373,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 	req.Host = testHost
 	req.Header.Set("Authorization", "Bearer "+correctSAToken)
 	rr = httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	httpHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200 for correct SA, got %d", rr.Code)
 	}
@@ -396,7 +398,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 	req.Host = testHost
 	req.Header.Set("Authorization", "Bearer "+sharedSAToken)
 	rr = httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	httpHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200 for shared front end group SA, got %d", rr.Code)
 	}
@@ -415,7 +417,7 @@ func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
 	req.Host = testHost
 	req.Header.Set("Authorization", "Bearer "+correctSAToken)
 	rr = httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	httpHandler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected 404 for expired challenge, got %d", rr.Code)
 	}
