@@ -28,69 +28,75 @@ import (
 
 var setupLog = ctrl.Log.WithName("setup")
 
-func main() {
-	opts := gari.DefaultOptions()
+// FlagVars holds non-Options command-line flag variables.
+type FlagVars struct {
+	DataplaneMode             bool
+	GatewayNamespace          string
+	GatewayName               string
+	DataplaneImage            string
+	AllowedSourceCIDRs        string
+	ProxyProtocolTrustedCIDRs string
+}
 
-	var (
-		dataplaneMode                bool
-		gatewayNamespace             string
-		gatewayName                  string
-		dataplaneImage               string
-		allowedSourceCIDRsStr        string
-		proxyProtocolTrustedCIDRsStr string
-	)
-
+// BindFlags registers all command-line flags on the given FlagSet.
+func BindFlags(fs *flag.FlagSet, opts *gari.Options, vars *FlagVars) {
 	defaultImg := os.Getenv("GARI_IMAGE")
 	if defaultImg == "" {
 		defaultImg = singlepod.DefaultDataplaneImage
 	}
 
-	flag.BoolVar(&dataplaneMode, "dataplane-mode", false, "Run in data-plane mode serving a single Gateway.")
-	flag.StringVar(&gatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
-	flag.StringVar(&gatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
-	flag.StringVar(&dataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
-	flag.StringVar(&allowedSourceCIDRsStr, "allowed-source-cidrs", "", "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners.")
-	flag.StringVar(&opts.ProxyProtocol, "proxy-protocol", opts.ProxyProtocol, "Enable PROXY protocol ('enabled').")
-	flag.StringVar(&proxyProtocolTrustedCIDRsStr, "proxy-protocol-trusted-cidrs", "", "Comma-separated list of trusted CIDRs for PROXY protocol.")
-	flag.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", opts.DrainSentinelPath, "Path to the sentinel file that marks the pod as draining.")
-	flag.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
-	flag.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
-	flag.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to for HTTP.")
-	flag.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "The address the proxy binds to for HTTPS.")
-	flag.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (disabled by default).")
-	flag.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address).")
-	flag.BoolVar(&opts.EnableH2C, "enable-h2c", opts.EnableH2C, "Enable H2C support on the proxy server.")
-	flag.DurationVar(&opts.UDPIdleTimeout, "udp-idle-timeout", opts.UDPIdleTimeout, "The idle timeout for UDP sessions.")
-	flag.IntVar(&opts.UDPMaxSessions, "udp-max-sessions", opts.UDPMaxSessions, "The maximum number of concurrent UDP sessions per listener.")
-	flag.DurationVar(&opts.ReadHeaderTimeout, "read-header-timeout", opts.ReadHeaderTimeout, "The amount of time allowed to read request headers on HTTP and HTTPS servers.")
-	flag.DurationVar(&opts.IdleTimeout, "idle-timeout", opts.IdleTimeout, "The maximum amount of time to wait for the next request when keep-alives are enabled.")
-	flag.DurationVar(&opts.ReadTimeout, "read-timeout", opts.ReadTimeout, "The maximum duration for reading the entire request, including the body (disabled by default).")
-	flag.DurationVar(&opts.WriteTimeout, "write-timeout", opts.WriteTimeout, "The maximum duration before timing out writes of the response (disabled by default).")
-	flag.DurationVar(&opts.TCPIdleTimeout, "tcp-idle-timeout", opts.TCPIdleTimeout, "The idle timeout for TCP connections on spliced listeners (disabled by default).")
-	flag.IntVar(&opts.TCPMaxConnections, "tcp-max-connections", opts.TCPMaxConnections, "The maximum number of concurrent TCP connections per listener.")
-	flag.StringVar((*string)(&opts.ForwardedForMode), "forwarded-for-mode", string(opts.ForwardedForMode), "How to handle X-Forwarded-For: append (default) or replace.")
-	flag.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses.")
-	flag.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to.")
-	flag.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server.")
-	flag.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity.")
-	flag.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection,
+	fs.BoolVar(&vars.DataplaneMode, "dataplane-mode", false, "Run in data-plane mode serving a single Gateway.")
+	fs.StringVar(&vars.GatewayNamespace, "gateway-namespace", "", "The namespace of the Gateway to serve in data-plane mode.")
+	fs.StringVar(&vars.GatewayName, "gateway-name", "", "The name of the Gateway to serve in data-plane mode.")
+	fs.StringVar(&vars.DataplaneImage, "dataplane-image", defaultImg, "The container image to use for provisioned per-Gateway data-plane Deployments.")
+	fs.StringVar(&vars.AllowedSourceCIDRs, "allowed-source-cidrs", "", "Comma-separated list of CIDRs permitted to connect to HTTP/HTTPS listeners.")
+	fs.StringVar(&opts.ProxyProtocol, "proxy-protocol", opts.ProxyProtocol, "Enable PROXY protocol ('enabled').")
+	fs.StringVar(&vars.ProxyProtocolTrustedCIDRs, "proxy-protocol-trusted-cidrs", "", "Comma-separated list of trusted CIDRs for PROXY protocol.")
+	fs.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", opts.DrainSentinelPath, "Path to the sentinel file that marks the pod as draining.")
+	fs.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "The address the metric endpoint binds to.")
+	fs.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "The address the probe endpoint binds to.")
+	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "The address the proxy binds to for HTTP.")
+	fs.StringVar(&opts.ProxyHTTPSAddr, "proxy-https-bind-address", opts.ProxyHTTPSAddr, "The address the proxy binds to for HTTPS.")
+	fs.StringVar(&opts.ProxyHTTP3Addr, "proxy-http3-bind-address", opts.ProxyHTTP3Addr, "The UDP address the proxy binds to for HTTP/3 (disabled by default).")
+	fs.IntVar(&opts.ProxyHTTP3AdvertisedPort, "proxy-http3-advertised-port", opts.ProxyHTTP3AdvertisedPort, "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address).")
+	fs.BoolVar(&opts.EnableH2C, "enable-h2c", opts.EnableH2C, "Enable H2C support on the proxy server.")
+	fs.DurationVar(&opts.UDPIdleTimeout, "udp-idle-timeout", opts.UDPIdleTimeout, "The idle timeout for UDP sessions.")
+	fs.IntVar(&opts.UDPMaxSessions, "udp-max-sessions", opts.UDPMaxSessions, "The maximum number of concurrent UDP sessions per listener.")
+	fs.DurationVar(&opts.ReadHeaderTimeout, "read-header-timeout", opts.ReadHeaderTimeout, "The amount of time allowed to read request headers on HTTP and HTTPS servers.")
+	fs.DurationVar(&opts.IdleTimeout, "idle-timeout", opts.IdleTimeout, "The maximum amount of time to wait for the next request when keep-alives are enabled.")
+	fs.DurationVar(&opts.ReadTimeout, "read-timeout", opts.ReadTimeout, "The maximum duration for reading the entire request, including the body (disabled by default).")
+	fs.DurationVar(&opts.WriteTimeout, "write-timeout", opts.WriteTimeout, "The maximum duration before timing out writes of the response (disabled by default).")
+	fs.DurationVar(&opts.TCPIdleTimeout, "tcp-idle-timeout", opts.TCPIdleTimeout, "The idle timeout for TCP connections on spliced listeners (disabled by default).")
+	fs.IntVar(&opts.TCPMaxConnections, "tcp-max-connections", opts.TCPMaxConnections, "The maximum number of concurrent TCP connections per listener.")
+	fs.StringVar((*string)(&opts.ForwardedForMode), "forwarded-for-mode", string(opts.ForwardedForMode), "How to handle X-Forwarded-For: append (default) or replace.")
+	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses.")
+	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to.")
+	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server.")
+	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity.")
+	fs.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&opts.ControllerName, "controller-name", opts.ControllerName, "The GatewayClass controller name.")
+	fs.StringVar(&opts.ControllerName, "controller-name", opts.ControllerName, "The GatewayClass controller name.")
+}
+
+func main() {
+	opts := gari.DefaultOptions()
+	var vars FlagVars
+	BindFlags(flag.CommandLine, &opts, &vars)
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(flag.CommandLine)
 	flag.Parse()
 
-	if allowedSourceCIDRsStr != "" {
-		for _, part := range strings.Split(allowedSourceCIDRsStr, ",") {
+	if vars.AllowedSourceCIDRs != "" {
+		for _, part := range strings.Split(vars.AllowedSourceCIDRs, ",") {
 			if trimmed := strings.TrimSpace(part); trimmed != "" {
 				opts.AllowedSourceCIDRs = append(opts.AllowedSourceCIDRs, trimmed)
 			}
 		}
 	}
-	if proxyProtocolTrustedCIDRsStr != "" {
-		for _, part := range strings.Split(proxyProtocolTrustedCIDRsStr, ",") {
+	if vars.ProxyProtocolTrustedCIDRs != "" {
+		for _, part := range strings.Split(vars.ProxyProtocolTrustedCIDRs, ",") {
 			if trimmed := strings.TrimSpace(part); trimmed != "" {
 				opts.ProxyProtocolTrustedCIDRs = append(opts.ProxyProtocolTrustedCIDRs, trimmed)
 			}
@@ -99,14 +105,14 @@ func main() {
 
 	ctrl.SetLogger(textlogger.NewLogger(logConfig))
 
-	if dataplaneMode {
-		if gatewayNamespace == "" || gatewayName == "" {
+	if vars.DataplaneMode {
+		if vars.GatewayNamespace == "" || vars.GatewayName == "" {
 			setupLog.Error(fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode"), "invalid configuration")
 			os.Exit(1)
 		}
 		opts.DataplaneMode = true
-		opts.DataplaneGatewayNamespace = gatewayNamespace
-		opts.DataplaneGatewayName = gatewayName
+		opts.DataplaneGatewayNamespace = vars.GatewayNamespace
+		opts.DataplaneGatewayName = vars.GatewayName
 		opts.DisableStatusUpdates = true
 		opts.LeaderElection = false
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr // enable HTTP/3 on the HTTPS port for dataplane
@@ -117,10 +123,13 @@ func main() {
 		opts.ProxyHTTP3Addr = ""
 		opts.AddressProvider = singlepod.NewAddressProvider(
 			nil,
-			singlepod.WithDataplaneImage(dataplaneImage),
+			singlepod.WithDataplaneImage(vars.DataplaneImage),
 			singlepod.WithEnableH2C(opts.EnableH2C),
 			singlepod.WithForwardedForMode(string(opts.ForwardedForMode)),
 			singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
+			singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
+			singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
+			singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
 		)
 	}
 
@@ -129,4 +138,46 @@ func main() {
 		setupLog.Error(err, "fatal error")
 		os.Exit(1)
 	}
+}
+
+// SetupDataplane parses args and builds the gari.Options for data-plane mode.
+func SetupDataplane(args []string) (gari.Options, error) {
+	opts := gari.DefaultOptions()
+	var vars FlagVars
+	fs := flag.NewFlagSet("dataplane", flag.ContinueOnError)
+	BindFlags(fs, &opts, &vars)
+
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+
+	if vars.GatewayNamespace == "" || vars.GatewayName == "" {
+		return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
+	}
+
+	opts.DataplaneMode = true
+	opts.DataplaneGatewayNamespace = vars.GatewayNamespace
+	opts.DataplaneGatewayName = vars.GatewayName
+	opts.DisableStatusUpdates = true
+	opts.LeaderElection = false
+	if opts.ProxyHTTP3Addr == "" && opts.ProxyHTTPSAddr != "" {
+		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
+	}
+
+	if vars.AllowedSourceCIDRs != "" {
+		for _, part := range strings.Split(vars.AllowedSourceCIDRs, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				opts.AllowedSourceCIDRs = append(opts.AllowedSourceCIDRs, trimmed)
+			}
+		}
+	}
+	if vars.ProxyProtocolTrustedCIDRs != "" {
+		for _, part := range strings.Split(vars.ProxyProtocolTrustedCIDRs, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				opts.ProxyProtocolTrustedCIDRs = append(opts.ProxyProtocolTrustedCIDRs, trimmed)
+			}
+		}
+	}
+
+	return opts, nil
 }

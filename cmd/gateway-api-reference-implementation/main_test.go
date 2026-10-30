@@ -1,0 +1,157 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"testing"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/provisioning/singlepod"
+	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+)
+
+func TestSetupDataplane_ProvisionerArgs(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme failed: %v", err)
+	}
+	if err := gatewayv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("gatewayv1 AddToScheme failed: %v", err)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gw-params",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			state.ParameterKeyServiceType:   "LoadBalancer",
+			state.ParameterKeyACMEChallenge: "enabled",
+		},
+	}
+
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-gw",
+			Namespace: "test-ns",
+			UID:       types.UID("test-gw-uid"),
+		},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "gari",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "https",
+					Port:     8443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+				},
+			},
+			Infrastructure: &gatewayv1.GatewayInfrastructure{
+				ParametersRef: &gatewayv1.LocalParametersReference{
+					Group: "",
+					Kind:  "ConfigMap",
+					Name:  "gw-params",
+				},
+			},
+		},
+	}
+
+	effectiveListeners := []*state.EffectiveListener{
+		{
+			Name:     gatewayv1.SectionName("https"),
+			Port:     gatewayv1.PortNumber(8443),
+			Protocol: gatewayv1.HTTPSProtocolType,
+		},
+	}
+
+	st := state.NewState()
+	st.SetControllerName("test-controller")
+	st.UpsertGatewayClass(&gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gari"},
+		Spec:       gatewayv1.GatewayClassSpec{ControllerName: "test-controller"},
+	})
+	st.UpsertGateway(gw)
+	st.UpsertConfigMap(cm)
+	st.Recompute()
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, cm).Build()
+	p := singlepod.NewAddressProvider(
+		c,
+		singlepod.WithState(st),
+		singlepod.WithEnableH2C(true),
+		singlepod.WithForwardedForMode("append"),
+		singlepod.WithDebugErrorResponses(true),
+		singlepod.WithACMEChallengeUpstreamURL("https://certserver.example.internal:8443"),
+		singlepod.WithACMEChallengeCABundlePath("/etc/ssl/certs/certserver-ca.crt"),
+		singlepod.WithACMEChallengeTokenPath("/var/run/secrets/tokens/certserver/token"),
+	)
+
+	_, _, err := p.GatewayAddressesWithReadiness(t.Context(), gw, effectiveListeners)
+	if err != nil {
+		t.Fatalf("GatewayAddressesWithReadiness failed: %v", err)
+	}
+
+	var deploy appsv1.Deployment
+	if err := c.Get(t.Context(), types.NamespacedName{Namespace: "test-ns", Name: singlepod.ResourceNameForGateway("test-gw")}, &deploy); err != nil {
+		t.Fatalf("failed to get created Deployment: %v", err)
+	}
+
+	if len(deploy.Spec.Template.Spec.Containers) == 0 {
+		t.Fatalf("expected at least 1 container in Deployment template, got 0")
+	}
+	args := deploy.Spec.Template.Spec.Containers[0].Args
+
+	opts, err := SetupDataplane(args)
+	if err != nil {
+		t.Fatalf("SetupDataplane failed on provisioner-generated args %v: %v", args, err)
+	}
+
+	if !opts.DataplaneMode {
+		t.Errorf("expected DataplaneMode=true")
+	}
+	if opts.DataplaneGatewayNamespace != "test-ns" {
+		t.Errorf("expected DataplaneGatewayNamespace='test-ns', got %q", opts.DataplaneGatewayNamespace)
+	}
+	if opts.DataplaneGatewayName != "test-gw" {
+		t.Errorf("expected DataplaneGatewayName='test-gw', got %q", opts.DataplaneGatewayName)
+	}
+	if opts.ProxyHTTP3AdvertisedPort != 8443 {
+		t.Errorf("expected ProxyHTTP3AdvertisedPort=8443, got %d", opts.ProxyHTTP3AdvertisedPort)
+	}
+	if !opts.EnableH2C {
+		t.Errorf("expected EnableH2C=true")
+	}
+	if string(opts.ForwardedForMode) != "append" {
+		t.Errorf("expected ForwardedForMode='append', got %q", opts.ForwardedForMode)
+	}
+	if !opts.DebugErrorResponses {
+		t.Errorf("expected DebugErrorResponses=true")
+	}
+	if opts.ACMEChallengeUpstreamURL != "https://certserver.example.internal:8443" {
+		t.Errorf("expected ACMEChallengeUpstreamURL='https://certserver.example.internal:8443', got %q", opts.ACMEChallengeUpstreamURL)
+	}
+	if opts.ACMEChallengeCABundlePath != "/etc/ssl/certs/certserver-ca.crt" {
+		t.Errorf("expected ACMEChallengeCABundlePath='/etc/ssl/certs/certserver-ca.crt', got %q", opts.ACMEChallengeCABundlePath)
+	}
+	if opts.ACMEChallengeTokenPath != "/var/run/secrets/tokens/certserver/token" {
+		t.Errorf("expected ACMEChallengeTokenPath='/var/run/secrets/tokens/certserver/token', got %q", opts.ACMEChallengeTokenPath)
+	}
+}
