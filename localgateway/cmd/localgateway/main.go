@@ -23,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/validation"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/gari"
 )
@@ -39,6 +40,9 @@ type Config struct {
 
 	// NodeName is the Kubernetes node name for fallback address resolution.
 	NodeName string
+
+	// MDNSPort is the UDP port for mDNS publishing (defaults to 5353).
+	MDNSPort int
 }
 
 // BuildOptions parses args and constructs gari.Options and localgateway Config.
@@ -48,6 +52,7 @@ func BuildOptions(args []string) (gari.Options, Config, error) {
 	gariOpts := gari.DefaultOptions()
 	cfg := Config{
 		NodeName: os.Getenv("NODE_NAME"),
+		MDNSPort: mdns.DefaultPort,
 	}
 
 	// Defaults tailored for localgateway all-in-one hostNetwork mode
@@ -69,6 +74,7 @@ func BuildOptions(args []string) (gari.Options, Config, error) {
 	// Flags binding directly to localgateway Config struct using the field's own value as default
 	fs.StringVar(&cfg.Interface, "interface", cfg.Interface, "Network interface to read LAN IP addresses from (e.g. eth0). If unset, node addresses are used.")
 	fs.StringVar(&cfg.NodeName, "node-name", cfg.NodeName, "Kubernetes node name for looking up LAN IP addresses when --interface is unset.")
+	fs.IntVar(&cfg.MDNSPort, "mdns-port", cfg.MDNSPort, "UDP port for mDNS publishing.")
 
 	logConfig := textlogger.NewConfig()
 	logConfig.AddFlags(fs)
@@ -93,8 +99,21 @@ func BuildOptions(args []string) (gari.Options, Config, error) {
 	return gariOpts, cfg, nil
 }
 
+// WirePublisher connects an mDNS Publisher to GARI options and registers it as a manager Runnable.
+func WirePublisher(opts *gari.Options, pub *mdns.Publisher) {
+	opts.GatewayStatusHook = pub.StatusHook
+	opts.OnGatewaysUpdate = pub.OnGatewaysUpdate
+	opts.SetupWithManager = func(mgr ctrl.Manager, s *gari.Server) error {
+		pub.SetEnqueueGateway(s.EnqueueGateway)
+		if err := mgr.Add(pub); err != nil {
+			return fmt.Errorf("failed to register mDNS publisher with manager: %w", err)
+		}
+		return nil
+	}
+}
+
 func main() {
-	opts, _, err := BuildOptions(os.Args[1:])
+	opts, cfg, err := BuildOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to parse options: %v\n", err)
 		os.Exit(1)
@@ -103,6 +122,20 @@ func main() {
 	ctx := ctrl.SetupSignalHandler()
 	setupLog := ctrl.Log.WithName("setup")
 	setupLog.Info("Starting localgateway controller (all-in-one hostNetwork)", "controllerName", opts.ControllerName, "proxyAddr", opts.ProxyAddr)
+
+	// Build mDNS publisher upfront before starting GARI
+	addrProvider, _ := opts.AddressProvider.(*address.AddressProvider)
+	pub, err := mdns.NewPublisher(mdns.PublisherOptions{
+		Interface:       cfg.Interface,
+		Port:            cfg.MDNSPort,
+		AddressProvider: addrProvider,
+	})
+	if err != nil {
+		setupLog.Error(err, "failed to start mDNS publisher")
+		os.Exit(1)
+	}
+
+	WirePublisher(&opts, pub)
 
 	if err := gari.Run(ctx, opts); err != nil {
 		setupLog.Error(err, "fatal error running localgateway")

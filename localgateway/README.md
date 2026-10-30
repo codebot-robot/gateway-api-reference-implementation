@@ -14,6 +14,13 @@ It is purpose-built to serve single-label `.local` hostnames (such as `grafana.l
   - Standard Gateway API listener/route hostname intersection naturally restricts attached HTTPRoutes to the listener's `.local` hostname.
 - **HTTP Only:** `localgateway` currently supports HTTP listeners only. HTTPS/TLS listeners are rejected with condition `Accepted=False` (`Reason: UnsupportedProtocol`) and `Programmed=False` (`Reason: Invalid`).
 - **LAN Address Provider:** Populates the node's LAN IPv4 and IPv6 addresses into `Gateway.status.addresses` via `--interface` or Node `InternalIP`.
+- **mDNS Publishing from the Data Plane:**
+  - Built-in pure-Go mDNS responder based on `github.com/miekg/dns`.
+  - Automatically publishes served `.local` hostnames on the LAN over mDNS (multicast UDP `224.0.0.251:5353` and `[ff02::fb]:5353`), so devices on the network resolve `grafana.local` to the gateway with no manual DNS configuration.
+  - **Port 5353 Ownership:** `localgateway` owns UDP port 5353 on the node. Any host `avahi-daemon` or systemd-resolved mDNS must be stopped or bound elsewhere; `localgateway` will fail clearly at startup if port 5353 is already taken.
+  - **RFC 6762 Probing & Conflict Detection:** Probes before claiming a name. If another host on the LAN already responds to the name, `localgateway` stops the claim, reports `Published=False` and `Conflicted=True` with reason `HostnameConflict` on the listener status, and periodically retries.
+  - **Lifecycle Management:** Sends unsolicited mDNS announcements when claiming a name, re-announces when interface addresses change, and sends goodbye (TTL 0) packets when a listener or Gateway is deleted and during graceful shutdown.
+  - **Status Reporting:** Provides a `Published` condition on each listener indicating whether its hostname is published, probing, in conflict, or rejected.
 - **Privileged Port 80 on hostNetwork:** The container image has `cap_net_bind_service=+ep` set on the binary, allowing non-root UID 65532 to bind port 80 when the container spec includes capability `NET_BIND_SERVICE`. If running in environments where the container runtime does not grant file capabilities, running as root (`runAsUser: 0`) is also supported.
 
 ---
@@ -106,6 +113,7 @@ curl -v -H "Host: grafana.local" http://<NODE_LAN_IP>/
 |---|---|---|
 | `--controller-name` | `github.com/gke-labs/gateway-api-reference-implementation/localgateway` | GatewayClass controller name managed by this instance |
 | `--proxy-bind-address` | `:80` | Host network address and port for the HTTP proxy |
+| `--mdns-port` | `5353` | UDP port for mDNS responder |
 | `--interface` | `""` | Network interface to read LAN IP(s) from (e.g. `eth0`). If unset, node addresses are used. |
 | `--node-name` | `$NODE_NAME` | Kubernetes node name for resolving fallback LAN addresses |
 | `--metrics-bind-address` | `:8080` | Address for Prometheus metrics |

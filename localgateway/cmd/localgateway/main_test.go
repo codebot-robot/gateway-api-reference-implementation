@@ -16,6 +16,7 @@ package main
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +26,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/address"
+	"github.com/gke-labs/gateway-api-reference-implementation/localgateway/pkg/mdns"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/proxy"
 	"github.com/gke-labs/gateway-api-reference-implementation/pkg/state"
 )
@@ -57,6 +59,9 @@ func TestBuildOptions(t *testing.T) {
 		if cfg.Interface != "" {
 			t.Errorf("expected empty cfg.Interface, got %q", cfg.Interface)
 		}
+		if cfg.MDNSPort != 5353 {
+			t.Errorf("expected MDNSPort 5353, got %d", cfg.MDNSPort)
+		}
 
 		// Ensure listener validator and address provider are set
 		if opts.ListenerValidator == nil {
@@ -75,6 +80,7 @@ func TestBuildOptions(t *testing.T) {
 			"--node-name=worker-node",
 			"--leader-elect=true",
 			"--leader-election-id=custom-lead",
+			"--mdns-port=5354",
 		}
 
 		opts, cfg, err := BuildOptions(args)
@@ -93,6 +99,9 @@ func TestBuildOptions(t *testing.T) {
 		}
 		if cfg.NodeName != "worker-node" {
 			t.Errorf("expected worker-node, got %q", cfg.NodeName)
+		}
+		if cfg.MDNSPort != 5354 {
+			t.Errorf("expected MDNSPort 5354, got %d", cfg.MDNSPort)
 		}
 		if !opts.LeaderElection {
 			t.Errorf("expected LeaderElection true")
@@ -311,4 +320,68 @@ func TestLocalGateway_E2E_AppLocalCompiledRoute(t *testing.T) {
 			t.Fatalf("expected address provider to report node IP %s, got %+v", nodeIP, addrs)
 		}
 	})
+}
+
+// TestLocalGateway_WirePublisher verifies that WirePublisher hooks the mDNS Publisher
+// into GatewayStatusHook, OnGatewaysUpdate, and SetupWithManager.
+func TestLocalGateway_WirePublisher(t *testing.T) {
+	opts, _, err := BuildOptions([]string{})
+	if err != nil {
+		t.Fatalf("BuildOptions failed: %v", err)
+	}
+
+	rawConn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind test socket: %v", err)
+	}
+	defer rawConn.Close()
+	ephemeralPort := rawConn.LocalAddr().(*net.UDPAddr).Port
+
+	pub, err := mdns.NewPublisher(mdns.PublisherOptions{
+		Port:        ephemeralPort,
+		IPv4Conn:    rawConn,
+		Ephemeral:   true,
+		DisableIPv6: true,
+	})
+	if err != nil {
+		t.Fatalf("NewPublisher failed: %v", err)
+	}
+	defer pub.Close()
+
+	WirePublisher(&opts, pub)
+
+	if opts.GatewayStatusHook == nil {
+		t.Errorf("expected GatewayStatusHook to be set")
+	}
+	if opts.OnGatewaysUpdate == nil {
+		t.Errorf("expected OnGatewaysUpdate to be set")
+	}
+	if opts.SetupWithManager == nil {
+		t.Errorf("expected SetupWithManager to be set")
+	}
+}
+
+// TestLocalGateway_MDNSPortOccupiedFailsStartup verifies that if the mDNS port is already taken,
+// starting the publisher fails clearly without touching real port 5353.
+func TestLocalGateway_MDNSPortOccupiedFailsStartup(t *testing.T) {
+	// Occupy a random ephemeral port first
+	blocker, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		t.Fatalf("failed to bind test socket: %v", err)
+	}
+	occupiedPort := blocker.LocalAddr().(*net.UDPAddr).Port
+	defer blocker.Close()
+
+	_, err = mdns.NewPublisher(mdns.PublisherOptions{
+		Port:        occupiedPort,
+		DisableIPv6: true,
+	})
+	if err == nil {
+		t.Fatalf("expected NewPublisher to fail on occupied port %d, but succeeded", occupiedPort)
+	}
+
+	expectedSub := "is already in use (host avahi-daemon must be stopped or bound elsewhere)"
+	if !strings.Contains(err.Error(), expectedSub) {
+		t.Fatalf("expected error containing %q, got: %v", expectedSub, err)
+	}
 }
