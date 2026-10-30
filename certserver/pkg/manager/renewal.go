@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
 )
 
@@ -152,13 +153,19 @@ func (m *Manager) runRenewalLoop(ctx context.Context) {
 
 // CheckRenewals inspects all tracked certificates, executing renewals that are due.
 func (m *Manager) CheckRenewals(ctx context.Context) error {
-	m.mu.Lock()
 	now := m.opts.Clock.Now()
+	if m.opts.BindingStore != nil {
+		m.opts.BindingStore.Prune(now, 30*24*time.Hour)
+	}
+
+	m.mu.Lock()
 
 	type dueTask struct {
 		hostnamesKey string
 		hostnames    []string
 		retryCount   int
+		requester    challenge.Requester
+		candidates   []challenge.Requester
 	}
 
 	var dueTasks []dueTask
@@ -181,10 +188,39 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 
 		if isDue {
 			item.state = metrics.StateRenewing
+			var req challenge.Requester
+			var candidates []challenge.Requester
+			if m.opts.BindingStore != nil {
+				for _, b := range m.opts.BindingStore.ListBindings() {
+					_, bKey, err := NormalizeHostnames(b.Hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
+					if err == nil && bKey == item.hostnamesKey {
+						cand := challenge.Requester{
+							ClusterID:               b.ClusterID,
+							Gateway:                 b.Gateway,
+							DataPlaneServiceAccount: b.DataPlaneServiceAccount,
+							HostnamesKey:            item.hostnamesKey,
+						}
+						candidates = append(candidates, cand)
+					}
+				}
+			}
+
+			if len(candidates) > 0 {
+				req = candidates[0]
+			} else if item.cert != nil {
+				req = challenge.Requester{
+					ClusterID:               item.cert.ClusterID,
+					Gateway:                 item.cert.Gateway,
+					DataPlaneServiceAccount: item.cert.DataPlaneServiceAccount,
+					HostnamesKey:            item.cert.HostnamesKey,
+				}
+			}
 			dueTasks = append(dueTasks, dueTask{
 				hostnamesKey: item.hostnamesKey,
 				hostnames:    item.hostnames,
 				retryCount:   item.retryCount,
+				requester:    req,
+				candidates:   candidates,
 			})
 		}
 	}
@@ -199,7 +235,7 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 		default:
 		}
 
-		newCert, err := m.Renew(ctx, task.hostnames)
+		newCert, err := m.Renew(ctx, task.hostnames, task.requester, task.candidates)
 		now = m.opts.Clock.Now()
 
 		m.mu.Lock()
@@ -223,7 +259,7 @@ func (m *Manager) CheckRenewals(ctx context.Context) error {
 				} else {
 					item.state = metrics.StateRenewing
 				}
-				log.Printf("certserver: certificate renewal failed for %s (attempt %d, next retry in %v): %v",
+				log.Printf("certserver: certificate renewal failed for %s (attempt %d, next retry in %v; DNS may no longer point to an authorized gateway): %v",
 					task.hostnamesKey, item.retryCount, backoff, err)
 			} else {
 				// On success: reset retry state, update certificate and recompute renewal time

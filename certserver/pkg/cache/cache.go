@@ -46,12 +46,15 @@ var (
 
 // Certificate represents a managed TLS certificate chain and its private key.
 type Certificate struct {
-	Hostnames    []string  `json:"hostnames"`
-	HostnamesKey string    `json:"hostnames_key"`
-	CertPEM      []byte    `json:"cert_pem"`
-	KeyPEM       []byte    `json:"key_pem"`
-	IssuedAt     time.Time `json:"issued_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	Hostnames               []string  `json:"hostnames"`
+	HostnamesKey            string    `json:"hostnames_key"`
+	CertPEM                 []byte    `json:"cert_pem"`
+	KeyPEM                  []byte    `json:"key_pem"`
+	IssuedAt                time.Time `json:"issued_at"`
+	ExpiresAt               time.Time `json:"expires_at"`
+	ClusterID               string    `json:"cluster_id,omitempty"`
+	Gateway                 string    `json:"gateway,omitempty"`
+	DataPlaneServiceAccount string    `json:"data_plane_service_account,omitempty"`
 
 	leaf *x509.Certificate
 }
@@ -100,12 +103,15 @@ func (c *Certificate) IsExpired(now time.Time) bool {
 
 // certBundle stores a complete certificate chain and key atomically in a single file per set.
 type certBundle struct {
-	Hostnames    []string  `json:"hostnames"`
-	HostnamesKey string    `json:"hostnames_key"`
-	CertPEM      []byte    `json:"cert_pem"`
-	KeyPEM       []byte    `json:"key_pem"`
-	IssuedAt     time.Time `json:"issued_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	Hostnames               []string  `json:"hostnames"`
+	HostnamesKey            string    `json:"hostnames_key"`
+	CertPEM                 []byte    `json:"cert_pem"`
+	KeyPEM                  []byte    `json:"key_pem"`
+	IssuedAt                time.Time `json:"issued_at"`
+	ExpiresAt               time.Time `json:"expires_at"`
+	ClusterID               string    `json:"cluster_id,omitempty"`
+	Gateway                 string    `json:"gateway,omitempty"`
+	DataPlaneServiceAccount string    `json:"data_plane_service_account,omitempty"`
 }
 
 // DiskCache implements certificate caching on local disk.
@@ -258,12 +264,15 @@ func (dc *DiskCache) Put(cert *Certificate) error {
 	}
 
 	bundle := certBundle{
-		Hostnames:    cert.Hostnames,
-		HostnamesKey: cert.HostnamesKey,
-		CertPEM:      cert.CertPEM,
-		KeyPEM:       cert.KeyPEM,
-		IssuedAt:     cert.IssuedAt,
-		ExpiresAt:    cert.ExpiresAt,
+		Hostnames:               cert.Hostnames,
+		HostnamesKey:            cert.HostnamesKey,
+		CertPEM:                 cert.CertPEM,
+		KeyPEM:                  cert.KeyPEM,
+		IssuedAt:                cert.IssuedAt,
+		ExpiresAt:               cert.ExpiresAt,
+		ClusterID:               cert.ClusterID,
+		Gateway:                 cert.Gateway,
+		DataPlaneServiceAccount: cert.DataPlaneServiceAccount,
 	}
 
 	bundleBytes, err := json.Marshal(bundle)
@@ -387,6 +396,9 @@ func (dc *DiskCache) Load() error {
 			bundle.IssuedAt,
 			bundle.ExpiresAt,
 		)
+		cert.ClusterID = bundle.ClusterID
+		cert.Gateway = bundle.Gateway
+		cert.DataPlaneServiceAccount = bundle.DataPlaneServiceAccount
 
 		dc.entries[bundle.HostnamesKey] = cert
 	}

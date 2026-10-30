@@ -112,15 +112,6 @@ func run(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("failed to load or generate account key: %w", err)
 	}
 
-	// Initialize Challenge Store and HTTP Handler
-	challengeStore := challenge.NewMemoryStore()
-	challengeHandler := challenge.NewHandler(challengeStore)
-
-	challengeServer := &http.Server{
-		Addr:    cfg.ChallengeListenAddr,
-		Handler: challengeHandler,
-	}
-
 	// Initialize Prometheus Metrics
 	reg := prometheus.DefaultRegisterer
 	m := metrics.New(reg)
@@ -130,6 +121,47 @@ func run(ctx context.Context, cfg *Config) error {
 	metricsServer := &http.Server{
 		Addr:    cfg.MetricsListenAddr,
 		Handler: metricsMux,
+	}
+
+	// Initialize BindingStore and AuditLogger
+	bindingStore := registry.NewMemoryBindingStore()
+	auditLogger := registry.NewAuditLogger(os.Stdout)
+
+	// Load cluster registry if configured
+	var clusterReg *registry.Registry
+	if cfg.ClusterConfigFile != "" {
+		serverCfg, err := registry.LoadServerConfigFile(cfg.ClusterConfigFile)
+		if err != nil {
+			return fmt.Errorf("failed to load cluster config file %s: %w", cfg.ClusterConfigFile, err)
+		}
+
+		clusterReg, err = registry.NewRegistry(serverCfg.Clusters)
+		if err != nil {
+			return fmt.Errorf("failed to initialize cluster registry: %w", err)
+		}
+		defer func() {
+			if err := clusterReg.Close(); err != nil {
+				logger.Printf("error closing cluster registry: %v", err)
+			}
+		}()
+	}
+
+	// Initialize Challenge Store and HTTP Handler
+	challengeStore := challenge.NewMemoryStore()
+	var chalOpts []challenge.HandlerOption
+	if clusterReg != nil {
+		chalOpts = append(chalOpts,
+			challenge.WithRegistry(clusterReg),
+			challenge.WithBindingStore(bindingStore),
+			challenge.WithAuditLogger(auditLogger),
+			challenge.WithMetrics(m),
+		)
+	}
+	challengeHandler := challenge.NewHandler(challengeStore, chalOpts...)
+
+	challengeServer := &http.Server{
+		Addr:    cfg.ChallengeListenAddr,
+		Handler: challengeHandler,
 	}
 
 	// Initialize ACME Client
@@ -149,6 +181,7 @@ func run(ctx context.Context, cfg *Config) error {
 	mgr := manager.NewManager(acmeCli, diskCache, challengeStore, m, func(o *manager.Options) {
 		o.MaxHostnamesPerSet = cfg.MaxHostnames
 		o.MaxPendingOrders = cfg.MaxPendingOrders
+		o.BindingStore = bindingStore
 	})
 
 	if err := mgr.Start(ctx); err != nil {
@@ -158,22 +191,7 @@ func run(ctx context.Context, cfg *Config) error {
 
 	// Initialize and start gRPC server if cluster config is provided
 	var grpcSrv *server.Server
-	if cfg.ClusterConfigFile != "" {
-		serverCfg, err := registry.LoadServerConfigFile(cfg.ClusterConfigFile)
-		if err != nil {
-			return fmt.Errorf("failed to load cluster config file %s: %w", cfg.ClusterConfigFile, err)
-		}
-
-		clusterReg, err := registry.NewRegistry(serverCfg.Clusters)
-		if err != nil {
-			return fmt.Errorf("failed to initialize cluster registry: %w", err)
-		}
-		defer func() {
-			if err := clusterReg.Close(); err != nil {
-				logger.Printf("error closing cluster registry: %v", err)
-			}
-		}()
-
+	if clusterReg != nil {
 		srvOpts := server.Options{
 			ListenAddr:        cfg.GRPCListenAddr,
 			TLSCertFile:       cfg.TLSCertFile,
@@ -185,7 +203,7 @@ func run(ctx context.Context, cfg *Config) error {
 			RateLimitBurst:    cfg.RateLimitBurst,
 		}
 
-		grpcSrv, err = server.NewServer(srvOpts, clusterReg, mgr, nil, nil)
+		grpcSrv, err = server.NewServer(srvOpts, clusterReg, mgr, bindingStore, auditLogger)
 		if err != nil {
 			return fmt.Errorf("failed to create gRPC server: %w", err)
 		}

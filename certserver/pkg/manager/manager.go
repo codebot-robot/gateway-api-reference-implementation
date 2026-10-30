@@ -151,15 +151,19 @@ func (m *Manager) GetCertificate(hostnamesKey string, releaseMode bool) (*Certif
 // if no issuance is already in flight for that hostname set.
 // It uses a detached context (via context.WithoutCancel) with a 10-minute timeout.
 // Returns true if a new issuance was started, false if an issuance is already in flight.
-func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string) (bool, error) {
+func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string, requester challenge.Requester) (bool, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
 		return false, err
 	}
+	requester.HostnamesKey = hostnamesKey
 
-	// If already in cache and not expired, no need to issue
-	if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
-		return false, nil
+	now := m.opts.Clock.Now()
+	// If already in cache and not expired (and requester has validated binding or no requester was given), no need to issue
+	if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(now) {
+		if requester.ClusterID == "" || m.opts.BindingStore == nil || m.opts.BindingStore.HasValidatedBinding(requester.ClusterID, requester.Gateway, hostnamesKey, now) {
+			return false, nil
+		}
 	}
 
 	m.inFlightMu.Lock()
@@ -179,12 +183,81 @@ func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string) (bool,
 			m.inFlightMu.Unlock()
 		}()
 
-		if _, err := m.Obtain(detachedCtx, normalized); err != nil {
+		if _, err := m.Obtain(detachedCtx, normalized, requester); err != nil {
 			log.Printf("certserver: async issuance failed for %s: %v", hostnamesKey, err)
 		}
 	}()
 
 	return true, nil
+}
+
+// EnsureRevalidation starts asynchronous certificate revalidation for the given hostnames and requester
+// if no revalidation is already in flight for that requester and hostname set.
+// It creates an ACME order to revalidate domain control without issuing a new certificate.
+func (m *Manager) EnsureRevalidation(ctx context.Context, hostnames []string, requester challenge.Requester) (bool, error) {
+	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
+	if err != nil {
+		return false, err
+	}
+	requester.HostnamesKey = hostnamesKey
+
+	revalKey := fmt.Sprintf("%s/%s/%s", hostnamesKey, requester.ClusterID, requester.Gateway)
+
+	m.inFlightMu.Lock()
+	if _, inFlight := m.inFlightIssuances[revalKey]; inFlight {
+		m.inFlightMu.Unlock()
+		return false, nil
+	}
+	m.inFlightIssuances[revalKey] = struct{}{}
+	m.inFlightMu.Unlock()
+
+	detachedCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	go func() {
+		defer cancel()
+		defer func() {
+			m.inFlightMu.Lock()
+			delete(m.inFlightIssuances, revalKey)
+			m.inFlightMu.Unlock()
+		}()
+
+		if err := m.revalidateControl(detachedCtx, normalized, hostnamesKey, requester); err != nil {
+			log.Printf("certserver: async revalidation failed for %s (requester %s/%s): %v",
+				hostnamesKey, requester.ClusterID, requester.Gateway, err)
+		}
+	}()
+
+	return true, nil
+}
+
+// revalidateControl creates an ACME order solely to prove domain control for the requester,
+// fulfilling authorizations through challenge binding and then deactivating them without finalizing the order.
+func (m *Manager) revalidateControl(ctx context.Context, normalized []string, hostnamesKey string, req challenge.Requester) error {
+	// Ensure ACME account is registered
+	if _, err := m.client.EnsureAccount(ctx); err != nil {
+		return fmt.Errorf("failed to ensure ACME account: %w", err)
+	}
+
+	order, err := m.client.AuthorizeOrder(ctx, acme.DomainIDs(normalized...))
+	if err != nil {
+		return fmt.Errorf("failed to authorize ACME order for revalidation: %w", err)
+	}
+
+	// Always deactivate authorizations without finalizing the order
+	defer func() {
+		for _, authzURL := range order.AuthzURLs {
+			if revokeErr := m.client.RevokeAuthorization(context.WithoutCancel(ctx), authzURL); revokeErr != nil {
+				log.Printf("certserver: failed to revoke authorization %s: %v", authzURL, revokeErr)
+			}
+		}
+	}()
+
+	for _, authzURL := range order.AuthzURLs {
+		if err := m.fulfillAuthorization(ctx, authzURL, req, nil); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Obtain creates or reuses a certificate order for the normalized hostname set.
@@ -194,17 +267,20 @@ func (m *Manager) EnsureIssuance(ctx context.Context, hostnames []string) (bool,
 // If a certificate has already expired while a background renewal is retrying, an incoming Obtain
 // can initiate its own order. Both orders produce valid certificates and write atomically to cache,
 // ensuring caller requests are satisfied without coalescing renewals into no-op cached returns.
-func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certificate, error) {
+func (m *Manager) Obtain(ctx context.Context, hostnames []string, requester challenge.Requester) (*cache.Certificate, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
 		return nil, err
 	}
+	requester.HostnamesKey = hostnamesKey
 
 	now := m.opts.Clock.Now()
 
 	// 1. Fast-path: check if valid certificate already exists in cache
 	if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(now) {
-		return existing, nil
+		if requester.ClusterID == "" || m.opts.BindingStore == nil || m.opts.BindingStore.HasValidatedBinding(requester.ClusterID, requester.Gateway, hostnamesKey, now) {
+			return existing, nil
+		}
 	}
 
 	// 2. Bound pending orders
@@ -216,7 +292,9 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 	ch := m.obtainSf.DoChan(hostnamesKey, func() (any, error) {
 		// Re-check cache under singleflight lock
 		if existing, err := m.cache.Get(hostnamesKey); err == nil && existing != nil && !existing.IsExpired(m.opts.Clock.Now()) {
-			return existing, nil
+			if requester.ClusterID == "" || m.opts.BindingStore == nil || m.opts.BindingStore.HasValidatedBinding(requester.ClusterID, requester.Gateway, hostnamesKey, m.opts.Clock.Now()) {
+				return existing, nil
+			}
 		}
 
 		if m.opts.MaxPendingOrders > 0 {
@@ -232,7 +310,7 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 		orderCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 		defer cancel()
 
-		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, false)
+		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, false, requester, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -252,11 +330,12 @@ func (m *Manager) Obtain(ctx context.Context, hostnames []string) (*cache.Certif
 
 // Renew forces a certificate renewal for the normalized hostname set, creating a new ACME order.
 // Concurrent renewals for the same set coalesce via renewSf and never return a cached certificate.
-func (m *Manager) Renew(ctx context.Context, hostnames []string) (*cache.Certificate, error) {
+func (m *Manager) Renew(ctx context.Context, hostnames []string, requester challenge.Requester, candidates []challenge.Requester) (*cache.Certificate, error) {
 	normalized, hostnamesKey, err := NormalizeHostnames(hostnames, m.opts.MaxHostnamesPerSet, m.opts.MaxHostnameLength)
 	if err != nil {
 		return nil, err
 	}
+	requester.HostnamesKey = hostnamesKey
 
 	// 1. Bound pending orders
 	if m.opts.MaxPendingOrders > 0 && m.pendingOrders.Load() >= m.opts.MaxPendingOrders {
@@ -276,7 +355,7 @@ func (m *Manager) Renew(ctx context.Context, hostnames []string) (*cache.Certifi
 		orderCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 		defer cancel()
 
-		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, true)
+		cert, err := m.issueCertificate(orderCtx, normalized, hostnamesKey, true, requester, candidates)
 		if err != nil {
 			return nil, err
 		}
@@ -295,8 +374,8 @@ func (m *Manager) Renew(ctx context.Context, hostnames []string) (*cache.Certifi
 }
 
 // issueCertificate executes the ACME order creation, HTTP-01 challenge completion, CSR submission, and caching.
-func (m *Manager) issueCertificate(ctx context.Context, normalized []string, hostnamesKey string, isRenewal bool) (*cache.Certificate, error) {
-	cert, err := m.executeACMEOrder(ctx, normalized, hostnamesKey)
+func (m *Manager) issueCertificate(ctx context.Context, normalized []string, hostnamesKey string, isRenewal bool, req challenge.Requester, candidates []challenge.Requester) (*cache.Certificate, error) {
+	cert, err := m.executeACMEOrder(ctx, normalized, hostnamesKey, req, candidates)
 	if err != nil {
 		if isRenewal {
 			m.metrics.RecordRenewal(false)
@@ -328,7 +407,7 @@ func (m *Manager) issueCertificate(ctx context.Context, normalized []string, hos
 	return cert, nil
 }
 
-func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hostnamesKey string) (*cache.Certificate, error) {
+func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hostnamesKey string, req challenge.Requester, candidates []challenge.Requester) (*cache.Certificate, error) {
 	// Ensure ACME account is registered
 	if _, err := m.client.EnsureAccount(ctx); err != nil {
 		return nil, fmt.Errorf("failed to ensure ACME account: %w", err)
@@ -340,9 +419,18 @@ func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hos
 		return nil, fmt.Errorf("failed to authorize ACME order: %w", err)
 	}
 
+	// Ensure authorizations are relinquished so subsequent orders must prove fresh domain control
+	defer func() {
+		for _, authzURL := range order.AuthzURLs {
+			if revokeErr := m.client.RevokeAuthorization(context.WithoutCancel(ctx), authzURL); revokeErr != nil {
+				log.Printf("certserver: failed to revoke authorization %s: %v", authzURL, revokeErr)
+			}
+		}
+	}()
+
 	// 2. Fulfill pending authorizations
 	for _, authzURL := range order.AuthzURLs {
-		if err := m.fulfillAuthorization(ctx, authzURL); err != nil {
+		if err := m.fulfillAuthorization(ctx, authzURL, req, candidates); err != nil {
 			return nil, err
 		}
 	}
@@ -406,7 +494,7 @@ func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hos
 		Bytes: keyDER,
 	})
 
-	return cache.NewCertificate(
+	cert := cache.NewCertificate(
 		normalized,
 		hostnamesKey,
 		certPEM,
@@ -414,16 +502,24 @@ func (m *Manager) executeACMEOrder(ctx context.Context, normalized []string, hos
 		leaf,
 		leaf.NotBefore,
 		leaf.NotAfter,
-	), nil
+	)
+	cert.ClusterID = req.ClusterID
+	cert.Gateway = req.Gateway
+	cert.DataPlaneServiceAccount = req.DataPlaneServiceAccount
+
+	return cert, nil
 }
 
-func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string) error {
+func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string, req challenge.Requester, candidates []challenge.Requester) error {
 	authz, err := m.client.GetAuthorization(ctx, authzURL)
 	if err != nil {
 		return fmt.Errorf("failed to get authorization %s: %w", authzURL, err)
 	}
 	if authz.Status == acme.StatusValid {
-		return nil
+		if revokeErr := m.client.RevokeAuthorization(ctx, authzURL); revokeErr != nil {
+			log.Printf("certserver: failed to revoke pre-validated authorization %s: %v", authzURL, revokeErr)
+		}
+		return fmt.Errorf("authorization for %s was pre-validated on ACME account; revoked to require fresh challenge validation", authz.Identifier.Value)
 	}
 
 	var chal *acme.Challenge
@@ -447,7 +543,7 @@ func (m *Manager) fulfillAuthorization(ctx context.Context, authzURL string) err
 		expiresAt = m.opts.Clock.Now().Add(10 * time.Minute)
 	}
 
-	if err := m.challengeStore.Put(ctx, chal.Token, authz.Identifier.Value, keyAuth, expiresAt); err != nil {
+	if err := m.challengeStore.PutWithCandidates(ctx, chal.Token, authz.Identifier.Value, keyAuth, expiresAt, req, candidates); err != nil {
 		return fmt.Errorf("failed to register challenge in store: %w", err)
 	}
 	defer func(token string) {

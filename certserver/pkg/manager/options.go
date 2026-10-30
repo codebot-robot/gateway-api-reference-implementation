@@ -16,6 +16,8 @@ package manager
 
 import (
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
 
 // Clock abstracts current time for testability.
@@ -40,6 +42,7 @@ type Options struct {
 	MaxRetryBackoff      time.Duration
 	RenewalCheckInterval time.Duration
 	Clock                Clock
+	BindingStore         registry.BindingStore
 }
 
 // DefaultOptions returns standard configuration defaults.
