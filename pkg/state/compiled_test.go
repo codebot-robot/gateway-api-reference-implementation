@@ -6332,3 +6332,76 @@ func TestCompileModel_CertificateSource(t *testing.T) {
 		}
 	})
 }
+
+func TestCompileModel_ValidatorHooks(t *testing.T) {
+	gwKey := types.NamespacedName{Namespace: "default", Name: "test-gw"}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-gw"},
+		Spec: gatewayv1.GatewaySpec{
+			GatewayClassName: "default",
+			Listeners: []gatewayv1.Listener{
+				{
+					Name:     "http",
+					Port:     80,
+					Protocol: gatewayv1.HTTPProtocolType,
+					Hostname: Ptr(gatewayv1.Hostname("example.com")),
+				},
+			},
+		},
+	}
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "test-route"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Name: "test-gw",
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"example.com"},
+		},
+	}
+
+	t.Run("ListenerValidator rejects listener", func(t *testing.T) {
+		inputs := ModelInputs{
+			Gateways: []*gatewayv1.Gateway{gw},
+			GatewayClasses: []*gatewayv1.GatewayClass{
+				{ObjectMeta: metav1.ObjectMeta{Name: "default"}},
+			},
+			HTTPRoutes: []*gatewayv1.HTTPRoute{route},
+			ListenerValidator: func(spec ListenerSpec, owner ListenerOwner, g *gatewayv1.Gateway) []metav1.Condition {
+				return []metav1.Condition{
+					NewCondition(
+						string(gatewayv1.ListenerConditionAccepted),
+						metav1.ConditionFalse,
+						string(gatewayv1.ListenerReasonUnsupportedValue),
+						"hostname not allowed",
+						g.Generation,
+					),
+				}
+			},
+		}
+
+		outputs := ComputeOutputs(inputs)
+		cg := outputs.CompiledGateways[gwKey]
+		if cg == nil || len(cg.EffectiveListeners) != 1 {
+			t.Fatalf("expected compiled gateway with 1 listener")
+		}
+		el := cg.EffectiveListeners[0]
+		if el.IsAccepted() {
+			t.Errorf("expected listener IsAccepted to be false")
+		}
+		accCond := FindCondition(el.Conditions, string(gatewayv1.ListenerConditionAccepted))
+		if accCond == nil || accCond.Status != metav1.ConditionFalse || accCond.Reason != string(gatewayv1.ListenerReasonUnsupportedValue) {
+			t.Errorf("expected Accepted=False/UnsupportedValue, got %+v", accCond)
+		}
+
+		// Proxy config should not serve the rejected listener
+		proxyListeners, _ := BuildProxyConfig([]*CompiledGateway{cg})
+		if len(proxyListeners) != 0 {
+			t.Errorf("expected 0 proxy listeners for unaccepted listener, got %d", len(proxyListeners))
+		}
+	})
+}

@@ -731,7 +731,13 @@ type ModelInputs struct {
 	DisabledRouteKinds      map[gatewayv1.Kind]bool
 
 	CertificateSources map[string]CertificateSource
+
+	ListenerValidator ListenerValidator
 }
+
+// ListenerValidator is an optional function to validate listener specifications.
+// If it returns conditions, they are applied to the listener and can reject it (e.g. Accepted=False).
+type ListenerValidator func(spec ListenerSpec, owner ListenerOwner, gw *gatewayv1.Gateway) []metav1.Condition
 
 // Outputs represents all computed outputs produced by ComputeOutputs.
 type Outputs struct {
@@ -1723,6 +1729,11 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 				inputs.CertificateSources,
 				inputs.DisabledRouteKinds,
 			)
+			if inputs.ListenerValidator != nil {
+				for _, cond := range inputs.ListenerValidator(ListenerToSpec(l), ListenerOwner{Kind: "Gateway", Namespace: gw.Namespace, Name: gw.Name}, gw) {
+					SetCondition(&el.Conditions, cond)
+				}
+			}
 			cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 		}
 
@@ -1764,6 +1775,11 @@ func CompileModel(inputs ModelInputs) *CompiledModel {
 					inputs.CertificateSources,
 					inputs.DisabledRouteKinds,
 				)
+				if inputs.ListenerValidator != nil {
+					for _, cond := range inputs.ListenerValidator(ListenerEntryToSpec(l), ListenerOwner{Kind: "ListenerSet", Namespace: ls.Namespace, Name: ls.Name}, gw) {
+						SetCondition(&el.Conditions, cond)
+					}
+				}
 				cg.EffectiveListeners = append(cg.EffectiveListeners, el)
 			}
 		}

@@ -128,6 +128,7 @@ type State struct {
 	disabledRouteKinds      map[gatewayv1.Kind]bool
 	onGatewaysUpdate        func([]*gatewayv1.Gateway)
 	gatewayFilter           func(gw *gatewayv1.Gateway) bool
+	listenerValidator       ListenerValidator
 
 	dataplanePublisher DataplanePublisher
 	lastWrittenConfigs map[types.NamespacedName][]byte
@@ -267,6 +268,15 @@ func (s *State) SetGatewayFilter(fn func(gw *gatewayv1.Gateway) bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.gatewayFilter = fn
+}
+
+// SetListenerValidator configures an optional validator function for listeners.
+func (s *State) SetListenerValidator(v ListenerValidator) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listenerValidator = v
+	s.revision++
+	s.markDirtyLocked()
 }
 
 func (s *State) SetDataplanePublisher(p DataplanePublisher) {
@@ -813,6 +823,7 @@ func (s *State) snapshotInputsLocked() ModelInputs {
 		GatewayCRDBundleVersion: s.gatewayCRDBundleVersion,
 		DisabledRouteKinds:      disabledRouteKinds,
 		CertificateSources:      certSources,
+		ListenerValidator:       s.listenerValidator,
 	}
 }
 

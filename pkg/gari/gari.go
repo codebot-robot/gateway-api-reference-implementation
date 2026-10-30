@@ -205,6 +205,10 @@ type Options struct {
 	// for Gateway TLS listeners configured with tls.options[gateway.gke-labs.io/certificate-source].
 	CertificateSources map[string]CertificateSource
 
+	// ListenerValidator is an optional hook to validate listener specifications.
+	// If it returns conditions, they are applied to the listener.
+	ListenerValidator state.ListenerValidator
+
 	// Manager is an optional controller-runtime manager. If provided, New will
 	// register reconcilers with it instead of creating a new manager.
 	Manager ctrl.Manager
@@ -704,6 +708,7 @@ func (s *Server) SetupWithManager(mgr ctrl.Manager) error {
 		GatewayFilter:        s.opts.GatewayFilter,
 		DisableStatusUpdates: s.opts.DisableStatusUpdates,
 		GatewayStatusHook:    s.opts.GatewayStatusHook,
+		ListenerValidator:    s.opts.ListenerValidator,
 
 		CertificateSources: s.opts.CertificateSources,
 	})
