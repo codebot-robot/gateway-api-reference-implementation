@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -68,5 +69,86 @@ func TestControllerManifest_RBACCustomResourceDefinitions(t *testing.T) {
 	}
 	if !foundCRDRule {
 		t.Fatalf("customresourcedefinitions rule not found in gcpgateway-controller ClusterRole")
+	}
+}
+
+func TestControllerManifest_CertserverDeployment(t *testing.T) {
+	manifestPath := filepath.Join("..", "..", "k8s", "controller.yaml")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", manifestPath, err)
+	}
+
+	docs := strings.Split(string(data), "\n---")
+	var foundDeploy bool
+
+	for _, doc := range docs {
+		var deploy appsv1.Deployment
+		if err := yaml.Unmarshal([]byte(doc), &deploy); err != nil {
+			continue
+		}
+		if deploy.Kind != "Deployment" || deploy.Name != "gcpgateway-controller" {
+			continue
+		}
+		foundDeploy = true
+
+		// 1. Verify projected token volume exists
+		var foundTokenVol bool
+		for _, vol := range deploy.Spec.Template.Spec.Volumes {
+			if vol.Name == "certserver-token" {
+				if vol.Projected == nil {
+					t.Fatalf("expected certserver-token volume to be projected")
+				}
+				for _, src := range vol.Projected.Sources {
+					if src.ServiceAccountToken != nil {
+						if src.ServiceAccountToken.Audience != "certserver" {
+							t.Errorf("expected audience certserver, got %s", src.ServiceAccountToken.Audience)
+						}
+						if src.ServiceAccountToken.Path != "token" {
+							t.Errorf("expected path token, got %s", src.ServiceAccountToken.Path)
+						}
+						foundTokenVol = true
+					}
+				}
+			}
+		}
+		if !foundTokenVol {
+			t.Errorf("certserver-token projected volume not found on Deployment")
+		}
+
+		// 2. Verify controller container configuration
+		if len(deploy.Spec.Template.Spec.Containers) == 0 {
+			t.Fatalf("no containers found in Deployment")
+		}
+		c := deploy.Spec.Template.Spec.Containers[0]
+
+		var foundMount bool
+		for _, m := range c.VolumeMounts {
+			if m.Name == "certserver-token" && m.MountPath == "/var/run/secrets/tokens/certserver" && m.ReadOnly {
+				foundMount = true
+			}
+		}
+		if !foundMount {
+			t.Errorf("expected readOnly volumeMount certserver-token at /var/run/secrets/tokens/certserver")
+		}
+
+		// 3. Verify arguments
+		hasAddr := slices.Contains(c.Args, "--certserver-address=certserver.gateway-system.svc:8443")
+		hasCA := slices.Contains(c.Args, "--certserver-ca-bundle-path=/etc/ssl/certs/certserver-ca.crt")
+		hasToken := slices.Contains(c.Args, "--certserver-token-path=/var/run/secrets/tokens/certserver/token")
+
+		if !hasAddr {
+			t.Errorf("expected --certserver-address in args, got %v", c.Args)
+		}
+		if !hasCA {
+			t.Errorf("expected --certserver-ca-bundle-path in args, got %v", c.Args)
+		}
+		if !hasToken {
+			t.Errorf("expected --certserver-token-path in args, got %v", c.Args)
+		}
+	}
+
+	if !foundDeploy {
+		t.Fatalf("gcpgateway-controller Deployment not found in %s", manifestPath)
 	}
 }

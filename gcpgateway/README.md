@@ -291,6 +291,72 @@ The response confirms end-to-end traffic passing through the Google Cloud L4 Loa
 
 ---
 
+## Automatic TLS Certificates via certserver
+
+`gcpgateway` integrates with `certserver` to automatically provision and renew TLS certificates for HTTPS listeners using GARI's pluggable certificate-source hook and certserver's authenticated `GetCertificate` gRPC API.
+
+### 1. Registering the Cluster's OIDC Issuer with certserver
+
+`certserver` verifies projected ServiceAccount tokens offline against the originating cluster's OIDC discovery endpoint and JSON Web Key Set (JWKS). Before `gcpgateway` can request certificates, register the cluster in `certserver`'s configuration:
+
+```yaml
+clusters:
+- clusterID: "cluster-prod-1"  # Matches gcpgateway --cluster-id
+  issuerURL: "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-central1/clusters/my-cluster"
+  jwksURL: "https://container.googleapis.com/v1/projects/my-gcp-project/locations/us-central1/clusters/my-cluster/jwks"
+  controllerNamespace: "default"
+  controllerServiceAccount: "gcpgateway-controller"
+  allowedHostnames:
+  - "echo.example.com"
+  - "*.example.com"
+```
+
+Find your GKE cluster's OIDC issuer URL with:
+```bash
+kubectl get --raw /.well-known/openid-configuration
+```
+
+### 2. Controller Configuration and Manifests
+
+The `gcpgateway-controller` Deployment in `k8s/controller.yaml` includes a projected service-account token volume (`certserver-token`) with audience `certserver` and 10-minute validity, mounted read-only at `/var/run/secrets/tokens/certserver/token`.
+
+When starting the controller, pass the certserver flags:
+- `--certserver-address`: The `host:port` address of the certserver gRPC service (e.g. `certserver.gateway-system.svc:8443`).
+- `--certserver-ca-bundle-path`: Path to the CA bundle PEM file to verify the certserver TLS endpoint (e.g. `/etc/ssl/certs/certserver-ca.crt`).
+- `--certserver-token-path`: Path to the projected service-account token file (e.g. `/var/run/secrets/tokens/certserver/token`).
+
+Without these flags, `certserver` is not registered as a certificate source, and any listener requesting it receives an `Unknown certificate source "certserver"` condition.
+
+### 3. Requesting Certificates on Gateway Listeners
+
+To obtain a certificate from `certserver`, configure a Gateway listener with:
+- An exact, non-wildcard `hostname`.
+- TLS mode `Terminate`.
+- The option `gateway.gke-labs.io/certificate-source: certserver` under `tls.options`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: prod-gw
+  namespace: default
+spec:
+  gatewayClassName: gcpgateway
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 443
+    hostname: "echo.example.com"
+    tls:
+      mode: Terminate
+      options:
+        gateway.gke-labs.io/certificate-source: certserver
+```
+
+When evaluated, the controller requests the certificate from `certserver`. While issuance is in progress, the listener condition reports `Pending`. Once issued, the certificate and private key are stored in the controller's in-memory cache, pushed to the per-Gateway data-plane config Secret, and renewed automatically before expiry.
+
+---
+
 ## Teardown
 
 When a Gateway is deleted (`kubectl delete gateway`), the controller uses the finalizer `gcpgateway.gke-labs.io/cleanup` to cleanly detach all data-plane endpoints from the zonal NEGs before allowing Kubernetes to finalize and delete the Gateway resource.
