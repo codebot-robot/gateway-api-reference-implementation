@@ -1308,7 +1308,7 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 
 	qKey := qualifyKey(bucketName, key)
 
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < 4; attempt++ {
 		s.keyMu.RLock()
 		entry, exists := s.keyIndex[qKey]
 		s.keyMu.RUnlock()
@@ -1317,102 +1317,157 @@ func (s *Engine) Get(bucketName, key string) ([]byte, bool, error) {
 			return nil, false, nil
 		}
 
+		val, matched, err := s.readIndexEntry(bucketName, key, qKey, entry)
+		if matched {
+			return val, true, nil
+		}
 		if entry.IsOversize {
-			s.keyMu.RLock()
-			data, ok := s.oversizeObjects[qKey]
-			s.keyMu.RUnlock()
-			if !ok {
-				return nil, false, nil
-			}
-			res := bytes.Clone(data)
-			if s.cipher != nil {
-				ad := AdditionalData(bucketName, key)
-				decrypted, err := s.cipher.Decrypt(res, ad)
-				if err != nil {
-					return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
-				}
-				res = decrypted
-			}
-			decompressed, err := s.decompress(res)
 			if err != nil {
-				s.setFailed(err)
-				return nil, false, s.failErr()
+				return nil, false, err
 			}
-			return decompressed, true, nil
+			return nil, false, nil
+		}
+		if err != nil && (errors.Is(err, ErrDecrypt) || s.isFailed()) {
+			return nil, false, err
 		}
 
-		handle, err := s.bp.PinPage(entry.LogicalPage)
-		if err != nil {
-			s.keyMu.RLock()
-			curEntry, stillExists := s.keyIndex[qKey]
-			s.keyMu.RUnlock()
-			if !stillExists || curEntry.LSN != entry.LSN || curEntry.LogicalPage != entry.LogicalPage {
-				continue // Concurrent modification, retry!
-			}
-			s.setFailed(fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err))
-			return nil, false, s.failErr()
+		// Optimistic read mismatched or failed to pin. Check if a concurrent writer modified the index.
+		s.keyMu.RLock()
+		curEntry, stillExists := s.keyIndex[qKey]
+		s.keyMu.RUnlock()
+		if !stillExists || curEntry.LSN != entry.LSN || curEntry.LogicalPage != entry.LogicalPage {
+			runtime.Gosched()
+			continue // Concurrent modification, retry!
 		}
+		// Index entry hasn't changed, but record didn't match or pin failed. Fall back to locked read.
+		break
+	}
 
-		handle.Desc.Mu.RLock()
-		pageLSN := handle.Desc.PageLSN.Load()
-		var recKey string
-		var recPayload []byte
-		var recLSN uint64
+	// Under sustained write contention, optimistic retries can repeatedly lose races.
+	// Fall back to acquiring writerMu.RLock(), which writers exclude, ensuring readers
+	// always make progress.
+	s.writerMu.RLock()
+	defer s.writerMu.RUnlock()
+	return s.getLocked(bucketName, key)
+}
 
-		if handle.Desc.NumBlocks == 1 {
-			slotted, wrapErr := WrapSlottedPage(handle.Block(0))
-			if wrapErr == nil {
-				var raw []byte
-				recKey, raw, recLSN, err = slotted.Get(entry.Slot)
-				if err == nil {
-					recPayload = bytes.Clone(raw)
-				}
-			} else {
-				err = wrapErr
-			}
-		} else {
-			var raw []byte
-			recKey, raw, recLSN, err = DecodeMultiBlockPage(handle.Blocks())
-			if err == nil {
-				recPayload = bytes.Clone(raw)
-			}
+// getLocked retrieves an object assuming s.writerMu.RLock() is held by the caller.
+// Under writerMu.RLock(), concurrent writes and deletes are excluded, ensuring that
+// the key index and page records cannot be invalidated during the read.
+func (s *Engine) getLocked(bucketName, key string) ([]byte, bool, error) {
+	if s.isFailed() {
+		return nil, false, s.failErr()
+	}
+
+	qKey := qualifyKey(bucketName, key)
+
+	s.keyMu.RLock()
+	entry, exists := s.keyIndex[qKey]
+	s.keyMu.RUnlock()
+
+	if !exists {
+		return nil, false, nil
+	}
+
+	val, matched, err := s.readIndexEntry(bucketName, key, qKey, entry)
+	if err != nil {
+		if errors.Is(err, ErrDecrypt) {
+			return nil, false, err
 		}
-		handle.Desc.Mu.RUnlock()
-		handle.Unpin()
-
-		// Verify key and LSN
-		if err != nil || recKey != qKey || recLSN != entry.LSN {
-			s.keyMu.RLock()
-			curEntry, stillExists := s.keyIndex[qKey]
-			s.keyMu.RUnlock()
-			if !stillExists || curEntry.LSN != entry.LSN || curEntry.LogicalPage != entry.LogicalPage || pageLSN > entry.LSN || attempt < 4 {
-				runtime.Gosched()
-				continue // Concurrent modification, retry!
-			}
-			s.setFailed(fmt.Errorf("corruption/stale read detected for %s: expected LSN %d, got LSN %d (recKey=%s, err=%v)",
-				key, entry.LSN, recLSN, recKey, err))
-			return nil, false, s.failErr()
+		s.setFailed(err)
+		return nil, false, s.failErr()
+	}
+	if !matched {
+		if entry.IsOversize {
+			return nil, false, nil
 		}
+		s.setFailed(fmt.Errorf("corruption/stale read detected for %s: expected LSN %d", key, entry.LSN))
+		return nil, false, s.failErr()
+	}
 
+	return val, true, nil
+}
+
+// readIndexEntry reads the record corresponding to entry, verifies its key and LSN,
+// and decrypts/decompresses the payload. It returns matched=true when the record
+// was found and matched entry, or matched=false if the record did not match or could
+// not be read due to page conflict.
+func (s *Engine) readIndexEntry(bucketName, key, qKey string, entry KeyIndexEntry) ([]byte, bool, error) {
+	if entry.IsOversize {
+		s.keyMu.RLock()
+		data, ok := s.oversizeObjects[qKey]
+		s.keyMu.RUnlock()
+		if !ok {
+			return nil, false, nil
+		}
+		res := bytes.Clone(data)
 		if s.cipher != nil {
 			ad := AdditionalData(bucketName, key)
-			decrypted, err := s.cipher.Decrypt(recPayload, ad)
+			decrypted, err := s.cipher.Decrypt(res, ad)
 			if err != nil {
 				return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
 			}
-			recPayload = decrypted
+			res = decrypted
 		}
-
-		decompressed, err := s.decompress(recPayload)
+		decompressed, err := s.decompress(res)
 		if err != nil {
 			s.setFailed(err)
 			return nil, false, s.failErr()
 		}
-
 		return decompressed, true, nil
 	}
 
-	return nil, false, errors.New("read conflict retry limit reached")
+	handle, err := s.bp.PinPage(entry.LogicalPage)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to pin page %d for key %s: %w", entry.LogicalPage, key, err)
+	}
+
+	handle.Desc.Mu.RLock()
+	var recKey string
+	var recPayload []byte
+	var recLSN uint64
+
+	if handle.Desc.NumBlocks == 1 {
+		slotted, wrapErr := WrapSlottedPage(handle.Block(0))
+		if wrapErr == nil {
+			var raw []byte
+			recKey, raw, recLSN, err = slotted.Get(entry.Slot)
+			if err == nil {
+				recPayload = bytes.Clone(raw)
+			}
+		} else {
+			err = wrapErr
+		}
+	} else {
+		var raw []byte
+		recKey, raw, recLSN, err = DecodeMultiBlockPage(handle.Blocks())
+		if err == nil {
+			recPayload = bytes.Clone(raw)
+		}
+	}
+	handle.Desc.Mu.RUnlock()
+	handle.Unpin()
+
+	if err != nil || recKey != qKey || recLSN != entry.LSN {
+		return nil, false, nil
+	}
+
+	if s.cipher != nil {
+		ad := AdditionalData(bucketName, key)
+		decrypted, err := s.cipher.Decrypt(recPayload, ad)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %v", ErrDecrypt, err)
+		}
+		recPayload = decrypted
+	}
+
+	decompressed, err := s.decompress(recPayload)
+	if err != nil {
+		s.setFailed(err)
+		return nil, false, s.failErr()
+	}
+
+	return decompressed, true, nil
 }
 
 // Delete removes an object by key, updating the progress token if provided.
@@ -1505,7 +1560,7 @@ func (s *Engine) Scan(bucket string, fn func(key string, value []byte) error) er
 	sort.Strings(keys)
 
 	for _, userKey := range keys {
-		val, exists, err := s.Get(bucket, userKey)
+		val, exists, err := s.getLocked(bucket, userKey)
 		if err != nil {
 			return err
 		}

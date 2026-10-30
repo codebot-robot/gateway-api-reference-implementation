@@ -627,7 +627,7 @@ func TestDiskStore_Benchmark_Worker(t *testing.T) {
 			t.Fatalf("diskstore creation failed: %v", err)
 		}
 
-		diskIndexer, err := New(diskStore, &corev1.ConfigMap{}, DefaultOnFatal,
+		diskIndexer, err := New(diskStore, &corev1.ConfigMap{}, testOnFatal(t),
 			WithBucketName("ConfigMap"),
 			WithIndexerCodec(NewHybridCodec()),
 		)
