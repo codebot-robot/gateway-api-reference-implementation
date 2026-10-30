@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1144,4 +1145,117 @@ func TestMain_SetsLogger(t *testing.T) {
 	if strings.Contains(output, "[controller-runtime] log.SetLogger(...) was never called") {
 		t.Errorf("expected no warning about SetLogger not being called, got:\n%s", output)
 	}
+}
+
+func TestFlagsGolden(t *testing.T) {
+	t.Setenv("CLUSTER_ID", "")
+	t.Setenv("NEG_PREFIX", "")
+	t.Setenv("PROJECT_ID", "")
+	t.Setenv("REGION", "")
+	t.Setenv("GARI_IMAGE", "")
+	t.Setenv("CERTSERVER_ADDRESS", "")
+	t.Setenv("CERTSERVER_CA_BUNDLE_PATH", "")
+	t.Setenv("CERTSERVER_TOKEN_PATH", "")
+
+	type flagInfo struct {
+		Name     string
+		DefValue string
+		Usage    string
+	}
+
+	t.Run("dataplane", func(t *testing.T) {
+		golden := []flagInfo{
+			{Name: "acme-challenge-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify the upstream certificate server"},
+			{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity"},
+			{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to"},
+			{Name: "allowed-source-cidrs", DefValue: "", Usage: "Allowed source CIDRs"},
+			{Name: "dataplane-mode", DefValue: "true", Usage: "Run in data-plane mode"},
+			{Name: "debug-error-responses", DefValue: "false", Usage: "Include detailed error messages in unmatched responses"},
+			{Name: "drain-sentinel-path", DefValue: "/var/run/gcpgateway/draining", Usage: "Path to drain sentinel file"},
+			{Name: "enable-h2c", DefValue: "false", Usage: "Enable H2C support on the proxy server"},
+			{Name: "forwarded-for-mode", DefValue: "append", Usage: "How to handle X-Forwarded-For: append (default) or replace"},
+			{Name: "gateway-name", DefValue: "", Usage: "Gateway name"},
+			{Name: "gateway-namespace", DefValue: "", Usage: "Gateway namespace"},
+			{Name: "health-probe-bind-address", DefValue: ":8999", Usage: "Health probe bind address"},
+			{Name: "metrics-bind-address", DefValue: ":8999", Usage: "Metrics bind address"},
+			{Name: "proxy-bind-address", DefValue: ":8080", Usage: "HTTP proxy bind address"},
+			{Name: "proxy-http3-advertised-port", DefValue: "0", Usage: "The port advertised in the Alt-Svc header for HTTP/3 (if 0, inferred from bind address)"},
+			{Name: "proxy-http3-bind-address", DefValue: "", Usage: "The UDP address the proxy binds to for HTTP/3 (defaults to the HTTPS bind address)"},
+			{Name: "proxy-https-bind-address", DefValue: ":8443", Usage: "HTTPS proxy bind address"},
+			{Name: "proxy-protocol", DefValue: "", Usage: "Enable PROXY protocol"},
+			{Name: "proxy-protocol-trusted-cidrs", DefValue: "", Usage: "Trusted PROXY protocol CIDRs"},
+		}
+
+		opts := gari.DefaultOptions()
+		opts.DataplaneMode = true
+		opts.DrainSentinelPath = DefaultSentinelPath
+
+		fs := flag.NewFlagSet("dataplane", flag.ContinueOnError)
+		BindDataplaneFlags(fs, &opts)
+
+		var got []flagInfo
+		fs.VisitAll(func(f *flag.Flag) {
+			got = append(got, flagInfo{Name: f.Name, DefValue: f.DefValue, Usage: f.Usage})
+		})
+
+		if len(got) != len(golden) {
+			t.Fatalf("got %d flags, want %d", len(got), len(golden))
+		}
+		for i := range golden {
+			if got[i] != golden[i] {
+				t.Errorf("flag %d mismatch:\ngot:  %+v\nwant: %+v", i, got[i], golden[i])
+			}
+		}
+	})
+
+	t.Run("controller", func(t *testing.T) {
+		golden := []flagInfo{
+			{Name: "acme-challenge-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify the upstream certificate server"},
+			{Name: "acme-challenge-token-path", DefValue: "", Usage: "Path to the projected service-account token file for data-plane identity"},
+			{Name: "acme-challenge-upstream-url", DefValue: "", Usage: "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to"},
+			{Name: "certserver-address", DefValue: "", Usage: "Address of the certserver gRPC service"},
+			{Name: "certserver-ca-bundle-path", DefValue: "", Usage: "Path to the CA bundle PEM file to verify certserver TLS"},
+			{Name: "certserver-token-path", DefValue: "", Usage: "Path to the projected service-account token file for controller identity"},
+			{Name: "cluster-id", DefValue: "cluster-1", Usage: "Unique Kubernetes cluster identifier"},
+			{Name: "controller-name", DefValue: "gke-labs.io/gcpgateway", Usage: "GatewayClass controller name"},
+			{Name: "dataplane-image", DefValue: "gari-controller:latest", Usage: "Data-plane container image"},
+			{Name: "debug-error-responses", DefValue: "false", Usage: "Include detailed error messages in unmatched responses"},
+			{Name: "drain-seconds", DefValue: "35", Usage: "Seconds to drain connections during rolling updates"},
+			{Name: "fake-compute", DefValue: "false", Usage: "Use in-memory fake Compute client for testing/offline mode"},
+			{Name: "health-poll-interval", DefValue: "5s", Usage: "Interval between load balancer health check polls"},
+			{Name: "leader-elect", DefValue: "false", Usage: "Enable leader election"},
+			{Name: "neg-prefix", DefValue: "gcpgw", Usage: "Prefix for zonal NEG names"},
+			{Name: "project", DefValue: "", Usage: "GCP Project ID"},
+			{Name: "region", DefValue: "", Usage: "GCP Region"},
+			{Name: "resync-interval", DefValue: "1m0s", Usage: "Interval between full periodic resyncs"},
+			{Name: "zones", DefValue: "", Usage: "Comma-separated list of GCP zones"},
+		}
+
+		cfg := DefaultControllerConfig()
+		opts := gari.DefaultOptions()
+		opts.ControllerName = DefaultControllerName
+		opts.ProxyAddr = ""
+		opts.ProxyHTTPSAddr = ""
+		opts.ProxyHTTP3Addr = ""
+		opts.DrainSentinelPath = DefaultSentinelPath
+		opts.LeaderElection = false
+		opts.DebugErrorResponses = false
+
+		fs := flag.NewFlagSet("controller", flag.ContinueOnError)
+		BindControllerFlags(fs, &opts, &cfg)
+
+		var got []flagInfo
+		fs.VisitAll(func(f *flag.Flag) {
+			got = append(got, flagInfo{Name: f.Name, DefValue: f.DefValue, Usage: f.Usage})
+		})
+
+		if len(got) != len(golden) {
+			t.Fatalf("got %d flags, want %d", len(got), len(golden))
+		}
+		for i := range golden {
+			if got[i] != golden[i] {
+				t.Errorf("flag %d mismatch:\ngot:  %+v\nwant: %+v", i, got[i], golden[i])
+			}
+		}
+	})
 }

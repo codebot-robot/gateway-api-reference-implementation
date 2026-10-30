@@ -103,27 +103,15 @@ func runDataplane(ctx context.Context, args []string) error {
 	return gari.Run(ctx, opts)
 }
 
-// SetupDataplane parses args and builds the gari.Options for data-plane mode.
-func SetupDataplane(args []string) (gari.Options, error) {
-	opts := gari.DefaultOptions()
-	opts.DataplaneMode = true
-
-	var (
-		dataplaneMode                bool
-		gatewayNamespace             string
-		gatewayName                  string
-		allowedSourceCIDRsStr        string
-		proxyProtocolTrustedCIDRsStr string
-	)
-
-	fs := flag.NewFlagSet("dataplane", flag.ContinueOnError)
-	fs.BoolVar(&dataplaneMode, "dataplane-mode", true, "Run in data-plane mode")
-	fs.StringVar(&gatewayNamespace, "gateway-namespace", "", "Gateway namespace")
-	fs.StringVar(&gatewayName, "gateway-name", "", "Gateway name")
-	fs.StringVar(&allowedSourceCIDRsStr, "allowed-source-cidrs", "", "Allowed source CIDRs")
+// BindDataplaneFlags registers data-plane command-line flags on the given FlagSet.
+func BindDataplaneFlags(fs *flag.FlagSet, opts *gari.Options) {
+	fs.BoolVar(&opts.DataplaneMode, "dataplane-mode", opts.DataplaneMode, "Run in data-plane mode")
+	fs.StringVar(&opts.DataplaneGatewayNamespace, "gateway-namespace", opts.DataplaneGatewayNamespace, "Gateway namespace")
+	fs.StringVar(&opts.DataplaneGatewayName, "gateway-name", opts.DataplaneGatewayName, "Gateway name")
+	fs.Var(gari.CommaSeparatedSlice(&opts.AllowedSourceCIDRs), "allowed-source-cidrs", "Allowed source CIDRs")
 	fs.StringVar(&opts.ProxyProtocol, "proxy-protocol", opts.ProxyProtocol, "Enable PROXY protocol")
-	fs.StringVar(&proxyProtocolTrustedCIDRsStr, "proxy-protocol-trusted-cidrs", "", "Trusted PROXY protocol CIDRs")
-	fs.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", DefaultSentinelPath, "Path to drain sentinel file")
+	fs.Var(gari.CommaSeparatedSlice(&opts.ProxyProtocolTrustedCIDRs), "proxy-protocol-trusted-cidrs", "Trusted PROXY protocol CIDRs")
+	fs.StringVar(&opts.DrainSentinelPath, "drain-sentinel-path", opts.DrainSentinelPath, "Path to drain sentinel file")
 	fs.StringVar(&opts.MetricsAddr, "metrics-bind-address", opts.MetricsAddr, "Metrics bind address")
 	fs.StringVar(&opts.HealthProbeBindAddress, "health-probe-bind-address", opts.HealthProbeBindAddress, "Health probe bind address")
 	fs.StringVar(&opts.ProxyAddr, "proxy-bind-address", opts.ProxyAddr, "HTTP proxy bind address")
@@ -138,34 +126,30 @@ func SetupDataplane(args []string) (gari.Options, error) {
 	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
 	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
 	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
+}
+
+// SetupDataplane parses args and builds the gari.Options for data-plane mode.
+func SetupDataplane(args []string) (gari.Options, error) {
+	opts := gari.DefaultOptions()
+	opts.DataplaneMode = true
+	opts.DrainSentinelPath = DefaultSentinelPath
+
+	fs := flag.NewFlagSet("dataplane", flag.ContinueOnError)
+	BindDataplaneFlags(fs, &opts)
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
 
-	if gatewayNamespace == "" || gatewayName == "" {
+	if opts.DataplaneGatewayNamespace == "" || opts.DataplaneGatewayName == "" {
 		return opts, fmt.Errorf("--gateway-namespace and --gateway-name are required in --dataplane-mode")
 	}
 
-	if allowedSourceCIDRsStr != "" {
-		for _, part := range strings.Split(allowedSourceCIDRsStr, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				opts.AllowedSourceCIDRs = append(opts.AllowedSourceCIDRs, trimmed)
-			}
-		}
-	}
-	if proxyProtocolTrustedCIDRsStr != "" {
-		for _, part := range strings.Split(proxyProtocolTrustedCIDRsStr, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				opts.ProxyProtocolTrustedCIDRs = append(opts.ProxyProtocolTrustedCIDRs, trimmed)
-			}
-		}
-	}
-
-	opts.DataplaneGatewayNamespace = gatewayNamespace
-	opts.DataplaneGatewayName = gatewayName
+	// Data-plane pods serve traffic for a single Gateway and do not perform
+	// status updates, run leader election, or manage an address provider.
 	opts.DisableStatusUpdates = true
 	opts.LeaderElection = false
+	// Default HTTP/3 bind address to HTTPS bind address for dataplane.
 	if opts.ProxyHTTP3Addr == "" {
 		opts.ProxyHTTP3Addr = opts.ProxyHTTPSAddr
 	}
@@ -174,26 +158,23 @@ func SetupDataplane(args []string) (gari.Options, error) {
 	return opts, nil
 }
 
-// SetupController parses args and builds the gari.Options for controller mode.
-// If computeClient is nil:
-//   - if --fake-compute is set, gcp.NewFakeComputeClient() is used.
-//   - otherwise compute.NewService(ctx) is called, returning an error on failure.
-func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
-	var (
-		region              string
-		zonesStr            string
-		dataplaneImg        string
-		drainSeconds        int
-		leaderElect         bool
-		fakeCompute         bool
-		debugErrorResponses bool
-	)
+// ControllerConfig holds binary-specific configuration for the gcpgateway controller.
+type ControllerConfig struct {
+	ClusterID          string
+	NegPrefix          string
+	Project            string
+	Region             string
+	Zones              []string
+	DataplaneImage     string
+	DrainSeconds       int
+	HealthPollInterval time.Duration
+	ResyncInterval     time.Duration
+	FakeCompute        bool
+	Certserver         client.Config
+}
 
-	var certserverCfg client.Config
-	certserverCfg.ServerAddress = os.Getenv("CERTSERVER_ADDRESS")
-	certserverCfg.CABundlePath = os.Getenv("CERTSERVER_CA_BUNDLE_PATH")
-	certserverCfg.TokenPath = os.Getenv("CERTSERVER_TOKEN_PATH")
-
+// DefaultControllerConfig returns the default ControllerConfig populated from environment variables.
+func DefaultControllerConfig() ControllerConfig {
 	defaultClusterID := os.Getenv("CLUSTER_ID")
 	if defaultClusterID == "" {
 		defaultClusterID = "cluster-1"
@@ -209,56 +190,79 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		defaultImg = singlepod.DefaultDataplaneImage
 	}
 
-	reconcilerCfg := controller.GatewayReconcilerConfig{
+	return ControllerConfig{
 		ClusterID:          defaultClusterID,
 		NegPrefix:          defaultNegPrefix,
 		Project:            defaultProject,
-		ControllerName:     DefaultControllerName,
+		Region:             defaultRegion,
+		DataplaneImage:     defaultImg,
+		DrainSeconds:       DefaultDrainSeconds,
 		HealthPollInterval: controller.HealthPollInterval,
 		ResyncInterval:     controller.ResyncInterval,
+		Certserver: client.Config{
+			ServerAddress: os.Getenv("CERTSERVER_ADDRESS"),
+			CABundlePath:  os.Getenv("CERTSERVER_CA_BUNDLE_PATH"),
+			TokenPath:     os.Getenv("CERTSERVER_TOKEN_PATH"),
+		},
 	}
+}
+
+// BindControllerFlags registers controller command-line flags on the given FlagSet.
+func BindControllerFlags(fs *flag.FlagSet, opts *gari.Options, cfg *ControllerConfig) {
+	fs.StringVar(&cfg.ClusterID, "cluster-id", cfg.ClusterID, "Unique Kubernetes cluster identifier")
+	fs.StringVar(&cfg.NegPrefix, "neg-prefix", cfg.NegPrefix, "Prefix for zonal NEG names")
+	fs.StringVar(&cfg.Project, "project", cfg.Project, "GCP Project ID")
+	fs.StringVar(&cfg.Region, "region", cfg.Region, "GCP Region")
+	fs.Var(gari.CommaSeparatedSlice(&cfg.Zones), "zones", "Comma-separated list of GCP zones")
+	fs.StringVar(&opts.ControllerName, "controller-name", opts.ControllerName, "GatewayClass controller name")
+	fs.StringVar(&cfg.DataplaneImage, "dataplane-image", cfg.DataplaneImage, "Data-plane container image")
+	fs.IntVar(&cfg.DrainSeconds, "drain-seconds", cfg.DrainSeconds, "Seconds to drain connections during rolling updates")
+	fs.DurationVar(&cfg.HealthPollInterval, "health-poll-interval", cfg.HealthPollInterval, "Interval between load balancer health check polls")
+	fs.DurationVar(&cfg.ResyncInterval, "resync-interval", cfg.ResyncInterval, "Interval between full periodic resyncs")
+	fs.BoolVar(&opts.LeaderElection, "leader-elect", opts.LeaderElection, "Enable leader election")
+	fs.BoolVar(&cfg.FakeCompute, "fake-compute", cfg.FakeCompute, "Use in-memory fake Compute client for testing/offline mode")
+	fs.BoolVar(&opts.DebugErrorResponses, "debug-error-responses", opts.DebugErrorResponses, "Include detailed error messages in unmatched responses")
+	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
+	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
+	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
+	fs.StringVar(&cfg.Certserver.ServerAddress, "certserver-address", cfg.Certserver.ServerAddress, "Address of the certserver gRPC service")
+	fs.StringVar(&cfg.Certserver.CABundlePath, "certserver-ca-bundle-path", cfg.Certserver.CABundlePath, "Path to the CA bundle PEM file to verify certserver TLS")
+	fs.StringVar(&cfg.Certserver.TokenPath, "certserver-token-path", cfg.Certserver.TokenPath, "Path to the projected service-account token file for controller identity")
+}
+
+// SetupController parses args and builds the gari.Options for controller mode.
+// If computeClient is nil:
+//   - if --fake-compute is set, gcp.NewFakeComputeClient() is used.
+//   - otherwise compute.NewService(ctx) is called, returning an error on failure.
+func SetupController(ctx context.Context, args []string, computeClient gcp.ComputeClient) (gari.Options, error) {
+	cfg := DefaultControllerConfig()
 
 	opts := gari.DefaultOptions()
+	opts.ControllerName = DefaultControllerName
 	opts.ProxyAddr = ""
 	opts.ProxyHTTPSAddr = ""
 	opts.ProxyHTTP3Addr = ""
 	opts.DrainSentinelPath = DefaultSentinelPath
+	opts.LeaderElection = false
+	opts.DebugErrorResponses = false
 
 	fs := flag.NewFlagSet("controller", flag.ContinueOnError)
-	fs.StringVar(&reconcilerCfg.ClusterID, "cluster-id", defaultClusterID, "Unique Kubernetes cluster identifier")
-	fs.StringVar(&reconcilerCfg.NegPrefix, "neg-prefix", defaultNegPrefix, "Prefix for zonal NEG names")
-	fs.StringVar(&reconcilerCfg.Project, "project", defaultProject, "GCP Project ID")
-	fs.StringVar(&region, "region", defaultRegion, "GCP Region")
-	fs.StringVar(&zonesStr, "zones", "", "Comma-separated list of GCP zones")
-	fs.StringVar(&reconcilerCfg.ControllerName, "controller-name", DefaultControllerName, "GatewayClass controller name")
-	fs.StringVar(&dataplaneImg, "dataplane-image", defaultImg, "Data-plane container image")
-	fs.IntVar(&drainSeconds, "drain-seconds", DefaultDrainSeconds, "Seconds to drain connections during rolling updates")
-	fs.DurationVar(&reconcilerCfg.HealthPollInterval, "health-poll-interval", controller.HealthPollInterval, "Interval between load balancer health check polls")
-	fs.DurationVar(&reconcilerCfg.ResyncInterval, "resync-interval", controller.ResyncInterval, "Interval between full periodic resyncs")
-	fs.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election")
-	fs.BoolVar(&fakeCompute, "fake-compute", false, "Use in-memory fake Compute client for testing/offline mode")
-	fs.BoolVar(&debugErrorResponses, "debug-error-responses", false, "Include detailed error messages in unmatched responses")
-	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
-	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
-	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
-	fs.StringVar(&certserverCfg.ServerAddress, "certserver-address", certserverCfg.ServerAddress, "Address of the certserver gRPC service")
-	fs.StringVar(&certserverCfg.CABundlePath, "certserver-ca-bundle-path", certserverCfg.CABundlePath, "Path to the CA bundle PEM file to verify certserver TLS")
-	fs.StringVar(&certserverCfg.TokenPath, "certserver-token-path", certserverCfg.TokenPath, "Path to the projected service-account token file for controller identity")
+	BindControllerFlags(fs, &opts, &cfg)
 
 	if err := fs.Parse(args); err != nil {
 		return gari.Options{}, err
 	}
 
 	var certCli *client.Client
-	if certserverCfg.ServerAddress != "" || certserverCfg.TokenPath != "" || certserverCfg.CABundlePath != "" {
-		if certserverCfg.ServerAddress == "" {
+	if cfg.Certserver.ServerAddress != "" || cfg.Certserver.TokenPath != "" || cfg.Certserver.CABundlePath != "" {
+		if cfg.Certserver.ServerAddress == "" {
 			return gari.Options{}, fmt.Errorf("--certserver-address is required when certserver flags are set")
 		}
-		if certserverCfg.TokenPath == "" {
+		if cfg.Certserver.TokenPath == "" {
 			return gari.Options{}, fmt.Errorf("--certserver-token-path is required when certserver flags are set")
 		}
 		var err error
-		certCli, err = client.New(certserverCfg)
+		certCli, err = client.New(cfg.Certserver)
 		if err != nil {
 			return gari.Options{}, fmt.Errorf("initializing certserver client: %w", err)
 		}
@@ -270,7 +274,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 
 	gcpClient := computeClient
 	if gcpClient == nil {
-		if fakeCompute {
+		if cfg.FakeCompute {
 			gcpClient = gcp.NewFakeComputeClient()
 		} else {
 			computeSvc, err := compute.NewService(ctx)
@@ -280,10 +284,6 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 			gcpClient = gcp.NewGCEComputeClient(computeSvc)
 		}
 	}
-
-	opts.ControllerName = reconcilerCfg.ControllerName
-	opts.LeaderElection = leaderElect
-	opts.DebugErrorResponses = debugErrorResponses
 
 	drainVol := corev1ac.Volume().
 		WithName("drain-volume").
@@ -296,33 +296,35 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		"/gcpgateway",
 		"hook",
 		"pre-stop",
-		fmt.Sprintf("--drain-seconds=%d", drainSeconds),
+		fmt.Sprintf("--drain-seconds=%d", cfg.DrainSeconds),
 	}
 
-	gracePeriodSeconds := int64(drainSeconds + 25)
+	gracePeriodSeconds := int64(cfg.DrainSeconds + 25)
 	if gracePeriodSeconds < 60 {
 		gracePeriodSeconds = 60
 	}
 
 	opts.AddressProvider = singlepod.NewAddressProvider(
 		nil,
-		singlepod.WithDataplaneImage(dataplaneImg),
+		singlepod.WithDataplaneImage(cfg.DataplaneImage),
 		singlepod.WithExtraReadinessGates(LoadBalancerReadyGate),
 		singlepod.WithPreStopCommand(preStopCmd...),
 		singlepod.WithExtraVolumes([]*corev1ac.VolumeApplyConfiguration{drainVol}, []*corev1ac.VolumeMountApplyConfiguration{drainMount}),
 		singlepod.WithTerminationGracePeriodSeconds(gracePeriodSeconds),
-		singlepod.WithDebugErrorResponses(debugErrorResponses),
+		singlepod.WithDebugErrorResponses(opts.DebugErrorResponses),
 		singlepod.WithACMEChallengeUpstreamURL(opts.ACMEChallengeUpstreamURL),
 		singlepod.WithACMEChallengeCABundlePath(opts.ACMEChallengeCABundlePath),
 		singlepod.WithACMEChallengeTokenPath(opts.ACMEChallengeTokenPath),
 	)
 
-	if zonesStr != "" {
-		for _, z := range strings.Split(zonesStr, ",") {
-			if trimmed := strings.TrimSpace(z); trimmed != "" {
-				reconcilerCfg.Zones = append(reconcilerCfg.Zones, trimmed)
-			}
-		}
+	reconcilerCfg := controller.GatewayReconcilerConfig{
+		ClusterID:          cfg.ClusterID,
+		NegPrefix:          cfg.NegPrefix,
+		Project:            cfg.Project,
+		Zones:              cfg.Zones,
+		ControllerName:     opts.ControllerName,
+		HealthPollInterval: cfg.HealthPollInterval,
+		ResyncInterval:     cfg.ResyncInterval,
 	}
 
 	var rec *controller.GatewayReconciler
@@ -343,9 +345,9 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 			Recorder:  recorder,
 		})
 
-		cfg := reconcilerCfg
+		rCfg := reconcilerCfg
 		if s != nil {
-			cfg.EnqueueGateway = s.EnqueueGateway
+			rCfg.EnqueueGateway = s.EnqueueGateway
 		}
 
 		rec = controller.NewGatewayReconciler(
@@ -353,7 +355,7 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 			mgr.GetScheme(),
 			gcpClient,
 			reg,
-			cfg,
+			rCfg,
 		)
 
 		if src, ok := opts.CertificateSources["certserver"]; ok && src != nil {
