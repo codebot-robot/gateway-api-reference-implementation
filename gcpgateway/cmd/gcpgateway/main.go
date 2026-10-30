@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/client"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/controller"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/gcp"
 	"github.com/gke-labs/gateway-api-reference-implementation/gcpgateway/pkg/registrar"
@@ -33,6 +34,7 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -187,6 +189,11 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 		debugErrorResponses bool
 	)
 
+	var certserverCfg client.Config
+	certserverCfg.ServerAddress = os.Getenv("CERTSERVER_ADDRESS")
+	certserverCfg.CABundlePath = os.Getenv("CERTSERVER_CA_BUNDLE_PATH")
+	certserverCfg.TokenPath = os.Getenv("CERTSERVER_TOKEN_PATH")
+
 	defaultClusterID := os.Getenv("CLUSTER_ID")
 	if defaultClusterID == "" {
 		defaultClusterID = "cluster-1"
@@ -234,9 +241,31 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 	fs.StringVar(&opts.ACMEChallengeUpstreamURL, "acme-challenge-upstream-url", opts.ACMEChallengeUpstreamURL, "URL of the upstream certificate server to forward ACME HTTP-01 challenge requests to")
 	fs.StringVar(&opts.ACMEChallengeCABundlePath, "acme-challenge-ca-bundle-path", opts.ACMEChallengeCABundlePath, "Path to the CA bundle PEM file to verify the upstream certificate server")
 	fs.StringVar(&opts.ACMEChallengeTokenPath, "acme-challenge-token-path", opts.ACMEChallengeTokenPath, "Path to the projected service-account token file for data-plane identity")
+	fs.StringVar(&certserverCfg.ServerAddress, "certserver-address", certserverCfg.ServerAddress, "Address of the certserver gRPC service")
+	fs.StringVar(&certserverCfg.CABundlePath, "certserver-ca-bundle-path", certserverCfg.CABundlePath, "Path to the CA bundle PEM file to verify certserver TLS")
+	fs.StringVar(&certserverCfg.TokenPath, "certserver-token-path", certserverCfg.TokenPath, "Path to the projected service-account token file for controller identity")
 
 	if err := fs.Parse(args); err != nil {
 		return gari.Options{}, err
+	}
+
+	var certCli *client.Client
+	if certserverCfg.ServerAddress != "" || certserverCfg.TokenPath != "" || certserverCfg.CABundlePath != "" {
+		if certserverCfg.ServerAddress == "" {
+			return gari.Options{}, fmt.Errorf("--certserver-address is required when certserver flags are set")
+		}
+		if certserverCfg.TokenPath == "" {
+			return gari.Options{}, fmt.Errorf("--certserver-token-path is required when certserver flags are set")
+		}
+		var err error
+		certCli, err = client.New(certserverCfg)
+		if err != nil {
+			return gari.Options{}, fmt.Errorf("initializing certserver client: %w", err)
+		}
+		if opts.CertificateSources == nil {
+			opts.CertificateSources = make(map[string]gari.CertificateSource)
+		}
+		opts.CertificateSources["certserver"] = certCli
 	}
 
 	gcpClient := computeClient
@@ -326,6 +355,14 @@ func SetupController(ctx context.Context, args []string, computeClient gcp.Compu
 			reg,
 			cfg,
 		)
+
+		if src, ok := opts.CertificateSources["certserver"]; ok && src != nil {
+			if r, ok := src.(manager.Runnable); ok {
+				if err := mgr.Add(r); err != nil {
+					return fmt.Errorf("registering certserver client with manager: %w", err)
+				}
+			}
+		}
 
 		return rec.SetupWithManager(mgr)
 	}

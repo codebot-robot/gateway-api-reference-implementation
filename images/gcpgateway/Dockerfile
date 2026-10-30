@@ -22,6 +22,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 COPY snigateway/go.mod snigateway/go.sum ./snigateway/
 COPY gcpgateway/go.mod gcpgateway/go.sum ./gcpgateway/
+COPY certserver/go.mod certserver/go.sum ./certserver/
 
 RUN go mod download
 RUN cd snigateway && go mod download

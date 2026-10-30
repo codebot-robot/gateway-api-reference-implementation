@@ -100,12 +100,28 @@ spec:
         args:
         - --controller-name=gke-labs.io/gcpgateway
         - --dataplane-image=$(DATAPLANE_IMAGE)
+        - --certserver-address=certserver.gateway-system.svc:8443
+        - --certserver-ca-bundle-path=/etc/ssl/certs/certserver-ca.crt
+        - --certserver-token-path=/var/run/secrets/tokens/certserver/token
         ports:
         - name: metrics
           containerPort: 8999
+        volumeMounts:
+        - name: certserver-token
+          mountPath: /var/run/secrets/tokens/certserver
+          readOnly: true
         readinessProbe:
           httpGet:
             path: /readyz
             port: 8999
           initialDelaySeconds: 1
           periodSeconds: 2
+      volumes:
+      - name: certserver-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: certserver
+              expirationSeconds: 600
+              path: token
+
