@@ -61,6 +61,7 @@ type ReconcilerOptions struct {
 	DisableStatusUpdates bool
 	CRDView              *CRDView
 	GatewayStatusHook    GatewayStatusHook
+	ListenerValidator    state.ListenerValidator
 
 	CertificateSources map[string]CertificateSource
 }
@@ -135,6 +136,9 @@ func RegisterReconcilers(mgr ctrl.Manager, st *state.State, p *proxy.Proxy, opts
 		})
 		st.SetOnGatewaysUpdate(opts.OnGatewaysUpdate)
 		st.SetGatewayFilter(opts.GatewayFilter)
+		if opts.ListenerValidator != nil {
+			st.SetListenerValidator(opts.ListenerValidator)
+		}
 		st.SetSynced(false)
 
 		if atp, ok := opts.AddressProvider.(AddressTypeProvider); ok {
