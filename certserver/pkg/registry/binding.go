@@ -29,29 +29,48 @@ type Binding struct {
 	RecordedAt              time.Time `json:"recorded_at"`
 }
 
-// BindingStore manages active Gateway bindings.
+// ValidatedBinding records that a Gateway has proven domain control for a hostname set.
+type ValidatedBinding struct {
+	ClusterID    string    `json:"cluster_id"`
+	Gateway      string    `json:"gateway"`
+	HostnamesKey string    `json:"hostnames_key"`
+	ValidatedAt  time.Time `json:"validated_at"`
+	ExpiresAt    time.Time `json:"expires_at"`
+}
+
+// BindingStore manages active Gateway bindings and successful binding validations.
 type BindingStore interface {
 	RecordBinding(b Binding)
 	GetBinding(clusterID, gateway string) (Binding, bool)
 	ListBindings() []Binding
+	RecordValidatedBinding(vb ValidatedBinding)
+	HasValidatedBinding(clusterID, gateway, hostnamesKey string, now time.Time) bool
+	GetValidatedBinding(clusterID, gateway, hostnamesKey string) (ValidatedBinding, bool)
+	Prune(now time.Time, maxAge time.Duration)
 }
 
 // MemoryBindingStore is a thread-safe in-memory implementation of BindingStore.
 type MemoryBindingStore struct {
-	// mu guards access to bindings.
-	mu       sync.RWMutex
-	bindings map[string]Binding // key: clusterID + "/" + gateway
+	// mu guards access to bindings and validatedBindings.
+	mu                sync.RWMutex
+	bindings          map[string]Binding          // key: clusterID + "/" + gateway
+	validatedBindings map[string]ValidatedBinding // key: clusterID + "/" + gateway + "/" + hostnamesKey
 }
 
 // NewMemoryBindingStore creates an empty in-memory binding store.
 func NewMemoryBindingStore() *MemoryBindingStore {
 	return &MemoryBindingStore{
-		bindings: make(map[string]Binding),
+		bindings:          make(map[string]Binding),
+		validatedBindings: make(map[string]ValidatedBinding),
 	}
 }
 
 func bindingKey(clusterID, gateway string) string {
 	return clusterID + "/" + gateway
+}
+
+func validatedBindingKey(clusterID, gateway, hostnamesKey string) string {
+	return clusterID + "/" + gateway + "/" + hostnamesKey
 }
 
 // RecordBinding saves or updates a Gateway binding mapping.
@@ -81,4 +100,56 @@ func (s *MemoryBindingStore) ListBindings() []Binding {
 		res = append(res, b)
 	}
 	return res
+}
+
+// RecordValidatedBinding saves a successful Gateway binding validation.
+func (s *MemoryBindingStore) RecordValidatedBinding(vb ValidatedBinding) {
+	if vb.ValidatedAt.IsZero() {
+		vb.ValidatedAt = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.validatedBindings[validatedBindingKey(vb.ClusterID, vb.Gateway, vb.HostnamesKey)] = vb
+}
+
+// HasValidatedBinding reports whether the Gateway has a valid (unexpired) binding validation for hostnamesKey.
+func (s *MemoryBindingStore) HasValidatedBinding(clusterID, gateway, hostnamesKey string, now time.Time) bool {
+	s.mu.RLock()
+	vb, ok := s.validatedBindings[validatedBindingKey(clusterID, gateway, hostnamesKey)]
+	s.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if !vb.ExpiresAt.IsZero() && now.After(vb.ExpiresAt) {
+		return false
+	}
+	return true
+}
+
+// GetValidatedBinding retrieves the validated binding record.
+func (s *MemoryBindingStore) GetValidatedBinding(clusterID, gateway, hostnamesKey string) (ValidatedBinding, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	vb, ok := s.validatedBindings[validatedBindingKey(clusterID, gateway, hostnamesKey)]
+	return vb, ok
+}
+
+// Prune removes expired validated bindings and recorded bindings older than maxAge.
+// If maxAge <= 0, a default of 30 days is applied.
+func (s *MemoryBindingStore) Prune(now time.Time, maxAge time.Duration) {
+	if maxAge <= 0 {
+		maxAge = 30 * 24 * time.Hour
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, b := range s.bindings {
+		if !b.RecordedAt.IsZero() && now.Sub(b.RecordedAt) > maxAge {
+			delete(s.bindings, k)
+		}
+	}
+	for k, vb := range s.validatedBindings {
+		if !vb.ExpiresAt.IsZero() && now.After(vb.ExpiresAt) {
+			delete(s.validatedBindings, k)
+		}
+	}
 }

@@ -32,8 +32,6 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
-
-	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
 )
 
 // Helper: base64 URL encoder without padding
@@ -479,34 +477,22 @@ func TestAuthorization(t *testing.T) {
 		}
 	})
 
-	// 3. Hostname normalization works (case, trailing dot, duplicates)
-	t.Run("hostname normalization (case, trailing dot, duplicates)", func(t *testing.T) {
-		raw := []string{
-			"EXAMPLE.COM.",
-			"example.com",
-			"Example.Com.",
-			"app.example.org.",
-			"APP.EXAMPLE.ORG",
+	// 3. Multiple hostnames policy check
+	t.Run("multiple hostnames policy check", func(t *testing.T) {
+		hostnames := []string{"app.example.org", "example.com"}
+		cluster := &ClusterConfig{
+			AllowedHostnames: []string{"example.com", "*.example.org"},
+		}
+		if err := CheckHostnamesPolicy(cluster, hostnames); err != nil {
+			t.Errorf("expected hostnames to be allowed: %v", err)
 		}
 
-		normalized, key, err := manager.NormalizeHostnames(raw, 10, 253)
-		if err != nil {
-			t.Fatalf("NormalizeHostnames failed: %v", err)
+		clusterDenied := &ClusterConfig{
+			AllowedHostnames: []string{"example.com", "*.example.org"},
+			DeniedHostnames:  []string{"app.example.org"},
 		}
-
-		expectedSlice := []string{"app.example.org", "example.com"}
-		if len(normalized) != len(expectedSlice) {
-			t.Fatalf("expected 2 normalized hostnames, got %v", normalized)
-		}
-		for i, v := range expectedSlice {
-			if normalized[i] != v {
-				t.Errorf("index %d: expected %q, got %q", i, v, normalized[i])
-			}
-		}
-
-		expectedKey := "app.example.org,example.com"
-		if key != expectedKey {
-			t.Errorf("expected key %q, got %q", expectedKey, key)
+		if err := CheckHostnamesPolicy(clusterDenied, hostnames); err == nil {
+			t.Errorf("expected denied hostname to be rejected")
 		}
 	})
 
@@ -635,5 +621,161 @@ func TestBindingStore(t *testing.T) {
 	}
 	if len(store.ListBindings()) != 1 {
 		t.Errorf("expected 1 binding in store, got %d", len(store.ListBindings()))
+	}
+
+	// Test ValidatedBinding
+	now := time.Now()
+	if store.HasValidatedBinding("cluster-1", "default/gateway-1", "foo.com,bar.com", now) {
+		t.Errorf("expected no validated binding yet")
+	}
+
+	vb := ValidatedBinding{
+		ClusterID:    "cluster-1",
+		Gateway:      "default/gateway-1",
+		HostnamesKey: "foo.com,bar.com",
+		ValidatedAt:  now,
+		ExpiresAt:    now.Add(1 * time.Hour),
+	}
+	store.RecordValidatedBinding(vb)
+
+	if !store.HasValidatedBinding("cluster-1", "default/gateway-1", "foo.com,bar.com", now) {
+		t.Errorf("expected validated binding to be active")
+	}
+
+	// Check expired binding
+	if store.HasValidatedBinding("cluster-1", "default/gateway-1", "foo.com,bar.com", now.Add(2*time.Hour)) {
+		t.Errorf("expected binding to be expired")
+	}
+}
+
+func TestMatchesDataPlaneServiceAccount(t *testing.T) {
+	tests := []struct {
+		name         string
+		configuredSA string
+		caller       CallerIdentity
+		wantMatch    bool
+	}{
+		{
+			name:         "exact full subject match",
+			configuredSA: "system:serviceaccount:ns1:sa1",
+			caller:       CallerIdentity{ClusterID: "c1", Namespace: "ns1", ServiceAccount: "sa1"},
+			wantMatch:    true,
+		},
+		{
+			name:         "slash format match",
+			configuredSA: "ns1/sa1",
+			caller:       CallerIdentity{ClusterID: "c1", Namespace: "ns1", ServiceAccount: "sa1"},
+			wantMatch:    true,
+		},
+		{
+			name:         "colon format match",
+			configuredSA: "ns1:sa1",
+			caller:       CallerIdentity{ClusterID: "c1", Namespace: "ns1", ServiceAccount: "sa1"},
+			wantMatch:    true,
+		},
+		{
+			name:         "unqualified SA is rejected",
+			configuredSA: "sa1",
+			caller:       CallerIdentity{ClusterID: "c1", Namespace: "ns1", ServiceAccount: "sa1"},
+			wantMatch:    false,
+		},
+		{
+			name:         "different SA name",
+			configuredSA: "ns1/sa1",
+			caller:       CallerIdentity{ClusterID: "c1", Namespace: "ns1", ServiceAccount: "sa2"},
+			wantMatch:    false,
+		},
+		{
+			name:         "empty configured SA",
+			configuredSA: "",
+			caller:       CallerIdentity{ClusterID: "c1", Namespace: "ns1", ServiceAccount: "sa1"},
+			wantMatch:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MatchesDataPlaneServiceAccount(tc.configuredSA, tc.caller)
+			if got != tc.wantMatch {
+				t.Errorf("MatchesDataPlaneServiceAccount() = %v, want %v", got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+func TestIsAuthorizedForwarder(t *testing.T) {
+	clusters := []ClusterConfig{
+		{
+			ClusterID:           "cluster-a",
+			IssuerURL:           "https://issuer-a.example.com",
+			SharedFrontEndGroup: "group-1",
+		},
+		{
+			ClusterID:           "cluster-b",
+			IssuerURL:           "https://issuer-b.example.com",
+			SharedFrontEndGroup: "group-1",
+		},
+		{
+			ClusterID: "cluster-c",
+			IssuerURL: "https://issuer-c.example.com",
+			// No shared-front-end group
+		},
+		{
+			ClusterID: "cluster-d",
+			IssuerURL: "https://issuer-d.example.com",
+			GatewaySharedFrontEndGroups: map[string]string{
+				"default/gw-special": "group-special",
+			},
+		},
+	}
+
+	reg, err := NewRegistry(clusters)
+	if err != nil {
+		t.Fatalf("failed to create registry: %v", err)
+	}
+	defer reg.Close()
+
+	bindingStore := NewMemoryBindingStore()
+	bindingStore.RecordBinding(Binding{
+		ClusterID:               "cluster-b",
+		Gateway:                 "default/gw-b",
+		DataPlaneServiceAccount: "default/dp-b",
+		Hostnames:               []string{"shared.example.com"},
+	})
+
+	// 1. Same cluster, matching SA -> authorized
+	if !IsAuthorizedForwarder(reg, bindingStore, "cluster-a", "default/gw-a", "default/dp-a",
+		CallerIdentity{ClusterID: "cluster-a", Namespace: "default", ServiceAccount: "dp-a"}) {
+		t.Errorf("expected authorized for same cluster matching SA")
+	}
+
+	// 2. Same cluster, different SA -> refused
+	if IsAuthorizedForwarder(reg, bindingStore, "cluster-a", "default/gw-a", "default/dp-a",
+		CallerIdentity{ClusterID: "cluster-a", Namespace: "default", ServiceAccount: "dp-other"}) {
+		t.Errorf("expected refused for same cluster different SA")
+	}
+
+	// 3. Different cluster in same shared-front-end group with recorded binding -> authorized
+	if !IsAuthorizedForwarder(reg, bindingStore, "cluster-a", "default/gw-a", "default/dp-a",
+		CallerIdentity{ClusterID: "cluster-b", Namespace: "default", ServiceAccount: "dp-b"}) {
+		t.Errorf("expected authorized for different cluster in same shared front end group")
+	}
+
+	// 4. Different cluster not in shared group -> refused
+	if IsAuthorizedForwarder(reg, bindingStore, "cluster-a", "default/gw-a", "default/dp-a",
+		CallerIdentity{ClusterID: "cluster-c", Namespace: "default", ServiceAccount: "dp-c"}) {
+		t.Errorf("expected refused for cluster not in shared front end group")
+	}
+
+	// 5. Cluster without shared group asking, forwarder from another cluster -> refused
+	if IsAuthorizedForwarder(reg, bindingStore, "cluster-c", "default/gw-c", "default/dp-c",
+		CallerIdentity{ClusterID: "cluster-a", Namespace: "default", ServiceAccount: "dp-a"}) {
+		t.Errorf("expected refused when requester has no shared group")
+	}
+
+	// 6. Per-gateway shared group override
+	if !IsAuthorizedForwarder(reg, bindingStore, "cluster-d", "default/gw-special", "default/dp-d",
+		CallerIdentity{ClusterID: "cluster-d", Namespace: "default", ServiceAccount: "dp-d"}) {
+		t.Errorf("expected authorized for same gateway")
 	}
 }

@@ -36,10 +36,11 @@ import (
 
 // ServerConfig configures the in-process Pebble test server.
 type ServerConfig struct {
-	EABKeyID       string
-	EABMACKey      string
-	ValidityPeriod uint64
-	ChallengeStore challenge.Store
+	EABKeyID         string
+	EABMACKey        string
+	ValidityPeriod   uint64
+	ChallengeStore   challenge.Store
+	ChallengeHandler http.Handler
 }
 
 // Server encapsulates an in-process Pebble ACME test environment.
@@ -69,7 +70,10 @@ func StartPebble(t *testing.T, cfg ServerConfig) *Server {
 	if challengeStore == nil {
 		challengeStore = challenge.NewMemoryStore()
 	}
-	challengeHandler := challenge.NewHandler(challengeStore)
+	challengeHandler := cfg.ChallengeHandler
+	if challengeHandler == nil {
+		challengeHandler = challenge.NewHandler(challengeStore)
+	}
 	challengeSrv := httptest.NewServer(challengeHandler)
 
 	_, chalPortStr, err := net.SplitHostPort(challengeSrv.Listener.Addr().String())

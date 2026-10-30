@@ -34,6 +34,7 @@ import (
 
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
@@ -358,6 +359,13 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 	}
 
 	// 9. Record Gateway binding mapping
+	requester := challenge.Requester{
+		ClusterID:               cluster.ClusterID,
+		Gateway:                 gateway,
+		DataPlaneServiceAccount: dataPlaneSA,
+		HostnamesKey:            hostnamesKey,
+	}
+
 	s.bindingStore.RecordBinding(registry.Binding{
 		ClusterID:               cluster.ClusterID,
 		Gateway:                 gateway,
@@ -367,21 +375,40 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 	})
 
 	// 10. Check certificate cache via manager interface
+	now := time.Now()
 	certData, err := s.mgr.GetCertificate(hostnamesKey, s.opts.ReleaseMode)
 	if err == nil && certData != nil {
-		// Cache hit! Return certificate and private key (in release mode)
+		// Cache hit! Check if this Gateway has passed its own binding check for these hostnames
+		if s.bindingStore.HasValidatedBinding(cluster.ClusterID, gateway, hostnamesKey, now) {
+			s.logAudit(registry.AuditEntry{
+				Identity:  identity,
+				Gateway:   gateway,
+				Hostnames: normalized,
+				Decision:  registry.DecisionAllowed,
+				Reason:    "certificate returned from cache",
+			})
+
+			return &certserverv1.GetCertificateResponse{
+				CertificateChain: certData.CertificateChain,
+				PrivateKey:       certData.PrivateKey,
+			}, nil
+		}
+
+		// Second requester / unvalidated gateway attempting to access cached certificate
 		s.logAudit(registry.AuditEntry{
 			Identity:  identity,
 			Gateway:   gateway,
 			Hostnames: normalized,
-			Decision:  registry.DecisionAllowed,
-			Reason:    "certificate returned from cache",
+			Decision:  registry.DecisionRefused,
+			Reason:    "cached certificate requires binding validation for this gateway",
 		})
 
-		return &certserverv1.GetCertificateResponse{
-			CertificateChain: certData.CertificateChain,
-			PrivateKey:       certData.PrivateKey,
-		}, nil
+		// Trigger revalidation for this requester to validate its domain control
+		if _, revalErr := s.mgr.EnsureRevalidation(ctx, normalized, requester); revalErr != nil {
+			log.Printf("certserver: failed to initiate revalidation for %s: %v", hostnamesKey, revalErr)
+		}
+
+		return nil, status.Errorf(codes.Unavailable, "binding verification in progress for %s; retry later", hostnamesKey)
 	}
 
 	if !errors.Is(err, cache.ErrNotFound) {
@@ -396,8 +423,8 @@ func (s *Server) GetCertificate(ctx context.Context, req *certserverv1.GetCertif
 		return nil, status.Errorf(codes.Internal, "internal error retrieving certificate")
 	}
 
-	// 11. Cache miss: start issuance only if none in flight, and return retryable status
-	if _, err := s.mgr.EnsureIssuance(ctx, normalized); err != nil {
+	// 11. Cache miss: start issuance only if none in flight, passing requester binding info
+	if _, err := s.mgr.EnsureIssuance(ctx, normalized, requester); err != nil {
 		log.Printf("certserver: failed to initiate issuance for %s: %v", hostnamesKey, err)
 	}
 

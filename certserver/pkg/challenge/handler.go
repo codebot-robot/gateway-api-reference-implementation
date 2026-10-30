@@ -15,8 +15,15 @@
 package challenge
 
 import (
+	"errors"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
 
 const (
@@ -25,6 +32,9 @@ const (
 
 	// maxTokenLength bounds the maximum length accepted for ACME challenge tokens.
 	maxTokenLength = 128
+
+	// DefaultValidatedBindingTTL is the default validity duration for recorded Gateway bindings.
+	DefaultValidatedBindingTTL = 24 * time.Hour
 )
 
 // isValidToken reports whether token is non-empty, within length bounds, and composed
@@ -52,21 +62,96 @@ func WithCallerFunc(fn func(*http.Request) string) HandlerOption {
 	}
 }
 
+// WithRegistry sets the cluster registry for token verification and policy enforcement.
+func WithRegistry(reg *registry.Registry) HandlerOption {
+	return func(h *Handler) {
+		h.registry = reg
+	}
+}
+
+// WithBindingStore sets the binding store for Gateway binding lookups and validations.
+func WithBindingStore(bs registry.BindingStore) HandlerOption {
+	return func(h *Handler) {
+		h.bindingStore = bs
+	}
+}
+
+// WithAuditLogger sets the structured audit logger.
+func WithAuditLogger(al *registry.AuditLogger) HandlerOption {
+	return func(h *Handler) {
+		h.auditLogger = al
+	}
+}
+
+// WithMetrics sets the Prometheus metrics collector.
+func WithMetrics(m *metrics.Metrics) HandlerOption {
+	return func(h *Handler) {
+		h.metrics = m
+	}
+}
+
+// WithTimeNow overrides time.Now for deterministic testing.
+func WithTimeNow(fn func() time.Time) HandlerOption {
+	return func(h *Handler) {
+		h.timeNow = fn
+	}
+}
+
+// WithValidatedBindingTTL configures the validity duration for recorded Gateway binding validations.
+func WithValidatedBindingTTL(ttl time.Duration) HandlerOption {
+	return func(h *Handler) {
+		h.validatedBindingTTL = ttl
+	}
+}
+
 // Handler implements http.Handler to serve HTTP-01 ACME challenge validations.
 type Handler struct {
-	resolver   ChallengeResolver
-	callerFunc func(*http.Request) string
+	resolver            ChallengeResolver
+	store               Store
+	registry            *registry.Registry
+	bindingStore        registry.BindingStore
+	auditLogger         *registry.AuditLogger
+	metrics             *metrics.Metrics
+	callerFunc          func(*http.Request) string
+	timeNow             func() time.Time
+	validatedBindingTTL time.Duration
 }
 
 // NewHandler creates a new ACME HTTP-01 challenge handler using the provided resolver.
 func NewHandler(resolver ChallengeResolver, opts ...HandlerOption) *Handler {
 	h := &Handler{
-		resolver: resolver,
+		resolver:            resolver,
+		timeNow:             time.Now,
+		validatedBindingTTL: DefaultValidatedBindingTTL,
+	}
+	if s, ok := resolver.(Store); ok {
+		h.store = s
 	}
 	for _, opt := range opts {
 		opt(h)
 	}
 	return h
+}
+
+func (h *Handler) now() time.Time {
+	if h.timeNow != nil {
+		return h.timeNow()
+	}
+	return time.Now()
+}
+
+func (h *Handler) logAudit(entry registry.AuditEntry) {
+	if h.auditLogger != nil {
+		if err := h.auditLogger.Log(entry); err != nil {
+			log.Printf("certserver: failed to write audit log entry: %v", err)
+		}
+	}
+}
+
+func (h *Handler) recordMetric(status string) {
+	if h.metrics != nil {
+		h.metrics.RecordChallengeRequest(status)
+	}
 }
 
 // ServeHTTP handles requests for /.well-known/acme-challenge/<token>.
@@ -87,6 +172,157 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	normHost := NormalizeHost(r.Host)
+
+	// If registry is configured, enforce data-plane service-account token verification and challenge binding.
+	if h.registry != nil {
+		authHeader := r.Header.Get("Authorization")
+		var bearerToken string
+		const prefix = "bearer "
+		if strings.HasPrefix(strings.ToLower(authHeader), prefix) {
+			bearerToken = strings.TrimSpace(authHeader[len(prefix):])
+		}
+
+		if bearerToken == "" {
+			h.logAudit(registry.AuditEntry{
+				Hostnames: []string{normHost},
+				Decision:  registry.DecisionRefused,
+				Reason:    "missing authorization token",
+			})
+			h.recordMetric("unauthenticated")
+			http.NotFound(w, r)
+			return
+		}
+
+		identity, _, err := h.registry.VerifyToken(r.Context(), bearerToken, "")
+		if err != nil {
+			h.logAudit(registry.AuditEntry{
+				Identity:  identity,
+				Hostnames: []string{normHost},
+				Decision:  registry.DecisionRefused,
+				Reason:    fmt.Sprintf("token verification failed: %v", err),
+			})
+			h.recordMetric("unauthenticated")
+			http.NotFound(w, r)
+			return
+		}
+
+		if h.store == nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		item, err := h.store.Get(r.Context(), token)
+		if err != nil {
+			h.logAudit(registry.AuditEntry{
+				Identity:  identity,
+				Hostnames: []string{normHost},
+				Decision:  registry.DecisionRefused,
+				Reason:    "challenge token not found",
+			})
+			h.recordMetric("not_found")
+			http.NotFound(w, r)
+			return
+		}
+
+		// 1. Host match
+		if normHost != item.Identifier {
+			h.logAudit(registry.AuditEntry{
+				Identity:  identity,
+				Gateway:   item.Requester.Gateway,
+				Hostnames: []string{normHost},
+				Decision:  registry.DecisionRefused,
+				Reason:    "request host does not match challenge identifier",
+			})
+			h.recordMetric("host_mismatch")
+			http.NotFound(w, r)
+			return
+		}
+
+		// 2. Expiry check
+		now := h.now()
+		if !item.ExpiresAt.IsZero() && now.After(item.ExpiresAt) {
+			if rmErr := h.store.Remove(r.Context(), token); rmErr != nil && !errors.Is(rmErr, ErrNotFound) {
+				log.Printf("certserver: failed to remove expired challenge %s: %v", token, rmErr)
+			}
+			h.logAudit(registry.AuditEntry{
+				Identity:  identity,
+				Gateway:   item.Requester.Gateway,
+				Hostnames: []string{normHost},
+				Decision:  registry.DecisionRefused,
+				Reason:    "challenge authorization expired",
+			})
+			h.recordMetric("expired")
+			http.NotFound(w, r)
+			return
+		}
+
+		// 3. Challenge binding check against primary requester or candidate requesters
+		authorized := registry.IsAuthorizedForwarder(h.registry, h.bindingStore, item.Requester.ClusterID, item.Requester.Gateway, item.Requester.DataPlaneServiceAccount, identity)
+		matchedReq := item.Requester
+		if !authorized && len(item.CandidateRequesters) > 0 {
+			for _, cand := range item.CandidateRequesters {
+				if registry.IsAuthorizedForwarder(h.registry, h.bindingStore, cand.ClusterID, cand.Gateway, cand.DataPlaneServiceAccount, identity) {
+					authorized = true
+					matchedReq = cand
+					break
+				}
+			}
+		}
+
+		if !authorized {
+			h.logAudit(registry.AuditEntry{
+				Identity:  identity,
+				Gateway:   item.Requester.Gateway,
+				Hostnames: []string{normHost},
+				Decision:  registry.DecisionRefused,
+				Reason:    fmt.Sprintf("forwarding identity %s is not authorized for requesting gateway %s in cluster %s", identity, item.Requester.Gateway, item.Requester.ClusterID),
+			})
+			h.recordMetric("binding_refused")
+			http.NotFound(w, r)
+			return
+		}
+
+		// Challenge binding passed! Record answering identity and validated binding.
+		if recErr := h.store.RecordAnswer(r.Context(), token, identity); recErr != nil {
+			log.Printf("certserver: failed to record answering identity for challenge %s: %v", token, recErr)
+		}
+
+		if h.bindingStore != nil && matchedReq.ClusterID != "" {
+			hostnamesKey := matchedReq.HostnamesKey
+			if hostnamesKey == "" {
+				hostnamesKey = item.Identifier
+			}
+			h.bindingStore.RecordValidatedBinding(registry.ValidatedBinding{
+				ClusterID:    matchedReq.ClusterID,
+				Gateway:      matchedReq.Gateway,
+				HostnamesKey: hostnamesKey,
+				ValidatedAt:  now,
+				ExpiresAt:    now.Add(h.validatedBindingTTL),
+			})
+		}
+
+		h.logAudit(registry.AuditEntry{
+			Identity:  identity,
+			Gateway:   matchedReq.Gateway,
+			Hostnames: []string{normHost},
+			Decision:  registry.DecisionAllowed,
+			Reason:    "challenge validation succeeded",
+		})
+		h.recordMetric("success")
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			if _, writeErr := w.Write([]byte(item.KeyAuth)); writeErr != nil {
+				log.Printf("certserver: failed to write challenge response: %v", writeErr)
+				return
+			}
+		}
+		return
+	}
+
+	// Fallback path when no registry is configured (e.g. unauthenticated unit tests)
 	caller := ""
 	if h.callerFunc != nil {
 		caller = h.callerFunc(r)
@@ -94,7 +330,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	keyAuth, err := h.resolver.ResolveChallenge(r.Context(), caller, r.Host, token)
 	if err != nil {
-		// Return 404 for unknown, expired, or wrong Host.
 		http.NotFound(w, r)
 		return
 	}
@@ -102,7 +337,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
-		if _, err := w.Write([]byte(keyAuth)); err != nil {
+		if _, writeErr := w.Write([]byte(keyAuth)); writeErr != nil {
+			log.Printf("certserver: failed to write challenge response: %v", writeErr)
 			return
 		}
 	}

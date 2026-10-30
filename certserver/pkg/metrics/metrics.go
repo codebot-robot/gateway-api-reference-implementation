@@ -32,11 +32,12 @@ const (
 
 // Metrics holds the Prometheus metric collectors for certserver.
 type Metrics struct {
-	CertificatesByState  *prometheus.GaugeVec
-	TimeToExpiry         *prometheus.GaugeVec
-	IssuanceTotal        *prometheus.CounterVec
-	RenewalTotal         *prometheus.CounterVec
-	registeredCollectors []prometheus.Collector
+	CertificatesByState    *prometheus.GaugeVec
+	TimeToExpiry           *prometheus.GaugeVec
+	IssuanceTotal          *prometheus.CounterVec
+	RenewalTotal           *prometheus.CounterVec
+	ChallengeRequestsTotal *prometheus.CounterVec
+	registeredCollectors   []prometheus.Collector
 }
 
 // New creates and registers certserver metrics with the provided registerer.
@@ -79,6 +80,14 @@ func New(reg prometheus.Registerer) *Metrics {
 			},
 			[]string{"status"},
 		),
+		ChallengeRequestsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: "certserver",
+				Name:      "challenge_requests_total",
+				Help:      "Total number of ACME HTTP-01 challenge verification requests by status (success, unauthenticated, refused, not_found, host_mismatch, expired).",
+			},
+			[]string{"status"},
+		),
 	}
 
 	m.CertificatesByState.WithLabelValues(string(StateValid)).Set(0)
@@ -90,6 +99,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.TimeToExpiry,
 		m.IssuanceTotal,
 		m.RenewalTotal,
+		m.ChallengeRequestsTotal,
 	}
 	for _, c := range collectors {
 		if err := reg.Register(c); err != nil {
@@ -148,4 +158,12 @@ func (m *Metrics) SetCertificatesCount(state State, count float64) {
 		return
 	}
 	m.CertificatesByState.WithLabelValues(string(state)).Set(count)
+}
+
+// RecordChallengeRequest records the outcome of an ACME HTTP-01 challenge verification request.
+func (m *Metrics) RecordChallengeRequest(status string) {
+	if m == nil || m.ChallengeRequestsTotal == nil {
+		return
+	}
+	m.ChallengeRequestsTotal.WithLabelValues(status).Inc()
 }

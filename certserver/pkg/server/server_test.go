@@ -25,6 +25,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -42,6 +43,7 @@ import (
 	acmeclient "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/acme"
 	certserverv1 "github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/api/v1"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/manager"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
@@ -151,12 +153,7 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
-	// 1. Start Pebble ACME test server
-	pebble := testserver.StartPebble(t, testserver.ServerConfig{
-		ValidityPeriod: 86400,
-	})
-
-	// 2. Start mock cluster JWKS server
+	// 1. Start mock cluster JWKS server
 	clusterKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("failed to generate cluster key: %v", err)
@@ -169,7 +166,7 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 	}))
 	defer jwksServer.Close()
 
-	// 3. Configure cluster registry
+	// 2. Configure cluster registry, binding store, and challenge handler
 	const clusterID = "cluster-test"
 	issuerURL := jwksServer.URL
 
@@ -191,6 +188,54 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 		t.Fatalf("failed to create registry: %v", err)
 	}
 	defer reg.Close()
+
+	bindingStore := registry.NewMemoryBindingStore()
+	auditLogger := registry.NewAuditLogger(nil)
+	m := metrics.New(prometheus.NewRegistry())
+
+	challengeStore := challenge.NewMemoryStore()
+	challengeHandler := challenge.NewHandler(
+		challengeStore,
+		challenge.WithRegistry(reg),
+		challenge.WithBindingStore(bindingStore),
+		challenge.WithAuditLogger(auditLogger),
+		challenge.WithMetrics(m),
+	)
+	challengeSrv := httptest.NewServer(challengeHandler)
+	defer challengeSrv.Close()
+
+	// Data plane forwarder forwards Pebble challenge validation requests to challengeSrv
+	// carrying the requesting Gateway's data-plane token.
+	dpToken := signControllerToken(t, issuerURL, "system:serviceaccount:default:dp-sa", clusterKey, kid)
+	dataPlaneForwarder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fwdReq, err := http.NewRequestWithContext(r.Context(), r.Method, challengeSrv.URL+r.URL.RequestURI(), nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fwdReq.Host = r.Host
+		fwdReq.Header.Set("Authorization", "Bearer "+dpToken)
+		resp, err := http.DefaultClient.Do(fwdReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	})
+
+	// 3. Start Pebble ACME test server pointed at dataPlaneForwarder
+	pebble := testserver.StartPebble(t, testserver.ServerConfig{
+		ValidityPeriod:   86400,
+		ChallengeStore:   challengeStore,
+		ChallengeHandler: dataPlaneForwarder,
+	})
 
 	// 4. Initialize Manager with Pebble ACME client and temp cache
 	tempDir := t.TempDir()
@@ -214,8 +259,9 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 		t.Fatalf("failed to create acme client: %v", err)
 	}
 
-	m := metrics.New(prometheus.NewRegistry())
-	mgr := manager.NewManager(acmeCli, diskCache, pebble.ChallengeStore, m)
+	mgr := manager.NewManager(acmeCli, diskCache, challengeStore, m, func(o *manager.Options) {
+		o.BindingStore = bindingStore
+	})
 	if err := mgr.Start(ctx); err != nil {
 		t.Fatalf("failed to start manager: %v", err)
 	}
@@ -229,9 +275,6 @@ func TestEndToEnd_GetCertificate(t *testing.T) {
 		ReleaseMode:  true,
 		MaxHostnames: 10,
 	}
-
-	bindingStore := registry.NewMemoryBindingStore()
-	auditLogger := registry.NewAuditLogger(nil)
 
 	srv, err := NewServer(serverOpts, reg, mgr, bindingStore, auditLogger)
 	if err != nil {

@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
 
 var (
@@ -31,6 +33,25 @@ var (
 	ErrHostMismatch = errors.New("request host does not match challenge identifier")
 )
 
+// Requester contains identity information of the Gateway requesting certificate issuance.
+type Requester struct {
+	ClusterID               string `json:"cluster_id"`
+	Gateway                 string `json:"gateway"`
+	DataPlaneServiceAccount string `json:"data_plane_service_account"`
+	HostnamesKey            string `json:"hostnames_key"`
+}
+
+// Item represents an active ACME challenge in the store.
+type Item struct {
+	Token               string                    `json:"token"`
+	Identifier          string                    `json:"identifier"` // normalized host
+	KeyAuth             string                    `json:"key_auth"`
+	ExpiresAt           time.Time                 `json:"expires_at"`
+	Requester           Requester                 `json:"requester"`
+	CandidateRequesters []Requester               `json:"candidate_requesters,omitempty"`
+	AnsweringIdentities []registry.CallerIdentity `json:"answering_identities,omitempty"`
+}
+
 // ChallengeResolver provides a lookup method for HTTP-01 challenge responses,
 // accepting a caller identity to support future authentication and challenge binding.
 type ChallengeResolver interface {
@@ -40,22 +61,18 @@ type ChallengeResolver interface {
 // Store defines the interface for registering, resolving, and removing pending ACME challenges.
 type Store interface {
 	ChallengeResolver
-	Put(ctx context.Context, token string, identifier string, keyAuth string, expiresAt time.Time) error
+	Put(ctx context.Context, token string, identifier string, keyAuth string, expiresAt time.Time, req Requester) error
+	PutWithCandidates(ctx context.Context, token string, identifier string, keyAuth string, expiresAt time.Time, req Requester, candidates []Requester) error
+	Get(ctx context.Context, token string) (*Item, error)
+	RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error
 	Remove(ctx context.Context, token string) error
-}
-
-type challengeItem struct {
-	token      string
-	identifier string // normalized host
-	keyAuth    string
-	expiresAt  time.Time
 }
 
 // MemoryStore is an in-memory thread-safe implementation of Store.
 type MemoryStore struct {
 	// mu guards the challenges map.
 	mu         sync.RWMutex
-	challenges map[string]*challengeItem
+	challenges map[string]*Item
 
 	timeNow func() time.Time
 }
@@ -63,22 +80,70 @@ type MemoryStore struct {
 // NewMemoryStore initializes a new in-memory challenge store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		challenges: make(map[string]*challengeItem),
+		challenges: make(map[string]*Item),
 		timeNow:    time.Now,
 	}
 }
 
-// Put adds or updates a pending challenge.
-func (s *MemoryStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time) error {
-	normHost := normalizeHost(identifier)
+// Put adds or updates a pending challenge with an explicit requester.
+func (s *MemoryStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time, req Requester) error {
+	return s.PutWithCandidates(ctx, token, identifier, keyAuth, expiresAt, req, nil)
+}
+
+// PutWithCandidates adds or updates a pending challenge with a primary requester and candidate requesters.
+func (s *MemoryStore) PutWithCandidates(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time, req Requester, candidates []Requester) error {
+	normHost := NormalizeHost(identifier)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.challenges[token] = &challengeItem{
-		token:      token,
-		identifier: normHost,
-		keyAuth:    keyAuth,
-		expiresAt:  expiresAt,
+	s.challenges[token] = &Item{
+		Token:               token,
+		Identifier:          normHost,
+		KeyAuth:             keyAuth,
+		ExpiresAt:           expiresAt,
+		Requester:           req,
+		CandidateRequesters: candidates,
 	}
+	return nil
+}
+
+// Get returns a safe copy of the challenge item for token, or ErrNotFound if not found or expired.
+// Copy is performed while holding the initial lock to avoid race conditions.
+func (s *MemoryStore) Get(ctx context.Context, token string) (*Item, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	item, ok := s.challenges[token]
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	now := s.timeNow()
+	if !item.ExpiresAt.IsZero() && now.After(item.ExpiresAt) {
+		delete(s.challenges, token)
+		return nil, ErrNotFound
+	}
+
+	cp := *item
+	if len(item.AnsweringIdentities) > 0 {
+		cp.AnsweringIdentities = make([]registry.CallerIdentity, len(item.AnsweringIdentities))
+		copy(cp.AnsweringIdentities, item.AnsweringIdentities)
+	}
+	if len(item.CandidateRequesters) > 0 {
+		cp.CandidateRequesters = make([]Requester, len(item.CandidateRequesters))
+		copy(cp.CandidateRequesters, item.CandidateRequesters)
+	}
+	return &cp, nil
+}
+
+// RecordAnswer appends the answering caller identity to the challenge item.
+func (s *MemoryStore) RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.challenges[token]
+	if !ok {
+		return ErrNotFound
+	}
+	item.AnsweringIdentities = append(item.AnsweringIdentities, identity)
 	return nil
 }
 
@@ -94,30 +159,29 @@ func (s *MemoryStore) Remove(ctx context.Context, token string) error {
 // validating token existence, expiry, and identifier matching.
 func (s *MemoryStore) ResolveChallenge(ctx context.Context, caller string, host string, token string) (string, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	item, ok := s.challenges[token]
 	if !ok {
-		s.mu.Unlock()
 		return "", ErrNotFound
 	}
 
 	now := s.timeNow()
-	if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
+	if !item.ExpiresAt.IsZero() && now.After(item.ExpiresAt) {
 		delete(s.challenges, token)
-		s.mu.Unlock()
 		return "", ErrNotFound
 	}
-	s.mu.Unlock()
 
-	normReqHost := normalizeHost(host)
-	if normReqHost != item.identifier {
+	normReqHost := NormalizeHost(host)
+	if normReqHost != item.Identifier {
 		return "", ErrHostMismatch
 	}
 
-	return item.keyAuth, nil
+	return item.KeyAuth, nil
 }
 
-// normalizeHost strips optional port and lowers the hostname string.
-func normalizeHost(host string) string {
+// NormalizeHost strips optional port and lowers the hostname string.
+func NormalizeHost(host string) string {
 	h := strings.TrimSpace(host)
 	if strings.Contains(h, ":") {
 		if parsedHost, _, err := net.SplitHostPort(h); err == nil {

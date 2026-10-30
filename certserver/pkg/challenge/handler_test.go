@@ -15,13 +15,25 @@
 package challenge
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 )
 
 func TestChallengeHandler_AcceptanceCriteria(t *testing.T) {
@@ -40,12 +52,12 @@ func TestChallengeHandler_AcceptanceCriteria(t *testing.T) {
 	expiredKeyAuth := "expired-token-67890.thumbprint-fghij"
 
 	// Register valid challenge
-	if err := store.Put(ctx, validToken, validHost, validKeyAuth, now.Add(10*time.Minute)); err != nil {
+	if err := store.Put(ctx, validToken, validHost, validKeyAuth, now.Add(10*time.Minute), Requester{}); err != nil {
 		t.Fatalf("store.Put valid challenge failed: %v", err)
 	}
 
 	// Register expired challenge
-	if err := store.Put(ctx, expiredToken, validHost, expiredKeyAuth, now.Add(-1*time.Minute)); err != nil {
+	if err := store.Put(ctx, expiredToken, validHost, expiredKeyAuth, now.Add(-1*time.Minute), Requester{}); err != nil {
 		t.Fatalf("store.Put expired challenge failed: %v", err)
 	}
 
@@ -188,7 +200,7 @@ func TestChallengeHandler_CallerIdentity(t *testing.T) {
 
 	now := time.Now()
 	store.timeNow = func() time.Time { return now }
-	if err := store.Put(ctx, "caller-tok", "example.com", "caller-auth", now.Add(time.Minute)); err != nil {
+	if err := store.Put(ctx, "caller-tok", "example.com", "caller-auth", now.Add(time.Minute), Requester{}); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -217,4 +229,206 @@ func (r *testResolverWithCaller) ResolveChallenge(ctx context.Context, caller st
 		r.onResolve(caller)
 	}
 	return r.store.ResolveChallenge(ctx, caller, host, token)
+}
+
+func TestChallengeHandler_WithRegistryAndBinding(t *testing.T) {
+	ctx := t.Context()
+	store := NewMemoryStore()
+	bindingStore := registry.NewMemoryBindingStore()
+
+	// Mock JWKS Server
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey failed: %v", err)
+	}
+	const kid = "key-1"
+
+	jwksServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		eBytes := []byte{byte(privKey.PublicKey.E >> 16), byte(privKey.PublicKey.E >> 8), byte(privKey.PublicKey.E)}
+		for len(eBytes) > 1 && eBytes[0] == 0 {
+			eBytes = eBytes[1:]
+		}
+		doc := map[string]any{
+			"keys": []map[string]any{
+				{
+					"kty": "RSA",
+					"kid": kid,
+					"alg": "RS256",
+					"use": "sig",
+					"n":   base64.RawURLEncoding.EncodeToString(privKey.PublicKey.N.Bytes()),
+					"e":   base64.RawURLEncoding.EncodeToString(eBytes),
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(doc)
+	}))
+	defer jwksServer.Close()
+
+	clusters := []registry.ClusterConfig{
+		{
+			ClusterID:           "cluster-1",
+			IssuerURL:           jwksServer.URL,
+			JWKSURL:             jwksServer.URL,
+			SharedFrontEndGroup: "fe-group",
+		},
+		{
+			ClusterID:           "cluster-2",
+			IssuerURL:           jwksServer.URL + "/cluster-2",
+			JWKSURL:             jwksServer.URL,
+			SharedFrontEndGroup: "fe-group",
+		},
+	}
+
+	reg, err := registry.NewRegistry(clusters, registry.WithHTTPClient(jwksServer.Client()))
+	if err != nil {
+		t.Fatalf("NewRegistry failed: %v", err)
+	}
+	defer reg.Close()
+
+	signToken := func(iss, sub string) string {
+		hBytes, _ := json.Marshal(map[string]any{"alg": "RS256", "kid": kid})
+		now := time.Now()
+		pBytes, _ := json.Marshal(map[string]any{
+			"iss": iss,
+			"sub": sub,
+			"aud": registry.CertServerAudience,
+			"exp": now.Add(time.Hour).Unix(),
+			"nbf": now.Add(-time.Minute).Unix(),
+		})
+		input := base64.RawURLEncoding.EncodeToString(hBytes) + "." + base64.RawURLEncoding.EncodeToString(pBytes)
+		hashed := sha256.Sum256([]byte(input))
+		sig, err := rsa.SignPKCS1v15(rand.Reader, privKey, crypto.SHA256, hashed[:])
+		if err != nil {
+			t.Fatalf("SignPKCS1v15 failed: %v", err)
+		}
+		return input + "." + base64.RawURLEncoding.EncodeToString(sig)
+	}
+
+	var auditBuf bytes.Buffer
+	auditLogger := registry.NewAuditLogger(&auditBuf)
+	promReg := prometheus.NewRegistry()
+	m := metrics.New(promReg)
+
+	now := time.Now()
+	handler := NewHandler(
+		store,
+		WithRegistry(reg),
+		WithBindingStore(bindingStore),
+		WithAuditLogger(auditLogger),
+		WithMetrics(m),
+		WithTimeNow(func() time.Time { return now }),
+	)
+
+	// Register pending challenge for default/gw-1 in cluster-1 with dataPlaneSA "default/dp-sa-1"
+	const testToken = "tok-valid-binding"
+	const testKeyAuth = "tok-valid-binding.auth123"
+	const testHost = "binding.example.com"
+
+	err = store.Put(ctx, testToken, testHost, testKeyAuth, now.Add(10*time.Minute), Requester{
+		ClusterID:               "cluster-1",
+		Gateway:                 "default/gw-1",
+		DataPlaneServiceAccount: "default/dp-sa-1",
+		HostnamesKey:            testHost,
+	})
+	if err != nil {
+		t.Fatalf("store.Put failed: %v", err)
+	}
+
+	// 1. Missing Authorization header -> 404
+	req := httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+testToken, nil)
+	req.Host = testHost
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing auth header, got %d", rr.Code)
+	}
+
+	// 2. Invalid Bearer token -> 404
+	req = httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+testToken, nil)
+	req.Host = testHost
+	req.Header.Set("Authorization", "Bearer invalid-jwt")
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for invalid token, got %d", rr.Code)
+	}
+
+	// 3. Valid token but wrong data plane service account -> 404
+	wrongSAToken := signToken(jwksServer.URL, "system:serviceaccount:default:dp-wrong")
+	req = httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+testToken, nil)
+	req.Host = testHost
+	req.Header.Set("Authorization", "Bearer "+wrongSAToken)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for wrong SA, got %d", rr.Code)
+	}
+
+	// 4. Valid token from correct data plane SA -> 200
+	correctSAToken := signToken(jwksServer.URL, "system:serviceaccount:default:dp-sa-1")
+	req = httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+testToken, nil)
+	req.Host = testHost
+	req.Header.Set("Authorization", "Bearer "+correctSAToken)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for correct SA, got %d", rr.Code)
+	}
+	if rr.Body.String() != testKeyAuth {
+		t.Errorf("expected body %q, got %q", testKeyAuth, rr.Body.String())
+	}
+
+	// Verify validated binding was recorded
+	if !bindingStore.HasValidatedBinding("cluster-1", "default/gw-1", testHost, now) {
+		t.Errorf("expected validated binding to be recorded in binding store")
+	}
+
+	// 5. Shared front end group: cluster-2 Gateway has recorded binding
+	bindingStore.RecordBinding(registry.Binding{
+		ClusterID:               "cluster-2",
+		Gateway:                 "default/gw-2",
+		DataPlaneServiceAccount: "default/dp-sa-2",
+		Hostnames:               []string{testHost},
+	})
+	sharedSAToken := signToken(jwksServer.URL+"/cluster-2", "system:serviceaccount:default:dp-sa-2")
+	req = httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+testToken, nil)
+	req.Host = testHost
+	req.Header.Set("Authorization", "Bearer "+sharedSAToken)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for shared front end group SA, got %d", rr.Code)
+	}
+
+	// 6. Expired challenge -> 404
+	const expToken = "tok-expired-binding"
+	err = store.Put(ctx, expToken, testHost, "exp.auth", now.Add(-1*time.Minute), Requester{
+		ClusterID:               "cluster-1",
+		Gateway:                 "default/gw-1",
+		DataPlaneServiceAccount: "default/dp-sa-1",
+	})
+	if err != nil {
+		t.Fatalf("store.Put expired failed: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, ACMEChallengePrefix+expToken, nil)
+	req.Host = testHost
+	req.Header.Set("Authorization", "Bearer "+correctSAToken)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for expired challenge, got %d", rr.Code)
+	}
+
+	// Verify audit logs contain NO tokens or key authorizations
+	auditOutput := auditBuf.String()
+	if strings.Contains(auditOutput, testToken) {
+		t.Errorf("audit log leaked ACME challenge token: %s", auditOutput)
+	}
+	if strings.Contains(auditOutput, testKeyAuth) {
+		t.Errorf("audit log leaked ACME key authorization: %s", auditOutput)
+	}
+	if strings.Contains(auditOutput, correctSAToken) {
+		t.Errorf("audit log leaked bearer token: %s", auditOutput)
+	}
 }

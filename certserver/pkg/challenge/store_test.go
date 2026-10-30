@@ -38,7 +38,7 @@ func TestMemoryStore_Lifecycle(t *testing.T) {
 	}
 
 	// 2. Put
-	if err := store.Put(ctx, token, host, keyAuth, now.Add(5*time.Minute)); err != nil {
+	if err := store.Put(ctx, token, host, keyAuth, now.Add(5*time.Minute), Requester{}); err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
 
@@ -74,7 +74,9 @@ func TestMemoryStore_Lifecycle(t *testing.T) {
 	}
 
 	// 7. Remove
-	_ = store.Put(ctx, "temp-token", host, keyAuth, now.Add(time.Hour))
+	if err := store.Put(ctx, "temp-token", host, keyAuth, now.Add(time.Hour), Requester{}); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
 	if err := store.Remove(ctx, "temp-token"); err != nil {
 		t.Fatalf("Remove failed: %v", err)
 	}

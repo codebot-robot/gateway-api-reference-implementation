@@ -33,6 +33,7 @@ import (
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/cache"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/challenge"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/metrics"
+	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/registry"
 	"github.com/gke-labs/gateway-api-reference-implementation/certserver/pkg/testserver"
 )
 
@@ -115,7 +116,7 @@ func TestManager_Pebble_Issuance(t *testing.T) {
 	defer mgr.Stop()
 
 	hostnames := []string{"web.example.com", "api.example.com"}
-	cert, err := mgr.Obtain(ctx, hostnames)
+	cert, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("Obtain failed: %v", err)
 	}
@@ -159,7 +160,7 @@ func TestManager_Pebble_ReuseFromCacheAfterRestart(t *testing.T) {
 		t.Fatalf("mgr1.Start failed: %v", err)
 	}
 	hostnames := []string{"restart.example.com"}
-	cert1, err := mgr1.Obtain(ctx, hostnames)
+	cert1, err := mgr1.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("mgr1.Obtain failed: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestManager_Pebble_ReuseFromCacheAfterRestart(t *testing.T) {
 	defer mgr2.Stop()
 
 	// Obtain should immediately succeed from local disk cache
-	cert2, err := mgr2.Obtain(ctx, hostnames)
+	cert2, err := mgr2.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("mgr2.Obtain from cache failed: %v", err)
 	}
@@ -207,7 +208,7 @@ func TestManager_Pebble_Renewal(t *testing.T) {
 	defer mgr.Stop()
 
 	hostnames := []string{"renew.example.com"}
-	cert1, err := mgr.Obtain(ctx, hostnames)
+	cert1, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("Obtain failed: %v", err)
 	}
@@ -256,7 +257,7 @@ func TestManager_Pebble_ConcurrentObtainSameSet(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			c, err := mgr.Obtain(ctx, hostnames)
+			c, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 			certs[idx] = c
 			errs[idx] = err
 		}(i)
@@ -299,7 +300,7 @@ func TestManager_Pebble_FailedValidation(t *testing.T) {
 	defer mgr.Stop()
 
 	// Validation must fail
-	_, err := mgr.Obtain(ctx, []string{"fail-validation.example.com"})
+	_, err := mgr.Obtain(ctx, []string{"fail-validation.example.com"}, challenge.Requester{})
 	if err == nil {
 		t.Fatal("expected Obtain to fail due to validation error, but it succeeded")
 	}
@@ -373,7 +374,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 
 	// 1. Initial Obtain succeeds
 	hostnames := []string{"retry.example.com"}
-	cert1, err := mgr.Obtain(ctx, hostnames)
+	cert1, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("initial Obtain failed: %v", err)
 	}
@@ -388,7 +389,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	_ = mgr.CheckRenewals(ctx)
 
 	// Verify existing certificate is STILL served from cache!
-	served, err := mgr.Obtain(ctx, hostnames)
+	served, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("Obtain after renewal failure should keep serving existing certificate, got error: %v", err)
 	}
@@ -412,7 +413,7 @@ func TestManager_Pebble_RenewalFailureBackoffAndKeepServing(t *testing.T) {
 	}
 
 	// Verify new certificate was issued and cached
-	renewed, err := mgr.Obtain(ctx, hostnames)
+	renewed, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("Obtain after recovered renewal failed: %v", err)
 	}
@@ -460,7 +461,7 @@ func TestManager_Pebble_ExternalAccountBinding(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	cert, err := mgr.Obtain(ctx, []string{"eab.example.com"})
+	cert, err := mgr.Obtain(ctx, []string{"eab.example.com"}, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("Obtain with EAB failed: %v", err)
 	}
@@ -484,25 +485,25 @@ func TestManager_LimitsAndValidation(t *testing.T) {
 	ctx := t.Context()
 
 	// 1. Wildcard rejection
-	_, err := mgr.Obtain(ctx, []string{"*.example.com"})
+	_, err := mgr.Obtain(ctx, []string{"*.example.com"}, challenge.Requester{})
 	if !errors.Is(err, ErrWildcardNotSupported) {
 		t.Errorf("expected ErrWildcardNotSupported, got %v", err)
 	}
 
 	// 2. Too many hostnames
-	_, err = mgr.Obtain(ctx, []string{"a.com", "b.com", "c.com", "d.com"})
+	_, err = mgr.Obtain(ctx, []string{"a.com", "b.com", "c.com", "d.com"}, challenge.Requester{})
 	if !errors.Is(err, ErrTooManyHostnames) {
 		t.Errorf("expected ErrTooManyHostnames, got %v", err)
 	}
 
 	// 3. Hostname too long
-	_, err = mgr.Obtain(ctx, []string{"this-hostname-is-longer-than-thirty-characters.com"})
+	_, err = mgr.Obtain(ctx, []string{"this-hostname-is-longer-than-thirty-characters.com"}, challenge.Requester{})
 	if !errors.Is(err, ErrHostnameTooLong) {
 		t.Errorf("expected ErrHostnameTooLong, got %v", err)
 	}
 
 	// 4. Empty hostnames
-	_, err = mgr.Obtain(ctx, []string{})
+	_, err = mgr.Obtain(ctx, []string{}, challenge.Requester{})
 	if !errors.Is(err, ErrNoHostnames) {
 		t.Errorf("expected ErrNoHostnames, got %v", err)
 	}
@@ -520,7 +521,7 @@ func TestManager_PrivateKeyNotInErrorsOrLogs(t *testing.T) {
 	_ = mgr.Start(ctx)
 	defer mgr.Stop()
 
-	cert, err := mgr.Obtain(ctx, []string{"privatekey-safe.example.com"})
+	cert, err := mgr.Obtain(ctx, []string{"privatekey-safe.example.com"}, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("Obtain failed: %v", err)
 	}
@@ -589,7 +590,7 @@ func TestManager_AccountKeyPersistenceAndReuseOnRestart(t *testing.T) {
 		t.Fatalf("mgr1.Start failed: %v", err)
 	}
 
-	if _, err := mgr1.Obtain(ctx, []string{"first.example.com"}); err != nil {
+	if _, err := mgr1.Obtain(ctx, []string{"first.example.com"}, challenge.Requester{}); err != nil {
 		t.Fatalf("mgr1.Obtain failed: %v", err)
 	}
 	acctURI1 := acmeCli1.Account.URI
@@ -637,7 +638,7 @@ func TestManager_AccountKeyPersistenceAndReuseOnRestart(t *testing.T) {
 	defer mgr2.Stop()
 
 	// New domain issuance using reused account key
-	if _, err := mgr2.Obtain(ctx, []string{"second.example.com"}); err != nil {
+	if _, err := mgr2.Obtain(ctx, []string{"second.example.com"}, challenge.Requester{}); err != nil {
 		t.Fatalf("mgr2.Obtain failed: %v", err)
 	}
 
@@ -680,13 +681,13 @@ func TestManager_SingleflightDetachedContext_FirstCallerCancels(t *testing.T) {
 
 	// Caller 1 starts order and will cancel its context
 	go func() {
-		_, err := mgr.Obtain(ctx1, hostnames)
+		_, err := mgr.Obtain(ctx1, hostnames, challenge.Requester{})
 		caller1Done <- err
 	}()
 
 	// Caller 2 concurrently waits for the same hostname set
 	go func() {
-		cert, err := mgr.Obtain(ctx, hostnames)
+		cert, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 		caller2Cert <- cert
 		caller2Done <- err
 	}()
@@ -728,13 +729,13 @@ func TestManager_Renewal_AlwaysProducesNewOrder_DoesNotCoalesceToNoop(t *testing
 	hostnames := []string{"renew-noop.example.com"}
 
 	// 1. Initial Obtain issues cert1
-	cert1, err := mgr.Obtain(ctx, hostnames)
+	cert1, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("initial Obtain failed: %v", err)
 	}
 
 	// 2. While cert1 is still completely valid in cache, call Renew
-	cert2, err := mgr.Renew(ctx, hostnames)
+	cert2, err := mgr.Renew(ctx, hostnames, challenge.Requester{}, nil)
 	if err != nil {
 		t.Fatalf("Renew failed: %v", err)
 	}
@@ -746,7 +747,7 @@ func TestManager_Renewal_AlwaysProducesNewOrder_DoesNotCoalesceToNoop(t *testing
 	}
 
 	// 4. Subsequent Obtain should now return the renewed certificate from cache
-	cert3, err := mgr.Obtain(ctx, hostnames)
+	cert3, err := mgr.Obtain(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("subsequent Obtain failed: %v", err)
 	}
@@ -761,11 +762,18 @@ type hookChallengeStore struct {
 	onPut func()
 }
 
-func (h *hookChallengeStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time) error {
+func (h *hookChallengeStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time, req challenge.Requester) error {
 	if h.onPut != nil {
 		h.onPut()
 	}
-	return h.Store.Put(ctx, token, identifier, keyAuth, expiresAt)
+	return h.Store.Put(ctx, token, identifier, keyAuth, expiresAt, req)
+}
+
+func (h *hookChallengeStore) PutWithCandidates(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time, req challenge.Requester, candidates []challenge.Requester) error {
+	if h.onPut != nil {
+		h.onPut()
+	}
+	return h.Store.PutWithCandidates(ctx, token, identifier, keyAuth, expiresAt, req, candidates)
 }
 
 type brokenChallengeStore struct {
@@ -773,11 +781,29 @@ type brokenChallengeStore struct {
 	pass  bool
 }
 
-func (b *brokenChallengeStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time) error {
+func (b *brokenChallengeStore) Put(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time, req challenge.Requester) error {
 	if !b.pass {
 		return nil // Drop challenge
 	}
-	return b.store.Put(ctx, token, identifier, keyAuth, expiresAt)
+	return b.store.Put(ctx, token, identifier, keyAuth, expiresAt, req)
+}
+
+func (b *brokenChallengeStore) PutWithCandidates(ctx context.Context, token, identifier, keyAuth string, expiresAt time.Time, req challenge.Requester, candidates []challenge.Requester) error {
+	if !b.pass {
+		return nil // Drop challenge
+	}
+	return b.store.PutWithCandidates(ctx, token, identifier, keyAuth, expiresAt, req, candidates)
+}
+
+func (b *brokenChallengeStore) Get(ctx context.Context, token string) (*challenge.Item, error) {
+	if !b.pass {
+		return nil, challenge.ErrNotFound
+	}
+	return b.store.Get(ctx, token)
+}
+
+func (b *brokenChallengeStore) RecordAnswer(ctx context.Context, token string, identity registry.CallerIdentity) error {
+	return b.store.RecordAnswer(ctx, token, identity)
 }
 
 func (b *brokenChallengeStore) Remove(ctx context.Context, token string) error {
@@ -816,7 +842,7 @@ func TestManager_GetCertificate_And_EnsureIssuance(t *testing.T) {
 	}
 
 	// 2. EnsureIssuance starts issuance (returns true)
-	started, err := mgr.EnsureIssuance(ctx, hostnames)
+	started, err := mgr.EnsureIssuance(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("EnsureIssuance failed: %v", err)
 	}
@@ -825,7 +851,7 @@ func TestManager_GetCertificate_And_EnsureIssuance(t *testing.T) {
 	}
 
 	// 3. Second call while in flight returns false (no duplicate flight)
-	startedSecond, err := mgr.EnsureIssuance(ctx, hostnames)
+	startedSecond, err := mgr.EnsureIssuance(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("EnsureIssuance second call failed: %v", err)
 	}
@@ -866,7 +892,7 @@ func TestManager_GetCertificate_And_EnsureIssuance(t *testing.T) {
 	}
 
 	// 6. EnsureIssuance on already-cached cert returns false
-	startedAfterCached, err := mgr.EnsureIssuance(ctx, hostnames)
+	startedAfterCached, err := mgr.EnsureIssuance(ctx, hostnames, challenge.Requester{})
 	if err != nil {
 		t.Fatalf("EnsureIssuance after cached failed: %v", err)
 	}

@@ -32,6 +32,11 @@ func TestMetrics_Lifecycle(t *testing.T) {
 	m.RecordRenewal(true)
 	m.RecordRenewal(false)
 
+	// Record challenge requests
+	m.RecordChallengeRequest("success")
+	m.RecordChallengeRequest("unauthenticated")
+	m.RecordChallengeRequest("refused")
+
 	// Set certificate state counts
 	m.SetCertificatesCount(StateValid, 3)
 	m.SetCertificatesCount(StateRenewing, 1)
@@ -79,4 +84,5 @@ func TestMetrics_Lifecycle(t *testing.T) {
 	nilMetrics.SetCertificateExpiry("x", 1)
 	nilMetrics.RemoveCertificateExpiry("x")
 	nilMetrics.SetCertificatesCount(StateValid, 1)
+	nilMetrics.RecordChallengeRequest("success")
 }

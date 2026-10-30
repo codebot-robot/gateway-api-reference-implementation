@@ -52,6 +52,10 @@ type ClusterConfig struct {
 
 	// SharedFrontEndGroup is an optional shared-front-end group membership.
 	SharedFrontEndGroup string `json:"sharedFrontEndGroup,omitempty"`
+
+	// GatewaySharedFrontEndGroups is an optional per-Gateway override for shared-front-end group memberships.
+	// Maps Gateway identity ("namespace/name" or "name") to group name.
+	GatewaySharedFrontEndGroups map[string]string `json:"gatewaySharedFrontEndGroups,omitempty"`
 }
 
 // ServerConfig represents the top-level configuration loaded from the server config file.
