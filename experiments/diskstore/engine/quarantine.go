@@ -220,3 +220,37 @@ func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOpti
 
 	return nil
 }
+
+// quarantineUnreferencedOversizeFiles scans oversizeDir and moves every file
+// that is not a directory and not in referenced to lost+found quarantine under the given QuarantineOptions.
+// It returns the number of files and total bytes moved to quarantine.
+func quarantineUnreferencedOversizeFiles(storeFS FS, oversizeDir string, referenced map[string]bool, opts QuarantineOptions) (int, int64, error) {
+	entries, err := storeFS.ReadDir(oversizeDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("failed to read oversize directory: %w", err)
+	}
+
+	var unreferenced []string
+	var unreferencedBytes int64
+	for _, entry := range entries {
+		if entry.IsDir() || referenced[entry.Name()] {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to get info for oversize file %s: %w", entry.Name(), err)
+		}
+		unreferenced = append(unreferenced, entry.Name())
+		unreferencedBytes += info.Size()
+	}
+
+	if err := quarantineFiles(storeFS, oversizeDir, unreferenced, opts); err != nil {
+		return 0, 0, err
+	}
+
+	return len(unreferenced), unreferencedBytes, nil
+}
+

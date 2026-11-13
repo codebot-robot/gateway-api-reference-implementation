@@ -575,3 +575,84 @@ func TestQuarantineFiles_PruningAndBoundsApplied(t *testing.T) {
 		t.Fatalf("expected exactly 2 files in lost+found after pruning, got %d", len(entries))
 	}
 }
+
+func TestQuarantineUnreferencedOversizeFiles(t *testing.T) {
+	memFS := NewMemFS()
+	dir := "test_quarantine_unref_oversize"
+
+	// 1. Nonexistent directory returns 0, 0, nil
+	count, bytesMoved, err := quarantineUnreferencedOversizeFiles(memFS, filepath.Join(dir, "oversize"), nil, QuarantineOptions{})
+	if err != nil {
+		t.Fatalf("expected nil error for nonexistent dir, got %v", err)
+	}
+	if count != 0 || bytesMoved != 0 {
+		t.Fatalf("expected 0, 0; got count=%d, bytes=%d", count, bytesMoved)
+	}
+
+	// 2. Empty directory returns 0, 0, nil
+	oversizeDir := filepath.Join(dir, "oversize")
+	if err := memFS.MkdirAll(oversizeDir, StoreDirMode); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	count, bytesMoved, err = quarantineUnreferencedOversizeFiles(memFS, oversizeDir, nil, QuarantineOptions{})
+	if err != nil {
+		t.Fatalf("expected nil error for empty dir, got %v", err)
+	}
+	if count != 0 || bytesMoved != 0 {
+		t.Fatalf("expected 0, 0; got count=%d, bytes=%d", count, bytesMoved)
+	}
+
+	// 3. Create referenced and unreferenced files
+	refName := "referenced.obj"
+	unrefName1 := "unref1.obj"
+	unrefName2 := "unref2.obj"
+
+	payloadRef := []byte("live-pointer-content")
+	payload1 := []byte("orphan-one-content-bytes")
+	payload2 := []byte("orphan-two-content-bytes-longer")
+
+	for name, content := range map[string][]byte{
+		refName:    payloadRef,
+		unrefName1: payload1,
+		unrefName2: payload2,
+	} {
+		f, err := memFS.OpenFile(filepath.Join(oversizeDir, name), os.O_CREATE|os.O_WRONLY, StoreFileMode)
+		if err != nil {
+			t.Fatalf("OpenFile %s failed: %v", name, err)
+		}
+		if _, err := f.WriteAt(content, 0); err != nil {
+			_ = f.Close()
+			t.Fatalf("WriteAt failed: %v", err)
+		}
+		_ = f.Close()
+	}
+
+	referenced := map[string]bool{refName: true}
+	count, bytesMoved, err = quarantineUnreferencedOversizeFiles(memFS, oversizeDir, referenced, QuarantineOptions{})
+	if err != nil {
+		t.Fatalf("quarantineUnreferencedOversizeFiles failed: %v", err)
+	}
+
+	if count != 2 {
+		t.Fatalf("expected 2 files quarantined, got %d", count)
+	}
+	expectedBytes := int64(len(payload1) + len(payload2))
+	if bytesMoved != expectedBytes {
+		t.Fatalf("expected %d bytes quarantined, got %d", expectedBytes, bytesMoved)
+	}
+
+	// Referenced file must still exist in oversizeDir
+	if f, err := memFS.Open(filepath.Join(oversizeDir, refName)); err != nil {
+		t.Fatalf("expected referenced file to remain in oversize directory: %v", err)
+	} else {
+		_ = f.Close()
+	}
+
+	// Unreferenced files must be in lost+found
+	lostDir := filepath.Join(oversizeDir, "lost+found")
+	entries, err := memFS.ReadDir(lostDir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("expected 2 entries in lost+found, got %d (err: %v)", len(entries), err)
+	}
+}
+
