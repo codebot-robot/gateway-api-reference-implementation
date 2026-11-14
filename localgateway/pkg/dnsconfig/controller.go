@@ -239,5 +239,5 @@ func (p *Publisher) publishOnce(ctx context.Context) error {
 		}
 	}
 
-	return singlepod.WriteConfigSecret(publishCtx, p.client, p.namespace, p.secretName, nil, payload)
+	return singlepod.PublishDataplaneConfig(publishCtx, p.client, p.namespace, p.secretName, nil, payload)
 }
