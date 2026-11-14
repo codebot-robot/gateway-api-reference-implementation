@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -727,7 +728,7 @@ func Recover(fs FS, heapFile File, storeDir string, walDir string, dbID [16]byte
 		}
 		return referenced
 	}
-	if _, _, err := quarantineUnreferencedOversizeFiles(fs, storeDir, getReferenced, options.Quarantine, 0); err != nil {
+	if _, err := quarantineUnreferencedOversizeFiles(context.Background(), fs, storeDir, getReferenced, options.Quarantine, 0); err != nil {
 		return nil, fmt.Errorf("failed to quarantine unreferenced oversize files: %w", err)
 	}
 

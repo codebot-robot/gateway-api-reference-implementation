@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -27,6 +28,32 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// FileInfo holds metadata about an oversize file moved to quarantine.
+type FileInfo struct {
+	Name string
+	Size uint64
+}
+
+type fileInfo struct {
+	size uint64
+}
+
+type loggerKey struct{}
+
+// WithLogger returns a new context with the logger attached.
+func WithLogger(ctx context.Context, logger *slog.Logger) context.Context {
+	return context.WithValue(ctx, loggerKey{}, logger)
+}
+
+func loggerFromContext(ctx context.Context) *slog.Logger {
+	if ctx != nil {
+		if l, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok && l != nil {
+			return l
+		}
+	}
+	return slog.Default()
+}
 
 const (
 	// DefaultMaxQuarantinedFiles is the default maximum number of quarantined files
@@ -194,9 +221,10 @@ func pruneLostFound(storeFS FS, opts QuarantineOptions) error {
 // When skipNotExist is false (used during crash recovery and WAL startup), no concurrent writers
 // exist, so an unreferenced or abandoned file vanishing between listing and rename is unexpected
 // and treated as an error.
-func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOptions, skipNotExist bool) ([]string, error) {
+func quarantineFiles(ctx context.Context, storeFS FS, dir string, files []string, opts QuarantineOptions, skipNotExist bool) ([]string, error) {
 	lostDir := filepath.Join(dir, "lost+found")
 	opts.Dir = lostDir
+	log := loggerFromContext(ctx)
 
 	var moved []string
 	if len(files) > 0 {
@@ -216,7 +244,7 @@ func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOpti
 				}
 				return moved, fmt.Errorf("failed to quarantine %s to %s: %w", src, dest, err)
 			}
-			slog.Warn("diskstore: moved file to quarantine", "from", src, "to", dest)
+			log.Warn("diskstore: moved file to quarantine", "from", src, "to", dest)
 			moved = append(moved, name)
 		}
 	}
@@ -237,7 +265,7 @@ func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOpti
 		if err := storeFS.SyncDir(dir); err != nil {
 			return moved, fmt.Errorf("failed to sync directory %s after quarantine: %w", dir, err)
 		}
-		slog.Debug("diskstore: quarantined files", "dir", dir, "count", len(moved))
+		log.Debug("diskstore: quarantined files", "dir", dir, "count", len(moved))
 	}
 
 	return moved, nil
@@ -247,21 +275,21 @@ func quarantineFiles(storeFS FS, dir string, files []string, opts QuarantineOpti
 // It lists the directory first, calls getReferenced to snapshot current referenced files,
 // and moves up to maxBatch unreferenced files to lost+found (or all files if maxBatch <= 0).
 // Subdirectories and files named in referenced are preserved.
-// It returns the count of files moved, total bytes moved, and any error encountered.
-func quarantineUnreferencedOversizeFiles(storeFS FS, storeDir string, getReferenced func() map[string]bool, opts QuarantineOptions, maxBatch int) (int, int64, error) {
+// It returns the FileInfo of files moved and any error encountered.
+func quarantineUnreferencedOversizeFiles(ctx context.Context, storeFS FS, storeDir string, getReferenced func() map[string]bool, opts QuarantineOptions, maxBatch int) ([]FileInfo, error) {
 	oversizeDir := filepath.Join(storeDir, "oversize")
 	oversizeEntries, err := storeFS.ReadDir(oversizeDir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist) {
-			return 0, 0, nil
+			return nil, nil
 		}
-		return 0, 0, fmt.Errorf("failed to read oversize directory: %w", err)
+		return nil, fmt.Errorf("failed to read oversize directory: %w", err)
 	}
 
 	referenced := getReferenced()
 
-	var unreferenced []string
-	sizes := make(map[string]int64)
+	unreferenced := make(map[string]fileInfo)
+	var names []string
 	for _, entry := range oversizeEntries {
 		if entry.IsDir() || referenced[entry.Name()] {
 			continue
@@ -271,27 +299,30 @@ func quarantineUnreferencedOversizeFiles(storeFS FS, storeDir string, getReferen
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			return 0, 0, fmt.Errorf("failed to stat unreferenced oversize file %s: %w", entry.Name(), err)
+			return nil, fmt.Errorf("failed to stat unreferenced oversize file %s: %w", entry.Name(), err)
 		}
-		unreferenced = append(unreferenced, entry.Name())
-		sizes[entry.Name()] = info.Size()
-		if maxBatch > 0 && len(unreferenced) >= maxBatch {
+		unreferenced[entry.Name()] = fileInfo{size: uint64(info.Size())}
+		names = append(names, entry.Name())
+		if maxBatch > 0 && len(names) >= maxBatch {
 			break
 		}
 	}
 
-	if len(unreferenced) == 0 {
-		return 0, 0, nil
+	if len(names) == 0 {
+		return nil, nil
 	}
 
 	liveSweep := maxBatch > 0
-	movedFiles, err := quarantineFiles(storeFS, oversizeDir, unreferenced, opts, liveSweep)
-	var movedBytes int64
-	for _, name := range movedFiles {
-		movedBytes += sizes[name]
+	movedNames, err := quarantineFiles(ctx, storeFS, oversizeDir, names, opts, liveSweep)
+	var movedFiles []FileInfo
+	for _, name := range movedNames {
+		movedFiles = append(movedFiles, FileInfo{
+			Name: name,
+			Size: unreferenced[name].size,
+		})
 	}
 	if err != nil {
-		return len(movedFiles), movedBytes, err
+		return movedFiles, err
 	}
-	return len(movedFiles), movedBytes, nil
+	return movedFiles, nil
 }

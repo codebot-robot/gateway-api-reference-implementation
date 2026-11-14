@@ -16,6 +16,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -23,7 +24,6 @@ import (
 	"hash/crc32"
 	"io"
 	"io/fs"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -298,8 +298,6 @@ type Engine struct {
 
 	// sweepInterval is the duration between periodic sweeps for unreferenced oversize files.
 	sweepInterval time.Duration
-	// sweepDone is closed when the background quarantine sweep goroutine terminates.
-	sweepDone chan struct{}
 }
 
 func removeDirRecursive(fs FS, dir string) error {
@@ -883,7 +881,6 @@ func Open(opts ...Option) (*Engine, error) {
 	}
 	s.sweepInterval = sweepInterval
 	if s.sweepInterval > 0 {
-		s.sweepDone = make(chan struct{})
 		go s.backgroundQuarantineSweep()
 	}
 
@@ -1936,9 +1933,6 @@ func (s *Engine) Close() error {
 		return nil
 	}
 	close(s.closedCh)
-	if s.sweepDone != nil {
-		<-s.sweepDone
-	}
 
 	var errs []error
 	// If not failed, checkpoint on close to truncate WAL and speed up reopen
@@ -1977,7 +1971,8 @@ func (s *Engine) Close() error {
 }
 
 func (s *Engine) backgroundQuarantineSweep() {
-	defer close(s.sweepDone)
+	ctx := context.Background()
+	log := loggerFromContext(ctx)
 	ticker := time.NewTicker(s.sweepInterval)
 	defer ticker.Stop()
 
@@ -1987,8 +1982,9 @@ func (s *Engine) backgroundQuarantineSweep() {
 			return
 		case <-ticker.C:
 			if !s.isFailed() {
-				// QuarantineSweep logs its own error on failure.
-				_ = s.QuarantineSweep()
+				if err := s.QuarantineSweep(ctx); err != nil {
+					log.Error("diskstore: background quarantine sweep failed", "error", err)
+				}
 			}
 		}
 	}
@@ -2017,7 +2013,7 @@ func (s *Engine) backgroundQuarantineSweep() {
 // make directory updates durable.
 //
 // The sweep does not run while the engine is closed or failed.
-func (s *Engine) QuarantineSweep() error {
+func (s *Engine) QuarantineSweep(ctx context.Context) error {
 	if s.closed.Load() || s.isFailed() {
 		return nil
 	}
@@ -2047,13 +2043,16 @@ func (s *Engine) QuarantineSweep() error {
 		return referenced
 	}
 
-	count, bytesMoved, err := quarantineUnreferencedOversizeFiles(s.fs, s.dir, getReferenced, s.quarantine, DefaultMaxQuarantineSweepBatch)
-	if count > 0 {
-		GlobalMetrics.QuarantineSweepFilesCount.Add(int64(count))
-		GlobalMetrics.QuarantineSweepBytesCount.Add(bytesMoved)
+	movedFiles, err := quarantineUnreferencedOversizeFiles(ctx, s.fs, s.dir, getReferenced, s.quarantine, DefaultMaxQuarantineSweepBatch)
+	if len(movedFiles) > 0 {
+		var totalBytes int64
+		for _, f := range movedFiles {
+			totalBytes += int64(f.Size)
+		}
+		GlobalMetrics.QuarantineSweepFilesCount.Add(int64(len(movedFiles)))
+		GlobalMetrics.QuarantineSweepBytesCount.Add(totalBytes)
 	}
 	if err != nil {
-		slog.Error("diskstore: oversize quarantine sweep failed", "error", err)
 		return err
 	}
 	return nil

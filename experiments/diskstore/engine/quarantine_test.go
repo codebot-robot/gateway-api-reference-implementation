@@ -441,7 +441,7 @@ func TestQuarantineFiles_EmptyList(t *testing.T) {
 		t.Fatalf("MkdirAll failed: %v", err)
 	}
 
-	_, err := quarantineFiles(memFS, dir, nil, QuarantineOptions{}, false)
+	_, err := quarantineFiles(t.Context(), memFS, dir, nil, QuarantineOptions{}, false)
 	if err != nil {
 		t.Fatalf("quarantineFiles with empty list failed: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestQuarantineFiles_MovesFilesAndSyncsBothDirs(t *testing.T) {
 		_ = f.Close()
 	}
 
-	_, err := quarantineFiles(memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{}, false)
+	_, err := quarantineFiles(t.Context(), memFS, dir, []string{"file1.bin", "file2.bin"}, QuarantineOptions{}, false)
 	if err != nil {
 		t.Fatalf("quarantineFiles failed: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestQuarantineFiles_RenameError_ReturnsFirstErrorAndDeletesNothing(t *testi
 		},
 	}
 
-	_, err = quarantineFiles(hookFS, dir, []string{fileName}, QuarantineOptions{}, false)
+	_, err = quarantineFiles(t.Context(), hookFS, dir, []string{fileName}, QuarantineOptions{}, false)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -558,7 +558,7 @@ func TestQuarantineFiles_PruningAndBoundsApplied(t *testing.T) {
 		_ = f.Close()
 	}
 
-	_, err := quarantineFiles(memFS, dir, names, QuarantineOptions{
+	_, err := quarantineFiles(t.Context(), memFS, dir, names, QuarantineOptions{
 		MaxQuarantinedFiles:     2,
 		MinQuarantinedRetention: -1,
 	}, false)
@@ -595,13 +595,13 @@ func TestQuarantineFiles_SkipNotExistParameter(t *testing.T) {
 	files := []string{"nonexistent.dat", "present.dat"}
 
 	// When skipNotExist is false (offline recovery/WAL cleanup), missing file is an error
-	_, err = quarantineFiles(memFS, dir, files, QuarantineOptions{}, false)
+	_, err = quarantineFiles(t.Context(), memFS, dir, files, QuarantineOptions{}, false)
 	if err == nil {
 		t.Fatalf("expected error when skipNotExist=false and file is missing, got nil")
 	}
 
 	// When skipNotExist is true (live sweep), missing file is skipped and existing file is moved
-	moved, err := quarantineFiles(memFS, dir, files, QuarantineOptions{}, true)
+	moved, err := quarantineFiles(t.Context(), memFS, dir, files, QuarantineOptions{}, true)
 	if err != nil {
 		t.Fatalf("quarantineFiles with skipNotExist=true failed: %v", err)
 	}

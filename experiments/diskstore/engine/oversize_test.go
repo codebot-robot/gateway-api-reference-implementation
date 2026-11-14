@@ -182,12 +182,12 @@ func TestOversize_ConcurrentPut_InterleavedRace(t *testing.T) {
 	g1Ready.Add(1)
 	g2Done.Add(1)
 
-	var g1Err error
+	g1Done := make(chan error, 1)
 	go func() {
 		// Signal ready right before entering Put
 		g1Ready.Done()
 		g2Done.Wait() // wait until Put(valY) completes
-		g1Err = store.Put(table, key, valX)
+		g1Done <- store.Put(table, key, valX)
 	}()
 
 	g1Ready.Wait()
@@ -198,17 +198,8 @@ func TestOversize_ConcurrentPut_InterleavedRace(t *testing.T) {
 	g2Done.Done()
 
 	// Wait for Goroutine 1 to finish Put(valX)
-	for {
-		store.keyMu.RLock()
-		cur := store.keyIndex[qKey]
-		store.keyMu.RUnlock()
-		if cur.OversizeFileName == fileX {
-			break
-		}
-	}
-
-	if g1Err != nil {
-		t.Fatalf("Goroutine 1 Put(valX) failed: %v", g1Err)
+	if err := <-g1Done; err != nil {
+		t.Fatalf("Goroutine 1 Put(valX) failed: %v", err)
 	}
 
 	// Verify file X exists on disk and Get returns valX
@@ -1757,7 +1748,7 @@ func TestOversize_PeriodicSweep_InFlightPutPreservedDuringSweep(t *testing.T) {
 	filesMovedBefore := QuarantineSweepFilesCount()
 
 	// Run a sweep while Put is in flight!
-	if err := store.QuarantineSweep(); err != nil {
+	if err := store.QuarantineSweep(t.Context()); err != nil {
 		t.Fatalf("QuarantineSweep failed: %v", err)
 	}
 
@@ -1871,7 +1862,7 @@ func TestOversize_PeriodicSweep_PutStartedAfterWriterMuBeforeReadDir(t *testing.
 	// which triggers onReadDir, starts Put, waits for Put's file to be on disk,
 	// then ReadDir lists the directory including Put's file.
 	// The sweep then reads inFlightOversize and sees the file is registered in-flight.
-	if err := store.QuarantineSweep(); err != nil {
+	if err := store.QuarantineSweep(t.Context()); err != nil {
 		t.Fatalf("QuarantineSweep failed: %v", err)
 	}
 
@@ -1959,7 +1950,7 @@ func TestOversize_PeriodicSweep_BatchBoundApplied(t *testing.T) {
 	beforeCount := QuarantineSweepFilesCount()
 
 	// First sweep: must move exactly DefaultMaxQuarantineSweepBatch (100) files
-	if err := store.QuarantineSweep(); err != nil {
+	if err := store.QuarantineSweep(t.Context()); err != nil {
 		t.Fatalf("QuarantineSweep pass 1 failed: %v", err)
 	}
 
@@ -1984,7 +1975,7 @@ func TestOversize_PeriodicSweep_BatchBoundApplied(t *testing.T) {
 	}
 
 	// Second sweep: must move the remaining 50 files
-	if err := store.QuarantineSweep(); err != nil {
+	if err := store.QuarantineSweep(t.Context()); err != nil {
 		t.Fatalf("QuarantineSweep pass 2 failed: %v", err)
 	}
 
@@ -2095,7 +2086,7 @@ func TestOversize_PeriodicSweep_DoesNotRunWithFailedEngine(t *testing.T) {
 	}
 
 	// Attempt sweep
-	if err := store.QuarantineSweep(); err != nil {
+	if err := store.QuarantineSweep(t.Context()); err != nil {
 		t.Fatalf("expected nil error when sweep is skipped on failed engine, got %v", err)
 	}
 
