@@ -171,6 +171,19 @@ spec:
         args:
         - --init-push-credentials
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gari-controller-push
+  namespace: default
+spec:
+  selector:
+    app: gari-controller
+  ports:
+  - name: push
+    port: 8443
+    targetPort: 8443
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -195,12 +208,25 @@ spec:
           value: ${IMAGE_PREFIX}/gari-controller
         args:
         - --dataplane-image=$(DATAPLANE_IMAGE)
+        - --push-bind-address=:8443
+        - --push-tls-cert-file=/etc/gari/push-tls/tls.crt
+        - --push-tls-key-file=/etc/gari/push-tls/tls.key
         ports:
         - name: metrics
           containerPort: 8999
+        - name: push
+          containerPort: 8443
+        volumeMounts:
+        - name: push-tls
+          mountPath: /etc/gari/push-tls
+          readOnly: true
         readinessProbe:
           httpGet:
             path: /readyz
             port: 8999
           initialDelaySeconds: 1
           periodSeconds: 2
+      volumes:
+      - name: push-tls
+        secret:
+          secretName: gari-controller-push-cert

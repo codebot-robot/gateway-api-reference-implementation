@@ -497,7 +497,7 @@ func (h *Harness) DeployController() {
 	h.RunCmd("kubectl", "wait", "--for=condition=complete", "job/gari-controller-push-credentials", "--namespace=default", "--timeout=2m")
 
 	h.RunCmd("kubectl", "set", "image", "deployment/gari-controller", "controller=gari-controller:e2e", "--namespace=default")
-	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c"]}]}}}}`)
+	h.RunCmd("kubectl", "patch", "deployment", "gari-controller", "-p", `{"spec":{"template":{"spec":{"containers":[{"name":"controller","imagePullPolicy":"Never","args":["--dataplane-image","gari-controller:e2e","--enable-h2c","--push-bind-address=:8443","--push-tls-cert-file=/etc/gari/push-tls/tls.crt","--push-tls-key-file=/etc/gari/push-tls/tls.key"]}]}}}}`)
 	h.RunCmd("kubectl", "rollout", "restart", "deployment/gari-controller", "--namespace=default")
 	h.RunCmd("kubectl", "rollout", "status", "deployment/gari-controller", "--namespace=default", "--timeout=2m")
 }
@@ -749,6 +749,61 @@ func GenerateTestCertificate(commonName string, dnsNames ...string) (certPEM, ke
 
 func (h *Harness) ClientManifest(url string, host string) string {
 	return h.ClientManifestWithArgs("test-client", url, host)
+}
+
+// PushTLSOptions contains optional configuration for PushTLSClientManifest.
+type PushTLSOptions struct {
+	ExpectFail bool
+	SecretName string
+	CertFile   string
+}
+
+func (h *Harness) PushTLSClientManifest(name, targetAddr string, opts ...PushTLSOptions) string {
+	expectFailArg := ""
+	volumeYAML := `
+  - name: push-ca
+    configMap:
+      name: gari-controller-push-ca`
+	caCertPath := "/etc/gari/ca.crt"
+
+	if len(opts) > 0 {
+		if opts[0].ExpectFail {
+			expectFailArg = "\n    - --expect-fail"
+		}
+		if opts[0].SecretName != "" {
+			volumeYAML = fmt.Sprintf(`
+  - name: push-ca
+    secret:
+      secretName: %s`, opts[0].SecretName)
+		}
+		if opts[0].CertFile != "" {
+			caCertPath = opts[0].CertFile
+		}
+	}
+
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+spec:
+  containers:
+  - name: toolbox
+    image: toolbox:e2e
+    imagePullPolicy: Never
+    command: ["/app/toolbox", "client"]
+    args:
+    - --tls-only%s
+    - --ca-cert=%s
+    - --sni=gari-controller-push.default.svc
+    - %s
+    volumeMounts:
+    - name: push-ca
+      mountPath: /etc/gari
+      readOnly: true
+  volumes:%s
+  restartPolicy: Never
+`, name, expectFailArg, caCertPath, targetAddr, volumeYAML)
 }
 
 func (h *Harness) ClientManifestWithArgs(name string, args ...string) string {

@@ -47,13 +47,40 @@ func TestGatewayAPI(t *testing.T) {
 	// 2. Deploy Controller (runs the push credentials Job)
 	h.DeployController()
 
-	// Verify push credentials Job created the expected Secret and ConfigMap objects
-	h.RunCmd("kubectl", "get", "secret", "gari-controller-push-ca-key", "--namespace=default")
-	h.RunCmd("kubectl", "get", "configmap", "gari-controller-push-ca", "--namespace=default")
-	h.RunCmd("kubectl", "get", "secret", "gari-controller-push-cert", "--namespace=default")
-
 	// 3. Deploy Backend (Toolbox Server)
 	h.DeployBackend()
+
+	// 3a. Verify Controller Push Listener accepts TLS connection verified against ConfigMap
+	pushClientPodName := "test-client-push-tls"
+	h.DeletePod(pushClientPodName)
+	h.KubectlApplyContent(h.PushTLSClientManifest(pushClientPodName, "gari-controller-push.default.svc:8443"))
+	h.WaitForPodSuccess(pushClientPodName, 1*time.Minute)
+	pushLogs := h.GetPodLogs(pushClientPodName)
+	t.Logf("Client logs (Push TLS): %s", pushLogs)
+	if !strings.Contains(pushLogs, "TLS handshake successful") {
+		t.Errorf("Expected TLS handshake to succeed for push listener, got: %s", pushLogs)
+	}
+
+	// 3b. Verify Controller Push Listener rejects TLS connection with an untrusted CA
+	badCASecretName := "untrusted-ca-cert"
+	badCACertPEM, badCAKeyPEM, err := GenerateTestCertificate("untrusted-ca", "untrusted-ca")
+	if err != nil {
+		t.Fatalf("Failed to generate untrusted CA certificate: %v", err)
+	}
+	h.CreateTLSSecret(badCASecretName, "default", badCACertPEM, badCAKeyPEM)
+	badPushClientPodName := "test-client-push-tls-untrusted"
+	h.DeletePod(badPushClientPodName)
+	h.KubectlApplyContent(h.PushTLSClientManifest(badPushClientPodName, "gari-controller-push.default.svc:8443", PushTLSOptions{
+		ExpectFail: true,
+		SecretName: badCASecretName,
+		CertFile:   "/etc/gari/tls.crt",
+	}))
+	h.WaitForPodSuccess(badPushClientPodName, 1*time.Minute)
+	badPushLogs := h.GetPodLogs(badPushClientPodName)
+	t.Logf("Client logs (Untrusted Push TLS): %s", badPushLogs)
+	if !strings.Contains(badPushLogs, "Connection rejected as expected") {
+		t.Errorf("Expected connection with untrusted CA to be rejected, got: %s", badPushLogs)
+	}
 
 	// 4. Create Gateway API Resources
 	certPEM, keyPEM, err := GenerateTestCertificate("example.com", "example.com")

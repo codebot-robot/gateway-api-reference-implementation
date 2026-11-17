@@ -117,6 +117,7 @@ func runClientCLI(args []string) {
 	caCertPath := fs.String("ca-cert", "", "Path to CA cert PEM file to trust")
 	insecure := fs.Bool("insecure", false, "Skip TLS verification")
 	expectFail := fs.Bool("expect-fail", false, "Expect request / TLS connection to fail/be closed")
+	tlsOnly := fs.Bool("tls-only", false, "Only perform TLS handshake and verify certificate")
 	http3Flag := fs.Bool("http3", false, "Use HTTP/3 (QUIC) protocol")
 	timeout := fs.Duration("timeout", 10*time.Second, "Request timeout")
 	retries := fs.Int("retries", 30, "Number of retries for request on failure")
@@ -149,6 +150,48 @@ func runClientCLI(args []string) {
 	}
 
 	var capturedPeerCerts []*x509.Certificate
+
+	if *tlsOnly {
+		serverName := *sni
+		if serverName == "" {
+			serverName = parseHostname(targetURL)
+		}
+		tlsConfig := &tls.Config{
+			ServerName:         serverName,
+			RootCAs:            rootCAs,
+			InsecureSkipVerify: *insecure,
+		}
+		dialAddr := targetURL
+		if *connectTo != "" {
+			dialAddr = *connectTo
+		} else if u, err := url.Parse(targetURL); err == nil && u.Host != "" {
+			dialAddr = u.Host
+		}
+		dialer := &net.Dialer{Timeout: *timeout}
+		conn, err := tls.DialWithDialer(dialer, "tcp", dialAddr, tlsConfig)
+		if *expectFail {
+			if err != nil {
+				fmt.Printf("Connection rejected as expected: %v\n", err)
+				return
+			}
+			closeBody(conn)
+			log.Fatalf("Expected TLS connection to fail, but succeeded")
+		}
+		if err != nil {
+			log.Fatalf("TLS handshake failed: %v", err)
+		}
+		defer closeBody(conn)
+		cs := conn.ConnectionState()
+		if len(cs.PeerCertificates) > 0 {
+			leaf := cs.PeerCertificates[0]
+			fmt.Printf("PeerCertSubjectCN: %s\n", leaf.Subject.CommonName)
+			fmt.Printf("PeerCertDNSNames: %s\n", strings.Join(leaf.DNSNames, ","))
+			fmt.Printf("PeerCertIssuerCN: %s\n", leaf.Issuer.CommonName)
+		}
+		fmt.Printf("TLS handshake successful: verified against CA\n")
+		return
+	}
+
 	var transport http.RoundTripper
 
 	if *http3Flag {
